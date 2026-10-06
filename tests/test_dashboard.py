@@ -1106,7 +1106,17 @@ def test_the_band_never_says_ok_on_a_stale_or_colourless_page(results):
         g.epoch()
         g.check(targets[0][0], targets[0][1], store.Status.OK, "fine (test)")
         mixed = g.html()
-        band = mixed[mixed.find("class='band"):][:220]
+        # THE SLICE IS BOUNDED BY THE BAND'S OWN CLOSE, and it is not cosmetic.
+        # A fixed-width window past the band start runs off the end of the band
+        # and into the NEXT block's text: measured on this page the band is 109
+        # characters and a 220-character window reaches 111 characters past its
+        # close, straight into `_whats_wrong`'s note -- which contains the very
+        # same "reported nothing" sentence. The check then passes on text that
+        # is not the band's, and CANNOT FAIL on the property it names. Verified
+        # by mutation: with the band's ok-branch grey append removed the
+        # fixed-window form still reads True; the bounded form reads False.
+        bstart = mixed.find("class='band")
+        band = mixed[bstart:mixed.find("</div></div>", bstart)]
         results.check(
             "a partly-unknown board states the grey count in the band itself",
             "band ok" in mixed and "reported nothing" in band,

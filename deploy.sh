@@ -364,9 +364,12 @@ remote "mkdir -p '$MONITOR_DIR'"
 #          what makes it worth excluding rather than relying on the rebuild.
 #   .git/  and docs/ are this repo's, not the container's.
 #   tests/ is 200 KB of offline suites the image does not run.
+#   proxy/ is the publishing stack, which is a separate concern with its own
+#          compose file: a sentinel deploy must not ship a second stack's config
+#          to the NAS.
 rsync -az --delete \
     --exclude 'data/' --exclude '.env' --exclude 'ssh/' --exclude '.git/' \
-    --exclude 'docs/' --exclude 'tests/' \
+    --exclude 'docs/' --exclude 'tests/' --exclude 'proxy/' \
     --exclude '__pycache__/' --exclude '*.pyc' \
     -e "ssh ${SSH_OPTS[*]}" \
     "$REPO_DIR/" "$STORAGE_USER@$STORAGE_IP:$MONITOR_DIR/"

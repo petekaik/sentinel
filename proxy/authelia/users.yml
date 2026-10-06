@@ -1,0 +1,17 @@
+# One user. The hash is argon2id and is generated ON THE NAS with:
+#
+#   docker run --rm authelia/authelia:4.38.10 \
+#     authelia crypto hash generate argon2 --password 'the password you chose'
+#
+# It is deliberately not in this repo. This file is a TEMPLATE that the operator
+# copies to the NAS and fills in, exactly as .env.example is -- a real hash in
+# version control is a credential in version control, and this tree is a git
+# repo.
+users:
+  operator:
+    displayname: Operator
+    # REPLACE THIS with the output of the command above.
+    password: "$argon2id$v=19$m=65536,t=3,p=4$REPLACE$REPLACE"
+    email: operator@example.invalid
+    groups:
+      - admins

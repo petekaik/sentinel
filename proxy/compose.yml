@@ -1,0 +1,84 @@
+# The publishing stack: nginx-proxy-manager terminating TLS, Authelia gating it.
+#
+# THIS IS NOT SENTINEL'S STACK AND SENTINEL'S DEPLOY DOES NOT SHIP IT. It is a
+# separate compose file for a separate concern -- reachability -- and sentinel's
+# container is unchanged by it: it still holds its own macvlan address and still
+# publishes no host port. The proxy reaches it container-to-container.
+#
+# ON THE SAME eth1 MACVLAN AS EVERYTHING ELSE ON THE NAS, because that is how
+# the other eleven services there are addressed and because it is the only way
+# to reach 198.51.100.11:8787 -- sentinel is not on the host's own interface.
+services:
+
+  nginx-proxy-manager:
+    image: jc21/nginx-proxy-manager:2.12.3
+    container_name: npm
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # NO `ports:` ON PURPOSE. NPM publishes nothing on the host: the LAN
+    # reaches it at its own macvlan address, and the internet reaches it through
+    # the router's port-forward to that address. A host port would put the
+    # admin interface on the NAS's own interface as well.
+    volumes:
+      - ${PROXY_DATA:-/share/CACHEDEV1_DATA/Programs/sentinel/proxy}/data:/data
+      - ${PROXY_DATA:-/share/CACHEDEV1_DATA/Programs/sentinel/proxy}/letsencrypt:/etc/letsencrypt
+    networks:
+      eth1:
+        ipv4_address: ${PROXY_IPV4:-198.51.100.20}
+
+  authelia:
+    image: authelia/authelia:4.38.10
+    container_name: authelia
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # THE CONFIG IS READ-ONLY AND THE WRITABLE STATE IS NOT INSIDE IT. Authelia
+    # needs a store for its WebAuthn device registrations (storage.local.path)
+    # and a file for the notifier, and BOTH must be writable. A `:ro` bind mount
+    # refuses writes at the kernel for any uid, so pointing those two paths into
+    # /config produces a container that never initialises -- "attempt to write a
+    # readonly database" -- and the offline suite cannot see it: it surfaces only
+    # at the operator's `docker compose up -d`. So they live in /data, on a named
+    # volume: the access rules this stack exists to enforce stay unwritable from
+    # inside the auth service, and nothing Authelia writes lands in the checkout
+    # that Step 11's `git add proxy` picks up.
+    volumes:
+      - ./authelia:/config:ro
+      - authelia-data:/data
+    environment:
+      - TZ=${TZ:-Europe/Helsinki}
+      # DOMAIN is substituted into the Authelia config, which needs it for the
+      # cookie domain and the WebAuthn RP id. Without it here the config's
+      # `${DOMAIN}` resolves to nothing and every passkey is bound to an empty
+      # hostname.
+      - DOMAIN=${DOMAIN:?set this in .env}
+      # THE THREE SECRETS ARRIVE BY ENV CONVENTION, not by explicit reference:
+      # Authelia reads AUTHELIA_SESSION_SECRET, AUTHELIA_STORAGE_ENCRYPTION_KEY
+      # and AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET by name, so
+      # the config file neither holds them nor mentions them. That is one fewer
+      # place for a secret to be written down.
+      - AUTHELIA_SESSION_SECRET=${AUTHELIA_SESSION_SECRET:?set this in .env}
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET=${AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET:?set this in .env}
+      - AUTHELIA_STORAGE_ENCRYPTION_KEY=${AUTHELIA_STORAGE_ENCRYPTION_KEY:?set this in .env}
+    networks:
+      eth1:
+        ipv4_address: ${AUTHELIA_IPV4:-198.51.100.21}
+
+volumes:
+  # Named, not a bind mount into the checkout: it holds the enrolled passkey
+  # registrations, which are operational state rather than configuration. Where
+  # it lives and how to back it up is in docs/publishing.md -- losing it costs a
+  # passkey re-enrolment and nothing else.
+  authelia-data:
+
+networks:
+  eth1:
+    external: true
+    name: eth1

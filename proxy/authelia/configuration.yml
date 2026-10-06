@@ -1,0 +1,103 @@
+# Authelia: one user, passkeys, and the two access rules that are deliberate.
+#
+# WHY EACH HOLE EXISTS IS IN docs/publishing.md. The short version: /healthz
+# must stay open so a broken login can be told apart from a dead monitor, and
+# /api/* must bypass from the LAN so the documented curl integration keeps
+# reading JSON instead of an HTML login page. Neither is an oversight, and
+# tests/test_proxy_config.py fails if either is deleted.
+
+theme: dark
+
+server:
+  host: 0.0.0.0
+  port: 9091
+
+log:
+  level: info
+
+# Sessions in memory: this is a single instance, so there is nothing to share
+# them with and no Redis to run on a NAS that already has sixteen containers.
+session:
+  name: authelia_session
+  expiration: 1d
+  inactivity: 12h
+  cookies:
+    - domain: ${DOMAIN}
+      authelia_url: https://${DOMAIN}
+      default_redirection_url: https://${DOMAIN}
+
+storage:
+  # A local SQLite file on the container's own filesystem: Authelia needs a store
+  # for its WebAuthn device registrations, and one file is smaller than a second
+  # service. IN /data, NOT /config -- /config is mounted read-only (see the
+  # compose file), and a store inside it makes the container fail to start.
+  local:
+    path: /data/db.sqlite3
+
+notifier:
+  # No SMTP: there is one user and no password reset flow to notify about. The
+  # passkeys ARE the second factor, so a mail path would be unused surface.
+  # /data for the same reason as the store above -- the notifier writes to it.
+  filesystem:
+    filename: /data/notifications.txt
+
+authentication_backend:
+  file:
+    path: /config/users.yml
+    password:
+      algorithm: argon2id
+
+access_control:
+  default_policy: deny
+  rules:
+    # THE ONE UNPROTECTED ENDPOINT, AND IT IS DELIBERATE.
+    #
+    # If this service is down the operator is locked out, and the only question
+    # left is whether the LOGIN is broken or the MONITOR is dead -- the two
+    # failures this whole design exists to keep apart. One line of text, naming
+    # whether the collector is fresh, answers it without a session.
+    #
+    # It discloses one word about the fleet. That is the trade, and it is made
+    # in the open rather than by accident.
+    - domain: ${DOMAIN}
+      resources:
+        - "^/healthz$"
+      policy: bypass
+
+    # THE LAN KEEPS ITS SCRIPTS. docs/architecture.md publishes
+    # `curl .../api/status.json` as the way an integrator reads the contract,
+    # and the point of a versioned document is that a script reads it. An
+    # interactive session gate would break every script that uses it -- so the
+    # API bypasses FROM THE LAN ONLY. From the internet it is two_factor like
+    # everything else; the public hostname gets no weaker a door.
+    #
+    # THE TWO PATHS ARE NAMED, NOT MATCHED BY WILDCARD. `^/api/[a-z]+\.json$`
+    # would be shorter and would silently open any /api/*.json that is ever
+    # added -- a door that widens without anyone deciding it should. The rule
+    # names exactly what §7.1 approves.
+    - domain: ${DOMAIN}
+      resources:
+        - "^/api/status\\.json$"
+        - "^/api/state\\.json$"
+      networks:
+        - 198.51.100.0/24
+      policy: bypass
+
+    # Everything else, from anywhere.
+    - domain: ${DOMAIN}
+      policy: two_factor
+
+regulation:
+  max_retries: 3
+  find_time: 2m
+  ban_time: 5m
+
+totp:
+  issuer: sentinel
+
+webauthn:
+  display_name: sentinel
+  attestation_conveyance_preference: indirect
+  # The RP id is the bare hostname, so a passkey is bound to the domain and not
+  # to a path -- iOS shows it in Keychain under this name.
+  rp_id: ${DOMAIN}

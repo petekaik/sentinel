@@ -1040,3 +1040,11 @@ Two rules the suites enforce structurally, both learned by measurement:
 - **The monitor holds an ssh credential to the fleet.** Least privilege and
   revocability are why a dedicated `monitor_id` key is preferred over reusing the
   operator's.
+- **The publish path is a second dependency for the only dead-man switch.**
+  The dashboard is reached through nginx-proxy-manager and Authelia, so a
+  failure in either makes the page unreachable — and from a phone that reads
+  the same as a dead collector. The `/healthz` bypass is what keeps the two
+  separable: it answers without a session, so "the login is broken" and "the
+  monitor is dead" stay different readings. That mitigates the confusion and
+  does not remove the dependency. `docs/publishing.md` is the runbook; this is
+  the same risk stated as a design trade.

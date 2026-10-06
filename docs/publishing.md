@@ -119,24 +119,65 @@ Add a **proxy host**:
   selecting the DNS provider and pasting the API token. Turn on *Force SSL*.
   There is no HTTP-01 option here on purpose — see step 1.
 
-Then **forward auth**, in the proxy host's Advanced tab, pointing at:
+Then **forward auth**. The value that goes in the proxy host's forward-auth field
+is the Authelia address the compose file actually assigns — `198.51.100.21`, port
+`9091`, the verify endpoint — and the redirect target is `$host`, nginx's own
+variable for the hostname being requested:
 
 ```
-http://198.51.100.21:9091/api/verify?rd=https://${DOMAIN}
+http://198.51.100.21:9091/api/verify?rd=https://$host
 ```
 
-(`${DOMAIN}` is the value from `.env`; inside NPM's own config the hostname is
-`$host`. Pasting the literal `${DOMAIN}` there is not a syntax error — nginx
-substitutes an undefined variable as empty — so it would silently point the
-redirect at `https://` and send you back to a login page you had already
-passed.)
+Not the `${DOMAIN}` template from `.env`: that is an `.env` variable, and in
+nginx a name it does not know is substituted as **empty**, so the redirect would
+silently point at `https://` and send you back to a login page you had already
+passed.
 
-i.e. an internal `location` that `location /` reaches through `auth_request`.
+It goes in the proxy host's **Advanced** tab, as an internal `location` that
+`location /` reaches through `auth_request`. `/api/verify` is Authelia 4.38's
+endpoint and **is slated for removal in v5**, which is why this value is filled
+in from the step here rather than hardcoded in prose anywhere else.
+
 No special case for `/healthz` is needed on the NPM side, and none should be
 added: NPM asks Authelia about every request and **Authelia decides**, per the
 rules in `proxy/authelia/configuration.yml`. That is why the two bypasses are in
 that file rather than in the proxy's config — one place holds the policy, and
 `tests/test_proxy_config.py` reads it.
+
+### The API bypass needs one more line, and it is not obvious
+
+**Authelia matches `access_control.networks` against the first `X-Forwarded-For`
+address, falling back to the TCP source.** An `auth_request` subrequest is made
+by nginx, so with no such header Authelia sees nginx's own address —
+`198.51.100.20`, which is **inside `198.51.100.0/24`** — and the `/api` rule
+matches everything, from anywhere. The LAN scoping would then hold in the config
+file and nowhere else. So, in the same **Advanced** tab on the proxy host:
+
+```
+proxy_set_header X-Forwarded-For $remote_addr;
+```
+
+**Then prove it. The snippet above is the instruction; this test is the
+authority on whether it works.** Run it from a machine that is **not** on
+`198.51.100.0/24` — a phone on cellular, or any host outside the LAN:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+     -H 'X-Forwarded-For: 169.254.1.2' https://${DOMAIN}/api/status.json
+```
+
+**It must print `302`. A `200` means the rule matched and the API is public.**
+The test exploits the very trust the header relies on: a request claiming to
+come from `169.254.1.2` — link-local, not the LAN — must be turned away by the
+login redirect.
+
+**If it prints `200`, close the API hole entirely:** delete the `/api` rule from
+`proxy/authelia/configuration.yml` and leave `/healthz` as the only bypass. A
+hole that cannot be shown to be scoped is not scoped, and the direct
+`http://198.51.100.11:8787/api/status.json` path in step 5 keeps working without
+it. Say here that it was closed and why — and expect the suite's "exactly two
+rules bypass authentication" check to fail from then on, deliberately: that is
+the guard reporting the decision, not a test to bend back.
 
 ## 4. Enroll the passkey
 

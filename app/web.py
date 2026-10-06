@@ -109,7 +109,8 @@ def build_state(cfg, conn, now=None):
     claimed, deferred, unclaimed = thresholds.audit(specs, classes)
 
     current, n_current = _rows(
-        conn, "SELECT target, check_id, status, detail, ts FROM check_run "
+        conn, "SELECT target, check_id, status, detail, ts, epoch_seq "
+              "FROM check_run "
               "WHERE epoch_seq = (SELECT MAX(epoch_seq) FROM check_run)")
     by_key = {(r["target"], r["check_id"]): r for r in current}
 
@@ -140,10 +141,22 @@ def build_state(cfg, conn, now=None):
             "claim": spec.claim if spec else None,
             "has_result": row is not None,
         }
-        if spec is not None:
+        # THE READING AND THE VERDICT MUST COME FROM THE SAME EPOCH.
+        #
+        # A check that is healthy often returns WITHOUT grading -- TvhLogSignals
+        # grades the tuner-refusal age only when that age is bad, and falls
+        # through to its pairing tests otherwise -- and a check that does not
+        # grade writes no sample. Asking for the newest sample REGARDLESS of
+        # epoch then puts a number from an arbitrary past epoch beside today's
+        # verdict, with nothing on the page saying how old it is. Measured
+        # 2026-10-06: a green row read "23.795 hours" from a sample ten days old.
+        # A stale figure beside a live verdict is the same lie as a green row
+        # over an empty one -- it is data-shaped, so nobody questions it -- and
+        # the honest answer is `--`, which the renderer already prints for None.
+        if spec is not None and row is not None:
             m, _n = _rows(conn, "SELECT value, text FROM sample WHERE target = ? "
-                                "AND metric = ? ORDER BY epoch_seq DESC LIMIT 1",
-                          (chk.target, spec.metric))
+                                "AND metric = ? AND epoch_seq = ? LIMIT 1",
+                          (chk.target, spec.metric, row["epoch_seq"]))
             if m:
                 item["value"] = m[0]["value"]
                 item["sample_text"] = m[0]["text"]

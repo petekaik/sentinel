@@ -594,6 +594,70 @@ def test_informational_rows_carry_no_colour(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+
+# ---------------------------------------------------------------------------
+# 10. A reading is not shown beside a verdict from another epoch
+# ---------------------------------------------------------------------------
+
+
+def test_a_sample_from_an_older_epoch_is_not_shown_as_current(results):
+    """The number beside a verdict must come from the epoch that verdict is from.
+
+    MEASURED 2026-10-06, on the live dashboard. `TvhLogSignals` grades the
+    tuner-refusal age only when that age is BAD; when it is old it falls through
+    to its pairing tests and returns a plain `ok` -- and a check that does not
+    grade writes no sample (nothing calls `res.metric`). The page asked for the
+    NEWEST sample for the metric regardless of epoch, so a green row read
+    `23.795 hours` from a sample ten days older than the verdict beside it, with
+    nothing on the page saying how old that number was.
+
+    That is the same failure as a green row over an empty one, wearing a number:
+    data-shaped, so nobody questions it. The reading and the verdict are two
+    tables -- the point of storing raw observations beside verdicts -- and they
+    are only meaningful together when they are the same epoch's.
+
+    Both halves are asserted. A test that only checked "no stale number" would
+    pass on a page that had stopped showing numbers at all.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+
+        def tile():
+            return {(t["target"], t["check_id"]): t
+                    for t in d.state()["tiles"]}[("storage", "tvh_log_signals")]
+
+        # Epoch 1: the check GRADED, so it wrote both a verdict and a sample.
+        d.epoch()
+        d.check("storage", "tvh_log_signals", store.Status.WARN, "23.8 hours")
+        store.record_sample(d.conn, d.seq, "storage", "tvh_tuner_refusal_h",
+                            23.795, "hours", None)
+        results.check(
+            "a graded epoch shows the sample written in that same epoch",
+            tile()["value"] == 23.795,
+            "value=%r -- this half exists so the assertion below cannot pass "
+            "trivially on a page that shows no numbers at all"
+            % (tile()["value"],))
+
+        # Epoch 2: the same check returns OK WITHOUT grading -- the fall-through
+        # path -- so this epoch writes no sample of its own.
+        d.epoch()
+        d.check("storage", "tvh_log_signals", store.Status.OK, "no live fault")
+
+        t = tile()
+        results.check(
+            "an epoch that did not grade shows NO reading, not the last one",
+            t["status"] == "ok" and t["value"] is None,
+            "status=%r value=%r unit=%r -- the tile is showing a sample from an "
+            "older epoch beside this epoch's verdict"
+            % (t["status"], t["value"], t["unit"]))
+        results.check(
+            "the page prints the absent reading rather than the stale figure",
+            "23.795" not in d.html(),
+            "the ten-day-old number is still on the page beside a current verdict")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 # ---------------------------------------------------------------------------
 # 9. The status API -- three-valued, not a boolean
 # ---------------------------------------------------------------------------
@@ -878,6 +942,7 @@ def test_status_api_is_a_stable_contract(results):
 
 
 TESTS = (test_empty_store_is_loud,
+         test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_stale_says_so_and_cannot_also_be_ok,
          test_unknown_is_never_green,
          test_unrecognised_status_is_grey_not_green,

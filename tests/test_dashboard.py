@@ -1233,36 +1233,47 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
             "the strip does not state what it is counting:\n%s"
             % green_strip[:300])
 
-        # EACH TARGET'S SEGMENTS SIT TOGETHER, asserted as CONTIGUITY.
+        # EACH GROUP WRAPPER HOLDS ONE TARGET'S SEGMENTS, AND THERE IS ONE
+        # WRAPPER PER TARGET. That is §4.4's grouping stated as a property of
+        # the output -- the wrappers and their contents -- rather than as a
+        # restatement of the sort that produces it.
         #
-        # The property §4.4 wants is adjacency -- reason #2 for the strip
-        # existing is that a red CLUSTER reads as "the problem is in cubox-2"
-        # without scanning. So this counts the runs of target in the strip and
-        # requires them to equal the number of distinct targets: interleaved,
-        # the runs outnumber the targets.
+        # WHY THE WRAPPERS AND NOT THE SEGMENTS' ORDER. The grouping needs TWO
+        # pieces of code to be right: the SORT, which puts each target's segments
+        # next to each other, and the BOUNDARY, which wraps them. An earlier
+        # draft of this check counted the runs of target in the segment sequence,
+        # reading them off the aria-labels -- and that proves only the sort.
+        # Deleting the whole boundary block collapses five wrappers into one and
+        # changes not one character the runs-check can see, so it stayed GREEN
+        # (measured: wrappers 5 -> 1, runs still 5). Asserting on the wrappers
+        # catches both, because it also proves they are not misaligned.
         #
-        # WHY NOT THE OBVIOUS FORM. An earlier draft asserted the segment
-        # sequence equalled `_verdict_items(state)`'s rags. Two things are wrong
-        # with that: on this all-OK board every rag is "green", so ANY
-        # permutation satisfies it -- it could only fail by losing segments
-        # entirely -- and once the strip sorts by target, deriving the expected
-        # order in the test means RE-SORTING IT THE SAME WAY, which is a
-        # verification that re-types the code it checks and therefore agrees
-        # with any bug in that code. Contiguity is a property, not a restatement,
-        # so it holds whichever order the implementation chooses.
-        tseq = [s.split("aria-label='")[1].split(" ")[0]
-                for s in green_strip.split("<span class='seg ")[1:]]
-        runs = sum(1 for i, t in enumerate(tseq) if i == 0 or t != tseq[i - 1])
+        # WHY NOT THE OBVIOUS FORM EITHER. The draft before that asserted the
+        # segment sequence equalled `_verdict_items(state)`'s rags. On this
+        # all-OK board every rag is "green", so ANY permutation satisfied it --
+        # it could only fail by losing segments outright -- and once the strip
+        # sorts by target, deriving the expected order here means RE-SORTING IT
+        # THE SAME WAY, which is a verification that re-types the code it checks
+        # and so agrees with any bug in that code.
+        groups = green_strip.split("<span class=seg-group>")[1:]
+        per_group = [[s.split("aria-label='")[1].split(" ")[0]
+                      for s in g.split("<span class='seg ")[1:]]
+                     for g in groups]
+        tseq = [t for g in per_group for t in g]
         results.check(
-            "each target's segments sit together, so a cluster reads as one box",
-            len(tseq) == len(web._verdict_items(state))
-            and runs == len(set(tseq)) and runs > 1,
-            "the strip drew %d segments over %d targets in %d runs: %r -- "
-            "interleaved, a red segment sits between two gaps and nothing says "
-            "which box it came from, which is §4.4's second reason for the strip "
-            "existing. (`runs > 1` keeps this from passing on a one-target "
-            "board, where grouping and no grouping look identical.)"
-            % (len(tseq), len(set(tseq)), runs, tseq[:8]))
+            "each group wrapper holds one target's segments, one wrapper per "
+            "target",
+            len(per_group) == len(set(tseq)) and len(set(tseq)) > 1
+            and all(len(set(g)) == 1 for g in per_group)
+            and len(tseq) == len(web._verdict_items(state)),
+            "the strip drew %d wrappers over %d targets, contents %r -- "
+            "interleaved or ungrouped, a red segment sits between two gaps and "
+            "nothing says which box it came from, which is §4.4's second reason "
+            "for the strip existing. (`len(set(tseq)) > 1` keeps this from "
+            "passing on a one-target board, where grouping and no grouping look "
+            "identical.)"
+            % (len(per_group), len(set(tseq)),
+               [sorted(set(g)) for g in per_group][:8]))
 
         # AN UNRECOGNISED STATUS STRING. `_status` maps anything it does not
         # know to UNKNOWN, so the strip must not draw it as a colour that

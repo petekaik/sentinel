@@ -1647,6 +1647,18 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
                     "code=%s Cache-Control=%r -- the app shell is a constant of "
                     "the image, so caching it is not a claim about the fleet"
                     % (code, hdrs.get("Cache-Control")))
+                # DERIVED FROM THE CODE, NOT TYPED HERE. A wrong content type does
+                # not stop this suite -- the manifest body still parses and the PNG
+                # magic still matches -- it stops a BROWSER installing the app, on a
+                # phone, with nothing in the log. That is the same silent class as a
+                # dropped CSS declaration, so the type comes from ASSETS rather than
+                # being copied beside it (items 84/58: a verification that re-types
+                # the thing it checks agrees with any bug in it).
+                results.check(
+                    "%s declares the content type it is served with" % path,
+                    hdrs.get("Content-Type") == web.shell.ASSETS[path][1],
+                    "Content-Type=%r but the image declares %r"
+                    % (hdrs.get("Content-Type"), web.shell.ASSETS[path][1]))
 
             # THE GUARD THAT MATTERS: the exception must not grow.
             for path in ("/", "/api/status.json", "/api/state.json", "/healthz"):
@@ -1689,6 +1701,39 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
                     "code=%s first8=%r last8=%r -- iOS will not accept an SVG "
                     "here, and a truncated file falls back to a screenshot "
                     "without saying so" % (code, raw[:8], raw[-8:]))
+            # THE ORDERING THAT MAKES THE SHELL WORTH ANYTHING, and it was the
+            # one structural claim this task made with no guard behind it. The
+            # shell branch sits ahead of the store precisely so the installed app
+            # still looks like an app during an outage; move that branch one
+            # statement down and every check above still passes.
+            #
+            # BOTH HALVES ARE LOAD-BEARING. The shell answering 200 alone would
+            # pass vacuously the day this config stops being unopenable, so the
+            # guard also asserts an observation path does NOT answer under it --
+            # the same two-sided shape as the cache mutation.
+            broken = make_cfg(os.path.join(tmpdir, "no-such-dir", "monitor.sqlite"))
+            httpd2, base2 = _serve(broken)
+            try:
+                for path in web.shell.ASSETS:
+                    code, hdrs, body = _get(base2 + path)
+                    results.check(
+                        "%s is served while the store cannot be opened" % path,
+                        code == 200
+                        and hdrs.get("Cache-Control") == web.shell.CACHE_CONTROL,
+                        "code=%s Cache-Control=%r -- the app shell is a constant "
+                        "of the image, so an outage must not stop it being served"
+                        % (code, hdrs.get("Cache-Control")))
+                code, _h, _b = _get(base2 + "/")
+                results.check(
+                    "an observation path does NOT answer under the same config",
+                    code != 200,
+                    "code=%s -- if this answers 200 then the store was opened "
+                    "after all, and the check above proves nothing about ordering"
+                    % code)
+            finally:
+                httpd2.shutdown()
+                httpd2.server_close()
+
         finally:
             httpd.shutdown()
             httpd.server_close()

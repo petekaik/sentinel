@@ -677,7 +677,7 @@ def render_html(state, cfg):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "cubox-monitor"
+    server_version = "sentinel"
     sys_version = ""
     protocol_version = "HTTP/1.1"
 

@@ -1,4 +1,4 @@
-# cubox-monitor — the image the fleet monitor runs in.
+# sentinel — the image the fleet monitor runs in.
 #
 # DELIBERATELY SMALL, AND DELIBERATELY PINNED. The application is Python 3
 # standard library only (sqlite3, http.server, subprocess, urllib) so there is no

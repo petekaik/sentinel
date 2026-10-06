@@ -26,8 +26,8 @@ incident from scratch, which must re-earn its confirmation streak.
 
 USAGE, from anywhere that can reach the container:
 
-    docker exec cubox-monitor python3 /app/dismiss.py --list
-    docker exec cubox-monitor python3 /app/dismiss.py \\
+    docker exec sentinel python3 /app/dismiss.py --list
+    docker exec sentinel python3 /app/dismiss.py \\
         storage/tvh_response_ms --reason "TVH has auth on; 401 is its resting state"
 
 Or, from the Mac, through the deploy script's passthrough:

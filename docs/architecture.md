@@ -1,6 +1,6 @@
 # 09 — Fleet monitoring, the status API, and safe auto-healing
 
-Covers the `cubox-monitor` container on Storage-NAS: what it watches, what it
+Covers the `sentinel` container on Storage-NAS: what it watches, what it
 stores, what it exposes, and the narrow set of things it is allowed to *do*.
 
 Referenced from `Dockerfile`, `compose.yml` and `.env.example`.
@@ -974,9 +974,9 @@ that dies with `exec format error`. And a plain deploy never touches Backup-NAS 
 host's credentials is how a surprise gets introduced.
 
 Configuration is environment variables in the **monitor directory on
-Storage-NAS** — `/share/CACHEDEV1_DATA/Programs/cubox-monitor/.env`, mode 600 —
+Storage-NAS** — `/share/CACHEDEV1_DATA/Programs/sentinel/.env`, mode 600 —
 not in the repo. It is created once from `.env.example` and is
-then **excluded from every deploy** (`15-deploy-monitor.sh` skips `.env` in the
+then **excluded from every deploy** (`deploy.sh` skips `.env` in the
 rsync and only writes it when it is ABSENT on the NAS). So editing the repo's
 copy, or the `.env.example` template, changes nothing on a running monitor and
 says nothing about it — the NAS file wins. That is items 79/83's shape: the live

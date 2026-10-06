@@ -113,7 +113,7 @@ def should_stop(th):
 def main():
     cfg = config_mod.Config()
 
-    print("cubox-monitor starting\n%s" % cfg.describe(), flush=True)
+    print("sentinel starting\n%s" % cfg.describe(), flush=True)
 
     # THE SCHEMA BEFORE THE PAGE. A brand-new database has no tables, and the
     # dashboard renders a store it cannot query as a 503 -- correct, but it would

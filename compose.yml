@@ -1,6 +1,6 @@
-# cubox-monitor — fleet monitoring + safe auto-healing for the CuBox fleet.
+# sentinel — fleet monitoring + safe auto-healing for the CuBox fleet.
 #
-# Location on Storage-NAS: /share/CACHEDEV1_DATA/Programs/cubox-monitor/compose.yml
+# Location on Storage-NAS: /share/CACHEDEV1_DATA/Programs/sentinel/compose.yml
 # Deployed by deploy.sh, which is also what installs the ssh
 # material, the threshold file and the reference worker.sh. Do not `docker
 # compose up` this by hand before the script has run once: the tree it mounts
@@ -19,9 +19,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: cubox-monitor:latest
-    container_name: cubox-monitor
-    hostname: cubox-monitor
+    image: sentinel:latest
+    container_name: sentinel
+    hostname: sentinel
     restart: unless-stopped
 
     # House convention (see Programs/pvr/compose.yml). Bounded because the NAS
@@ -94,7 +94,7 @@ services:
       # The store. On the NAS's OWN filesystem and never a network share: SQLite
       # is unsupported on a network filesystem and can corrupt. It outlives the
       # container, so replacing the image loses no history.
-      - ${MONITOR_DATA:-/share/CACHEDEV1_DATA/Programs/cubox-monitor/data}:/data
+      - ${MONITOR_DATA:-/share/CACHEDEV1_DATA/Programs/sentinel/data}:/data
       # The code, read-only, so editing a check or a threshold is an edit plus
       # `docker compose restart` rather than a rebuild -- the same pattern the
       # pvr stack uses for its scripts.

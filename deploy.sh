@@ -1,6 +1,6 @@
 #!/bin/bash
 # sentinel/deploy.sh
-# Deploy / upgrade the cubox-monitor container on Storage-NAS.
+# Deploy / upgrade the sentinel container on Storage-NAS.
 #
 # Usage:
 #   ./deploy.sh                    # sync, build, start
@@ -43,7 +43,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STORAGE_IP="${STORAGE_IP:-198.51.100.10}"
 STORAGE_USER="${STORAGE_USER:-admin}"
-MONITOR_DIR="${MONITOR_DIR:-/share/CACHEDEV1_DATA/Programs/cubox-monitor}"
+MONITOR_DIR="${MONITOR_DIR:-/share/CACHEDEV1_DATA/Programs/sentinel}"
 # Not on PATH on QTS. Measured 2026-09-26: `command -v docker` finds nothing and
 # this path is the one that answers, with compose v2.29.1-qnap2 as a plugin.
 MONITOR_DOCKER="${MONITOR_DOCKER:-/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker}"
@@ -149,8 +149,8 @@ _oneoff() {
     _script="$1"; shift
     _args=""
     for a in "$@"; do _args="$_args $(shq "$a")"; done
-    if remote "'$MONITOR_DOCKER' inspect -f '{{.State.Running}}' cubox-monitor 2>/dev/null" | grep -q '^true$'; then
-        remote "'$MONITOR_DOCKER' exec cubox-monitor python3 $_script$_args"
+    if remote "'$MONITOR_DOCKER' inspect -f '{{.State.Running}}' sentinel 2>/dev/null" | grep -q '^true$'; then
+        remote "'$MONITOR_DOCKER' exec sentinel python3 $_script$_args"
     else
         dc "run --rm --no-deps monitor python3 $_script$_args"
     fi
@@ -563,7 +563,7 @@ echo "    installed: $(grep -c . "$TMP_KH" 2>/dev/null || echo 0) host key(s)"
 
 # ---------------------------------------------------------------------------
 echo ""
-echo "==> Reference worker.sh for the drift check"
+echo "==> Leftover reference worker.sh (item 90)"
 # ---------------------------------------------------------------------------
 # NOTHING IS PUSHED HERE ANY MORE (item 90, 2026-10-06). This step used to copy
 # configs/transcode/worker.sh to $MONITOR_DIR/expected/worker.sh, and the drift

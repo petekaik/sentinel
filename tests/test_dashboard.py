@@ -1433,13 +1433,35 @@ def test_a_closed_section_still_renders_every_row(results):
             and html.count("<details") >= 4,
             "details open=%d close=%d -- expected at least four balanced "
             "sections" % (html.count("<details"), html.count("</details>")))
+        # THE EXPECTED IDS ARE DERIVED, NOT TYPED. `informational` and
+        # `thresholds` render only when they have rows, so a typed list of all
+        # five would red on correct code the first time the data changes -- and
+        # it would be the same defect as the hardcoded row count one section up.
+        # The contract Step 3's docstring names is five ids; asserting three of
+        # them is a guard that covers a contract it does not fully name.
+        expected_ids = ["incidents", "checks", "evidence"]
+        if state["informational"]:
+            expected_ids.append("informational")
+        if state["deferred"] or state["unclaimed"]:
+            expected_ids.append("thresholds")
         results.check(
             "every section carries the id the refresh restores it by",
-            all(("id='sec-%s'" % s) in html
-                for s in ("incidents", "checks", "evidence")),
+            all(("id='sec-%s'" % s) in html for s in expected_ids),
             "a section lost its id, so the refresh cannot restore whether it "
             "was open -- and restoring by position instead would shift every "
-            "section after one that appears or disappears")
+            "section after one that appears or disappears. Expected %r"
+            % expected_ids)
+        # §4.1's wireframe (:90-94) and §4.5's table (:174-175) both put
+        # `All N checks` above the incident section and agree with each other,
+        # so the order is the spec's. The brief originally emitted them the
+        # other way and nothing asserted either -- an order nobody checks is an
+        # order the next edit is free to reverse.
+        results.check(
+            "the sections follow the spec's order, counts before incidents",
+            -1 < html.find("id='sec-checks'") < html.find("id='sec-incidents'"),
+            "§4.1 and §4.5 both order the all-checks section above the incident "
+            "section: checks at %d, incidents at %d"
+            % (html.find("id='sec-checks'"), html.find("id='sec-incidents'")))
 
         # The counts live in the SUMMARIES, so a shut section still says how
         # much is behind it.
@@ -1470,6 +1492,7 @@ def test_a_closed_section_still_renders_every_row(results):
             "the page animates for a reader who asked it not to")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_empty_store_is_loud,

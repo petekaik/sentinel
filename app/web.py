@@ -1006,21 +1006,23 @@ def render_html(state, cfg):
 
     # ---- everything else, behind native disclosure -------------------------
     #
-    # ORDER IS BY HOW LIKELY IT IS TO BE THE REASON THE PAGE WAS OPENED, and each
-    # summary states its own count so a shut section still says how much is
-    # behind it. A collapsed list that does not say how many rows it holds reads
-    # as an empty one -- which is the same defect as an absent row reading as
-    # fine, one level up.
+    # THE ORDER IS THE SPEC'S, NOT THE READER'S GUESS. §4.1's wireframe (:90-94)
+    # and §4.5's table (:174-175) both put `All N checks` above the incident
+    # section, and they agree with each other, so the disclosure follows them.
+    # Each summary states its own count so a shut section still says how much is
+    # behind it: a collapsed list that does not say how many rows it holds reads
+    # as an empty one -- the same defect as an absent row reading as fine, one
+    # level up.
+    all_rows = (len(state["extra"]) + len(state["tiles"]) + len(state["others"])
+                + len(state["informational"]))
+    a(_details("checks", "All %d checks" % all_rows, tiles_and_checks_html))
+
     n = len(state["incidents"])
     if n:
         a(_details("incidents", "%d live incident%s" % (n, "" if n == 1 else "s"),
                    incidents_html, open_=True))
     else:
         a(_details("incidents", "No live incident", incidents_html))
-
-    all_rows = (len(state["extra"]) + len(state["tiles"]) + len(state["others"])
-                + len(state["informational"]))
-    a(_details("checks", "All %d checks" % all_rows, tiles_and_checks_html))
 
     if state["informational"]:
         a(_details("informational",

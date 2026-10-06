@@ -30,6 +30,7 @@ constructed in-process; there is no captured artefact to drift from.
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -1494,6 +1495,120 @@ def test_a_closed_section_still_renders_every_row(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 12. Naming, and colour that is never the only channel
+# ---------------------------------------------------------------------------
+#
+# Needs `import re` added to the module's imports (:31-40); the token guard
+# below reads the stylesheet's var() uses and definitions.
+
+
+def test_the_page_names_the_platform_and_never_colours_alone(results):
+    """The title, the tokens, and four states all saying their own word."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        html = d.html()
+        results.check(
+            "the page is titled sentinel, not named after tenant #1",
+            "<h1>sentinel</h1>" in html and "CuBox fleet monitor" not in html,
+            "the <h1> still names the first adapter as if it were the platform, "
+            "which CLAUDE.md is explicit that it is not")
+
+        want_watched = ", ".join(sorted(
+            {r["target"] for r in d.state()["tiles"] + d.state()["extra"]
+             + d.state()["others"] + d.state()["informational"]}))
+        results.check(
+            "the subtitle names the targets the page is actually watching",
+            want_watched in html and "Watching" in html,
+            "the subtitle does not name the rows' own targets, so it is either "
+            "a stale literal or empty -- expected %r" % want_watched)
+
+        results.check(
+            "the old colour aliases are gone from the stylesheet",
+            "--green:" not in html.split("</style>")[0],
+            "the stylesheet still defines --green/--amber/--red/--grey as well "
+            "as the role tokens, so there are two names for one colour and they "
+            "will drift")
+
+        # THE GUARD THE ALIAS REMOVAL NEEDS. Deleting `--green` while some rule
+        # still says `var(--green)` raises nothing and logs nothing: the
+        # declaration becomes invalid and the element silently has no colour.
+        # The hero's bar would go invisible, and every other test on this page
+        # would still pass. Task 1's hero CSS uses the aliases, so this is the
+        # exact miss it would make.
+        css = html.split("</style>")[0]
+        defined = set(re.findall(r"(--[a-z-]+)\s*:", css))
+        used = set(re.findall(r"var\((--[a-z-]+)\)", css))
+        results.check(
+            "every colour token the stylesheet uses is one it defines",
+            used <= defined,
+            "the stylesheet uses %s but does not define %s -- a var() with no "
+            "definition is not an error anywhere, it is an element that "
+            "quietly has no colour"
+            % (sorted(used - defined), sorted(defined)))
+
+        # THE ONE GUARD THAT LOOKS AT A CSS VALUE, and it asserts a PROPERTY,
+        # not the value: a backslash that is not the start of a hex escape is
+        # not an error anywhere -- the declaration is dropped and the element
+        # silently loses that property. That is not hypothetical: Task 4's
+        # disclosure markers were written through a Python-level escape (`\u`
+        # is not a CSS escape, because `u` is not a hex digit), so `▸` rendered
+        # as nothing and every check on the page stayed green. This is the same
+        # failure Task 5's token guard above exists to catch, one level down:
+        # a var() with no definition and a declaration that never parses are
+        # both silent. It copies no value, so a restyle is free to change every
+        # colour -- and legitimate hex escapes (`\2014`) are not flagged.
+        results.check(
+            "no CSS escape can silently drop a declaration",
+            not re.search(r"\\(?![0-9a-fA-F])", css),
+            "the stylesheet carries a backslash that is not a hex escape -- the "
+            "declaration it sits in is dropped and the element quietly has no "
+            "such property, which no assertion about structure can see")
+
+        results.check(
+            "no heading uppercases itself",
+            "uppercase" not in css,
+            "a heading still text-transforms to caps -- the tracked-out "
+            "ALL-CAPS eyebrow is the generated-page tell §4.6 removes")
+
+        results.check(
+            "no webfont is fetched for the one page that has to be trustworthy",
+            "@font-face" not in html and "fonts.googleapis" not in html
+            and "fonts.gstatic" not in html,
+            "the page pulls a font over the network -- a typography dependency "
+            "on the page whose whole job is to be believable when the network "
+            "is the thing that is broken")
+
+        # FOUR STATES, FOUR WORDS. Each state's own word is in the document, so
+        # a reader who cannot separate the colours loses nothing. The markers
+        # are the ACTUAL markup each state renders in -- a tile prints its word
+        # after the value; the coloured rows print it as the pill's text.
+        for (target, cid), status in zip(
+                [(c.target, c.id) for c in registry_instances(d.cfg)
+                 if c.spec and not getattr(c, "informational", False)][:4],
+                (store.Status.OK, store.Status.WARN, store.Status.FAIL,
+                 store.Status.UNKNOWN)):
+            d.check(target, cid, status, "state (test)")
+        html = d.html()
+        results.check(
+            "every coloured state also prints its status word",
+            all(marker in html for marker in (
+                "&middot; ok<", ">warn<", ">fail<", ">unknown<")),
+            "a state is conveyed by colour alone -- a reader who cannot "
+            "separate the greens from the reds loses that row's outcome "
+            "entirely")
+        results.check(
+            "the four states are drawn as four different colour classes",
+            all(c in html for c in ("tile green", "pill amber", "pill red",
+                                    "pill grey")),
+            "the states are not distinctly coloured, so the word assertions "
+            "above prove nothing about the colours")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
@@ -1508,7 +1623,8 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_status_api_is_a_stable_contract,
          test_the_freshness_hero_tracks_the_staleness_it_leads_with,
          test_the_band_never_says_ok_on_a_stale_or_colourless_page,
-         test_the_strip_makes_all_grey_a_different_shape_from_all_green)
+         test_the_strip_makes_all_grey_a_different_shape_from_all_green,
+         test_the_page_names_the_platform_and_never_colours_alone)
 
 
 def main():

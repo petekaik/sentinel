@@ -638,17 +638,14 @@ def build_status(cfg, conn, now=None):
 CSS = """
 :root { --bg:#0e1216; --panel:#161c22; --fg:#e6edf3; --dim:#8b949e;
         --line:#232c35; --ok:#3fb950; --warn:#e3b341; --fail:#f85149;
-        --unknown:#7d8590;
-        --green:var(--ok); --amber:var(--warn); --red:var(--fail);
-        --grey:var(--unknown); }
+        --unknown:#7d8590; }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg);
        font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
 .wrap { max-width:1200px; margin:0 auto; padding:18px 16px 60px; }
 h1 { font-size:17px; margin:0 0 2px; }
-h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em;
-     color:var(--dim); margin:26px 0 8px; border-bottom:1px solid var(--line);
-     padding-bottom:5px; }
+h2 { font-size:15px; font-weight:600; color:var(--fg); margin:22px 0 8px;
+     border-bottom:1px solid var(--line); padding-bottom:5px; }
 .sub { color:var(--dim); font-size:12px; }
 .hero { padding:14px 0 4px; }
 .hero .hage { font-size:38px; line-height:1.05; font-weight:600;
@@ -661,38 +658,37 @@ h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em;
                 font-size:10.5px; color:var(--dim); margin:9px 0 4px; }
 .hero .hbar { height:6px; border-radius:3px; background:#1b2229;
               border:1px solid var(--line); overflow:hidden; }
-.hero .hbar i { display:block; height:100%; background:var(--green); }
+.hero .hbar i { display:block; height:100%; background:var(--ok); }
 .hero.lagging .hbar i { background:var(--warn); }
 .hero.stale .hbar i { background:var(--fail); }
 .banner { padding:10px 13px; border-radius:5px; margin:12px 0 0;
           border:1px solid var(--line); font-weight:600; }
-.banner.red { background:#3a1416; border-color:var(--red); color:#ffb4b0; }
-.banner.amber { background:#2e2510; border-color:var(--amber); color:#f0d18a; }
+.banner.red { background:#3a1416; border-color:var(--fail); color:#ffb4b0; }
+.banner.amber { background:#2e2510; border-color:var(--warn); color:#f0d18a; }
 .banner.ok { background:#0f2415; border-color:#1d5c2c; color:#8fdc9f; }
-.banner.none { background:#2a1a1a; border-color:var(--red); color:#ffb4b0; }
+.banner.none { background:#2a1a1a; border-color:var(--fail); color:#ffb4b0; }
 .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(255px,1fr));
         gap:9px; }
 .tile { border:1px solid var(--line); border-left-width:5px; border-radius:5px;
         padding:9px 11px; background:#171b21; }
-.tile.green { border-left-color:var(--green); }
-.tile.amber { border-left-color:var(--amber); }
-.tile.red { border-left-color:var(--red); }
-.tile.grey { border-left-color:var(--grey); }
-.tile .t { font-size:11px; color:var(--dim); text-transform:uppercase;
-           letter-spacing:.05em; }
+.tile.green { border-left-color:var(--ok); }
+.tile.amber { border-left-color:var(--warn); }
+.tile.red { border-left-color:var(--fail); }
+.tile.grey { border-left-color:var(--unknown); }
+.tile .t { font-size:11px; color:var(--dim); letter-spacing:.05em; }
 .tile .v { font-size:19px; margin:3px 0 2px; }
 .tile .d { font-size:11.5px; color:var(--dim); }
 .tile .badge { float:right; font-size:10px; padding:1px 6px; border-radius:9px;
                background:#232a34; color:var(--dim); }
 table { width:100%; border-collapse:collapse; font-size:12.5px; }
 th { text-align:left; color:var(--dim); font-weight:500; font-size:11px;
-     text-transform:uppercase; letter-spacing:.05em; padding:5px 7px;
+     letter-spacing:.05em; padding:5px 7px;
      border-bottom:1px solid var(--line); }
 td { padding:5px 7px; border-bottom:1px solid #1c212a; vertical-align:top; }
-tr.red td:first-child { border-left:3px solid var(--red); }
-tr.amber td:first-child { border-left:3px solid var(--amber); }
-tr.grey td:first-child { border-left:3px solid var(--grey); }
-tr.green td:first-child { border-left:3px solid var(--green); }
+tr.red td:first-child { border-left:3px solid var(--fail); }
+tr.amber td:first-child { border-left:3px solid var(--warn); }
+tr.grey td:first-child { border-left:3px solid var(--unknown); }
+tr.green td:first-child { border-left:3px solid var(--ok); }
 .pill { display:inline-block; min-width:52px; text-align:center; padding:1px 5px;
         border-radius:3px; font-size:10.5px; font-weight:600; }
 .pill.green { background:#12351d; color:#7ee08f; }
@@ -720,8 +716,8 @@ a { color:#6cb6ff; }
 .band.unknown .bst { color:#a8b0bd; }
 .wcard { border:1px solid var(--line); border-left-width:5px; border-radius:5px;
          padding:10px 12px; background:var(--panel); margin:7px 0; }
-.wcard.red { border-left-color:var(--red); }
-.wcard.amber { border-left-color:var(--amber); }
+.wcard.red { border-left-color:var(--fail); }
+.wcard.amber { border-left-color:var(--warn); }
 .wcard .wtop { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; }
 .wcard .wt { font-size:13px; }
 .wcard .wc { font-size:11.5px; color:var(--dim); }
@@ -730,9 +726,9 @@ a { color:#6cb6ff; }
 .strip { display:flex; flex-wrap:wrap; gap:8px; margin:13px 0 2px; }
 .strip .seg-group { display:flex; gap:1px; }
 .strip .seg { width:5px; height:20px; border-radius:1px; display:block; }
-.strip .seg.green { background:var(--green); }
-.strip .seg.amber { background:var(--amber); }
-.strip .seg.red { background:var(--red); }
+.strip .seg.green { background:var(--ok); }
+.strip .seg.amber { background:var(--warn); }
+.strip .seg.red { background:var(--fail); }
 .strip .seg.grey { background:var(--unknown); }
 details { margin:9px 0; border-top:1px solid var(--line); padding-top:8px; }
 summary { cursor:pointer; font-size:13px; color:var(--fg); padding:5px 0;
@@ -825,11 +821,18 @@ def render_html(state, cfg):
     a = out.append
     a("<!doctype html><meta charset=utf-8>")
     a("<meta name=viewport content='width=device-width,initial-scale=1'>")
-    a("<title>CuBox fleet monitor</title><style>%s</style>" % CSS)
+    a("<title>sentinel</title><style>%s</style>" % CSS)
     a("<div class=wrap>")
-    a("<h1>CuBox fleet monitor</h1>")
-    a("<div class=sub>Storage-NAS TVH/DVB &middot; Backup-NAS &middot; "
-      "cubox-1 / cubox-2 &middot; refreshed on every load, nothing is cached</div>")
+    a("<h1>sentinel</h1>")
+    # THE TARGET LIST IS DERIVED, NOT TYPED. §4.6's subtitle names the four
+    # tenants, and writing those four names here as a literal would be a CuBox
+    # literal in the presentation layer -- the one thing CLAUDE.md says the page
+    # must not become, stale the moment a second adapter lands.
+    watched = sorted({r["target"] for r in
+                      state["tiles"] + state["extra"] + state["others"]
+                      + state["informational"]})
+    a("<div class=sub>Watching %s. Refreshed on every load, and nothing here "
+      "is cached.</div>" % _esc(", ".join(watched) or "nothing yet"))
 
     # ---- the hero: how current this page is --------------------------------
     a(_freshness(state))
@@ -891,8 +894,8 @@ def render_html(state, cfg):
              "too -- so an empty list means no check is currently reporting a "
              "problem <em>and</em> none is frozen.</div>")
     else:
-        _inc("<table><tr><th>sev</th><th>target</th><th>check</th><th>state</th>"
-             "<th>since</th><th>obs</th><th>detail</th></tr>")
+        _inc("<table><tr><th>Sev</th><th>Target</th><th>Check</th><th>State</th>"
+             "<th>Since</th><th>Obs</th><th>Detail</th></tr>")
         for i in state["incidents"]:
             sev = i["severity"] or "grey"
             _inc("<tr class=%s><td><span class='pill %s'>%s</span></td>"
@@ -950,7 +953,7 @@ def render_html(state, cfg):
         _inf("<h2>Informational &mdash; not health metrics</h2>")
         _inf("<div class=note>These are reported so the row EXISTS, and no colour "
              "is assigned. A missing row would read as &ldquo;fine&rdquo;.</div>")
-        _inf("<table><tr><th>target</th><th>reading</th><th>detail</th></tr>")
+        _inf("<table><tr><th>Target</th><th>Reading</th><th>Detail</th></tr>")
         for it in state["informational"]:
             # The unit is appended only when there IS one: "%s %s" with an empty
             # unit leaves a trailing space in the cell, which is invisible on the
@@ -989,7 +992,7 @@ def render_html(state, cfg):
         "busy database rather than an error, which is the same shape as this "
         "project's <code>done 0 / orphan 18</code> gate that printed "
         "&ldquo;Coverage is complete&rdquo;.</div>")
-    _ev("<table><tr><th>table</th><th>rows</th></tr>")
+    _ev("<table><tr><th>Table</th><th>Rows</th></tr>")
     for name, n in sorted(state["counts"]["tables"].items()):
         _ev("<tr><td>%s</td><td>%s</td></tr>" % (_esc(name), _esc(n)))
     _ev("</table>")

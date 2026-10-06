@@ -1098,6 +1098,32 @@ def test_the_band_never_says_ok_on_a_stale_or_colourless_page(results):
             and "nothing reported a colour" in grey,
             "a page where no check reported a colour did not say so plainly")
 
+        # NEVER COLLECTED, WHICH IS NOT THE SAME FACT AS TOO OLD. Both cases
+        # band UNKNOWN -- that much they share -- so a test asserting only the
+        # class would pass either way and could never catch the two collapsing
+        # into one sentence. The REASON is what has to differ, and the reason
+        # lives in the band, so the band is what gets sliced.
+        #
+        # THE SLICE IS BOUNDED BY THE BAND'S OWN CLOSE and the assertion is
+        # scoped to it, because "ever been recorded" is ALSO said by the banner
+        # further down the page. A page-wide `in` here would be satisfied by the
+        # banner no matter what the band said -- the same vacuity the mixed
+        # board's slice above records, and the reason this one is written the
+        # long way.
+        os.makedirs(os.path.join(tmpdir, "never"), exist_ok=True)
+        v = Dash(os.path.join(tmpdir, "never"))
+        never = v.html()
+        vstart = never.find("class='band")
+        vband = never[vstart:never.find("</div></div>", vstart)]
+        results.check(
+            "a page that has never collected does not claim a collection went "
+            "stale",
+            "band unknown" in never and "ever been recorded" in vband
+            and "too old" not in vband,
+            "the never-collected band reads %r -- it bands UNKNOWN for the right "
+            "verdict but gives the STALE reason, asserting a collection that was "
+            "never made and contradicting the banner below it" % vband)
+
         # SOME GREEN, SOME GREY. The verdict stays ok -- that is the platform's
         # existing rule and not this design's business -- but the grey count
         # must be stated at the top, never folded away behind the green one.

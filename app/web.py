@@ -305,6 +305,19 @@ def _rag_counts(items):
     return out
 
 
+def _n(count):
+    """`1 check is` / `2 checks are`, for the band's reason line.
+
+    THE BAND IS THE LINE A PHONE READS FIRST, and `1 checks are red` on it is
+    exactly the sort of detail that makes a page read as generated. §4.1's
+    wireframe writes the same line as `2 checks are red, 1 is amber`, so the
+    agreement is spec copy rather than polish. The numbers themselves are left
+    alone -- the wireframe is a sketch and does not say what a zero count should
+    read as, so it keeps saying `0 amber` rather than going silent.
+    """
+    return "%d %s" % (count, "check is" if count == 1 else "checks are")
+
+
 def _band_verdict(state):
     """The band's verdict and its reason. Staleness DOMINATES, exactly as it
     does in `build_status`.
@@ -314,19 +327,32 @@ def _band_verdict(state):
     describes the fleet as it was. A band reading OK above the red STALE banner
     is the false green this page exists to prevent, and the API already refuses
     it -- the page must not be the weaker of the two readers.
+
+    "NEVER COLLECTED" AND "TOO OLD" ARE TWO FACTS, NOT ONE. They share a verdict
+    -- UNKNOWN, because in both cases the rows below describe nothing current --
+    but the reason must not. A page that has never collected saying "the last
+    collection is too old" asserts a collection that was never made, and it
+    contradicts the banner two lines below it, which says NO COLLECTION HAS EVER
+    BEEN RECORDED. This is the same rule as an absent row never reading as fine,
+    one level up: "the answer is no" must never share a sentence with "I could
+    not ask". The `none` sentence is the API's own, verbatim (`build_status`),
+    so the two readers cannot drift.
     """
-    if state["staleness"] in ("none", "stale"):
+    if state["staleness"] == "none":
+        return "unknown", ("no collection has ever been recorded, so this "
+                           "document knows nothing about the fleet")
+    if state["staleness"] == "stale":
         return "unknown", ("the last collection is too old to say anything about "
                            "now, whatever the rows below still read")
     items = _verdict_items(state)
     verdict, _why = _verdict(items)
     n = _rag_counts(items)
     if verdict == "fail":
-        why = "%d checks are red, %d amber" % (n["red"], n["amber"])
+        why = "%s red, %d amber" % (_n(n["red"]), n["amber"])
     elif verdict == "warn":
-        why = "%d amber, and nothing red" % n["amber"]
+        why = "%s amber, and nothing red" % _n(n["amber"])
     elif verdict == "ok":
-        why = "%d checks green, none red or amber" % n["green"]
+        why = "%s green, none red or amber" % _n(n["green"])
         if n["grey"]:
             # THE BAND MUST NOT LET A READER BELIEVE THE BOARD IS FULLY KNOWN.
             # The verdict is still ok -- that is the platform's existing rule

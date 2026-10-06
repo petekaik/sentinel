@@ -1,7 +1,7 @@
 """The publishing stack's config: the two deliberate holes, and nothing else.
 
 THIS SUITE DOES NOT RUN THE STACK. It cannot -- the suite is offline and the
-stack is three containers on a NAS. What it guards is the pair of access-control
+stack runs on a NAS. What it guards is the pair of access-control
 decisions that are EASY TO TIDY AWAY AND EXPENSIVE TO LOSE:
 
   * /healthz stays unauthenticated, so a broken login can be told apart from a
@@ -41,6 +41,27 @@ def _rules(authelia):
     """
     block = authelia.split("access_control:", 1)[1]
     return ["- domain:" + part for part in block.split("- domain:")[1:]]
+
+
+def _services(compose):
+    """The keys of the `services:` block -- the services actually declared.
+
+    THE BARE WORDS ARE NOT EVIDENCE, and this file is the proof: `authelia`
+    occurs in the `authelia-data:` volume key and `nginx-proxy-manager` in this
+    file's own header comment. A substring check for either name therefore stays
+    GREEN with that service deleted -- a guard that cannot fail on the exact
+    deletion its message names. Measured: deleting the `authelia` service alone
+    leaves the bare-word form at 7 checks, 0 failed.
+
+    Structural, and the same shape as `_rules` above: split on the block header,
+    take what follows, and keep the lines that are keys at the top level of that
+    block. Indent depth is the discriminator, so a nested mapping key inside a
+    service (`    environment:`) is not counted as a service and the assertion
+    does not depend on any service's spelling.
+    """
+    block = compose.split("services:", 1)[1].split("\nvolumes:", 1)[0]
+    return {ln.split(":", 1)[0].strip() for ln in block.split("\n")
+            if len(ln) - len(ln.lstrip(" ")) == 2 and ln.strip().endswith(":")}
 
 
 def test_the_proxy_keeps_its_two_deliberate_holes(results):
@@ -91,8 +112,9 @@ def test_the_proxy_keeps_its_two_deliberate_holes(results):
         "passkey gate is not in force")
     results.check(
         "the proxy and the auth service are both declared",
-        "nginx-proxy-manager" in compose and "authelia" in compose,
-        "one of the two services is missing from the compose file")
+        {"nginx-proxy-manager", "authelia"} <= _services(compose),
+        "one of the two services is missing from the compose file -- declared: "
+        "%r" % sorted(_services(compose)))
     results.check(
         "the proxy manager's own admin interface is not published",
         "81:81" not in compose and "443:443" not in compose,

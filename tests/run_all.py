@@ -24,7 +24,7 @@ import test_checks_fixtures as fixture_tests    # noqa: E402
 import test_collect_offline as collect_tests    # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
 import test_incident_lifecycle as incident_tests  # noqa: E402
-import test_proxy_config as proxy_tests             # noqa: E402
+import test_proxy_config as proxy_tests         # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
 
 SUITES = (

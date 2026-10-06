@@ -103,9 +103,11 @@ class Dash:
         # is a lie -- an age of 0 would render as the backdate of some earlier
         # epoch, and the bar's arithmetic would measure the gap between two
         # epochs instead of the age the caller asked for.
-        ts = self.conn.execute(
-            "SELECT ts FROM collector_run ORDER BY epoch_seq DESC LIMIT 1"
-        ).fetchone()["ts"]
+        #
+        # `state["last"]` IS that row, so the selection is REUSED rather than
+        # re-typed here: a second copy of the query agrees with any bug in the
+        # first, and `MAX(ts)` was exactly that bug.
+        ts = self.state()["last"]["ts"]
         return web.build_state(self.cfg, self.conn, now=ts + age_s)
 
     def html(self):
@@ -1001,11 +1003,17 @@ def test_the_freshness_hero_tracks_the_staleness_it_leads_with(results):
 
         results.check(
             "a board with no collection ever draws NO bar and says 'never'",
-            # `class=hbar`, not `hbar`: the hero's stylesheet rule (`.hero
-            # .hbar`) is inlined into every page, so a bare substring search
-            # for `hbar` is satisfied by the CSS that defines the bar this
-            # check exists to prove absent. The element is what is asserted.
-            "class='hero none" in never and "class=hbar" not in never,
+            # THE BAR'S CONTENT, not its attribute spelling. `class=hbar` alone
+            # is a check that can pass while a bar is on the page: re-quote the
+            # attribute (`class='hbar'`) in a later edit and the substring is
+            # absent while the element is not. The fill is what a drawn bar
+            # always has, so `"<i style='width:"` is asserted too. `class=hbar`,
+            # not `hbar`, for the other half: the hero's stylesheet rule
+            # (`.hero .hbar`) is inlined into every page, so a bare `hbar` is
+            # satisfied by the CSS that defines the bar this check exists to
+            # prove absent.
+            "class='hero none" in never and "class=hbar" not in never
+            and "<i style='width:" not in never,
             "staleness=none drew a bar -- an empty track reads as '0s ago', "
             "which is the one thing 'never collected' is not")
 
@@ -1015,6 +1023,17 @@ def test_the_freshness_hero_tracks_the_staleness_it_leads_with(results):
             "the hero does not state the threshold the bar is drawn against, so "
             "the bar has no scale and its length means nothing:\n%s"
             % fresh[fresh.find("class='hero"):][:300])
+
+        # THE BAR IS AN IMAGE TO A SCREEN READER, which is the whole reason it
+        # is a `role=img` div rather than a plain element: the fill's length is
+        # the reading, and a length is not text. Delete the `aria-label` and the
+        # bar announces nothing, so the one thing the role exists for is gone.
+        results.check(
+            "the bar carries its reading as text for a screen reader",
+            "role=img" in fresh and "aria-label='last collection" in fresh,
+            "a role=img element with no accessible name is an image a screen "
+            "reader reads as nothing at all; the bar was:\n%s"
+            % fresh[fresh.find("class=hbar"):][:300])
 
         # NON-VACUOUS HALF: the degradation sentences still exist, unchanged.
         results.check(

@@ -1773,6 +1773,76 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 14. The reactive layer, and the seam it depends on
+# ---------------------------------------------------------------------------
+
+
+def test_the_refresh_script_has_the_hooks_it_looks_for(results):
+    """The ids are an integration seam, and a rename would fail silently."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        html = d.html()
+        results.check(
+            "the page carries the container the script swaps",
+            "id=live" in html or 'id="live"' in html,
+            "the script replaces #live, and the renderer does not emit it -- "
+            "the page would simply stop updating, with no error anywhere")
+        results.check(
+            "the page carries the script",
+            "id=refresh" in html or 'id="refresh"' in html,
+            "no refresh script on the page")
+        results.check(
+            "the script re-fetches the SERVER's render, not a client-side one",
+            "fetch('/')" in html or 'fetch("/")' in html,
+            "the script does not re-fetch the page -- a client-side renderer "
+            "would be a second render_html to keep identical forever")
+        # THE CALL IS ASSERTED, NOT ONLY THE COPY, and that is what makes Step
+        # 6's mutation evidence. The string alone is a literal in the
+        # `unreachable` function's BODY, so deleting the call -- which is
+        # exactly "the failure branch is gone" -- leaves the definition, the
+        # string and this check green. Measured on a scratch tree: with the
+        # copy asserted alone the mutation gives 0 failed. Naming the function
+        # is the same shape as the other hooks this test asserts (`d.open =
+        # true`, `scrollY`), and it is the brief's own fence's name.
+        results.check(
+            "a failed fetch is rendered as UNKNOWN, never as the stale page",
+            "cannot reach the monitor" in html and ".catch(unreachable)" in html,
+            "the script has no failure branch, so a page that can no longer "
+            "check would go on asserting health -- which is the false green "
+            "this whole design exists to prevent")
+        results.check(
+            "the poll period comes from the configured interval",
+            ("%d" % (d.cfg.interval * 1000)) in html,
+            "the script does not use the configured interval")
+        results.check(
+            "polling stops when the page is hidden",
+            "visibilitychange" in html,
+            "a phone in a pocket would poll all night")
+        # THE SEAM THAT WOULD FAIL SILENTLY. The script restores disclosure by
+        # id, so the renderer's ids and the script's lookup must agree; if
+        # either is renamed the page keeps working and quietly loses the state.
+        results.check(
+            "the script restores disclosure by the ids the renderer emits",
+            "d.id" in html and "id='sec-checks'" in html
+            and "d.open = true" in html,
+            "the script does not snapshot and restore by id, so an open section "
+            "snaps shut every interval -- or reopens the wrong one")
+        results.check(
+            "the scroll position survives the swap",
+            "scrollY" in html and "scrollTo" in html,
+            "the page jumps to the top every interval, so reading anything "
+            "below the fold is impossible")
+        # NOT HERE: a `prefers-reduced-motion` assertion would already be
+        # satisfied by Task 4's stylesheet media query, which is the thing that
+        # actually honours it. It is asserted in Task 4's test, beside that CSS.
+        # Asserting it here would be a check that cannot fail on this task's
+        # code -- and a test that cannot fail is not evidence.
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
@@ -1789,7 +1859,8 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_band_never_says_ok_on_a_stale_or_colourless_page,
          test_the_strip_makes_all_grey_a_different_shape_from_all_green,
          test_the_page_names_the_platform_and_never_colours_alone,
-         test_the_app_shell_may_cache_and_nothing_else_may)
+         test_the_app_shell_may_cache_and_nothing_else_may,
+         test_the_refresh_script_has_the_hooks_it_looks_for)
 
 
 def main():

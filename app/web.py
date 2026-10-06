@@ -753,6 +753,84 @@ summary:focus-visible { outline:2px solid #6cb6ff; outline-offset:2px; }
 """
 
 
+# THE REACTIVE LAYER, AND WHY IT RE-FETCHES THE PAGE
+#
+# The obvious implementation is a client-side renderer that fetches
+# /api/status.json and patches the tiles. It is also a SECOND render_html that
+# has to be kept identical to the first one forever, which is item 7's shape and
+# has already cost this project twice. So the script fetches `/` and swaps the
+# DOM: the server stays the only thing that knows how to draw this page.
+#
+# TWO FAILURE MODES ARE DESIGNED IN, because both are the stale-sample defect in
+# new clothes. If the fetch fails, the banner flips to UNKNOWN naming the
+# monitor as unreachable -- a page that has stopped being able to check must not
+# go on asserting health. If the swap brings a stale page, that page carries its
+# own red banner and arrives stating its own age.
+REFRESH_JS = """
+(function () {
+  var el = document.getElementById('live');
+  var ms = %d;
+  var timer = null;
+
+  function snapshot() {
+    // BY ID, NOT BY POSITION. The incidents section appears and disappears as
+    // incidents open and resolve, so an index shifts and the wrong section
+    // reopens -- a bug that only shows up on the one day it matters.
+    var ids = [];
+    el.querySelectorAll('details').forEach(function (d) {
+      if (d.open && d.id) { ids.push(d.id); }
+    });
+    return ids;
+  }
+
+  function restore(ids) {
+    ids.forEach(function (id) {
+      var d = el.querySelector('#' + CSS.escape(id));
+      if (d) { d.open = true; }
+    });
+  }
+
+  function unreachable() {
+    var b = el.querySelector('.band');
+    if (b) {
+      b.className = 'band unknown';
+      b.innerHTML = '<div class=bst>UNKNOWN</div><div class=bwhy>' +
+                    'cannot reach the monitor, so this page cannot say ' +
+                    'anything about the fleet</div>';
+    }
+  }
+
+  function tick() {
+    if (document.hidden) { return; }
+    fetch('/').then(function (r) {
+      if (!r.ok) { throw new Error('http ' + r.status); }
+      return r.text();
+    }).then(function (text) {
+      var doc = new DOMParser().parseFromString(text, 'text/html');
+      var fresh = doc.getElementById('live');
+      if (!fresh) { throw new Error('no #live in the response'); }
+      var prev = snapshot();
+      var y = window.scrollY;
+      el.innerHTML = fresh.innerHTML;
+      restore(prev);
+      window.scrollTo(0, y);
+    }).catch(unreachable);
+  }
+
+  function arm() {
+    if (timer) { clearInterval(timer); }
+    timer = document.hidden ? null : setInterval(tick, ms);
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { tick(); }
+    arm();
+  });
+  arm();
+})();
+"""
+
+
 def _esc(s):
     return html.escape("" if s is None else str(s), quote=False)
 
@@ -846,6 +924,7 @@ def render_html(state, cfg):
                       + state["informational"]})
     a("<div class=sub>Watching %s. Refreshed on every load, and nothing here "
       "is cached.</div>" % _esc(", ".join(watched) or "nothing yet"))
+    a("<div id=live>")
 
     # ---- the hero: how current this page is --------------------------------
     a(_freshness(state))
@@ -1054,7 +1133,9 @@ def render_html(state, cfg):
     a(_details("evidence",
                "Evidence — %d row counts from this render"
                % len(state["counts"]["tables"]), evidence_html))
-    a("</div>")
+    a("</div>")                                   # #live
+    a("<script id=refresh>%s</script>" % (REFRESH_JS % (cfg.interval * 1000)))
+    a("</div>")                                   # .wrap
     return "\n".join(out)
 
 

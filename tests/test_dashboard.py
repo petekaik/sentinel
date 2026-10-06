@@ -1233,16 +1233,36 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
             "the strip does not state what it is counting:\n%s"
             % green_strip[:300])
 
-        # THE SEGMENT ORDER IS THE REGISTRY'S OWN, so the strip and the list
-        # cannot disagree about what they are showing.
-        got = [s.split("'")[0] for s in green_strip.split("class='seg ")[1:]]
-        want = [web._status(i["status"]).rag for i in web._verdict_items(state)]
+        # EACH TARGET'S SEGMENTS SIT TOGETHER, asserted as CONTIGUITY.
+        #
+        # The property §4.4 wants is adjacency -- reason #2 for the strip
+        # existing is that a red CLUSTER reads as "the problem is in cubox-2"
+        # without scanning. So this counts the runs of target in the strip and
+        # requires them to equal the number of distinct targets: interleaved,
+        # the runs outnumber the targets.
+        #
+        # WHY NOT THE OBVIOUS FORM. An earlier draft asserted the segment
+        # sequence equalled `_verdict_items(state)`'s rags. Two things are wrong
+        # with that: on this all-OK board every rag is "green", so ANY
+        # permutation satisfies it -- it could only fail by losing segments
+        # entirely -- and once the strip sorts by target, deriving the expected
+        # order in the test means RE-SORTING IT THE SAME WAY, which is a
+        # verification that re-types the code it checks and therefore agrees
+        # with any bug in that code. Contiguity is a property, not a restatement,
+        # so it holds whichever order the implementation chooses.
+        tseq = [s.split("aria-label='")[1].split(" ")[0]
+                for s in green_strip.split("<span class='seg ")[1:]]
+        runs = sum(1 for i, t in enumerate(tseq) if i == 0 or t != tseq[i - 1])
         results.check(
-            "the strip's segments are the page's own rows, in the page's order",
-            got == want,
-            "strip order %r != row order %r -- the strip reordered the checks, "
-            "so the two can disagree about what they are showing"
-            % (got[:8], want[:8]))
+            "each target's segments sit together, so a cluster reads as one box",
+            len(tseq) == len(web._verdict_items(state))
+            and runs == len(set(tseq)) and runs > 1,
+            "the strip drew %d segments over %d targets in %d runs: %r -- "
+            "interleaved, a red segment sits between two gaps and nothing says "
+            "which box it came from, which is §4.4's second reason for the strip "
+            "existing. (`runs > 1` keeps this from passing on a one-target "
+            "board, where grouping and no grouping look identical.)"
+            % (len(tseq), len(set(tseq)), runs, tseq[:8]))
 
         # AN UNRECOGNISED STATUS STRING. `_status` maps anything it does not
         # know to UNKNOWN, so the strip must not draw it as a colour that
@@ -1284,8 +1304,11 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
         results.check(
             "a board with no verdict-bearing row renders an empty strip, not a "
             "broken one",
-            "class='seg " not in empty and "0 graded:" in empty,
-            "a zero-length selection produced: %r" % empty[:200])
+            "class='seg " not in empty and "0 graded:" in empty
+            and "seg-group" not in empty,
+            "a zero-length selection produced: %r -- a stray group wrapper is "
+            "the `if group:` guard missing, and it renders an empty span on a "
+            "page with no rows at all" % empty[:200])
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

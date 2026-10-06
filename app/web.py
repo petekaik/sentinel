@@ -436,18 +436,34 @@ def _tally_strip(state):
     consequence is that the strip has fewer segments than the all-checks list
     has rows, so every count here names what it counts.
 
-    GROUPED, NOT LISTED: a red cluster is how you read "the problem is in
-    cubox-2" without scanning. The grouping is a gap inserted wherever the
-    target CHANGES in the order the page already iterates -- the strip keeps the
-    registry's own order rather than imposing a new one, so the strip and the
-    all-checks list cannot disagree about membership even if the registry's
-    ordering changes, and no sort is needed to achieve it.
+    GROUPED, NOT LISTED, AND THE GROUPING IS WHY IT IS SORTED. A red cluster is
+    how you read "the problem is in cubox-2" without scanning -- that is §4.4's
+    second reason for the strip existing at all, and it is a claim about
+    ADJACENCY, so it needs the target's segments to actually sit together.
+
+    THE REGISTRY'S ORDER DOES NOT GIVE THAT, and this is the one place the plan
+    was wrong. `checks.expand` yields one class's per-box instances adjacent, so
+    targets INTERLEAVE: measured on the real registry, 71 rows carry 5 distinct
+    targets in 55 contiguous runs -- `backup, backup, backup, cubox-1, cubox-2,
+    cubox-1, ...`. A gap-wherever-the-target-changes rule over that order draws
+    55 wrappers of ~1.3 segments each, which is not a grouping at all: a red
+    segment sits between two gaps and nothing tells you which box it came from,
+    §4.4's "wraps by target group" on a phone has no groups to wrap by, and the
+    strip is ~40% gaps on a 390px screen.
+
+    SO THE STRIP SORTS BY TARGET, stably, so the registry's order survives
+    WITHIN each target. §4.4's headline says "grouped by target" and its order
+    bullet exists so that "the strip and the list can never disagree about
+    MEMBERSHIP" -- and the sort changes no membership: it is the same 71 rows.
+    It also brings the strip into line with the page's own "All checks by
+    target" table, which already iterates `sorted(by_target)` (`:875`). Where
+    the two cannot both hold, the headline and the reason for existing win.
 
     IT IS AN INDICATOR, NOT A CONTROL. At 5px per segment on a 390px phone these
     are far below any tap target and they do not pretend otherwise: no cursor,
     no hover, no title promising navigation.
     """
-    items = _verdict_items(state)
+    items = sorted(_verdict_items(state), key=lambda it: it["target"])
     n = _rag_counts(items)
     label = ("%d graded: %d green, %d amber, %d red, %d unknown"
              % (len(items), n["green"], n["amber"], n["red"], n["grey"]))

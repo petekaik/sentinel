@@ -1647,18 +1647,38 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
                     "code=%s Cache-Control=%r -- the app shell is a constant of "
                     "the image, so caching it is not a claim about the fleet"
                     % (code, hdrs.get("Cache-Control")))
-                # DERIVED FROM THE CODE, NOT TYPED HERE. A wrong content type does
-                # not stop this suite -- the manifest body still parses and the PNG
-                # magic still matches -- it stops a BROWSER installing the app, on a
-                # phone, with nothing in the log. That is the same silent class as a
-                # dropped CSS declaration, so the type comes from ASSETS rather than
-                # being copied beside it (items 84/58: a verification that re-types
-                # the thing it checks agrees with any bug in it).
+                # THE TYPE MUST AGREE WITH THE FORMAT, NOT MERELY WITH ITSELF.
+                # An earlier form of this check compared the header against
+                # `web.shell.ASSETS[path][1]` -- and that compares the table to
+                # the table, because the route reads that same entry
+                # (`shell.asset()` returns `ASSETS[relpath][1]` unchanged), so a
+                # declaration that is simply WRONG moves both sides and stays
+                # green. Measured: mutating the manifest's type to `text/plain`
+                # left the suite at 140 checks, 0 failed. A guard that cannot
+                # fail on the mislabelling it exists for is not evidence.
+                #
+                # The format is already established one check over -- the PNG
+                # magic bytes and the manifest's `json.loads` -- so the type is
+                # asserted to agree with THAT, which is a fact about the file
+                # rather than a value this test copies. A wrong type stops a
+                # phone installing the app with nothing in any log: the same
+                # silent class as a dropped CSS declaration.
+                #
+                # A PNG's type is a fact about PNGs, so it is asserted exactly; a
+                # manifest's is not settled (`application/manifest+json` and
+                # `application/json` both install), so it is asserted by family
+                # and a legitimate spelling is not red.
+                ctype = hdrs.get("Content-Type", "")
+                if path.endswith(".png"):
+                    kind_ok = ctype == "image/png"
+                else:
+                    kind_ok = "json" in ctype
                 results.check(
-                    "%s declares the content type it is served with" % path,
-                    hdrs.get("Content-Type") == web.shell.ASSETS[path][1],
-                    "Content-Type=%r but the image declares %r"
-                    % (hdrs.get("Content-Type"), web.shell.ASSETS[path][1]))
+                    "%s is served as the format it actually is" % path,
+                    code == 200 and kind_ok,
+                    "Content-Type=%r for %s -- a PNG must arrive as an image and "
+                    "the manifest as JSON, or the browser refuses the asset and "
+                    "nothing anywhere says so" % (ctype, path))
 
             # THE GUARD THAT MATTERS: the exception must not grow.
             for path in ("/", "/api/status.json", "/api/state.json", "/healthz"):

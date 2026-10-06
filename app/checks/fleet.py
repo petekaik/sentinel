@@ -26,10 +26,8 @@ THREE RULES THAT GOVERN EVERY CHECK IN THIS MODULE
 
 import os
 
-import export
 import parsers
 from checks import Check, fail, ok, unknown, warn
-from store import Status
 
 
 def output_for(rel):
@@ -122,8 +120,6 @@ class EnvFailLines(_BoxLogCheck):
     id = "env_fail_lines"
     spec = "env_fail_lines"
     title = "environment failures (worker refused to act)"
-    description = ("ENV-FAIL lines in the window. The worker aborts a pass after "
-                   "two; a burst means a NAS/source/mount outage.")
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -171,8 +167,6 @@ class DeadlockKills(_BoxLogCheck):
     id = "deadlock_kills"
     spec = "deadlock_kills"
     title = "VPU encoder deadlocks (item 52)"
-    description = ("stall_watch() kills in the window. Distinguished from a cap "
-                   "kill, which the worker's own source calls 'NOT the cap'.")
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -221,8 +215,6 @@ class JobFailures(_BoxLogCheck):
     id = "job_failures"
     spec = "job_failures"
     title = "transcode job failures"
-    description = ("FAILED lines in the window, with the cause breakdown and any "
-                   "file that failed more than once.")
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -422,8 +414,6 @@ class StateOnTmpfs(_BoxLogCheck):
     id = "state_on_tmpfs"
     spec = None                      # logic-only: any occurrence is a fault
     title = "worker is persisting state to tmpfs (NOT durable)"
-    description = ("The worker's own STATE_DIR-on-tmpfs warning. Any occurrence "
-                   "means the box is transcoding but saving nothing.")
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -490,9 +480,6 @@ class PassCadence(_BoxLogCheck):
     id = "pass_cadence_min"
     spec = "pass_cadence_min"
     title = "time since last pass start"
-    description = ("Age of the last pass-start log line, both timestamps taken "
-                   "from the box. Only meaningful when the box is idle, which is "
-                   "established from the log rather than assumed.")
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -640,16 +627,13 @@ class LogParserWatch(_BoxLogCheck):
 
     This is not theoretical. Writing this parser against the real log found the
     prefix regex swallowing the two-space indent on `  verify:`/`  FAILED` lines,
-    which silently zeroed verify_ok, verify_stalled, verify_cap, failed and
-    published -- five checks green by default. The count that would have caught it
-    is this one.
+    which silently zeroed five separate fields at once -- five checks green by
+    default. The count that would have caught it is this one.
     """
 
     id = "log_parse_failures"
     spec = "log_parse_failures"
     title = "worker log lines this parser does not recognise"
-    description = ("Non-zero means the worker's log format drifted, so every "
-                   "check reading that log may be reporting a structural zero.")
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -814,8 +798,6 @@ class SharedLayerParity(Check):
     target = "fleet"
     spec = None
     title = "Both boxes applied the same generation"
-    description = ("One shared layer feeds both nodes, so their applied T2 "
-                   "generation must match. Blind to both boxes stalling together.")
 
     def run(self, ctx):
         ids = list(ctx.cfg.cubox_ids)

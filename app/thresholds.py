@@ -38,7 +38,7 @@ class ConfigError(Exception):
 
 
 # A spec's `direction` says which side of the boundary is healthy.
-DIRECTIONS = ("high_is_good", "low_is_good", "range")
+DIRECTIONS = ("high_is_good", "low_is_good")
 
 # Every key a section may carry. Anything else is a TYPO, and configparser will
 # not warn about it -- it simply will not appear in the section.
@@ -50,8 +50,7 @@ DIRECTIONS = ("high_is_good", "low_is_good", "range")
 # right, the check would be wrong, and nothing anywhere would say so.
 ALLOWED_KEYS = frozenset((
     "metric", "unit", "direction", "green", "amber",
-    "green_lo", "green_hi", "amber_lo", "amber_hi",
-    "target", "note", "unavailable_reason", "known_condition", "window_min",
+    "target", "note", "unavailable_reason", "window_min",
     "claim",
 ))
 
@@ -81,26 +80,21 @@ ALLOWED_KEYS = frozenset((
 class Spec:
     """One threshold definition."""
 
-    __slots__ = ("id", "metric", "unit", "direction", "green", "amber",
-                 "green_lo", "green_hi", "amber_lo", "amber_hi", "target",
-                 "note", "unavailable_reason", "known_condition", "window_min",
-                 "claim")
+    __slots__ = ("id", "metric", "unit", "direction", "green", "amber", "target",
+                 "note", "unavailable_reason", "window_min", "claim")
 
     def __init__(self, check_id, metric=None, unit=None, direction="high_is_good",
                  green=None, amber=None, target=None, note=None,
-                 unavailable_reason=None, known_condition=None, window_min=None,
-                 claim=None):
+                 unavailable_reason=None, window_min=None, claim=None):
         self.id = check_id
         self.metric = metric or check_id
         self.unit = unit or ""
         self.direction = direction
         self.green = green
         self.amber = amber
-        self.green_lo = self.green_hi = self.amber_lo = self.amber_hi = None
         self.target = target
         self.note = note
         self.unavailable_reason = unavailable_reason
-        self.known_condition = known_condition
         # How far back a count-shaped check looks, in minutes, measured from the
         # BOX's own last log line rather than the monitor's clock (no RTC on the
         # boxes -- item 23). None means "no windowing: the whole tail counts".
@@ -112,14 +106,6 @@ class Spec:
     def __repr__(self):
         return "<Spec %s %s green=%s amber=%s>" % (
             self.id, self.direction, self.green, self.amber)
-
-    def fmt(self, value):
-        if value is None:
-            return "not observed"
-        if self.unit:
-            return "%.1f %s" % (value, self.unit) if isinstance(value, float) \
-                else "%s %s" % (value, self.unit)
-        return str(value)
 
 
 def _num(section, key, path):
@@ -174,40 +160,22 @@ def load(path):
             target=section.get("target"),
             note=section.get("note"),
             unavailable_reason=section.get("unavailable_reason"),
-            known_condition=section.get("known_condition"),
             window_min=_num(section, "window_min", path),
             claim=(section.get("claim") or "").strip() or None,
         )
-        if direction == "range":
-            spec.green_lo = _num(section, "green_lo", path)
-            spec.green_hi = _num(section, "green_hi", path)
-            spec.amber_lo = _num(section, "amber_lo", path)
-            spec.amber_hi = _num(section, "amber_hi", path)
-            if None in (spec.green_lo, spec.green_hi):
-                raise ConfigError(
-                    "%s: [%s] direction=range needs green_lo and green_hi" % (path, name))
-            if spec.amber_lo is None:
-                spec.amber_lo = spec.green_lo
-            if spec.amber_hi is None:
-                spec.amber_hi = spec.green_hi
-            if spec.amber_lo > spec.green_lo or spec.amber_hi < spec.green_hi:
-                raise ConfigError(
-                    "%s: [%s] the amber band must CONTAIN the green band, else a "
-                    "value can be neither" % (path, name))
-        else:
-            if spec.green is None or spec.amber is None:
-                raise ConfigError(
-                    "%s: [%s] needs both green and amber for direction=%s"
-                    % (path, name, direction))
-            if direction == "high_is_good" and spec.amber > spec.green:
-                raise ConfigError(
-                    "%s: [%s] high_is_good wants amber <= green (a value between "
-                    "them is amber); got green=%s amber=%s"
-                    % (path, name, spec.green, spec.amber))
-            if direction == "low_is_good" and spec.amber < spec.green:
-                raise ConfigError(
-                    "%s: [%s] low_is_good wants amber >= green; got green=%s amber=%s"
-                    % (path, name, spec.green, spec.amber))
+        if spec.green is None or spec.amber is None:
+            raise ConfigError(
+                "%s: [%s] needs both green and amber for direction=%s"
+                % (path, name, direction))
+        if direction == "high_is_good" and spec.amber > spec.green:
+            raise ConfigError(
+                "%s: [%s] high_is_good wants amber <= green (a value between "
+                "them is amber); got green=%s amber=%s"
+                % (path, name, spec.green, spec.amber))
+        if direction == "low_is_good" and spec.amber < spec.green:
+            raise ConfigError(
+                "%s: [%s] low_is_good wants amber >= green; got green=%s amber=%s"
+                % (path, name, spec.green, spec.amber))
         specs[name] = spec
     return specs
 
@@ -288,30 +256,6 @@ def evaluate(value, spec):
                 v, spec.green, spec.amber, spec.unit)
         return Status.FAIL, "%.1f > %s %s" % (v, spec.amber, spec.unit)
 
-    # range
-    if spec.green_lo <= v <= spec.green_hi:
-        return Status.OK, "%.1f inside [%s, %s] %s" % (
-            v, spec.green_lo, spec.green_hi, spec.unit)
-    if spec.amber_lo <= v <= spec.amber_hi:
-        return Status.WARN, "%.1f outside [%s, %s] but inside [%s, %s] %s" % (
-            v, spec.green_lo, spec.green_hi, spec.amber_lo, spec.amber_hi, spec.unit)
-    return Status.FAIL, "%.1f outside [%s, %s] %s" % (
-        v, spec.amber_lo, spec.amber_hi, spec.unit)
-
-
-def age_status(age_s, spec):
-    """A convenience for the age-shaped checks (state save, heartbeat, pass).
-
-    Ages are `low_is_good` in spirit, but they are their own helper because an
-    age is derived from two timestamps and a caller that has no second timestamp
-    must get UNKNOWN rather than a very large number.
-    """
-    if age_s is None:
-        return Status.UNKNOWN, spec.unavailable_reason or "age could not be computed"
-    return evaluate(age_s, spec)
-
-
-def as_dict(specs):
-    return {k: {"metric": s.metric, "unit": s.unit, "direction": s.direction,
-                "green": s.green, "amber": s.amber, "target": s.target,
-                "note": s.note} for k, s in specs.items()}
+    return Status.UNKNOWN, (
+        "direction %r is not one this evaluator knows, so the value was not "
+        "graded" % (spec.direction,))

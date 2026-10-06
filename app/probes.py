@@ -141,7 +141,7 @@ class Host:
         return args
 
 
-def run(argv, timeout=30, stdin=None, env=None):
+def run(argv, timeout=30, stdin=None):
     """Run a local argv with a hard timeout. Never raises for a non-zero rc."""
     t0 = time.time()
     try:
@@ -151,7 +151,6 @@ def run(argv, timeout=30, stdin=None, env=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
-            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         return RemoteResult(
@@ -370,13 +369,6 @@ class DockerAPI:
             return None, "docker inspect returned no RestartCount"
         return int(n), None
 
-    def started_at(self, name):
-        """The container's start timestamp, or (None, why)."""
-        data, why = self.inspect(name)
-        if data is None:
-            return None, why
-        return (data.get("State") or {}).get("StartedAt"), None
-
     def logs(self, name, tail=500, since=None):
         """Container log text, demultiplexed. Returns (text, why)."""
         q = "stderr=1&stdout=1&timestamps=1&tail=%d" % tail
@@ -457,7 +449,7 @@ def statvfs(path):
     }, None
 
 
-def http_probe(url, timeout=10, expect_any=True):
+def http_probe(url, timeout=10):
     """A HEAD/GET probe that returns the status code rather than a bool.
 
     Deliberately does NOT use `curl -f`: `-f` exits non-zero on ANY 4xx, so a
@@ -494,18 +486,6 @@ def http_probe(url, timeout=10, expect_any=True):
         return None, "timed out after %ds" % timeout
     except OSError as exc:
         return None, str(exc)
-
-
-def tcp_probe(host, port, timeout=5):
-    """A bare connect probe. Answers 'something is listening', nothing more."""
-    t0 = time.time()
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True, int((time.time() - t0) * 1000), ""
-    except socket.timeout:
-        return None, int((time.time() - t0) * 1000), "connect timed out"
-    except OSError as exc:
-        return False, int((time.time() - t0) * 1000), str(exc)
 
 
 def ping(host, timeout=5):
@@ -546,6 +526,34 @@ def ping(host, timeout=5):
         return None, res.reason()
     return res.rc == 0, res.reason()
 
+
+
+def shq(text):
+    """Single-quote `text` for the REMOTE shell, which is what ssh hands the
+    string to. A literal single quote inside is closed, escaped and reopened --
+    the only form that is safe for every byte a path may contain (item 51: this
+    project has lost data to a path with a space in it), BusyBox sh included.
+    """
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+_SCRIPT_CACHE = {}
+
+
+def script_text(path):
+    """Read a probe script once. It is a constant of the image, not per-host."""
+    if path not in _SCRIPT_CACHE:
+        try:
+            with open(path) as fh:
+                _SCRIPT_CACHE[path] = fh.read()
+        except OSError as exc:
+            _SCRIPT_CACHE[path] = None
+            _SCRIPT_CACHE[path + ":err"] = str(exc)
+    return _SCRIPT_CACHE[path]
+
+
+def script_error(path):
+    return _SCRIPT_CACHE.get(path + ":err", "")
 
 @dataclass
 class Evidence:

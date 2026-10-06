@@ -233,14 +233,6 @@ if [ -n "$CUBPXE" ] && [ -d "$CUBPXE/shared" ]; then
         f shared_current_present no
         f shared_manifest_lines ''
     fi
-    # The authoring designation, if one is recorded per device. It lives in T3,
-    # not here -- this is a convenience listing so the dashboard can say which box
-    # is expected to be flipping the pointer.
-    for id in $IDS; do
-        if [ -f "$STATE_BASE/$id/fleet/author" ]; then
-            f "sharedauthor:$id" "$(cat "$STATE_BASE/$id/fleet/author" 2>/dev/null)"
-        fi
-    done
 else
     f shared_dir no
 fi

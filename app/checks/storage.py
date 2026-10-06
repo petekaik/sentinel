@@ -32,7 +32,6 @@ THREE TRAPS THIS FILE IS WRITTEN AROUND
 """
 
 import os
-import time
 
 from checks import Check, ok, warn, fail, unknown
 from store import Status
@@ -43,9 +42,6 @@ class MediaVolume(Check):
     target = "storage"
     spec = "media_volume_used_pct"
     title = "Media volume used"
-    description = ("The filesystem behind BOTH /mnt/recordings and "
-                   "/mnt/transcoded. Filling it stops recording and transcoding "
-                   "at the same moment.")
 
     def run(self, ctx):
         path = ctx.cfg.recordings_root
@@ -91,8 +87,6 @@ class DvbAdapters(Check):
     target = "storage"
     spec = "dvb_adapter_count"
     title = "DVB adapters present"
-    description = ("PRESENCE only. The only proof a tuner WORKS is a real "
-                   "recording, which must never be run automatically.")
 
     def run(self, ctx):
         root = "/dev/dvb"
@@ -137,8 +131,6 @@ class TvhHttp(Check):
     target = "storage"
     spec = "tvh_response_ms"
     title = "TVH HTTP reachable"
-    description = ("401 IS AN ANSWER. It proves something is listening; it does "
-                   "not prove the service works.")
 
     def run(self, ctx):
         import probes
@@ -181,7 +173,6 @@ class TvhContainer(Check):
     target = "storage"
     spec = None
     title = "TVH container state"
-    description = "The container's own health, from the docker API."
 
     def run(self, ctx):
         if ctx.docker is None:
@@ -239,8 +230,6 @@ class TvhLogSignals(Check):
     target = "storage"
     spec = "tvh_tuner_refusal_h"
     title = "TVH log: no free adapter, DVR pairing, EPG"
-    description = ("The container log is the only place these appear. Read "
-                   "through the docker API, so it needs no TVH credentials.")
 
     def run(self, ctx):
         import parsers
@@ -395,8 +384,6 @@ class EpgFreshness(Check):
     target = "storage"
     spec = "epg_freshness_h"
     title = "EPG freshness"
-    description = ("Stale EPG means the schedule is drifting, which is the "
-                   "precursor to missed recordings.")
 
     def run(self, ctx):
         import parsers
@@ -493,8 +480,6 @@ class TvhTunerSilent(Check):
     target = "storage"
     spec = "tvh_tuner_silent_h"
     title = "DVB tuner reception"
-    description = ("A tuner that is assigned work and receives nothing is wedged "
-                   "-- distinct from a mux that no tuner can reach.")
 
     def run(self, ctx):
         import parsers
@@ -608,8 +593,6 @@ class TvhMuxUnreachable(Check):
     target = "storage"
     spec = "tvh_mux_unreachable"
     title = "DVB mux reachability"
-    description = ("A mux no tuner could carry suggests a signal or "
-                   "mux-definition change, which is fixed by a rescan.")
 
     def run(self, ctx):
         import parsers

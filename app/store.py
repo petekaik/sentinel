@@ -23,7 +23,6 @@ that is expected to run unattended for months.
 """
 
 import json
-import os
 import sqlite3
 import time
 from enum import Enum
@@ -75,8 +74,6 @@ SEVERITY = {Status.WARN: "amber", Status.FAIL: "red"}
 #   resolved  -- positively observed to be gone
 #   dismissed -- a HUMAN closed it, with a reason, and that is a different fact
 #                from `resolved`. See `dismiss()` for why they must not merge.
-INCIDENT_STATES = ("pending", "open", "unknown", "latched", "resolved",
-                   "dismissed")
 
 # THE LIVE SET, DEFINED ONCE.
 #
@@ -687,16 +684,15 @@ def note_remedy_attempt(conn, key, detail=None):
 # ---------------------------------------------------------------------------
 
 
-def current_status(conn, seq=None):
+def current_status(conn):
     """The newest outcome per (target, check_id).
 
     Returns a list of row-ish dicts. Callers must handle an EMPTY list as
     `unknown` unless they can prove the query covers the window -- see
     `db_summary` and the module docstring.
     """
-    if seq is None:
-        row = conn.execute("SELECT MAX(epoch_seq) AS s FROM check_run").fetchone()
-        seq = row["s"] if row else None
+    row = conn.execute("SELECT MAX(epoch_seq) AS s FROM check_run").fetchone()
+    seq = row["s"] if row else None
     if seq is None:
         return []
     # Tie-break on id: several checks share an epoch_seq, and a re-run of the
@@ -748,25 +744,12 @@ def db_summary(conn):
     return out
 
 
-def metric_series(conn, target, metric, limit=240):
-    rows = conn.execute(
-        "SELECT epoch_seq, ts, value, unit, text FROM sample "
-        "WHERE target = ? AND metric = ? ORDER BY epoch_seq DESC LIMIT ?",
-        (target, metric, limit),
-    ).fetchall()
-    return [dict(r) for r in rows][::-1]
+# One week of samples at one per minute. A module constant rather than a
+# parameter because there is one caller and it has never passed one.
+KEEP_SAMPLES_EPOCHS = 10080
 
 
-def latest_metric(conn, target, metric):
-    row = conn.execute(
-        "SELECT epoch_seq, ts, value, unit, text FROM sample "
-        "WHERE target = ? AND metric = ? ORDER BY epoch_seq DESC LIMIT 1",
-        (target, metric),
-    ).fetchone()
-    return dict(row) if row else None
-
-
-def prune(conn, keep_samples_epochs=10080):
+def prune(conn):
     """Bound growth without touching incident history.
 
     Samples are pruned by age; incidents, remedies and the journal are kept,
@@ -775,10 +758,7 @@ def prune(conn, keep_samples_epochs=10080):
     row = conn.execute("SELECT MAX(epoch_seq) AS s FROM sample").fetchone()
     if not row or row["s"] is None:
         return 0
-    cutoff = row["s"] - keep_samples_epochs
+    # 10080 epochs at one per minute is one week of samples.
+    cutoff = row["s"] - KEEP_SAMPLES_EPOCHS
     cur = conn.execute("DELETE FROM sample WHERE epoch_seq < ?", (cutoff,))
     return cur.rowcount
-
-
-def db_path_from_env():
-    return os.environ.get("MONITOR_DB", "/data/monitor.sqlite")

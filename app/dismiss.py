@@ -85,8 +85,7 @@ def main(argv=None):
     ap.add_argument("--reason", help="required with a key; why this is being "
                                      "closed by hand")
     ap.add_argument("--by", default=None,
-                    help="who is closing it (default: $MONITOR_DISMISSED_BY, "
-                         "else the container's user)")
+                    help="who is closing it (default: operator)")
     ap.add_argument("--list", action="store_true",
                     help="show the live incidents and their keys, then exit")
     args = ap.parse_args(argv)

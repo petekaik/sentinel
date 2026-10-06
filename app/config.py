@@ -157,11 +157,11 @@ class Config:
             x for x in _env("DVB_ADAPTERS", ",".join(DEFAULT_DVB_ADAPTERS), e).split(",")
             if x
         )
-        # Optional. Without these TVH's own API stays UNKNOWN, which is stated on
-        # the dashboard rather than hidden -- a wrong password returns the same
-        # 401 as no password, so credentials need their own probe to be believed.
+        # Optional. Without a username TVH's own API stays UNKNOWN, which is
+        # stated on the dashboard rather than hidden -- a wrong password returns
+        # the same 401 as no password, so credentials need their own probe to be
+        # believed.
         self.tvh_user = _env("TVH_USER", "", e)
-        self.tvh_pass = _env("TVH_PASS", "", e)
         self.tvh_url = _env("TVH_URL", "http://198.51.100.12:9981", e)
         # How much of the container log one collection reads. This is a WINDOW
         # SIZE, not a detail: the DVR-pairing check pairs a recording's
@@ -209,7 +209,7 @@ class Config:
         #
         # And a deadline that SKIPPED a host would be actively harmful: an
         # `Attempt` with no pulls recorded has `ok == False`, so a skipped host is
-        # indistinguishable from an unreachable one in `consecutive_failures` and
+        # indistinguishable from an unreachable one in the escalation streak and
         # would raise a "host unreachable" FAIL after three epochs. That is item
         # 72's permanent false alarm, arrived at by trying to be careful.
         #

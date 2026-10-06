@@ -445,27 +445,6 @@ def _class_message(cid, host, why, cfg, pulls, n=1):
            why or "unknown"))
 
 
-def consecutive_failures(conn, host, limit=ESCALATE_AFTER):
-    """True only if the last `limit` attempts for this host ALL failed.
-
-    Requires EXACTLY `limit` rows, not `<=`: on a fresh database there is one row
-    and it failed, which is one failure and not three. Getting that wrong makes
-    the monitor shout on its first poll after every deployment.
-    """
-    rows = conn.execute(
-        "SELECT ok, why FROM collection_attempt WHERE host = ? "
-        "ORDER BY epoch_seq DESC, id DESC LIMIT ?",
-        (host, limit),
-    ).fetchall()
-    if len(rows) < limit:
-        return False, ""
-    if all(r["ok"] for r in rows):
-        return False, ""
-    # Newest first, so the first failure in reading order is the most recent.
-    newest_bad = next((r["why"] for r in rows if not r["ok"] and r["why"]), "")
-    return True, newest_bad
-
-
 def escalate(conn, seq, attempts, cfg):
     """Turn a host's sustained silence into a visible verdict -- and back again.
 
@@ -605,7 +584,6 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
 
     classes = checks.registry(*checks.all_modules())
     ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
-                         dry_run=dry_run or cfg.dry_run,
                          check_classes=classes)
 
     attempts = {}

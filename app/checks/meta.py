@@ -11,7 +11,7 @@ place nobody reads. As a check it gets a row, a colour, and a place in the
 incident history -- which is what makes it possible to answer "since when?" later.
 """
 
-from checks import Check, ok, unknown, warn, fail
+from checks import Check, ok, unknown, fail
 
 
 class SpecCoverage(Check):

@@ -205,14 +205,11 @@ OUT_SENTINEL = re.compile(r"^created output sentinel (\S+) \(first run against t
 COPIED_EDL = re.compile(r"^  copied \.edl alongside$")
 # worker.sh:1154-1157 -- sources too new to touch. Three spellings; the third is
 # a total and the first two are samples, so only the total is counted.
-DEFERRED_RECENT = re.compile(r"^deferred-recent: (\d+) source\(s\) too new to touch this pass")
 
 # worker.sh:1313-1403 -- the `--probe` diagnostic path. Its lines are NOT pass
 # activity, and its PASS/FAIL is about a single capped segment. Kept separate so
 # a probe run can never be read as library throughput.
 PROBE_LINE = re.compile(r"^probe: ")
-PROBE_PASS = re.compile(r"^probe: PASS -- ")
-PROBE_FAIL = re.compile(r"^probe: FAIL -- ")
 
 # worker.sh:1380 -- the bench harness (scripts/09) interleaving its own output.
 # Tolerant of indentation on purpose: this is informational, and both observed
@@ -272,43 +269,17 @@ class WorkerLog:
     known_ignored: int = 0
     first_iso: str = None
     last_iso: str = None
-    last_host: str = None
 
     pass_start: dict = None          # the LAST one: {iso, mode, host, index, total, out}
     pass_starts: int = 0
     summary: PassSummary = None      # the LAST one
-    summaries: int = 0
 
-    space_ok: dict = None            # {free_kb, largest_mib}
-    jobs_started: list = field(default_factory=list)
-    published: list = field(default_factory=list)
-    verify_ok: int = 0
-    verify_stalled: list = field(default_factory=list)
     verify_cap: list = field(default_factory=list)
-    verify_other: list = field(default_factory=list)
     failed: list = field(default_factory=list)
     stalls: list = field(default_factory=list)
-    sweeps: list = field(default_factory=list)
     env_fails: list = field(default_factory=list)
-    config_bad: list = field(default_factory=list)
     state_on_tmpfs: list = field(default_factory=list)
     src_not_mounted: list = field(default_factory=list)
-    would_do: int = 0
-    two_env_fails: int = 0
-    not_mounted_dryrun: list = field(default_factory=list)
-    deferred_recent: int = None      # the last pass's total, or None if absent
-    probe_pass: int = 0
-    probe_fail: int = 0
-    probe_lines: int = 0
-
-    @property
-    def mode(self):
-        return (self.pass_start or {}).get("mode")
-
-    @property
-    def is_dry(self):
-        """A dry pass claims nothing. Never let one be read as a live pass."""
-        return self.mode == "dry-run" or self.mode == "dry"
 
     def recent(self, items, minutes, key="iso"):
         """Items whose timestamp is within `minutes` of THIS LOG'S LAST LINE.
@@ -348,21 +319,6 @@ class WorkerLog:
                 out.append(it)
         return out
 
-    @property
-    def healthy_signals(self):
-        """True only if NO alarm-shaped line appears anywhere in the window.
-
-        NOTE this is a property of the WINDOW, not of the fleet's current state:
-        the tail spans days, so a historical ENV-FAIL keeps this False long after
-        the condition is gone. Consumers that want "is it bad NOW" must window by
-        timestamp themselves -- see checks/fleet.py, which does exactly that and
-        which is the check that matters. This property is kept because it is the
-        honest answer to "does the window contain anything alarming".
-        """
-        return not (self.env_fails or self.state_on_tmpfs or self.src_not_mounted
-                    or self.config_bad)
-
-
 def parse_worker_log(text):
     """Parse a tail of `<host>-worker.log`.
 
@@ -383,7 +339,6 @@ def parse_worker_log(text):
         if wl.first_iso is None:
             wl.first_iso = iso
         wl.last_iso = iso
-        wl.last_host = host
 
         m = PASS_START.match(msg)
         if m:
@@ -397,55 +352,16 @@ def parse_worker_log(text):
 
         m = PASS_SUMMARY.match(msg)
         if m:
-            wl.summaries += 1
             counts = {k: int(v) for k, v in SUMMARY_KV.findall(m.group(2))}
             wl.summary = PassSummary(
                 raw=msg, mode=m.group(1) or "", counts=counts, iso=iso, host=host
             )
             continue
 
-        m = SPACE_OK.match(msg)
-        if m:
-            wl.space_ok = {
-                "free_kb": int(m.group(1)),
-                "largest_mib": int(m.group(2)),
-                "iso": iso,
-            }
-            continue
-
-        m = JOB_START.match(msg)
-        if m:
-            wl.jobs_started.append(
-                {"iso": iso, "rel": m.group(1), "path_kind": m.group(2),
-                 "dur_s": int(m.group(3))}
-            )
-            continue
-
-        m = PUBLISHED.match(msg)
-        if m:
-            wl.published.append(
-                {"iso": iso, "final": m.group(1), "wall_s": int(m.group(2))}
-            )
-            continue
-
-        if VERIFY_OK.match(msg):
-            wl.verify_ok += 1
-            continue
-        m = VERIFY_STALLED.match(msg)
-        if m:
-            wl.verify_stalled.append(
-                {"iso": iso, "rc": int(m.group(1)), "frame": int(m.group(2))}
-            )
-            continue
         m = VERIFY_CAP.match(msg)
         if m:
             wl.verify_cap.append({"iso": iso, "rc": int(m.group(1))})
             continue
-        m = VERIFY_OTHER.match(msg)
-        if m:
-            wl.verify_other.append({"iso": iso, "rc": int(m.group(1)), "msg": msg})
-            continue
-
         # ORDER IS LOAD-BEARING: FAILED_NO_DURATION MUST BE TRIED FIRST.
         #
         # FAILED_LINE's rel group is non-greedy `(.*?)` followed by `\(attempt`,
@@ -472,19 +388,9 @@ def parse_worker_log(text):
             )
             continue
 
-        m = SWEEP.match(msg)
-        if m:
-            wl.sweeps.append({"iso": iso, "name": m.group(1), "bytes": int(m.group(2))})
-            continue
-
         m = ENV_FAIL.match(msg)
         if m:
             wl.env_fails.append({"iso": iso, "msg": m.group(1)})
-            continue
-
-        m = CONFIG_BAD.match(msg)
-        if m:
-            wl.config_bad.append({"iso": iso, "msg": m.group(1)})
             continue
 
         m = STATE_ON_TMPFS.match(msg)
@@ -497,46 +403,25 @@ def parse_worker_log(text):
             wl.src_not_mounted.append({"iso": iso, "root": m.group(1)})
             continue
 
-        m = NOT_MOUNTED_DRYRUN.match(msg)
-        if m:
-            wl.not_mounted_dryrun.append({"iso": iso, "root": m.group(1)})
-            continue
-
-        m = WOULD_DO.match(msg)
-        if m:
-            wl.would_do += 1
-            continue
-
-        if TWO_ENV_FAILS.match(msg):
-            wl.two_env_fails += 1
-            continue
-
-        # The deferred-recent total. The sample lines (`deferred-recent: <rel>`)
-        # and the ellipsis line are matched by the same prefix and deliberately
-        # not counted -- only the `N source(s)` total is a number.
-        m = DEFERRED_RECENT.match(msg)
-        if m:
-            wl.deferred_recent = int(m.group(1))
-            continue
-
-        # Probe/bench diagnostics. LAST in the chain, so a probe line that
-        # resembles a real message is still read as the real message.
-        if PROBE_FAIL.match(msg):
-            wl.probe_fail += 1
-            wl.probe_lines += 1
-            continue
-        if PROBE_PASS.match(msg):
-            wl.probe_pass += 1
-            wl.probe_lines += 1
-            continue
-        if PROBE_LINE.match(msg):
-            wl.probe_lines += 1
-            continue
-
         # ---- recognised, informative, deliberately not extracted ----
+        #
+        # WHY THESE ARE MATCHED AND NOT PARSED. A line shape this parser has never
+        # seen is a staleness signal (see `parse_failures` below), so every shape
+        # the worker can emit must be recognised -- but recognising it and
+        # extracting a number from it are different jobs, and nothing reads the
+        # number. These are the shapes that carry no consumer. The probe lines are
+        # LAST in the chain, so a probe line that resembles a real message is
+        # still read as the real message.
         if (MOUNTING_OUT.match(msg) or OUT_SENTINEL.match(msg)
                 or COPIED_EDL.match(msg) or FRAMES_LINE.match(msg)
                 or BENCH_LINE.match(msg)
+                or SPACE_OK.match(msg) or JOB_START.match(msg)
+                or PUBLISHED.match(msg)
+                or VERIFY_OK.match(msg) or VERIFY_STALLED.match(msg)
+                or VERIFY_OTHER.match(msg)
+                or SWEEP.match(msg) or CONFIG_BAD.match(msg)
+                or NOT_MOUNTED_DRYRUN.match(msg) or WOULD_DO.match(msg)
+                or TWO_ENV_FAILS.match(msg) or PROBE_LINE.match(msg)
                 or msg.startswith("deferred-recent: ")):
             wl.known_ignored += 1
             continue
@@ -551,80 +436,6 @@ def parse_worker_log(text):
 # ---------------------------------------------------------------------------
 # The state export's small files
 # ---------------------------------------------------------------------------
-
-
-def parse_last_record(text):
-    """`run/<host>.last` -- the pass record, written at pass END.
-
-    Format (measured):
-      2026-09-26T06:56:33Z|mode=live|sources=12 done=6 mine=6 notmine=6 ...
-
-    NOTE: this is WRITTEN ONLY AT PASS END. A pass runs ~20 h when there is work
-    to do, so this is structurally stale and MUST NOT be used as a liveness
-    signal -- item 66, and the reason the collector uses the `=== pass start ===`
-    log line instead. It is kept because it is the durable record of the last
-    COMPLETED pass, which is a different and useful fact.
-    """
-    text = (text or "").strip()
-    if not text:
-        return None
-    parts = text.split("|")
-    if len(parts) < 2:
-        return None
-    iso = parts[0].strip()
-    mode = ""
-    counts = {}
-    for chunk in parts[1:]:
-        if chunk.startswith("mode="):
-            mode = chunk[5:]
-            continue
-        counts.update({k: int(v) for k, v in SUMMARY_KV.findall(chunk)})
-    return PassSummary(raw=text, mode=mode, counts=counts, iso=iso)
-
-
-def parse_heartbeat(text):
-    """`run/<host>.job` -- the in-flight job marker.
-
-    Format (measured): `2026-09-26T02:40:08Z cubox-1 Futurama/Futurama_....ts`
-    Split with maxsplit=2: everything after the SECOND space is the relpath, which
-    routinely contains spaces (item 51).
-
-    CRITICAL: this file is written at job START (worker.sh:947-948) and NOTHING
-    EVER CLEARS IT -- "Nothing automatic clears this and nothing can: a job wedged
-    in D state on a dead NFS server cannot be killed, so a human reads this." So
-    the mere EXISTENCE or NAME of this file proves nothing about whether a job is
-    running. Measured 2026-09-26: cubox-1's heartbeat was dated 05:40 while the
-    box ran passes with jobs=0 through 06:56. The caller must compare its mtime
-    against ExecMainStartTimestamp and then decide running-ness from `.part`
-    growth -- see checks/cubox.py.
-    """
-    text = (text or "").strip()
-    if not text:
-        return None
-    parts = text.split(" ", 2)
-    if len(parts) < 3:
-        return None
-    iso, host, rel = parts[0], parts[1], parts[2]
-    return {"iso": iso, "host": host, "rel": rel.strip()}
-
-
-def parse_claims(text):
-    """`claim-<host>.txt` -- `<md5> <relpath>` per line.
-
-    maxsplit=1: the relpath is the rest of the line, spaces and all.
-    """
-    out = []
-    for line in (text or "").splitlines():
-        line = line.rstrip("\n")
-        if not line.strip():
-            continue
-        parts = line.split(" ", 1)
-        if len(parts) != 2:
-            continue
-        digest, rel = parts[0].strip(), parts[1].strip()
-        if _MD5_RE.match(digest) and rel:
-            out.append({"md5": digest, "rel": rel})
-    return out
 
 
 def parse_skiplist(text):
@@ -650,33 +461,6 @@ def parse_skiplist(text):
             "rel": rel,
         })
     return out
-
-
-def failed_log_names(names):
-    """Filter a `failed/` listing down to files that ARE failures.
-
-    MEASURED TRAP: the live `failed/` directory contains non-failure leftovers --
-    `faststart-test.log`, `rss.log`, `stall-watch.log`, `probe.log.stale-0923`.
-    Those are diagnostic artifacts an operator left behind, not job failures, so
-    counting directory entries over-reports. Only a `<32 hex>.log` is a job's
-    ffmpeg stderr log, because worker.sh:878 names it by the job key (an md5).
-
-    `probe.log` is separate again: a FAILED probe is written there, and a PASSING
-    probe deletes it (worker.sh:1326, 1387) -- so its presence is a real signal,
-    just not a job failure.
-    """
-    jobs, probe, other = [], None, []
-    for name in names or []:
-        base = name.rsplit("/", 1)[-1]
-        if base == "probe.log":
-            probe = name
-            continue
-        stem = base[:-4] if base.endswith(".log") else None
-        if stem and _MD5_RE.match(stem):
-            jobs.append(name)
-        else:
-            other.append(name)
-    return {"job_logs": sorted(jobs), "probe": probe, "other": sorted(other)}
 
 
 # ---------------------------------------------------------------------------
@@ -1156,14 +940,6 @@ class TvhLog:
                         "sub_id": s["sub_id"] if s else None})
         return out
 
-    def epg_grab_adapters(self):
-        """mux -> adapters that were assigned its EPG grab in this window."""
-        out = {}
-        for s in self.subscribes:
-            if s.get("title") == "epggrab" and s.get("mux"):
-                out.setdefault(s["mux"], set()).add(s.get("adapter") or "(unknown)")
-        return {m: sorted(a) for m, a in sorted(out.items())}
-
 
 def parse_tvh_log(text):
     """Parse a tail of the tvheadend container log."""
@@ -1275,13 +1051,6 @@ def parse_tvh_log(text):
 
 
 # ---------------------------------------------------------------------------
-# systemd surfaces
-# ---------------------------------------------------------------------------
-
-SYSTEMCTL_SHOW = re.compile(r"^([A-Za-z]+)=(.*)$")
-
-
-# ---------------------------------------------------------------------------
 # The combined-ssh capture protocol (shared by app/export.py and
 # app/backupfacts.py)
 # ---------------------------------------------------------------------------
@@ -1379,49 +1148,6 @@ def section_bool(text):
     if v in ("0", "no", "false", "off"):
         return False
     return None
-
-
-def parse_systemctl_show(text):
-    """`systemctl show -p A,B,C unit` -> dict.
-
-    KNOWN TRAP (item 63): `systemctl show -p <Name>` exits 0 and prints NOTHING
-    for a property name that does not exist, so "this property is unset" and "I
-    have never heard of that property" are indistinguishable in the output. A
-    caller that needs to tell those apart must ask for the property ALONE and use
-    the presence of the line, not the emptiness of the value.
-    """
-    out = {}
-    for line in (text or "").splitlines():
-        m = SYSTEMCTL_SHOW.match(line)
-        if m:
-            out[m.group(1)] = m.group(2)
-    return out
-
-
-UNIT_FILE_STATE = re.compile(r"^\s*(UnitFileState|ActiveState|SubState|Result|NRestarts|ExecMainStartTimestamp|ExecMainPID|ConditionResult)=(.*)$")
-
-
-def parse_units_properties(text):
-    """Parse the multi-property `systemctl show -p ...` output."""
-    return parse_systemctl_show(text)
-
-
-def parse_failed_units(text):
-    """`systemctl --failed --no-legend --plain` -> list of unit names.
-
-    Empty output means ZERO failed units, which is the healthy case and is a
-    legitimate OK -- unlike an empty result from a query that could not run. The
-    caller distinguishes those by transport, not by emptiness.
-    """
-    units = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        unit = line.split()[0]
-        if unit.endswith((".service", ".timer", ".socket", ".mount", ".target", ".path")):
-            units.append(unit)
-    return units
 
 
 def parse_meminfo(text):
@@ -1907,12 +1633,10 @@ class BackupFacts:
     # each of these is separate rather than merged.
     shared_dir: bool = None            # the layer exists on the NAS at all
     shared_current: str = ""           # the pointer's CONTENT ("" = empty or absent)
-    shared_current_seen: bool = False  # the key was emitted (vs the probe dying first)
     shared_current_mtime: int = None   # epoch, on the NAS's own clock
     shared_generations: list = field(default_factory=list)
     shared_current_present: bool = None  # is the named generation among them
     shared_manifest_lines: int = None
-    shared_author: dict = field(default_factory=dict)   # cubox id -> designation
 
     def ok(self):
         return self.transport_ok
@@ -1941,11 +1665,6 @@ class BackupFacts:
             return None
         return age
 
-    def load_pct(self):
-        """Load1 as a percentage of the host's ONE core, or None."""
-        if self.load1 is None:
-            return None
-        return self.load1 * 100.0
 
     def mem_available_mb(self):
         if self.mem_available_kb is None:
@@ -1956,29 +1675,6 @@ class BackupFacts:
         if not self.df or self.df.get("available_kb") is None:
             return None
         return self.df["available_kb"] / 1048576.0
-
-    def missing_tftp_files(self):
-        """Names that are absent or ZERO BYTES. Absent from the probe = unknown.
-
-        Returns (definitely_missing, never_observed). The split is the point: a
-        zero-byte zImage is a boot failure, and a name the probe never reported
-        is a probe that died early -- which is UNKNOWN, not a boot failure.
-        """
-        missing, unobserved = [], []
-        for name in self.tftp_files:
-            v = self.tftp_files[name]
-            if v is None:
-                missing.append(name)
-            elif v == 0:
-                missing.append("%s (0 bytes)" % name)
-        return missing, unobserved
-
-
-_BACKUP_PREFIX = {
-    "tftp:": "tftp_files",
-    "state:": "state",
-    "statecfg:": "statecfg",
-}
 
 
 def parse_backup_facts(text, transport_ok=True, why="", duration_ms=0):
@@ -2055,7 +1751,6 @@ def parse_backup_facts(text, transport_ok=True, why="", duration_ms=0):
     # the number is plausible, and it is wrong.
     sh = section_kv(sec.get("shared", []))
     bf.shared_dir = section_bool(sh.get("shared_dir"))
-    bf.shared_current_seen = "shared_current" in sh
     bf.shared_current = (sh.get("shared_current") or "").strip()
     bf.shared_current_mtime = section_int(sh.get("shared_current_mtime"))
     bf.shared_current_present = section_bool(sh.get("shared_current_present"))
@@ -2065,7 +1760,4 @@ def parse_backup_facts(text, transport_ok=True, why="", duration_ms=0):
             name = line.split("=", 1)[1].strip()
             if name:
                 bf.shared_generations.append(name)
-        elif line.startswith("sharedauthor:"):
-            k, _, v = line.partition("=")
-            bf.shared_author[k[len("sharedauthor:"):].strip()] = v.strip()
     return bf

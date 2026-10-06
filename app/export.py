@@ -20,11 +20,10 @@ SECTIONS ARE MARKED, AND THE LOG'S LENGTH IS ASSERTED. The worker log contains
 arbitrary text including paths with spaces and non-ASCII. A marker line is only
 safe if it cannot occur in the payload, so the marker is `===MONITOR-SECTION:x===`
 (which the worker never emits) and the log section additionally carries its
-promised line count and byte count, so a truncated transfer is DETECTED rather
+promised line count, so a truncated transfer is DETECTED rather
 than parsed as a short log.
 """
 
-import re
 import time
 from dataclasses import dataclass, field
 
@@ -50,42 +49,18 @@ if [ -d "$D" ]; then echo 'dir_exists=1'; else echo 'dir_exists=0'; fi
 echo '===MONITOR-SECTION:config==='
 cat "$D/config" 2>/dev/null
 
-echo '===MONITOR-SECTION:claim==='
-cat "$D/claim-$2.txt" 2>/dev/null
-
 echo '===MONITOR-SECTION:skiplist==='
 cat "$D/skiplist" 2>/dev/null
-
-echo '===MONITOR-SECTION:job==='
-if [ -f "$D/run/$2.job" ]; then
-    echo "mtime=$(stat -c %Y "$D/run/$2.job" 2>/dev/null || date -r "$D/run/$2.job" +%s 2>/dev/null || echo '')"
-    cat "$D/run/$2.job" 2>/dev/null
-else
-    echo 'mtime='
-fi
-
-echo '===MONITOR-SECTION:last==='
-if [ -f "$D/run/$2.last" ]; then
-    echo "mtime=$(stat -c %Y "$D/run/$2.last" 2>/dev/null || date -r "$D/run/$2.last" +%s 2>/dev/null || echo '')"
-    cat "$D/run/$2.last" 2>/dev/null
-else
-    echo 'mtime='
-fi
 
 echo '===MONITOR-SECTION:logmeta==='
 if [ -f "$D/log/$2-worker.log" ]; then
     echo "lines=$(wc -l < "$D/log/$2-worker.log" 2>/dev/null || echo '')"
-    echo "bytes=$(wc -c < "$D/log/$2-worker.log" 2>/dev/null || echo '')"
-    echo "mtime=$(stat -c %Y "$D/log/$2-worker.log" 2>/dev/null || date -r "$D/log/$2-worker.log" +%s 2>/dev/null || echo '')"
 else
     echo 'lines='
 fi
 
 echo '===MONITOR-SECTION:log==='
 tail -n LOGTAIL "$D/log/$2-worker.log" 2>/dev/null
-
-echo '===MONITOR-SECTION:failed==='
-ls -1 "$D/failed" 2>/dev/null
 """
 
 
@@ -101,27 +76,15 @@ class StateExport:
     dir_exists: bool = False
 
     config_text: str = ""
-    claim_text: str = ""
     skiplist_text: str = ""
-    job_text: str = ""
-    job_mtime: int = None
-    last_text: str = ""
-    last_mtime: int = None
     log_text: str = ""
     log_lines: int = None
-    log_bytes: int = None
-    log_mtime: int = None
-    failed_names: list = field(default_factory=list)
     log_truncated: bool = False
     preamble: list = field(default_factory=list)
 
     # Parsed views, computed once.
     worker: object = None
-    heartbeat: dict = None
-    last_pass: object = None
-    claims: list = field(default_factory=list)
     skiplist: list = field(default_factory=list)
-    failed: dict = field(default_factory=dict)
     config: dict = field(default_factory=dict)
 
     @property
@@ -136,13 +99,14 @@ class StateExport:
         note, while the timestamp is what the box actually claimed. The caller
         must pass the box's own `now` where possible -- the boxes have no RTC
         (item 23), so comparing a box timestamp against the monitor's clock is
-        invalid across a reboot. Falls back to mtime when the log has no parseable
-        last line.
+        invalid across a reboot. Returns None -- UNKNOWN -- when the log has no
+        parseable last line, rather than falling back to the file's mtime, which
+        moves on any append including a note.
         """
         now = now if now is not None else self.server_now
         if self.worker is None or not self.worker.last_iso:
             return None
-        t = iso_to_epoch(self.worker.last_iso)
+        t = parsers.iso_to_epoch(self.worker.last_iso)
         if t is None:
             return None
         if now is None or now < t:
@@ -152,68 +116,9 @@ class StateExport:
             return None
         return (now - t) / 60.0
 
-    def heartbeat_age_min(self, now=None):
-        """Age of the heartbeat FILE, from its mtime.
-
-        NOTE: this is an age, not a verdict. See parsers.parse_heartbeat -- the
-        file is never cleared, so its age alone says nothing about whether a job
-        is running. The caller compares it against ExecMainStartTimestamp.
-        """
-        if self.job_mtime is None:
-            return None
-        now = now if now is not None else self.server_now
-        if now is None or now < self.job_mtime:
-            return None
-        return (now - self.job_mtime) / 60.0
-
-
-def iso_to_epoch(iso):
-    """ISO8601 Z -> epoch seconds, or None.
-
-    ONE implementation, in parsers (the lower layer), because the earlier version
-    lived here and used `time.mktime` -- which reads a struct_time as LOCAL time.
-    On a Europe/Helsinki host that shifts every box timestamp by 2-3 hours, so a
-    box that had just written a log line would have been reported hours idle.
-    """
-    return parsers.iso_to_epoch(iso)
-
 
 def build_script(log_tail=LOG_TAIL):
     return SCRIPT_TEMPLATE.replace("LOGTAIL", str(int(log_tail)))
-
-
-# The client-side ssh banner, which was MEASURED on stdout in the first real
-# capture (3 lines, at the very top, before any marker):
-#
-#   ** WARNING: connection is not using a post-quantum key exchange algorithm.
-#   ** This session may be vulnerable to "store now, decrypt later" attacks.
-#   ** The server may need to be upgraded. See https://openssh.com/pq.html
-#
-# It only landed harmlessly because it happened to precede the first marker. That
-# is luck, not design -- ssh emits this once at connection setup, so it is always
-# first TODAY, and nothing guarantees that. If it ever arrived mid-stream it would
-# be appended to a section body: three junk lines inside `config` (parsed as keys,
-# silently ignored) or inside `failed` (read as failed-job filenames). So it is
-# stripped EXPLICITLY and counted, rather than dropped by position.
-SSH_BANNER_RE = parsers.SSH_BANNER_RE
-
-
-def split_sections(text):
-    """The section splitter, from parsers -- the ONE implementation.
-
-    app/backupfacts.py reads the same protocol, so a local copy here would be a
-    second thing that can drift (item 7's lesson, and the reason iso_to_epoch is
-    delegated below). See parsers.split_sections for what `_preamble` is for.
-    """
-    return parsers.split_sections(text)
-
-
-def _kv(lines):
-    return parsers.section_kv(lines)
-
-
-def _int(text):
-    return parsers.section_int(text)
 
 
 def pull(ctx, cubox_id):
@@ -224,7 +129,7 @@ def pull(ctx, cubox_id):
                            why="no backup host configured")
 
     base = "%s/%s/transcode" % (ctx.cfg.state_export_base.rstrip("/"), cubox_id)
-    script = "sh -s -- %s %s" % (_quote(base), _quote(cubox_id))
+    script = "sh -s -- %s %s" % (probes.shq(base), probes.shq(cubox_id))
     payload = build_script().lstrip("\n")
 
     t0 = time.time()
@@ -235,7 +140,7 @@ def pull(ctx, cubox_id):
     if not res.ran:
         return se
 
-    sections = split_sections(res.out)
+    sections = parsers.split_sections(res.out)
     se.preamble = [l for l in sections.get("_preamble", []) if l.strip()]
     # A section marker is the ONLY thing that makes the output parseable, so ask
     # for a real one -- `_preamble` is always present and would otherwise make
@@ -247,8 +152,8 @@ def pull(ctx, cubox_id):
                   "preamble=%r" % (se.preamble[:3],))
         return se
 
-    meta = _kv(sections.get("meta", []))
-    se.server_now = _int(meta.get("now"))
+    meta = parsers.section_kv(sections.get("meta", []))
+    se.server_now = parsers.section_int(meta.get("now"))
     se.dir_exists = meta.get("dir_exists") == "1"
 
     if not se.dir_exists:
@@ -257,27 +162,10 @@ def pull(ctx, cubox_id):
         return se
 
     se.config_text = "\n".join(sections.get("config", []))
-    se.claim_text = "\n".join(sections.get("claim", []))
     se.skiplist_text = "\n".join(sections.get("skiplist", []))
 
-    job = list(sections.get("job", []))
-    job_meta = _kv(job[:1]) if job else {}
-    se.job_mtime = _int(job_meta.get("mtime"))
-    # The body starts after the mtime= line. When the file is absent the marker
-    # line is `mtime=` alone, so the body is correctly empty.
-    body = job[1:] if job and job[0].startswith("mtime=") else job
-    se.job_text = "\n".join(body).strip()
-
-    last = list(sections.get("last", []))
-    last_meta = _kv(last[:1]) if last else {}
-    se.last_mtime = _int(last_meta.get("mtime"))
-    lbody = last[1:] if last and last[0].startswith("mtime=") else last
-    se.last_text = "\n".join(lbody).strip()
-
-    lm = _kv(sections.get("logmeta", []))
-    se.log_lines = _int(lm.get("lines"))
-    se.log_bytes = _int(lm.get("bytes"))
-    se.log_mtime = _int(lm.get("mtime"))
+    lm = parsers.section_kv(sections.get("logmeta", []))
+    se.log_lines = parsers.section_int(lm.get("lines"))
 
     log_lines = sections.get("log", [])
     # Strip the one blank line the script's `tail` may leave, and ASSERT the
@@ -299,15 +187,9 @@ def pull(ctx, cubox_id):
         if got < expected - 2:
             se.log_truncated = True
 
-    se.failed_names = [l.strip() for l in sections.get("failed", []) if l.strip()]
-
     # ---- parsed views, computed once and shared by every consumer ----
     se.worker = parsers.parse_worker_log(se.log_text)
-    se.heartbeat = parsers.parse_heartbeat(se.job_text)
-    se.last_pass = parsers.parse_last_record(se.last_text)
-    se.claims = parsers.parse_claims(se.claim_text)
     se.skiplist = parsers.parse_skiplist(se.skiplist_text)
-    se.failed = parsers.failed_log_names(se.failed_names)
     se.config = parse_config_text(se.config_text)
     return se
 
@@ -321,10 +203,6 @@ def _run_script(host, script, payload):
     """
     argv = host.base_args() + [script]
     return probes.run(argv, timeout=host.timeout, stdin=payload.encode())
-
-
-def _quote(text):
-    return "'" + text.replace("'", "'\\''") + "'"
 
 
 def parse_config_text(text):

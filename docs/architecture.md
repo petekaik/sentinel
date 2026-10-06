@@ -341,9 +341,10 @@ header is the mechanism, not politeness.
 
 ### `api_version`
 
-Integer, currently **`1`**. Additive changes keep the version; a removed or
+Integer, currently **`2`**. Additive changes keep the version; a removed or
 re-typed key raises it. An integrator should refuse a version it does not know
-rather than read a document whose shape it is guessing at.
+rather than read a document whose shape it is guessing at. Version 2 removed the
+per-item `known_condition` key, which no check ever set.
 
 ### The `verdict` field is three-valued, and that is the point
 
@@ -383,7 +384,7 @@ under its own `informational` array, where nothing can consume it as health.
 
 ```json
 {
- "api_version": 1,
+ "api_version": 2,
  "generated_at": 1758888888.5,
  "generated_at_iso": "2026-09-26T07:34:48Z",
  "verdict": "fail",
@@ -404,7 +405,7 @@ under its own `informational` array, where nothing can consume it as health.
  "worst": [{"target": "cubox-1", "check_id": "host_auth_failed",
             "status": "fail", "detail": "CANNOT AUTHENTICATE…",
             "spec": null, "value": null, "unit": "",
-            "known_condition": null, "claim": null}],
+            "claim": null}],
  "worst_truncated": false,
  "incidents": [{"key": "cubox-1|host_auth_failed|cubox-1",
                 "target": "cubox-1", "check_id": "host_auth_failed",

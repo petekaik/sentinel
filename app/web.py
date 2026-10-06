@@ -37,8 +37,8 @@ Read-only throughout: the store is opened `mode=ro`, so a render cannot write an
 a slow query cannot block the collector's writer.
 """
 
+import html
 import json
-import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -137,7 +137,6 @@ def build_state(cfg, conn, now=None):
             "value": None, "unit": spec.unit if spec else "",
             "spec_note": spec.note if spec else None,
             "unavailable_reason": spec.unavailable_reason if spec else None,
-            "known_condition": spec.known_condition if spec else None,
             "claim": spec.claim if spec else None,
             "has_result": row is not None,
         }
@@ -167,7 +166,7 @@ def build_state(cfg, conn, now=None):
               "detail": r["detail"], "from": "collector",
               "spec": None, "value": None, "unit": "", "has_result": True,
               "informational": False, "spec_note": None,
-              "unavailable_reason": None, "known_condition": None, "claim": None}
+              "unavailable_reason": None, "claim": None}
              for (t, c), r in sorted(by_key.items())]
 
     summary = store.db_summary(conn)
@@ -241,7 +240,7 @@ def _tally(state):
 # cannot disagree about what is red. That is item 7 applied to a second reader.
 # ---------------------------------------------------------------------------
 
-API_VERSION = 1
+API_VERSION = 2
 
 # How many of the worst rows the API lists. A cap, and a silent cap is how a
 # truncated list reads as a complete one -- so `worst_truncated` and the full
@@ -338,7 +337,7 @@ def build_status(cfg, conn, now=None):
     worst = [{"target": i["target"], "check_id": i["check_id"],
               "status": i["status"], "detail": i["detail"], "spec": i["spec"],
               "value": i["value"], "unit": i["unit"],
-              "known_condition": i["known_condition"], "claim": i["claim"]}
+              "claim": i["claim"]}
              for i in flagged[:WORST_LIMIT]]
 
     last = state["last"]
@@ -496,8 +495,7 @@ a { color:#6cb6ff; }
 
 
 def _esc(s):
-    return (str("" if s is None else s).replace("&", "&amp;")
-            .replace("<", "&lt;").replace(">", "&gt;"))
+    return html.escape("" if s is None else str(s), quote=False)
 
 
 def _age(seconds):

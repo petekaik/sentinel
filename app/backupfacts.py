@@ -26,29 +26,8 @@ READ-ONLY. The script creates nothing, mounts nothing, and its only writes are t
 stdout. This runs every 60 seconds forever against the tightest box in the fleet.
 """
 
-import os
-
 import parsers
 import probes
-
-_SCRIPT_CACHE = {}
-
-
-def _script(path):
-    """Read the probe script once. It is a constant of the image, not per-host."""
-    if path not in _SCRIPT_CACHE:
-        try:
-            with open(path) as fh:
-                _SCRIPT_CACHE[path] = fh.read()
-        except OSError as exc:
-            _SCRIPT_CACHE[path] = None
-            _SCRIPT_CACHE[path + ":err"] = str(exc)
-    return _SCRIPT_CACHE[path]
-
-
-def script_error(path):
-    return _SCRIPT_CACHE.get(path + ":err", "")
-
 
 def build_command(cfg):
     """The remote command line: the fixed paths as argv, then the two lists.
@@ -61,11 +40,7 @@ def build_command(cfg):
     config, and a variable-length argv tail is a parsing problem on a BusyBox
     shell that is easier to avoid than to solve.
     """
-    def q(text):
-        # Single-quote for the remote shell. A literal single quote inside is
-        # closed, escaped and reopened -- the only form that is safe for every
-        # byte a path may contain (BusyBox sh included).
-        return "'" + str(text).replace("'", "'\\''") + "'"
+    q = probes.shq
 
     argv = [
         q(cfg.cubpxe_root),
@@ -87,12 +62,12 @@ def pull(host, script_path, cfg, timeout=None):
     transport-failed block, so it surfaces as UNKNOWN with the reason rather than
     as a host that reported nothing.
     """
-    text = _script(script_path)
+    text = probes.script_text(script_path)
     if text is None:
         return parsers.parse_backup_facts(
             "", transport_ok=False,
             why="probe script %s unreadable: %s"
-                % (script_path, script_error(script_path)),
+                % (script_path, probes.script_error(script_path)),
         )
 
     res = probes.run(host.base_args() + [build_command(cfg)],

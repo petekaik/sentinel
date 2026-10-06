@@ -27,7 +27,6 @@ file rather than in the script:
 """
 
 from checks import Check, ok, warn, fail, unknown
-from store import Status
 
 
 class _BackupCheck(Check):
@@ -85,9 +84,6 @@ class BackupReachable(_BackupCheck):
     target = "backup"
     spec = None
     title = "Backup-NAS readable"
-    description = ("The one ssh that brings back every other fact on this host. "
-                   "Reported on its own so a transport failure is never "
-                   "mistaken for a fault.")
 
     def run(self, ctx):
         bf = ctx.backup_facts()
@@ -162,8 +158,6 @@ class BackupLoad(_BackupCheck):
     target = "backup"
     spec = "backup_load1"
     title = "Backup-NAS load average"
-    description = ("ONE core. This box is already saturated, which is the "
-                   "standing reason nothing new runs on it.")
 
     def run(self, ctx):
         bf, err = self.facts_or_unknown(ctx, "load", "the load average")
@@ -194,9 +188,6 @@ class BackupMemory(_BackupCheck):
     target = "backup"
     spec = "backup_mem_available_mb"
     title = "Backup-NAS memory available"
-    description = ("Kernel 3.4.6 predates MemAvailable (Linux 3.14), so this is "
-                   "the pre-3.14 ESTIMATE MemFree+Buffers+Cached. The detail "
-                   "says which formula produced the number.")
 
     def run(self, ctx):
         bf, err = self.facts_or_unknown(ctx, "mem", "the memory reading")
@@ -229,9 +220,6 @@ class BackupDisk(_BackupCheck):
     target = "backup"
     spec = "backup_disk_free_gb"
     title = "Backup-NAS disk free"
-    description = ("Holds the shared rootfs, the TFTP boot files and every "
-                   "state export. Running out stops the fleet BOOTING, not just "
-                   "persisting.")
 
     def run(self, ctx):
         bf, err = self.facts_or_unknown(ctx, "disk", "the free space")
@@ -258,9 +246,6 @@ class NfsExportAdvertised(_BackupCheck):
     target = "backup"
     spec = None
     title = "NFS export for cubpxe"
-    description = ("Checked by reading /etc/exports, NOT showmount: showmount is "
-                   "not installed on QTS armv5, so a check built on it would be "
-                   "a permanent false RED.")
 
     def run(self, ctx):
         bf, err = self.facts_or_unknown(ctx, "exports", "the export table")
@@ -301,8 +286,6 @@ class TftpBootFiles(_BackupCheck):
     target = "backup"
     spec = None
     title = "TFTP boot files"
-    description = ("uBoot fetches these before there is any filesystem. ZERO "
-                   "BYTES IS A BOOT FAILURE, so size is asserted, not presence.")
 
     def run(self, ctx):
         bf, err = self.facts_or_unknown(ctx, "tftp", "the boot files")
@@ -357,8 +340,6 @@ class NfsRootTree(_BackupCheck):
     target = "backup"
     spec = None
     title = "Shared rootfs tree"
-    description = ("The read-only rootfs both CuBoxes boot from. A half-written "
-                   "tree is not a working export.")
 
     def run(self, ctx):
         bf, err = self.facts_or_unknown(ctx, "nfsroot", "the shared rootfs")
@@ -401,8 +382,6 @@ class StateExports(_BackupCheck):
     target = "backup"
     spec = None
     title = "Per-device state exports"
-    description = ("Both cubox-N directories, with the files that prove each is "
-                   "a real export rather than a directory someone made.")
 
     def run(self, ctx):
         bf, err = self.facts_or_unknown(ctx, "state", "the state exports")

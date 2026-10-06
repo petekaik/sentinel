@@ -293,6 +293,61 @@ def test_real_capture_does_not_break_a_check(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+
+# ---------------------------------------------------------------------------
+# 2b. The parser's recognition set, guarded by the real capture
+# ---------------------------------------------------------------------------
+
+
+def test_the_real_log_has_no_unrecognised_line_shape(results):
+    """Every line shape the worker emits must be RECOGNISED, even where the
+    parser deliberately does not extract a value from it.
+
+    WHY THIS IS ITS OWN TEST. `log_parse_failures` grades this count in
+    production, but the guard that matters is the parser's recognition set, and
+    that set is a list of regexes -- the easiest thing in this file to shorten by
+    accident. `known_ignored` carries the shapes nothing reads: probe, job,
+    published, space-ok, sweep, verify-ok and the rest. Delete one term from that
+    alternation and nothing goes red until the count reaches production, where a
+    shape it no longer recognises reads as a format change.
+
+    The lines are NOT retyped here. They are counted out of the captured log, so
+    the test cannot agree with a bug the capture would have disagreed with.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        cfg = _cfg(tmpdir)
+        for box, name in sorted(EXPORT_FIXTURES.items()):
+            se = _export(cfg, box)
+            wl = se.worker
+            results.check(
+                "%s: the captured log parses (a mutation of the fixture would "
+                "make this test vacuous)" % box,
+                wl is not None and wl.lines > 100,
+                "worker=%s lines=%s -- %s" % (wl is not None,
+                                              wl.lines if wl else None, se.why))
+            if wl is None:
+                continue
+            results.check(
+                "%s: every one of the %d lines in the capture is a shape the "
+                "parser recognises" % (box, wl.lines),
+                wl.parse_failures == 0,
+                "%d of %d lines are unrecognised (%s). A shape the parser does "
+                "not know is a format change, and the log-derived checks read it "
+                "as a quiet box. If a recognition branch was just deleted, put "
+                "its regex back in the known_ignored alternation."
+                % (wl.parse_failures, wl.lines, name))
+            results.check(
+                "%s: the known-but-not-extracted shapes are counted, not dropped"
+                % box,
+                wl.known_ignored > 0,
+                "known_ignored=%d. Zero means every remaining branch EXTRACTS, "
+                "so this test would not notice that the recognise-only "
+                "alternation had been gutted." % wl.known_ignored)
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 # ---------------------------------------------------------------------------
 # 2. The idle gate, both halves and the middle
 # ---------------------------------------------------------------------------
@@ -1297,6 +1352,7 @@ def test_orphan_parts_counts_only_temps_no_pass_can_be_writing(results):
 
 TESTS = (test_no_suite_leaked_a_transport_stub,
          test_real_capture_does_not_break_a_check,
+         test_the_real_log_has_no_unrecognised_line_shape,
          test_idle_gate_has_both_halves,
          test_a_deliberate_stop_is_not_a_stall,
          test_a_heartbeat_age_is_only_graded_inside_a_pass,

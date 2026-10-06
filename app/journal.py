@@ -102,13 +102,8 @@ def build_command(cursor, lines=DEFAULT_LINES):
     """
     cmd = "journalctl --no-pager --output=json --lines=%d" % lines
     if cursor:
-        cmd += " --after-cursor=%s" % _shq(cursor)
+        cmd += " --after-cursor=%s" % probes.shq(cursor)
     return cmd
-
-
-def _shq(s):
-    """Single-quote for the REMOTE shell. ssh passes the whole string to `sh`."""
-    return "'" + str(s).replace("'", "'\\''") + "'"
 
 
 def _micros(entry):

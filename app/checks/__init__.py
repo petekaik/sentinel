@@ -69,7 +69,6 @@ class Check:
     target = ""
     spec = None          # a thresholds.Spec id, or None for logic-only checks
     title = ""           # human-readable, for the dashboard
-    description = ""
 
     # True for a check that runs ONCE PER CUBOX. The collector instantiates one
     # of these per box and calls bind(), so `self.target` becomes the box id.
@@ -109,7 +108,7 @@ class Check:
     def run(self, ctx):
         raise NotImplementedError
 
-    def result_from_spec(self, ctx, value, subject="", evidence=None, extra=None):
+    def result_from_spec(self, ctx, value, subject="", evidence=None):
         """Evaluate `value` against this check's threshold spec.
 
         The whole point of routing through here is that `value=None` can only
@@ -155,13 +154,11 @@ class Context:
     interval to Backup-NAS is both wasteful and a second thing that can time out.
     """
 
-    def __init__(self, cfg, specs, hosts, docker=None, dry_run=False,
-                 check_classes=None):
+    def __init__(self, cfg, specs, hosts, docker=None, check_classes=None):
         self.cfg = cfg
         self.specs = specs
         self.hosts = hosts
         self.docker = docker
-        self.dry_run = dry_run
         # The Check CLASSES the collector will run, so `checks/meta.py` can audit
         # spec coverage. None (the default, and what the offline suite gets) is a
         # distinct state from [] -- see SpecCoverage.run: it says "the audit

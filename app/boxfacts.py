@@ -29,30 +29,10 @@ absent is UNKNOWN -- which is the correct answer for a box whose state mount is
 wedged, and is strictly better than throwing away the reachability evidence too.
 """
 
-import os
 import re
 
 import parsers
 import probes
-
-_SCRIPT_CACHE = {}
-
-
-def _script(path):
-    """Read the probe script once. It is a constant of the image, not per-box."""
-    if path not in _SCRIPT_CACHE:
-        try:
-            with open(path) as fh:
-                _SCRIPT_CACHE[path] = fh.read()
-        except OSError as exc:
-            _SCRIPT_CACHE[path] = None
-            _SCRIPT_CACHE[path + ":err"] = str(exc)
-    return _SCRIPT_CACHE[path]
-
-
-def script_error(path):
-    return _SCRIPT_CACHE.get(path + ":err", "")
-
 
 def pull(host, script_path, timeout=None, write_probe=False):
     """Run the probe on `host` and return a parsers.BoxFacts.
@@ -62,12 +42,12 @@ def pull(host, script_path, timeout=None, write_probe=False):
     than as a box that reported nothing. That distinction is the whole point of
     this module's docstring, applied to its own failure mode.
     """
-    text = _script(script_path)
+    text = probes.script_text(script_path)
     if text is None:
         return parsers.parse_facts(
             "", transport_ok=False,
             why="probe script %s unreadable: %s"
-                % (script_path, script_error(script_path)),
+                % (script_path, probes.script_error(script_path)),
         )
 
     argv_text = "sh -s -- BOXFACTS_WRITE_PROBE=1" if write_probe else "sh -s"

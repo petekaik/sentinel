@@ -26,11 +26,8 @@ through `result_from_spec`, whose `value=None` path returns UNKNOWN by
 construction -- so an unparseable number cannot become a green.
 """
 
-import os
-import time
 
 from checks import Check, ok, warn, fail, unknown
-from store import Status
 
 
 class _BoxCheck(Check):
@@ -64,8 +61,6 @@ class FailedUnits(_BoxCheck):
     id = "failed_units"
     spec = "failed_units"
     title = "Failed systemd units"
-    description = ("Units in the failed state. Item 36: six units failed on "
-                   "every boot from one cause and nothing reported it.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -113,8 +108,6 @@ class StateSaveRunning(_BoxCheck):
     id = "state_save_age_min"
     spec = "state_save_age_min"
     title = "State-save timer"
-    description = ("The 15-minute save timer, and the EXACT detector for the "
-                   "silent /mnt/state footgun.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -213,9 +206,6 @@ class StateMountLive(_BoxCheck):
     id = "state_mount"
     spec = None
     title = "/mnt/state is live and points at THIS box"
-    description = ("The fleet's known silent failure. mountinfo cannot see it: "
-                   "the mount is present and looks perfect while every access "
-                   "fails.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -295,7 +285,6 @@ class MemAvailable(_BoxCheck):
     id = "mem_available_mb"
     spec = "mem_available_mb"
     title = "Available memory"
-    description = "2 GB, no swap. An OOM here takes sshd or the /etc tmpfs."
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -371,9 +360,6 @@ class CmaFree(_BoxCheck):
     id = "cma_free_mb"
     spec = "cma_free_mb"
     title = "VPU CMA pool free (idle only)"
-    description = ("The encoder's contiguous-memory pool. Graded only when the "
-                   "box is provably between passes -- a running job legitimately "
-                   "holds most of it, and the pass lock does NOT indicate a job.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -482,9 +468,6 @@ class JobHeartbeat(_BoxCheck):
     id = "heartbeat_age_min"
     spec = "heartbeat_age_min"
     title = "age of the current job"
-    description = ("How long the job now running has been running, graded only "
-                   "while a pass is in flight and only for a heartbeat written "
-                   "by THAT pass.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -620,8 +603,6 @@ class OrphanParts(_BoxCheck):
     id = "orphan_parts"
     spec = "orphan_parts"
     title = "job temps with no pass in flight"
-    description = ("In-flight output temps that no pass can be writing. A .part "
-                   "while a pass runs is normal and is not counted here.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -688,8 +669,6 @@ class TmpfsFill(_BoxCheck):
     id = "tmpfs_used_pct"
     spec = "tmpfs_used_pct"
     title = "Writable tmpfs fill"
-    description = ("/etc /tmp /var/tmp /var/log /build are RAM. A full /etc "
-                   "loses the box's identity at the next boot.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -784,11 +763,6 @@ class Temperature(_BoxCheck):
     # fanless board is telling anyone.
     informational = True
     title = "SoC temperature (informational)"
-    description = ("FYI only: no active cooling, so a reading is not actionable, "
-                   "and the boxes are expected to run at 100% load indefinitely. "
-                   "Not available on this board anyway -- no thermal zone exists. "
-                   "Rendered so the absence is explicit and never mistaken for "
-                   "healthy.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -857,7 +831,6 @@ class VpuPresent(_BoxCheck):
     id = "vpu_present"
     spec = None
     title = "VPU driver, nodes and encoder"
-    description = "The hardware the whole fleet exists for."
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -905,9 +878,6 @@ class StateDirOnTmpfs(_BoxCheck):
     id = "state_dir_tmpfs"
     spec = None
     title = "Worker is not persisting into tmpfs"
-    description = ("STATE_DIR is resolved ONCE at worker load. A worker that "
-                   "started while /mnt/state was unmounted writes to "
-                   "/build/transcode-state forever.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -961,12 +931,6 @@ class WorkerDrift(_BoxCheck):
     id = "worker_drift"
     spec = None
     title = "worker.sh matches the generation this box applied"
-    description = ("Whether the code RUNNING on this box is the code its applied "
-                   "generation says it should be running. BOTH SIDES COME FROM "
-                   "THE BOX: the live digest of /etc/cubox-transcode/worker.sh, "
-                   "and the digest the shared layer's MANIFEST records for the "
-                   "generation this box last applied. Cosmetic differences are "
-                   "reported, not alarmed.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -1106,8 +1070,6 @@ class WorkerPairParity(Check):
     target = "fleet"
     spec = None
     title = "Both boxes run the same worker"
-    description = ("One read-only image is shared by both nodes, so the two "
-                   "worker.sh copies must be identical.")
 
     def run(self, ctx):
         import boxfacts
@@ -1165,8 +1127,6 @@ class StallWatchPresent(_BoxCheck):
     id = "stall_watch"
     spec = None
     title = "Worker can detect the item-52 VPU deadlock"
-    description = ("Whether the deployed worker has its own deadlock watchdog. "
-                   "Without it a deadlocked job runs to the wall-clock cap.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -1218,9 +1178,6 @@ class StrikeWatch(_BoxCheck):
     id = "failed_dir"
     spec = None
     title = "Failed-job logs on the export"
-    description = ("Item 65: a log in failed/ is written at JOB START and "
-                   "removed only on success, so its presence alone means "
-                   "nothing.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -1250,9 +1207,6 @@ class FstabDelivered(_BoxCheck):
     id = "fstab_delivered"
     spec = None
     title = "/etc/fstab matches the state export"
-    description = ("The image's fstab is only a first-boot default; the live "
-                   "one is restored from the state export. Comparing the two "
-                   "digests proves the DELIVERY, not the file's existence.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -1365,8 +1319,6 @@ class SharedLayerApplied(_BoxCheck):
     id = "shared_applied"
     spec = "shared_applied_lag_min"
     title = "Running the fleet's current generation"
-    description = ("The box's applied T2 generation against the layer's own "
-                   "`current`. The only check that can see BOTH boxes stalled.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -1538,8 +1490,6 @@ class SharedPromoted(_BoxCheck):
     id = "shared_promoted"
     spec = None
     title = "T2 content has not been promoted into per-device state"
-    description = ("Item 77: recursive save_etc() copies T2 units into T3, which "
-                   "then win on restore and pin a fleet change to one box.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -1617,9 +1567,6 @@ class SharedNonExec(_BoxCheck):
     id = "shared_nonexec"
     spec = None
     title = "Shared-layer scripts are executable"
-    description = ("rsync -a preserves the repo's mode, so a 0644 script is "
-                   "delivered non-executable while staying byte-identical to its "
-                   "source and invisible to the text-comparing drift check.")
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)

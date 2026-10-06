@@ -513,7 +513,6 @@ else
   f worker_manifest_md5 ""
 fi
 
-f shared_author         "$(cat /mnt/state/fleet/author 2>/dev/null)"
 # The FALLBACK record. Present means the applier could not reach the layer and the
 # box is running the image's build-time snapshot instead -- which is a legitimate
 # degraded mode, not a dead box, so it is its own fact rather than folded into a

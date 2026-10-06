@@ -1550,22 +1550,26 @@ def test_the_page_names_the_platform_and_never_colours_alone(results):
             % (sorted(used - defined), sorted(defined)))
 
         # THE ONE GUARD THAT LOOKS AT A CSS VALUE, and it asserts a PROPERTY,
-        # not the value: a backslash that is not the start of a hex escape is
-        # not an error anywhere -- the declaration is dropped and the element
-        # silently loses that property. That is not hypothetical: Task 4's
-        # disclosure markers were written through a Python-level escape (`\u`
-        # is not a CSS escape, because `u` is not a hex digit), so `▸` rendered
-        # as nothing and every check on the page stayed green. This is the same
-        # failure Task 5's token guard above exists to catch, one level down:
-        # a var() with no definition and a declaration that never parses are
+        # not the value: a backslash that is not the start of a hex escape does
+        # NOT drop the declaration. CSS Syntax 4.3.7, "Consume an escaped code
+        # point": a backslash before a hex digit consumes a hex escape, and a
+        # backslash before ANYTHING ELSE returns that code point -- it escapes
+        # one character, which is then emitted literally. So the declaration
+        # parses and the value is silently not the one that was meant. Not
+        # hypothetical: write the disclosure marker as `\u25b8` and `u` is an
+        # ordinary character, so the marker renders as the visible text `u25b8`
+        # rather than as the glyph, and every check on the page stays green.
+        # This is the same failure Task 5's token guard above exists to catch,
+        # one level down: a var() with no definition and a mangled escape are
         # both silent. It copies no value, so a restyle is free to change every
-        # colour -- and legitimate hex escapes (`\2014`) are not flagged.
+        # colour -- and legitimate hex escapes (`\2014`) are not flagged,
+        # while a TRAILING backslash, which really is a parse error, is.
         results.check(
             "no CSS escape can silently drop a declaration",
             not re.search(r"\\(?![0-9a-fA-F])", css),
-            "the stylesheet carries a backslash that is not a hex escape -- the "
-            "declaration it sits in is dropped and the element quietly has no "
-            "such property, which no assertion about structure can see")
+            "the stylesheet carries a backslash that is not a hex escape -- it "
+            "escapes the character after it, so the value is silently not the "
+            "one intended, which no assertion about structure can see")
 
         results.check(
             "no heading uppercases itself",

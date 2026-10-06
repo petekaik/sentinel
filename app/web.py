@@ -421,6 +421,51 @@ def _whats_wrong_section(state):
                _whats_wrong(state)))
 
 
+def _tally_strip(state):
+    """One segment per verdict-bearing check, grouped by target.
+
+    WHY THIS EXISTS AT ALL. "All green" and "all grey" render identically today,
+    differing only in the colour of a 5px left border, so the rule this project
+    cares about most -- an absent answer is not a good answer -- is invisible at
+    a glance. As a strip they are different shapes.
+
+    INFORMATIONAL ROWS ARE EXCLUDED. They carry no colour by operator ruling, so
+    drawing a temperature reading as a grey segment would make a perfectly
+    healthy board look partly unknown -- collapsing "no colour by ruling" into
+    UNKNOWN, which is the exact confusion this strip exists to remove. The
+    consequence is that the strip has fewer segments than the all-checks list
+    has rows, so every count here names what it counts.
+
+    GROUPED, NOT LISTED: a red cluster is how you read "the problem is in
+    cubox-2" without scanning. The grouping is a gap inserted wherever the
+    target CHANGES in the order the page already iterates -- the strip keeps the
+    registry's own order rather than imposing a new one, so the strip and the
+    all-checks list cannot disagree about membership even if the registry's
+    ordering changes, and no sort is needed to achieve it.
+
+    IT IS AN INDICATOR, NOT A CONTROL. At 5px per segment on a 390px phone these
+    are far below any tap target and they do not pretend otherwise: no cursor,
+    no hover, no title promising navigation.
+    """
+    items = _verdict_items(state)
+    n = _rag_counts(items)
+    label = ("%d graded: %d green, %d amber, %d red, %d unknown"
+             % (len(items), n["green"], n["amber"], n["red"], n["grey"]))
+    out, group, seen = [], [], None
+    for it in items:
+        if seen is not None and it["target"] != seen:
+            out.append("<span class=seg-group>%s</span>" % "".join(group))
+            group = []
+        seen = it["target"]
+        group.append("<span class='seg %s' aria-label='%s %s: %s'></span>"
+                     % (_status(it["status"]).rag, _esc(it["target"]),
+                        _esc(it["check_id"]), _esc(it["status"])))
+    if group:
+        out.append("<span class=seg-group>%s</span>" % "".join(group))
+    return ("<div class=strip role=img aria-label='%s'>%s</div>"
+            % (_esc(label), "".join(out)))
+
+
 def build_status(cfg, conn, now=None):
     """The integration API: a compact, stable status document."""
     state = build_state(cfg, conn, now=now)
@@ -658,6 +703,13 @@ a { color:#6cb6ff; }
 .wcard .wc { font-size:11.5px; color:var(--dim); }
 .wcard .wd { font-size:12px; color:var(--dim); margin-top:5px;
              overflow-wrap:anywhere; }
+.strip { display:flex; flex-wrap:wrap; gap:8px; margin:13px 0 2px; }
+.strip .seg-group { display:flex; gap:1px; }
+.strip .seg { width:5px; height:20px; border-radius:1px; display:block; }
+.strip .seg.green { background:var(--green); }
+.strip .seg.amber { background:var(--amber); }
+.strip .seg.red { background:var(--red); }
+.strip .seg.grey { background:#39424d; }
 """
 
 
@@ -731,6 +783,9 @@ def render_html(state, cfg):
 
     # ---- the band: the verdict, with staleness dominating it ----------------
     a(_verdict_band(state))
+
+    # ---- the strip: one segment per graded check, grouped by target --------
+    a(_tally_strip(state))
 
     a(_whats_wrong_section(state))
 

@@ -1173,6 +1173,123 @@ def test_the_band_never_says_ok_on_a_stale_or_colourless_page(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 10. The tally strip
+# ---------------------------------------------------------------------------
+
+
+def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
+    """Membership, informational exclusion, and the grey/green distinction."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        # EVERY NON-INFORMATIONAL REGISTRY CHECK -- not only the spec-having
+        # ones. `_verdict_items` is `tiles + extra + others`, and `others` are
+        # the spec-less logic-only checks (31 of them in this registry), which
+        # carry a colour and belong in the strip by §4.4. Driving only the
+        # spec-having 40 leaves those 31 with no stored result, so they render
+        # UNKNOWN: an "all-green" board would not be all green, the strip's
+        # label would read "31 unknown" rather than "0 unknown", and the counts
+        # asserted below could not agree with the strip they are counting.
+        targets = [(c.target, c.id) for c in registry_instances(d.cfg)
+                   if not getattr(c, "informational", False)]
+
+        for target, cid in targets:
+            d.check(target, cid, store.Status.UNKNOWN, "not observed (test)")
+        grey_strip = web._tally_strip(d.state())
+        # THE MEMBERSHIP SET `targets` MUST BE. If this ever disagrees with the
+        # strip, the counts below are measuring a different page than the strip
+        # is drawing, and a test that cannot fail is not evidence.
+        results.check(
+            "the driven set is exactly the verdict-bearing rows",
+            len(targets) == len(web._verdict_items(d.state())),
+            "targets=%d but _verdict_items=%d -- the test drives a different set "
+            "than the strip draws"
+            % (len(targets), len(web._verdict_items(d.state()))))
+        results.check(
+            "an all-UNKNOWN board's strip has a segment per check and none green",
+            grey_strip.count("class='seg ") == len(targets)
+            and "seg green" not in grey_strip and "seg grey" in grey_strip,
+            "segments=%d expected=%d green-present=%s"
+            % (grey_strip.count("class='seg "), len(targets),
+               "seg green" in grey_strip))
+
+        # NON-VACUOUS HALF: a stored OK must produce green segments.
+        d.epoch()
+        for target, cid in targets:
+            d.check(target, cid, store.Status.OK, "fine (test)")
+        state = d.state()
+        green_strip = web._tally_strip(state)
+        results.check(
+            "an all-OK board's strip is green, so the check above can fail",
+            "seg green" in green_strip and "seg grey" not in green_strip,
+            "the strip did not go green on a board where every check is OK")
+
+        results.check(
+            "the strip's label states its own count, per colour",
+            ("%d graded:" % len(web._verdict_items(state))) in green_strip
+            and "0 unknown" in green_strip,
+            "the strip does not state what it is counting:\n%s"
+            % green_strip[:300])
+
+        # THE SEGMENT ORDER IS THE REGISTRY'S OWN, so the strip and the list
+        # cannot disagree about what they are showing.
+        got = [s.split("'")[0] for s in green_strip.split("class='seg ")[1:]]
+        want = [web._status(i["status"]).rag for i in web._verdict_items(state)]
+        results.check(
+            "the strip's segments are the page's own rows, in the page's order",
+            got == want,
+            "strip order %r != row order %r -- the strip reordered the checks, "
+            "so the two can disagree about what they are showing"
+            % (got[:8], want[:8]))
+
+        # AN UNRECOGNISED STATUS STRING. `_status` maps anything it does not
+        # know to UNKNOWN, so the strip must not draw it as a colour that
+        # carries a meaning it does not have.
+        os.makedirs(os.path.join(tmpdir, "bogus"), exist_ok=True)
+        u = Dash(os.path.join(tmpdir, "bogus"))
+        u.epoch()
+        u.check(targets[0][0], targets[0][1], "OK", "shouted (test)")
+        bogus = web._tally_strip(u.state())
+        results.check(
+            "a status string the build does not recognise is drawn unknown",
+            "class='seg grey" in bogus and "class='seg green" not in bogus,
+            "the status 'OK' produced: %s -- a status with no meaning here must "
+            "never be drawn as a colour that has one, and it must not be drawn "
+            "green on the strength of looking like green"
+            % bogus[bogus.find("class=strip"):][:240])
+
+        # THE LABEL IS NOT THE LIST'S COUNT. Informational rows are excluded,
+        # so the strip has fewer segments than the all-checks list has rows and
+        # the two numbers must each say what they count.
+        info = [c.id for c in registry_instances(d.cfg)
+                if getattr(c, "informational", False)]
+        if info:
+            results.check(
+                "no informational row is drawn as a segment",
+                all((" %s:" % cid) not in green_strip for cid in info),
+                "an informational row reached the strip -- drawing a colourless "
+                "row grey collapses 'no colour by ruling' into UNKNOWN, which is "
+                "the confusion the strip exists to remove")
+
+        # A ZERO-LENGTH SELECTION: no verdict-bearing rows at all.
+        #
+        # The label literal is `0 graded:` -- matching the format §4.4 specifies
+        # ("77 graded: 74 green, 2 amber, 1 red, 0 unknown") and the format the
+        # per-colour check above asserts. The plan originally wrote
+        # `0 graded checks`, which no branch of `_tally_strip` produces.
+        empty = web._tally_strip({"tiles": [], "extra": [], "others": [],
+                                  "informational": [], "incidents": []})
+        results.check(
+            "a board with no verdict-bearing row renders an empty strip, not a "
+            "broken one",
+            "class='seg " not in empty and "0 graded:" in empty,
+            "a zero-length selection produced: %r" % empty[:200])
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_stale_says_so_and_cannot_also_be_ok,
@@ -1185,7 +1302,8 @@ TESTS = (test_empty_store_is_loud,
          test_status_api_is_three_valued,
          test_status_api_is_a_stable_contract,
          test_the_freshness_hero_tracks_the_staleness_it_leads_with,
-         test_the_band_never_says_ok_on_a_stale_or_colourless_page)
+         test_the_band_never_says_ok_on_a_stale_or_colourless_page,
+         test_the_strip_makes_all_grey_a_different_shape_from_all_green)
 
 
 def main():

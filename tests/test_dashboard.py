@@ -1406,7 +1406,73 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-TESTS = (test_empty_store_is_loud,
+# ---------------------------------------------------------------------------
+# 11. Disclosure hides nothing
+# ---------------------------------------------------------------------------
+
+
+def test_a_closed_section_still_renders_every_row(results):
+    """Collapsed is a presentation state, not an omission."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        targets = [(c.target, c.id) for c in registry_instances(d.cfg)]
+        for target, cid in targets:
+            d.check(target, cid, store.Status.OK, "fine (test)")
+
+        state, html = d.state(), d.html()
+        results.check(
+            "every check in the registry appears in the HTML",
+            all(cid in html for _target, cid in targets),
+            "a check is missing from the document entirely -- collapsing must "
+            "hide presentation, never rows")
+        results.check(
+            "the page uses native <details>, so disclosure needs no script",
+            html.count("<details") == html.count("</details>")
+            and html.count("<details") >= 4,
+            "details open=%d close=%d -- expected at least four balanced "
+            "sections" % (html.count("<details"), html.count("</details>")))
+        results.check(
+            "every section carries the id the refresh restores it by",
+            all(("id='sec-%s'" % s) in html
+                for s in ("incidents", "checks", "evidence")),
+            "a section lost its id, so the refresh cannot restore whether it "
+            "was open -- and restoring by position instead would shift every "
+            "section after one that appears or disappears")
+
+        # The counts live in the SUMMARIES, so a shut section still says how
+        # much is behind it.
+        summary_texts = [html[m:m + 120] for m in
+                         [i for i in range(len(html))
+                          if html.startswith("<summary", i)]]
+        joined = " ".join(summary_texts)
+        want_all = (len(state["extra"]) + len(state["tiles"])
+                    + len(state["others"]) + len(state["informational"]))
+        results.check(
+            "the all-checks summary states its own count",
+            ("All %d checks" % want_all) in joined,
+            "summaries found: %r -- a collapsed list that does not say how many "
+            "rows it holds reads as an empty one" % joined[:300])
+        results.check(
+            "the evidence summary is present, so row counts are not lost",
+            "Evidence" in joined,
+            "the row-count section lost its summary: %r" % joined[:300])
+
+        # THE QUALITY FLOOR, and this task is where it is actually provided:
+        # §4.7 makes `prefers-reduced-motion` part of it, and Step 5's media
+        # query is the only thing on the page that honours it. The guard is
+        # asserted HERE, with the CSS that satisfies it -- asserted in Task 7 it
+        # would be satisfied by this stylesheet and say nothing about the script.
+        results.check(
+            "reduced motion is respected",
+            "prefers-reduced-motion" in html,
+            "the page animates for a reader who asked it not to")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+TESTS = (test_a_closed_section_still_renders_every_row,
+         test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_stale_says_so_and_cannot_also_be_ok,
          test_unknown_is_never_green,

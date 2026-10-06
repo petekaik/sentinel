@@ -734,6 +734,21 @@ a { color:#6cb6ff; }
 .strip .seg.amber { background:var(--amber); }
 .strip .seg.red { background:var(--red); }
 .strip .seg.grey { background:var(--unknown); }
+details { margin:9px 0; border-top:1px solid var(--line); padding-top:8px; }
+summary { cursor:pointer; font-size:13px; color:var(--fg); padding:5px 0;
+          list-style:none; }
+summary::-webkit-details-marker { display:none; }
+summary::before { content:"▸ "; color:var(--dim); }
+details[open] > summary::before { content:"▾ "; }
+summary:focus-visible { outline:2px solid #6cb6ff; outline-offset:2px; }
+
+/* The only motion this page has is the refresh swap and the disclosure
+   opening. A reader who asked for none still gets a page that updates -- it
+   just stops moving while it does. */
+@media (prefers-reduced-motion: reduce) {
+  * { transition:none !important; animation:none !important;
+      scroll-behavior:auto !important; }
+}
 """
 
 
@@ -789,6 +804,20 @@ def _freshness(state):
             "%s'><i style='width:%.1f%%'></i></div></div>"
             % (st, _esc(_age(age)), _esc(_span(limit)), _esc(_age(age)),
                _esc(_span(limit)), pct))
+
+
+def _details(sid, summary, body, open_=False):
+    """A native disclosure. No script, no framework, no custom accordion.
+
+    `<details>` is the platform's own answer and it works with a keyboard, a
+    screen reader and a thumb without anything from us.
+
+    The id is not decoration: the reactive layer restores which sections were
+    open after it swaps the DOM, and it does that BY ID, so a section appearing
+    or disappearing between renders does not shift every section after it.
+    """
+    return ("<details id='sec-%s'%s><summary>%s</summary>%s</details>"
+            % (_esc(sid), " open" if open_ else "", _esc(summary), body))
 
 
 def render_html(state, cfg):
@@ -853,67 +882,75 @@ def render_html(state, cfg):
           % tally["informational"]) if tally["informational"] else ""))
 
     # ---- live incidents ------------------------------------------------------
-    a("<h2>Live incidents (%d)</h2>" % len(state["incidents"]))
+    incidents = []
+    _inc = incidents.append
+    _inc("<h2>Live incidents (%d)</h2>" % len(state["incidents"]))
     if not state["incidents"]:
-        a("<div class=note>No live incident. A condition that is still being "
-          "confirmed, or one that can no longer be observed, would appear here "
-          "too -- so an empty list means no check is currently reporting a "
-          "problem <em>and</em> none is frozen.</div>")
+        _inc("<div class=note>No live incident. A condition that is still being "
+             "confirmed, or one that can no longer be observed, would appear here "
+             "too -- so an empty list means no check is currently reporting a "
+             "problem <em>and</em> none is frozen.</div>")
     else:
-        a("<table><tr><th>sev</th><th>target</th><th>check</th><th>state</th>"
-          "<th>since</th><th>obs</th><th>detail</th></tr>")
+        _inc("<table><tr><th>sev</th><th>target</th><th>check</th><th>state</th>"
+             "<th>since</th><th>obs</th><th>detail</th></tr>")
         for i in state["incidents"]:
             sev = i["severity"] or "grey"
-            a("<tr class=%s><td><span class='pill %s'>%s</span></td>"
-              "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
-              "<td class=detail>%s</td></tr>"
-              % (sev, sev, _esc(sev.upper()), _esc(i["target"]),
-                 _esc(i["check_id"]), _esc(i["state"]),
-                 _esc(_age(state["now"] - i["first_seen"])),
-                 i["observed_count"], _esc(i["last_detail"] or "")))
-        a("</table>")
+            _inc("<tr class=%s><td><span class='pill %s'>%s</span></td>"
+                 "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                 "<td class=detail>%s</td></tr>"
+                 % (sev, sev, _esc(sev.upper()), _esc(i["target"]),
+                    _esc(i["check_id"]), _esc(i["state"]),
+                    _esc(_age(state["now"] - i["first_seen"])),
+                    i["observed_count"], _esc(i["last_detail"] or "")))
+        _inc("</table>")
+    incidents_html = "\n".join(incidents)
 
-    # ---- the RAG tiles ------------------------------------------------------
-    a("<h2>Critical metrics (%d)</h2>" % len(state["tiles"]))
-    a("<div class=grid>")
+    # ---- the RAG tiles, then every check the registry does not own ----------
+    tacc = []
+    _tc = tacc.append
+    _tc("<h2>Critical metrics (%d)</h2>" % len(state["tiles"]))
+    _tc("<div class=grid>")
     for t in state["tiles"]:
         colour = _status(t["status"]).rag
         if t["value"] is None:
             val = "--"
         else:
             val = ("%g%s" % (t["value"], (" " + t["unit"]) if t["unit"] else ""))
-        a("<div class='tile %s'><span class=badge>%s</span>"
-          "<div class=t>%s &middot; %s</div><div class=v>%s</div>"
-          "<div class=d>%s</div></div>"
-          % (colour, _esc(t["target"]), _esc(t["title"]), _esc(t["status"]),
-             _esc(val), _esc(t["detail"])))
-    a("</div>")
-
-    # ---- every check, including the ones the registry does not own ----------
+        _tc("<div class='tile %s'><span class=badge>%s</span>"
+            "<div class=t>%s &middot; %s</div><div class=v>%s</div>"
+            "<div class=d>%s</div></div>"
+            % (colour, _esc(t["target"]), _esc(t["title"]), _esc(t["status"]),
+               _esc(val), _esc(t["detail"])))
+    _tc("</div>")
     rows = state["extra"] + state["tiles"] + state["others"] + state["informational"]
     by_target = {}
     for r in rows:
         by_target.setdefault(r["target"], []).append(r)
-    a("<h2>All checks by target</h2>")
+    _tc("<h2>All checks by target</h2>")
     for target in sorted(by_target):
         items = sorted(by_target[target], key=lambda x: x["check_id"])
-        a("<table><tr><th colspan=3>%s (%d checks)</th></tr>"
-          % (_esc(target), len(items)))
+        _tc("<table><tr><th colspan=3>%s (%d checks)</th></tr>"
+            % (_esc(target), len(items)))
         for it in items:
             colour = _status(it["status"]).rag
             src = " <span class=sub>(collector)</span>" if it.get("from") else ""
-            a("<tr class=%s><td style='width:80px'><span class='pill %s'>%s</span>"
-              "</td><td style='width:210px'>%s%s</td><td class=detail>%s</td></tr>"
-              % (colour, colour, _esc(it["status"]), _esc(it["check_id"]), src,
-                 _esc(it["detail"])))
-        a("</table>")
+            _tc("<tr class=%s><td style='width:80px'>"
+                "<span class='pill %s'>%s</span>"
+                "</td><td style='width:210px'>%s%s</td><td class=detail>%s</td>"
+                "</tr>"
+                % (colour, colour, _esc(it["status"]), _esc(it["check_id"]), src,
+                   _esc(it["detail"])))
+        _tc("</table>")
+    tiles_and_checks_html = "\n".join(tacc)
 
     # ---- informational -----------------------------------------------------
+    iacc = []
+    _inf = iacc.append
     if state["informational"]:
-        a("<h2>Informational &mdash; not health metrics</h2>")
-        a("<div class=note>These are reported so the row EXISTS, and no colour "
-          "is assigned. A missing row would read as &ldquo;fine&rdquo;.</div>")
-        a("<table><tr><th>target</th><th>reading</th><th>detail</th></tr>")
+        _inf("<h2>Informational &mdash; not health metrics</h2>")
+        _inf("<div class=note>These are reported so the row EXISTS, and no colour "
+             "is assigned. A missing row would read as &ldquo;fine&rdquo;.</div>")
+        _inf("<table><tr><th>target</th><th>reading</th><th>detail</th></tr>")
         for it in state["informational"]:
             # The unit is appended only when there IS one: "%s %s" with an empty
             # unit leaves a trailing space in the cell, which is invisible on the
@@ -921,44 +958,84 @@ def render_html(state, cfg):
             val = "--" if it["value"] is None else "%g" % it["value"]
             if it["unit"]:
                 val = "%s %s" % (val, it["unit"])
-            a("<tr><td>%s<br><span class=sub>%s</span></td><td>%s</td>"
-              "<td class=detail>%s</td></tr>"
-              % (_esc(it["target"]), _esc(it["title"]), _esc(val),
-                 _esc(it["detail"])))
-        a("</table>")
+            _inf("<tr><td>%s<br><span class=sub>%s</span></td><td>%s</td>"
+                 "<td class=detail>%s</td></tr>"
+                 % (_esc(it["target"]), _esc(it["title"]), _esc(val),
+                    _esc(it["detail"])))
+        _inf("</table>")
+    informational_html = "\n".join(iacc)
 
     # ---- thresholds with no check behind them ------------------------------
+    dacc = []
+    _def = dacc.append
     if state["deferred"] or state["unclaimed"]:
-        a("<h2>Thresholds with no check behind them</h2>")
+        _def("<h2>Thresholds with no check behind them</h2>")
         for d in state["deferred"]:
-            a("<div class=note><b>%s</b> &mdash; deliberately not implemented: %s"
-              "</div>" % (_esc(d["id"]), _esc(d["reason"])))
+            _def("<div class=note><b>%s</b> &mdash; deliberately not implemented:"
+                 " %s</div>" % (_esc(d["id"]), _esc(d["reason"])))
         for u in state["unclaimed"]:
-            a("<div class='note' style='border-color:#da3633'><b>%s</b> &mdash; "
-              "UNCLAIMED. No check reads this and no reason is recorded. This is "
-              "a defect in the monitor, not a status of the fleet.</div>"
-              % _esc(u))
+            _def("<div class='note' style='border-color:#da3633'><b>%s</b> "
+                 "&mdash; UNCLAIMED. No check reads this and no reason is "
+                 "recorded. This is a defect in the monitor, not a status of the "
+                 "fleet.</div>" % _esc(u))
+    deferred_html = "\n".join(dacc)
 
     # ---- footer: the row counts, so an empty read is visible ----------------
-    a("<h2>Evidence of what this render actually read</h2>")
-    a("<div class=note>Row counts, so &ldquo;0 rows&rdquo; can never be mistaken "
-      "for &ldquo;0 problems&rdquo;. SQLite returns an EMPTY RESULT SET for a "
-      "busy database rather than an error, which is the same shape as this "
-      "project's <code>done 0 / orphan 18</code> gate that printed "
-      "&ldquo;Coverage is complete&rdquo;.</div>")
-    a("<table><tr><th>table</th><th>rows</th></tr>")
+    eacc = []
+    _ev = eacc.append
+    _ev("<h2>Evidence of what this render actually read</h2>")
+    _ev("<div class=note>Row counts, so &ldquo;0 rows&rdquo; can never be mistaken "
+        "for &ldquo;0 problems&rdquo;. SQLite returns an EMPTY RESULT SET for a "
+        "busy database rather than an error, which is the same shape as this "
+        "project's <code>done 0 / orphan 18</code> gate that printed "
+        "&ldquo;Coverage is complete&rdquo;.</div>")
+    _ev("<table><tr><th>table</th><th>rows</th></tr>")
     for name, n in sorted(state["counts"]["tables"].items()):
-        a("<tr><td>%s</td><td>%s</td></tr>" % (_esc(name), _esc(n)))
-    a("</table>")
-    a("<div class=foot>interval %ds &middot; stale past %ds &middot; "
-      "database %s &middot; rendered %s &middot; "
-      "<a href='/api/status.json'>/api/status.json</a> (versioned, for "
-      "integration) &middot; "
-      "<a href='/api/state.json'>/api/state.json</a> (this page's own model) "
-      "&middot; nothing on this page is cached, and it is regenerated on every "
-      "load</div>"
-      % (cfg.interval, state["stale_after_s"], _esc(cfg.db_path),
-         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(state["now"]))))
+        _ev("<tr><td>%s</td><td>%s</td></tr>" % (_esc(name), _esc(n)))
+    _ev("</table>")
+    _ev("<div class=foot>interval %ds &middot; stale past %ds &middot; "
+        "database %s &middot; rendered %s &middot; "
+        "<a href='/api/status.json'>/api/status.json</a> (versioned, for "
+        "integration) &middot; "
+        "<a href='/api/state.json'>/api/state.json</a> (this page's own model) "
+        "&middot; nothing on this page is cached, and it is regenerated on every "
+        "load</div>"
+        % (cfg.interval, state["stale_after_s"], _esc(cfg.db_path),
+           time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(state["now"]))))
+    evidence_html = "\n".join(eacc)
+
+    # ---- everything else, behind native disclosure -------------------------
+    #
+    # ORDER IS BY HOW LIKELY IT IS TO BE THE REASON THE PAGE WAS OPENED, and each
+    # summary states its own count so a shut section still says how much is
+    # behind it. A collapsed list that does not say how many rows it holds reads
+    # as an empty one -- which is the same defect as an absent row reading as
+    # fine, one level up.
+    n = len(state["incidents"])
+    if n:
+        a(_details("incidents", "%d live incident%s" % (n, "" if n == 1 else "s"),
+                   incidents_html, open_=True))
+    else:
+        a(_details("incidents", "No live incident", incidents_html))
+
+    all_rows = (len(state["extra"]) + len(state["tiles"]) + len(state["others"])
+                + len(state["informational"]))
+    a(_details("checks", "All %d checks" % all_rows, tiles_and_checks_html))
+
+    if state["informational"]:
+        a(_details("informational",
+                   "Informational (%d) — not health metrics by ruling"
+                   % len(state["informational"]), informational_html))
+
+    if state["deferred"] or state["unclaimed"]:
+        a(_details("thresholds",
+                   "Thresholds with no check behind them (%d)"
+                   % (len(state["deferred"]) + len(state["unclaimed"])),
+                   deferred_html))
+
+    a(_details("evidence",
+               "Evidence — %d row counts from this render"
+               % len(state["counts"]["tables"]), evidence_html))
     a("</div>")
     return "\n".join(out)
 

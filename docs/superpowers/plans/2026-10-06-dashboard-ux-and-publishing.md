@@ -730,12 +730,18 @@ def _tally_strip(state):
             % (_esc(label), "".join(out)))
 ```
 
-In `render_html`, insert after `a(_whats_wrong_section(state))`:
+In `render_html`, insert **immediately after `a(_verdict_band(state))`**:
 
 ```python
     # ---- the strip: one segment per graded check, grouped by target --------
     a(_tally_strip(state))
 ```
+
+**This lands ABOVE the What's-wrong section, which is where §4.1's wireframe
+puts it** — hero, band, strip, then the wrong-rows. Task 2 already inserted
+`a(_whats_wrong_section(state))` on that same anchor, so inserting here pushes
+it down, and the order comes out right. The page reads: how current, what the
+verdict is, the shape of the board, then the specific rows.
 
 - [ ] **Step 4: Add the strip's CSS**
 
@@ -994,6 +1000,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 # ---------------------------------------------------------------------------
 # 12. Naming, and colour that is never the only channel
 # ---------------------------------------------------------------------------
+#
+# Needs `import re` added to the module's imports (:31-40); the token guard
+# below reads the stylesheet's var() uses and definitions.
 
 
 def test_the_page_names_the_platform_and_never_colours_alone(results):
@@ -1015,6 +1024,29 @@ def test_the_page_names_the_platform_and_never_colours_alone(results):
             "the stylesheet still defines --green/--amber/--red/--grey as well "
             "as the role tokens, so there are two names for one colour and they "
             "will drift")
+
+        # THE GUARD THE ALIAS REMOVAL NEEDS. Deleting `--green` while some rule
+        # still says `var(--green)` raises nothing and logs nothing: the
+        # declaration becomes invalid and the element silently has no colour.
+        # The hero's bar would go invisible, and every other test on this page
+        # would still pass. Task 1's hero CSS uses the aliases, so this is the
+        # exact miss it would make.
+        css = html.split("</style>")[0]
+        defined = set(re.findall(r"(--[a-z-]+)\s*:", css))
+        used = set(re.findall(r"var\((--[a-z-]+)\)", css))
+        results.check(
+            "every colour token the stylesheet uses is one it defines",
+            used <= defined,
+            "the stylesheet uses %s but does not define %s -- a var() with no "
+            "definition is not an error anywhere, it is an element that "
+            "quietly has no colour"
+            % (sorted(used - defined), sorted(defined)))
+
+        results.check(
+            "no heading uppercases itself",
+            "uppercase" not in css,
+            "a heading still text-transforms to caps -- the tracked-out "
+            "ALL-CAPS eyebrow is the generated-page tell §4.6 removes")
 
         results.check(
             "no webfont is fetched for the one page that has to be trustworthy",
@@ -1697,11 +1729,17 @@ REFRESH_JS = """
 
 - [ ] **Step 4: Wrap the document and emit the script**
 
-In `render_html`, change the opening wrapper so everything after the `<div class=wrap>`'s header is inside `<div id=live>`:
+In `render_html`, open `#live` **immediately after the subtitle line** — the last
+line of the header — so the title and subtitle sit OUTSIDE the swapped region and
+never flicker on a refresh. In the current file that is after the `a("<div
+class=sub>...")` line (:532-533); do not anchor on `<div class=wrap>`, which is
+two lines above the header:
 
 ```python
     a("<div class=wrap>")
-    a("<div id=live>")
+    a("<h1>sentinel</h1>")            # header -- outside #live, never swapped
+    a("<div class=sub>...</div>")
+    a("<div id=live>")               # <-- INSERT HERE
 ```
 
 and close it after the last section, before the closing `</div>` of `.wrap`:

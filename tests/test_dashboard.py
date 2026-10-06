@@ -1796,7 +1796,22 @@ def test_the_refresh_script_has_the_hooks_it_looks_for(results):
             "no refresh script on the page")
         results.check(
             "the script re-fetches the SERVER's render, not a client-side one",
-            "fetch('/')" in html or 'fetch("/")' in html,
+            # `)` OR `,` AFTER THE QUOTE, and that is not pedantry. Step 3's own
+            # fence writes `fetch('/', {cache: 'no-store'})`, so the browser is
+            # told to bypass its cache as well as being served `no-store` -- two
+            # mechanisms for the one thing this script exists to prevent, a stale
+            # sample shown as current. A literal of `fetch('/')` REJECTS THAT CODE
+            # while differing from it by one token of freshness and none of
+            # meaning, which would make the check the thing that has to change.
+            #
+            # Widening to the comma does NOT weaken the discriminator, and that is
+            # measured rather than argued: a client-side renderer writing
+            # `fetch('/api/status.json')` contains `fetch('/'` but NOT `fetch('/',`,
+            # so it is still red. The narrow form rejects this plan's own
+            # implementation and the widened form accepts it -- and both reject
+            # the renderer, which is the enemy this check names.
+            ("fetch('/')" in html or 'fetch("/")' in html
+             or "fetch('/'," in html or 'fetch("/",' in html),
             "the script does not re-fetch the page -- a client-side renderer "
             "would be a second render_html to keep identical forever")
         # THE CALL IS ASSERTED, NOT ONLY THE COPY, and that is what makes Step

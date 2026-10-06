@@ -802,7 +802,7 @@ REFRESH_JS = """
 
   function tick() {
     if (document.hidden) { return; }
-    fetch('/').then(function (r) {
+    fetch('/', {cache: 'no-store'}).then(function (r) {
       if (!r.ok) { throw new Error('http ' + r.status); }
       return r.text();
     }).then(function (text) {

@@ -1805,11 +1805,16 @@ def test_the_refresh_script_has_the_hooks_it_looks_for(results):
             # meaning, which would make the check the thing that has to change.
             #
             # Widening to the comma does NOT weaken the discriminator, and that is
-            # measured rather than argued: a client-side renderer writing
-            # `fetch('/api/status.json')` contains `fetch('/'` but NOT `fetch('/',`,
-            # so it is still red. The narrow form rejects this plan's own
-            # implementation and the widened form accepts it -- and both reject
-            # the renderer, which is the enemy this check names.
+            # measured rather than argued. A client-side renderer writing
+            # `fetch('/api/status.json')` contains NEITHER literal -- after
+            # `fetch('/` it has an `a`, not a quote -- so the widened check rejects
+            # it exactly as the narrow one did (measured: the renderer reds this
+            # check, 148/1, and nothing else). The widening therefore accepted
+            # exactly one more shape, `fetch('/',` followed by arguments, and that
+            # shape is the implementation's and never a renderer's. The narrow
+            # literal's only fault was rejecting the plan's own code -- a false
+            # negative, never a true one, which is the one direction a check may
+            # not fail in.
             ("fetch('/')" in html or 'fetch("/")' in html
              or "fetch('/'," in html or 'fetch("/",' in html),
             "the script does not re-fetch the page -- a client-side renderer "

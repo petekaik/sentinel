@@ -43,6 +43,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import checks
+import shell
 import store
 import thresholds
 
@@ -254,6 +255,10 @@ def _tally(state):
 # ---------------------------------------------------------------------------
 
 API_VERSION = 2
+
+# The observation rule, named so that the shell exception is visibly an
+# exception rather than a second literal that happens to differ.
+OBSERVATION_CACHE = "no-store, no-cache, must-revalidate, max-age=0"
 
 # How many of the worst rows the API lists. A cap, and a silent cap is how a
 # truncated list reads as a complete one -- so `worst_truncated` and the full
@@ -820,8 +825,16 @@ def render_html(state, cfg):
     out = []
     a = out.append
     a("<!doctype html><meta charset=utf-8>")
-    a("<meta name=viewport content='width=device-width,initial-scale=1'>")
-    a("<title>sentinel</title><style>%s</style>" % CSS)
+    a("<meta name=viewport content='width=device-width,initial-scale=1,"
+      "viewport-fit=cover'>")
+    a("<title>sentinel</title>")
+    a("<link rel=manifest href=/manifest.webmanifest>")
+    a("<link rel=apple-touch-icon href=/icons/icon-180.png>")
+    a("<meta name=apple-mobile-web-app-capable content=yes>")
+    a("<meta name=apple-mobile-web-app-title content=sentinel>")
+    a("<meta name=apple-mobile-web-app-status-bar-style content=black-translucent>")
+    a("<meta name=theme-color content='#0e1216'>")
+    a("<style>%s</style>" % CSS)
     a("<div class=wrap>")
     a("<h1>sentinel</h1>")
     # THE TARGET LIST IS DERIVED, NOT TYPED. §4.6's subtitle names the four
@@ -1063,27 +1076,49 @@ class Handler(BaseHTTPRequestHandler):
         import sys
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
-    def _send(self, code, body, ctype):
-        raw = body.encode("utf-8")
+    def _send(self, code, body, ctype, cache=None):
+        raw = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
-        # THE DEAD-MAN SWITCH DEPENDS ON THESE THREE LINES. A cached 200 served
-        # while the collector is dead is a false GREEN, and this page is the only
-        # thing that would have told anyone.
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, "
-                                          "max-age=0")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
+        # THE DEAD-MAN SWITCH DEPENDS ON THESE LINES, and `cache` is the ONE
+        # documented way past them: the app shell is a constant of the image and
+        # not an observation, so an icon may be cached and nothing that carries
+        # a reading may be. See shell.py.
+        self.send_header("Cache-Control", cache or OBSERVATION_CACHE)
+        if cache is None:
+            # HTTP/1.0 belt-and-braces, for the observation rule only. With
+            # Cache-Control present these are ignored (RFC 7234 s5.4), so
+            # sending them beside the shell's max-age=86400 would put a
+            # contradiction in the response that changes nothing -- and a
+            # response nobody can read at a glance is one people stop reading.
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
         self.end_headers()
         try:
             self.wfile.write(raw)
         except (BrokenPipeError, ConnectionResetError):
+            # KEPT FROM THE ORIGINAL, and not decoration: an iOS client that
+            # backgrounds mid-poll resets the connection, and losing the whole
+            # dashboard thread to a reset would take the dead-man switch with it.
             pass
 
     def do_GET(self):
         path = self.path.split("?")[0]
         cfg = self.cfg
+        # THE SHELL IS ANSWERED BEFORE THE STORE IS OPENED. It is a constant of
+        # the image, so it must still serve when the database cannot be opened
+        # -- the icon is what makes the installed app look like an app, and that
+        # does not stop being true during an outage.
+        if path in shell.ASSETS:
+            try:
+                body, ctype = shell.asset(path)
+            except OSError as exc:                    # noqa: BLE001 - rendered
+                self._send(500, "shell asset %s is missing from the image: %s\n"
+                           % (path, exc), "text/plain; charset=utf-8")
+                return
+            self._send(200, body, ctype, cache=shell.CACHE_CONTROL)
+            return
         try:
             conn = store.connect(cfg.db_path, read_only=True)
         except Exception as exc:                   # noqa: BLE001 - rendered

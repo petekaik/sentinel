@@ -48,6 +48,7 @@ import config as config_mod   # noqa: E402
 import store                  # noqa: E402
 import thresholds             # noqa: E402
 import web                    # noqa: E402
+import shell                  # noqa: E402
 
 CACHE = "no-store, no-cache, must-revalidate, max-age=0"
 
@@ -1613,6 +1614,100 @@ def test_the_page_names_the_platform_and_never_colours_alone(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 13. The shell, and the ONE place a cache header is allowed
+# ---------------------------------------------------------------------------
+
+
+def _get_bytes(url):
+    """The body as BYTES. `_get` decodes utf-8 with "replace", which is right
+    for the HTML and the JSON and destroys a PNG -- comparing a decoded image
+    against its magic bytes would test the decoder, not the file.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def test_the_app_shell_may_cache_and_nothing_else_may(results):
+    """Manifest and icons cache; every observation path still does not."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        httpd, base = _serve(d.cfg)
+        try:
+            for path in web.shell.ASSETS:
+                code, hdrs, body = _get(base + path)
+                results.check(
+                    "%s is served, and cacheable" % path,
+                    code == 200 and hdrs.get("Cache-Control") == web.shell.CACHE_CONTROL,
+                    "code=%s Cache-Control=%r -- the app shell is a constant of "
+                    "the image, so caching it is not a claim about the fleet"
+                    % (code, hdrs.get("Cache-Control")))
+
+            # THE GUARD THAT MATTERS: the exception must not grow.
+            for path in ("/", "/api/status.json", "/api/state.json", "/healthz"):
+                code, hdrs, body = _get(base + path)
+                results.check(
+                    "%s did NOT gain a cache header" % path,
+                    hdrs.get("Cache-Control") == CACHE
+                    and hdrs.get("Cache-Control") != web.shell.CACHE_CONTROL,
+                    "Cache-Control=%r -- an observation path became cacheable, "
+                    "and a cached 200 while the collector is dead is a false "
+                    "GREEN" % hdrs.get("Cache-Control"))
+
+            code, hdrs, body = _get(base + "/manifest.webmanifest")
+            try:
+                man = json.loads(body)
+                ok_man = (man["name"] == "sentinel" and man["display"] == "standalone"
+                          and len(man["icons"]) >= 2)
+            except Exception as exc:                     # noqa: BLE001
+                ok_man, man = False, {"error": str(exc)}
+            results.check(
+                "the manifest installs as a standalone app called sentinel",
+                ok_man, "manifest=%r" % man)
+
+            # PNG magic, so a truncated or wrong file is caught here rather than
+            # on the phone.
+            #
+            # THE IEND SLICE IS [-8:-4], NOT [-12:-8]. A PNG ends with the IEND
+            # chunk's 4-byte LENGTH, its 4-byte TYPE, then its 4-byte CRC -- so
+            # the last twelve bytes are `\0\0\0\0` `IEND` `<crc>` and the type
+            # is the middle quarter, not the first. Measured on a real 4x4 PNG:
+            # `raw[-12:-8]` is b'\x00\x00\x00\x00' and `raw[-8:-4]` is b'IEND'.
+            # The earlier form asserted a slice that can never hold it, so this
+            # check could only ever fail.
+            for path in [p for p in web.shell.ASSETS if p.endswith(".png")]:
+                code, hdrs, raw = _get_bytes(base + path)
+                results.check(
+                    "%s is a real, complete PNG" % path,
+                    code == 200 and raw[:8] == b"\x89PNG\r\n\x1a\n"
+                    and raw[-8:-4] == b"IEND",
+                    "code=%s first8=%r last8=%r -- iOS will not accept an SVG "
+                    "here, and a truncated file falls back to a screenshot "
+                    "without saying so" % (code, raw[:8], raw[-8:]))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+        html = d.html()
+        results.check(
+            "the page links the shell and the iOS home-screen tags",
+            "rel=manifest" in html and "apple-touch-icon" in html
+            and "apple-mobile-web-app-capable" in html,
+            "the head is missing one of the tags iOS needs to install it")
+        results.check(
+            "there is no service worker, deliberately",
+            "serviceWorker" not in html and "sw.js" not in html,
+            "a service worker appeared -- iOS installs without one, so it would "
+            "exist only to cache, which is the one thing no-store forbids")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
@@ -1628,7 +1723,8 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_freshness_hero_tracks_the_staleness_it_leads_with,
          test_the_band_never_says_ok_on_a_stale_or_colourless_page,
          test_the_strip_makes_all_grey_a_different_shape_from_all_green,
-         test_the_page_names_the_platform_and_never_colours_alone)
+         test_the_page_names_the_platform_and_never_colours_alone,
+         test_the_app_shell_may_cache_and_nothing_else_may)
 
 
 def main():

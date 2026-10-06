@@ -1226,6 +1226,56 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
             "seg green" in green_strip and "seg grey" not in green_strip,
             "the strip did not go green on a board where every check is OK")
 
+        # THE STRIP MUST ACTUALLY BE ON THE PAGE, AND IN §4.1's PLACE. Every
+        # check above calls `_tally_strip` DIRECTLY, so not one of them would
+        # notice the call site being deleted or moved -- measured: delete
+        # `a(_tally_strip(state))` from `render_html` and the suite stays green,
+        # and moving it below the wrong-rows stays green too. §4.1's wireframe is
+        # hero, band, strip, then the rows, and that ORDER is the requirement.
+        #
+        # THE FIRST `<h2>` IS THE WRONG-ROWS HEADING: it is the first heading
+        # after the hero, the band and the strip. Anchored on the tag rather than
+        # on its text, so the check does not depend on an apostrophe surviving
+        # `_esc`.
+        page = d.html()
+        results.check(
+            "the strip is rendered on the page, between the band and the rows",
+            "class=strip" in page
+            and page.find("class='band") < page.find("class=strip")
+            < page.find("<h2>"),
+            "band=%d strip=%d first h2=%d -- the strip is missing from the page, "
+            "or is out of §4.1's order, while every direct call to `_tally_strip` "
+            "in this test still passes"
+            % (page.find("class='band"), page.find("class=strip"),
+               page.find("<h2>")))
+
+        # A BOARD WITH RED AND AMBER ON IT. Both boards above are all-grey and
+        # all-green, so the label's amber and red counts were never exercised --
+        # measured: swapping the green and amber counts stays green, and forcing
+        # `0 red` stays green. The strip is `role=img`, which makes this label
+        # its ENTIRE accessible text, so a count that does not match the board is
+        # a false claim about the fleet -- the one class of defect this project
+        # exists to prevent.
+        os.makedirs(os.path.join(tmpdir, "coloured"), exist_ok=True)
+        r = Dash(os.path.join(tmpdir, "coloured"))
+        r.epoch()
+        for target, cid in targets:
+            r.check(target, cid, store.Status.OK, "fine (test)")
+        r.check(targets[0][0], targets[0][1], store.Status.FAIL,
+                "past the limit (test)")
+        r.check(targets[1][0], targets[1][1], store.Status.WARN, "near (test)")
+        coloured = web._tally_strip(r.state())
+        results.check(
+            "the label counts red and amber, and segments are drawn in them",
+            "1 red" in coloured and "1 amber" in coloured
+            and ("%d green" % (len(targets) - 2)) in coloured
+            and "seg red" in coloured and "seg amber" in coloured,
+            "the strip on a board with 1 red, 1 amber and %d green reads %r -- "
+            "its label is the whole of its accessible text, so a count that does "
+            "not match the board is a false statement about the fleet"
+            % (len(targets) - 2,
+               coloured.split("aria-label='")[1].split("'")[0]))
+
         results.check(
             "the strip's label states its own count, per colour",
             ("%d graded:" % len(web._verdict_items(state))) in green_strip
@@ -1256,9 +1306,13 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
         # THE SAME WAY, which is a verification that re-types the code it checks
         # and so agrees with any bug in that code.
         groups = green_strip.split("<span class=seg-group>")[1:]
-        per_group = [[s.split("aria-label='")[1].split(" ")[0]
-                      for s in g.split("<span class='seg ")[1:]]
-                     for g in groups]
+        # `labelled` keeps each segment's whole aria-label (`<target> <check_id>:
+        # <status>`) so the within-group check below can read the check_id too;
+        # `per_group` is the target of each, which the check beneath needs.
+        labelled = [[s.split("aria-label='")[1].split("'")[0]
+                     for s in g.split("<span class='seg ")[1:]]
+                    for g in groups]
+        per_group = [[lbl.split(" ", 1)[0] for lbl in g] for g in labelled]
         tseq = [t for g in per_group for t in g]
         results.check(
             "each group wrapper holds one target's segments, one wrapper per "
@@ -1274,6 +1328,35 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
             "identical.)"
             % (len(per_group), len(set(tseq)),
                [sorted(set(g)) for g in per_group][:8]))
+
+        # WITHIN A GROUP, THE REGISTRY'S OWN ORDER SURVIVES -- the sort is meant
+        # to be STABLE, and the docstring says so, but nothing behind it held:
+        # measured, reversing each group's segments stays green.
+        #
+        # WHAT IS COMPARED IS THE STRIP'S INPUT, NOT ITS SORT. `ids_by_target` is
+        # `_verdict_items`' own relative order for that target -- the order the
+        # segments were handed to the grouping in -- so this asserts a property
+        # of the output against its source, and does not re-run the sort it
+        # checks.
+        ids_by_target = {}
+        for it in web._verdict_items(state):
+            ids_by_target.setdefault(it["target"], []).append(it["check_id"])
+
+        def _ids(labels):
+            """The check_ids in one group, in the order they were drawn."""
+            out = []
+            for lbl in labels:
+                _t, rest = lbl.split(" ", 1)
+                out.append(rest.rsplit(": ", 1)[0])
+            return out
+
+        results.check(
+            "within each group the registry's own order is kept",
+            all(_ids(g) == ids_by_target[g[0].split(" ", 1)[0]]
+                for g in labelled),
+            "a group's segments are not in the registry's order for that target, "
+            "so the sort is not stable and the boxes reshuffle between renders: "
+            "%r" % [_ids(g)[:3] for g in labelled][:3])
 
         # AN UNRECOGNISED STATUS STRING. `_status` maps anything it does not
         # know to UNKNOWN, so the strip must not draw it as a colour that
@@ -1322,7 +1405,6 @@ def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
             "page with no rows at all" % empty[:200])
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-
 
 TESTS = (test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,

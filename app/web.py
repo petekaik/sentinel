@@ -455,9 +455,17 @@ def _tally_strip(state):
     WITHIN each target. §4.4's headline says "grouped by target" and its order
     bullet exists so that "the strip and the list can never disagree about
     MEMBERSHIP" -- and the sort changes no membership: it is the same 71 rows.
-    It also brings the strip into line with the page's own "All checks by
-    target" table, which already iterates `sorted(by_target)` (`:875`). Where
-    the two cannot both hold, the headline and the reason for existing win.
+    Where the two cannot both hold, the headline and the reason for existing
+    win.
+
+    WHAT THE SORT DOES AND DOES NOT BRING INTO LINE, stated honestly because an
+    earlier draft overstated it: the page's "All checks by target" table already
+    iterates its targets in sorted order, so the GROUP order agrees with it. It
+    does not agree WITHIN a target -- that table orders each target's rows by
+    check_id, while this strip keeps the registry's order -- and the sort also
+    places a collector-emitted row inside its target's group, where §4.4's order
+    bullet would have those rows last. Neither changes membership, and both are
+    deliberate: the group is the unit this strip exists to show.
 
     IT IS AN INDICATOR, NOT A CONTROL. At 5px per segment on a 390px phone these
     are far below any tap target and they do not pretend otherwise: no cursor,
@@ -725,7 +733,7 @@ a { color:#6cb6ff; }
 .strip .seg.green { background:var(--green); }
 .strip .seg.amber { background:var(--amber); }
 .strip .seg.red { background:var(--red); }
-.strip .seg.grey { background:#39424d; }
+.strip .seg.grey { background:var(--unknown); }
 """
 
 

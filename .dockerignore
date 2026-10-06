@@ -1,0 +1,32 @@
+# The image carries the code; the tree it is built from must not carry the
+# by-products of having been tested on a Mac.
+#
+# __pycache__ is not cosmetic here. The compose file bind-mounts ./app read-only
+# over the image's copy, so a stale .pyc from a different interpreter (a Mac's
+# 3.12 against the image's 3.12 is fine; a future 3.13 is not) travels into the
+# container and can shadow a module. PYTHONDONTWRITEBYTECODE=1 in the Dockerfile
+# stops the container making more of them; this stops the Mac's being shipped.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Tests, fixtures and the harness are run from the repo, never from the
+# container. The container has no test runner and should not gain one: a
+# container that can run tests is a container whose image has to carry them.
+tests/
+.venv/
+venv/
+
+# The operator's file, and the material the deploy script installs on the NAS.
+# These are bind-mounted, not baked: an image that carried a private key would
+# leak it into every `docker save` and every layer cache.
+#
+# There is no `expected/` entry any more (item 90): the drift check no longer
+# carries a copy of the fleet inside the thing that grades the fleet.
+.env
+ssh/
+data/
+
+# Editor and OS noise.
+.DS_Store
+*.swp

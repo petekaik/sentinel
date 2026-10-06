@@ -1,0 +1,217 @@
+# config.default -- seed for the per-device worker config.
+#
+# 03-build-state.sh copies this to <state>/transcode/config ONLY IF that file is
+# absent, so a box's own edits are never clobbered by a re-run of 03. The file
+# lives on the per-device state export: it survives reboots, it is per-device by
+# construction, and it is read at the start of EVERY pass, so a change takes
+# effect without a reboot and without a redeploy.
+#
+# Format: KEY=value, one per line, # comments. There is exactly ONE reader: the
+# worker's load_config(). It validates the key name, skips anything that is not
+# [A-Za-z0-9_], and refuses a short deny-list of shell-critical names (IFS, PATH,
+# LD_PRELOAD and friends), so a corrupted line cannot inject a command or break
+# everything downstream of it.
+#
+# The unit deliberately carries NO EnvironmentFile= pointing at this file. It
+# used to, and that made this file inert: systemd set the keys in the
+# environment before bash started, load_config is environment-WINS, and so every
+# value here was shadowed by the unit's identical copy -- an edit took effect
+# only after a service restart, silently. Do not add it back. Two readers of one
+# fact is the defect, not the redundancy.
+#
+# Environment-WINS is still the rule, and it is what makes `TOTAL=2
+# ./worker.sh --dry-run` a safe way to try a setting without editing this file.
+# The worker re-reads this file at the top of every pass, so a change here lands
+# on the next pass; a value supplied on the command line is never unset by that
+# reload, so the two mechanisms do not fight.
+#
+# Effective values, with the config file accounted for, come from
+# `transcode-ctl show-config`. Do not read defaults out of this file: it is a
+# SEED, and every key here is also defaulted in worker.sh.
+
+# ---------------------------------------------------------------------------
+# Sharding. The fleet splits the library by md5 of each file's path RELATIVE to
+# the recordings root, modulo TOTAL, and each box takes the residue equal to its
+# own index (cubox-1 -> 0, cubox-2 -> 1).
+#
+#   TOTAL=1  every box considers every file (correct for one box, and the
+#            starting point: it duplicates work if a second box is also at 1)
+#   TOTAL=2  the library is split; each box takes half
+#
+# MIGRATION ORDER IS LOAD-BEARING, AND THE RULE IS: NEVER NARROW A CLAIM BEFORE
+# SOMETHING ELSE COVERS WHAT YOU DROP.
+#
+#   ENROLLING A NEW BOX -- bring cubox-2 UP at TOTAL=2 FIRST, then raise cubox-1
+#   to 2. While cubox-1 is still at 1 it claims every file, so the overlap is
+#   duplication (harmless); once it is at 2 it holds the evens and cubox-2 holds
+#   the odds. There is no instant at which a file is claimed by nobody.
+#
+#   The reverse -- cubox-1 to 2 first -- NARROWS cubox-1 to the evens while
+#   cubox-2 is not yet doing passes, and nothing claims the odds until it starts.
+#   That window is a real GAP, and neither box can see it: each only ever asks
+#   "is this file mine?", and for those files the honest answer on both is "no".
+#
+# THIS PARAGRAPH SAID THE OPPOSITE UNTIL 2026-09-25, and its worked example was
+# arithmetically wrong. It read "raise TOTAL on cubox-1 FIRST", justified by
+# "if cubox-2 is set to 2 while cubox-1 is still at 1, every file with md5 % 2 == 1
+# is owned by nobody". That is not true: at TOTAL=1 the modulus is 1, residue 0 is
+# the only class, and cubox-1 claims EVERY file -- odds included. Nothing is
+# unowned in that state; cubox-2 merely duplicates. The old rule is gap-free for
+# two boxes that are both already running a worker, which is presumably where it
+# came from -- and it is wrong in the one situation anyone actually reads it, a
+# box being enrolled.
+#
+# `scripts/11-transcode-verify.sh` is what settles this rather than the reasoning
+# above: it computes ownership from each box's LIVE (TOTAL, MY_INDEX), unions the
+# per-box claim files against the source listing, and reports GAP as a hard error.
+# Run it after changing this number. Reason, then measure.
+#
+# The shard is a work-distribution HINT, not ownership. The only correctness
+# criterion is the done-test, so a mis-set TOTAL moves work around rather than
+# corrupting anything. TOTAL unset or garbage is coerced to 1 with a loud
+# CONFIG-BAD line, because modulus 0 makes every file read "not mine" -- a total
+# stall that looks exactly like a quiet box.
+# ---------------------------------------------------------------------------
+# SEED VALUE, and worth distinguishing from what a running box uses. This file is
+# the seed for a box with no stored config (a first enrolment, or --force). A box
+# that has one reads /mnt/state/transcode/config instead, so changing this line
+# does NOT change a box that is already enrolled -- that config must be edited
+# too, and it is the authority for its keys.
+#
+# 2 rather than 1 since 2026-09-25, because the fleet is now two boxes. At 1 a
+# second box duplicates the first one's entire workload while looking healthy.
+# ---------------------------------------------------------------------------
+TOTAL=2
+
+# ---------------------------------------------------------------------------
+# How many times a file may FAIL before it is skipped for good. Environment
+# failures (NAS gone, output unwritable, ffmpeg missing) deliberately do NOT
+# count against this: an outage must not walk the library into a permanent skip
+# list. See `transcode-ctl clear-skip` to undo a skip after fixing the cause.
+# ---------------------------------------------------------------------------
+MAX_ATTEMPTS=3
+
+# ---------------------------------------------------------------------------
+# Progressive fast path. 1 = when a source is already h264 with
+# field_order=progressive, copy the video and transcode only the audio
+# (measured 1.36x realtime on 24 CPU-s, against 0.30x for a full transcode).
+#
+# This fires ZERO times on the current library: all 13 recordings probe
+# field_order=tt. It is kept because it costs one ffprobe and guards future
+# content -- do not expect it to shorten this backlog.
+#
+# The gate is exact string equality against one ffprobe line, so every other
+# outcome (empty, tt/bb/tb/bt, an error, a renamed field) takes the yadif path.
+# No branch can invent "progressive".
+# ---------------------------------------------------------------------------
+FASTPATH=1
+
+# ---------------------------------------------------------------------------
+# An output smaller than this is NOT considered done, and the worker will
+# re-transcode over it. The size floor is not decoration: the transcoded tree
+# already holds 12 zero-byte mp4s from a prior silent failure, and an
+# existence-only test would treat them as finished forever. With the floor they
+# are simply redone and the atomic rename replaces them -- no manual cleanup.
+# ---------------------------------------------------------------------------
+MIN_BYTES=1048576
+
+# ---------------------------------------------------------------------------
+# Ignore source files modified in the last N minutes. A file still being written
+# by the PVR recorder would otherwise be transcoded mid-write, and the duration
+# check would pass against a growing source. Deferrals are counted as
+# `deferred`, never as `done`.
+# ---------------------------------------------------------------------------
+RECENT_MIN=15
+
+# ---------------------------------------------------------------------------
+# Video bitrate. LEAVE THIS UNSET.
+#
+# Unset means "derive it": the worker reads the source container bitrate and
+# uses 1.2x, clamped to [2500k, 12000k]. Measured sources are 3.45-5.10 Mb/s, so
+# derived rates land at 4140k-6120k. The container rate includes audio and
+# teletext, and AAC replaces the mp2 track, so 1.2x slightly over-provisions the
+# video -- which is the conservative direction.
+#
+# Setting it forces ONE rate on every file and overrides the derivation. The
+# VPU encoder has no CRF, only a target bitrate, so this is the only lever on
+# output size. Operator decision was to match the source.
+#
+# BR=8000k
+# ---------------------------------------------------------------------------
+
+# AAC audio bitrate for the output.
+AUDIO_BR=192k
+
+# ---------------------------------------------------------------------------
+# Seconds of source used by --probe-run, the acceptance test. Not used by a real
+# pass. 60 s at the measured 0.327x takes about three minutes.
+# ---------------------------------------------------------------------------
+CAP_SEG=60
+
+# ---------------------------------------------------------------------------
+# Loop pacing. IDLE_JOBS is the pause after a pass that did work; IDLE_EMPTY
+# after a pass that found nothing, so an exhausted library does not spin.
+# ---------------------------------------------------------------------------
+IDLE_JOBS=10
+IDLE_EMPTY=300
+
+# ---------------------------------------------------------------------------
+# Free-space guard: at pass start the output must have at least this many times
+# the largest source file free. Covers the output, the in-flight .part, and the
+# once-only +faststart rewrite. The worker reads the df VALUE, not its exit
+# status (item 29).
+# ---------------------------------------------------------------------------
+FREE_FACTOR=3
+
+# ---------------------------------------------------------------------------
+# Paths. These are defaults the worker also carries; listed here so an operator
+# can see and override them without reading the script.
+#
+# SRC_ROOT is the recordings tree (automounted read-only).
+# TRANSCODED_PATH is the Storage-NAS filesystem path as seen FROM THE NAS. The
+# NFS export path for Storage-NAS takes the FULL form -- the opposite of
+# Backup-NAS, whose exports are matched by the short name `showmount -e` prints
+# (item 20).
+#
+# Note the output tree is the EXISTING transcoded/ directory, shared with the
+# x86 transcode pool. Atomic rename makes that collision harmless -- wasted
+# work, never corruption.
+# ---------------------------------------------------------------------------
+SRC_ROOT=/mnt/recordings
+STORAGE_IP=198.51.100.10
+TRANSCODED_PATH=/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded
+
+# ---------------------------------------------------------------------------
+# Overriding where output lands. Normally UNSET, and the worker DERIVES it:
+# /mnt/transcoded if that directory exists (Phase B, baked into the image), else
+# /build/out (Phase A, under a tmpfs the boot hook already mounts).
+#
+# Setting OUT_ROOT bypasses the derivation. It is here for a trial run against a
+# scratch tree; leaving it set in production would point the worker at a path
+# whose mount nothing else maintains. The derivation is deliberately additive so
+# a Phase A worker keeps working across the Phase B rebuild with no edit.
+#
+# OUT_ROOT=/build/out
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# VPU encoder capture-buffer pool. THE DEADLOCK SWITCH, measured 2026-09-26.
+#
+# 4 (the driver default, and the knob floor) deadlocks at source EOF; 16 is NOT
+# sufficient -- five jobs deadlocked at 16 with the value confirmed in the
+# running argv; 64 COMPLETED where 16 deadlocked, on a controlled comparison:
+# cubox-1, same source, same day, only this value changed.
+#
+#   16: DEADLOCK  rc=137  last frame 44987  1 drain-warn  corrupt 234
+#       artifact 1,019,215,920 bytes with NO moov -- present, unplayable
+#   64: COMPLETED rc=0    last frame 44989  0 drain-warn  corrupt 229
+#       artifact 1,020,909,188 bytes, passing all six verify gates
+#
+# NOT a memory trade: peak RSS 136,120 kB at 16 vs 135,180 kB at 64, CmaFree 0 kB
+# during both runs and ~52 MB back after a clean exit.
+#
+# n=1, so the pool bounds the FREQUENCY of the deadlock while stall_watch()
+# bounds the COST of a recurrence. Both stay. Takes effect on the NEXT pass --
+# no reboot, no redeploy. Mirrors the stanza in configs/transcode/config.default.
+# ---------------------------------------------------------------------------
+CAPTURE_BUFFERS=64

@@ -1,0 +1,193 @@
+# cubox-monitor — fleet monitoring + safe auto-healing for the CuBox fleet.
+#
+# Location on Storage-NAS: /share/CACHEDEV1_DATA/Programs/cubox-monitor/compose.yml
+# Deployed by deploy.sh, which is also what installs the ssh
+# material, the threshold file and the reference worker.sh. Do not `docker
+# compose up` this by hand before the script has run once: the tree it mounts
+# will not exist yet, and the mounts are read-only, so the container would fail
+# in a way that looks like a code bug.
+#
+# WHAT THIS CONTAINER IS, IN ONE LINE: the only thing on this fleet that can tell
+# a human the fleet is unwell, and the only durable log it will ever keep -- the
+# CuBoxes run volatile 32 MB journald, neither NAS keeps one, and there is no
+# push notification by design. Everything about its configuration follows from
+# that: nothing is cached anywhere, absent data is never green, and the container
+# exits rather than keep collecting for a page nobody can load.
+services:
+
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cubox-monitor:latest
+    container_name: cubox-monitor
+    hostname: cubox-monitor
+    restart: unless-stopped
+
+    # House convention (see Programs/pvr/compose.yml). Bounded because the NAS
+    # has 16 containers on a Celeron J1900 and this one must never be the reason
+    # TVH drops a recording.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.05'
+          memory: 64M
+
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Europe/Helsinki}
+      - MONITOR_DB=/data/monitor.sqlite
+      - MONITOR_CHECKS=/etc/monitor/checks.conf
+      - MONITOR_SSH_KEY=/etc/monitor/ssh/id_ed25519
+      - MONITOR_KNOWN_HOSTS=/etc/monitor/ssh/known_hosts
+
+    # THE GRACEFUL PATH IS LONGER THAN DOCKER'S, AND THIS VALUE IS LOAD-BEARING.
+    # main.py stops after the epoch in flight rather than interrupting it -- an
+    # interrupted epoch is at best a partial write -- so shutdown can take up to
+    # one interval plus one bounded epoch (interval + 4 x ssh_timeout = 160 s at
+    # the defaults; 200 s leaves slack).
+    #
+    # MEASURED 2026-09-26, because the obvious guess here is wrong. `docker stop`
+    # with an unset HostConfig.StopTimeout SIGKILLed after ~3 SECONDS (exit=137,
+    # reproduced twice, at two different intervals), even though main.py's SIGTERM
+    # handler had already run and logged -- the loop never reached its clean exit
+    # line. The same image with `docker run --stop-timeout 60` exited 0 with the
+    # clean path's own log line, and `docker kill -s TERM` alone exited 0 after
+    # 41 s. So the clean path works and 3 s is far too short for it; "Docker's
+    # default is 10 s" is a plausible number that this measurement does not
+    # support, and 10 s would SIGKILL the path this setting exists to protect.
+    # SQLite survives a SIGKILL regardless (WAL + journal), so exceeding this is
+    # not corruption -- it is only not the path we chose.
+    stop_grace_period: 200s
+
+    # NO `ports:` BLOCK, DELIBERATELY. This container holds its own LAN address
+    # on the `eth1` macvlan network, exactly like the other eleven services on
+    # Storage-NAS (tvheadend .52, jellyfin .53, mediamax .20, and so on), so the
+    # dashboard is reached at http://${LOCAL_IPV4}:8787 directly. A host-port
+    # publish would instead put it on the NAS's own interface, which is the
+    # arrangement every other service on this host avoids.
+    #
+    # The access control is now the container's own address rather than a bind
+    # address: the process listens on 0.0.0.0 INSIDE ITS OWN NETWORK NAMESPACE,
+    # which resolves to nothing but ${LOCAL_IPV4}. That is a narrower statement
+    # than it looks -- "0.0.0.0" here cannot be reached from any host interface,
+    # any VPN, or any other container network.
+    #
+    # macvlan's one real constraint is that a container cannot reach its own
+    # host's address. Nothing here needs to: the Storage-NAS checks read local
+    # paths and the local docker socket, and the plan forbids ssh'ing into
+    # Storage-NAS for a Storage-NAS check in any case.
+    networks:
+      eth1:
+        ipv4_address: ${LOCAL_IPV4:-198.51.100.11}
+
+    volumes:
+      # The store. On the NAS's OWN filesystem and never a network share: SQLite
+      # is unsupported on a network filesystem and can corrupt. It outlives the
+      # container, so replacing the image loses no history.
+      - ${MONITOR_DATA:-/share/CACHEDEV1_DATA/Programs/cubox-monitor/data}:/data
+      # The code, read-only, so editing a check or a threshold is an edit plus
+      # `docker compose restart` rather than a rebuild -- the same pattern the
+      # pvr stack uses for its scripts.
+      - ./app:/app:ro
+      # Thresholds and check definitions: DATA, not code, so tuning is a restart.
+      - ./checks.conf:/etc/monitor/checks.conf:ro
+      # ssh material: the fleet's key and a known_hosts file. There is no ~/.ssh
+      # in the container and there must not be an implicit one -- an alias that
+      # resolves on the operator's laptop and not in here is a failure that only
+      # appears after deployment.
+      - ./ssh:/etc/monitor/ssh:ro
+      # A ./expected mount used to sit here, carrying the reference worker.sh the
+      # drift check compared each box against. It is GONE as of 2026-10-06 (item
+      # 90): both of that check's digests now come from the box's own applied
+      # generation, so there is no snapshot in this tree left to go stale.
+      #
+      # THE NESTING RULE IT WAS THE FIRST TO HIT STILL GOVERNS THE MOUNT ABOVE. A
+      # bind mount nested inside another read-only bind mount cannot be created at
+      # all: Docker has to mkdir the mountpoint inside the parent, the parent is
+      # `:ro`, and so the CONTAINER REFUSES TO START with an error that names
+      # neither the parent's read-only flag nor the file being mounted:
+      #
+      #   error mounting ".../expected" to rootfs at "/app/expected":
+      #   create mountpoint for /app/expected mount: mkdirat ...
+      #   read-only file system
+      #
+      # Measured 2026-09-26 while smoke-testing the image. Hence /etc/monitor,
+      # which groups every installed input (thresholds, ssh material) in one
+      # place, with only CODE under /app.
+
+      # -- Storage-NAS, read locally ---------------------------------------
+      # THE MONITOR RUNS ON THIS HOST. It never ssh's into Storage-NAS for a
+      # Storage-NAS check: that would add a whole class of unreachable-noise and
+      # one more way for a check to be wrong.
+      #
+      # Read-only, and the claim is structural rather than a promise: every check
+      # on this host stats, lists or reads, and a read-only mount is what makes
+      # "the monitor cannot alter the media tree" true by construction. Note the
+      # docker socket below is the one exception in kind -- see the Dockerfile.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Recordings and transcoded are the SAME filesystem (measured 2026-09-26),
+      # which is why a full volume is one sharper RED rather than two checks: it
+      # stops recording AND transcoding at the same moment.
+      #
+      # PVR_DATA is the directory the pvr stack owns; do not point this at
+      # Storage-NAS's general media share by guess -- the paths are the ones
+      # app/config.py records as measured.
+      - ${PVR_DATA:-/share/CACHEDEV1_DATA/Programs/pvr}/media/recordings:/mnt/recordings:ro
+      - ${PVR_DATA:-/share/CACHEDEV1_DATA/Programs/pvr}/media/transcoded:/mnt/transcoded:ro
+
+    devices:
+      # WITHOUT THIS `dvb_adapter_count` IS PERMANENTLY UNKNOWN. The check reads
+      # /dev/dvb/adapter*, which exists on the host (WinTV-dualHD, em28xx+si2168)
+      # but not in a container unless it is passed through. TVH does exactly this
+      # in the pvr stack.
+      - /dev/dvb:/dev/dvb
+
+    # CAP_NET_RAW IS ALREADY IN DOCKER'S DEFAULT SET -- this is declared anyway,
+    # because the ICMP hint (probes.py:543, busybox ping) is the one thing here
+    # that depends on it and the dependency is invisible: busybox's ping needs no
+    # file capability, so nothing breaks until someone later hardens this service
+    # with `cap_drop: [ALL]` and silently loses the "is the box down, or is its
+    # ssh broken?" distinction. An explicit grant makes that a build-time
+    # decision rather than a mystery.
+    cap_add:
+      - NET_RAW
+
+    healthcheck:
+      # WHAT THIS PROVES, EXACTLY: that the dashboard answered. That is a stronger
+      # statement than it looks, because main.py exits the process if the
+      # dashboard thread dies and the collection loop cannot die (every epoch
+      # exception is caught inside it). So "the page answered" is very nearly
+      # "the collector is running".
+      #
+      # WHAT IT DELIBERATELY DOES NOT PROVE: that the fleet is healthy. A stale
+      # collector still answers 200. Making staleness unhealthy here would restart
+      # the container every time the NAS itself stuttered, which is noise, not
+      # healing -- the staleness judgement belongs on the page, where a human
+      # reads it, and that is where it is.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=5).status==200 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# The house network, external and shared with every other Storage-NAS service.
+# It is NOT created here: it already exists on the NAS and other running
+# containers (tvheadend, jellyfin, homeassistant, ...) are attached to it, so
+# declaring it `external: true` is what stops this compose file from either
+# creating a second, isolated subnet or -- far worse -- tearing down the one
+# eleven live services are standing on.
+networks:
+  eth1:
+    external: true
+    name: eth1

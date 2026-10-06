@@ -1,0 +1,75 @@
+===MONITOR-SECTION:meta===
+now=1790407414
+uname=Linux
+kernel=3.4.6
+===MONITOR-SECTION:load===
+2.31 2.52 2.51 1/271 13614
+===MONITOR-SECTION:meminfo===
+MemTotal:         515428 kB
+MemFree:           87336 kB
+Buffers:           86880 kB
+Cached:           107308 kB
+SwapCached:        10420 kB
+Active:           149592 kB
+Inactive:         159164 kB
+Active(anon):      61960 kB
+Inactive(anon):    71584 kB
+Active(file):      87632 kB
+Inactive(file):    87580 kB
+Unevictable:        2252 kB
+Mlocked:            2252 kB
+SwapTotal:        530124 kB
+SwapFree:         479672 kB
+Dirty:                32 kB
+Writeback:             0 kB
+AnonPages:        107368 kB
+Mapped:            28864 kB
+Shmem:             17516 kB
+Slab:              65248 kB
+SReclaimable:      54556 kB
+SUnreclaim:        10692 kB
+KernelStack:        2168 kB
+PageTables:         5664 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:      787836 kB
+Committed_AS:    1942196 kB
+VmallocTotal:     499712 kB
+VmallocUsed:        4324 kB
+VmallocChunk:     489252 kB
+===MONITOR-SECTION:disk===
+Filesystem           1k-blocks      Used Available Use% Mounted on
+/dev/sda3            113836004   3484180 109827536   3% /share/HDA_DATA
+===MONITOR-SECTION:root===
+@Recycle
+cubox-rootfs-bookworm-armhf.tar.gz
+images
+nfsroot
+nfsroot.old
+sdma-imx6q.bin
+state
+vpu_fw_imx6q.bin
+===MONITOR-SECTION:exports===
+"/share/NFSv=4" *(no_subtree_check,no_root_squash,insecure,fsid=0)
+"/share/HDA_DATA/Public" *(rw,async,no_subtree_check,insecure,no_root_squash)
+"/share/NFSv=4/Public" *(rw,nohide,async,no_subtree_check,insecure,no_root_squash)
+"/share/HDA_DATA/cubpxe" *(rw,async,no_subtree_check,insecure,no_root_squash)
+"/share/NFSv=4/cubpxe" *(rw,nohide,async,no_subtree_check,insecure,no_root_squash)
+export_match=yes
+===MONITOR-SECTION:nfsroot===
+nfsroot_dir=yes
+nfsroot_usr=yes
+nfsroot_hostname=yes
+nfsroot_rollback=yes
+===MONITOR-SECTION:tftp===
+tftp_dir=yes
+tftp:zImage=5448192
+tftp:initrd.img=19546619
+tftp:imx6q-cubox-i.dtb=  38230
+===MONITOR-SECTION:state===
+state_base=/share/HDA_DATA/cubpxe/state
+state:cubox-1=present
+statecfg:cubox-1=present
+state:cubox-2=present
+statecfg:cubox-2=present

@@ -1,0 +1,59 @@
+hostname        cubox-1
+kernel          6.1.0-50-armmp
+debian          12.15
+uptime          59621s
+boot_id         00000000-0000-4000-8000-000000000001
+--- rootfs identity (both must be the SAME shared tree)
+rootfs_dev      198.51.100.20:/cubpxe/nfsroot
+rootfs_fstype   nfs
+vmlinuz         vmlinuz-6.1.0-50-armmp 
+initrd          /boot/initrd.img-6.1.0-50-armmp 19546619 Sep 25 13:42|
+--- the worker and its unit
+worker_etc      2d85bda959825faa9b6e8d4fb0d5fe1f
+worker_lib      
+worker_paths    config.default transcode-ctl worker.sh 
+unit_state      active / enabled
+stall_watch     9 references
+transcode_ctl   48f12b090899d311e511d6e3875eff83
+--- config actually in force (per-device, from the state export)
+config_md5      069d5b764a9d5dfcf193b81aa88b64d3
+cfg TOTAL          2
+cfg MAX_ATTEMPTS   3
+cfg CAPTURE_BUFFERS 64
+cfg STALL_POLL     <unset>
+cfg STALL_SAMPLES  <unset>
+cfg FASTPATH       1
+cfg MIN_BYTES      1048576
+cfg RECENT_MIN     15
+cfg AUDIO_BR       192k
+cfg IDLE_JOBS      10
+cfg IDLE_EMPTY     300
+cfg FREE_FACTOR    3
+cfg OUT_ROOT       <unset>
+--- mounts (the automounts are what the fstab delivery question is about)
+mount /mnt/recordings   ACTIVE  systemd-1                                                        autofs rw,relatime,fd=49,
+198.51.100.10:/share/CACHEDEV1_DATA/Programs/pvr/media/recordings nfs    ro,relatime,vers=3
+mount /mnt/transcoded   ACTIVE  systemd-1                                                        autofs rw,relatime,fd=50,
+198.51.100.10:/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded nfs    rw,relatime,vers=3
+mount /mnt/state        ACTIVE  198.51.100.20:/cubpxe/state/cubox-1 nfs    rw,relatime,vers=3,rsize=32768,wsize=32768,namle
+mount /build            ACTIVE  tmpfs  tmpfs  rw,relatime,size=65536k,mode=755
+--- fstab as delivered (tmpfs, restored from state at boot)
+fstab_md5       1298131cb69adf8c6f0ff2b16bceda36
+fstab  198.51.100.10:/share/CACHEDEV1_DATA/Programs/pvr/media/recordings /mnt/recordings nfs vers=3,tcp,ro,nolock,noauto,x-systemd.automount,x-systemd.idle-timeout=60 0 0
+fstab  198.51.100.10:/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded /mnt/transcoded nfs vers=3,tcp,rw,soft,nolock,noauto,x-systemd.automount,x-systemd.idle-timeout=600 0 0
+state_fstab_md5 1298131cb69adf8c6f0ff2b16bceda36
+--- worker state and progress
+state_files     claim-cubox-1.txt config config.pre-total2 failed log run skiplist 
+skiplist        4 entries
+  claim-cubox-1.txt: 6 lines
+log_lines       281
+log_last        2026-09-26T06:36:25Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+--- hardware surfaces the fleet depends on
+coda_vpu        coda_vpu
+video_nodes     /dev/video0 /dev/video1 /dev/video10 /dev/video11 /dev/video12 /dev/video2 /dev/video3 /dev/video4 /dev/video5 /dev/video6 /dev/video7 /dev/video8 /dev/video9 
+CmaTotal        262144 kB
+CmaFree         256492 kB
+mem_avail       1959712 kB
+ffmpeg          ffmpeg version 7.1.4 Copyright (c) 2000-2026 the FFmpeg deve
+v4l2m2m         1 encoder(s)
+--- failed units (the boot-health surface, item 36)

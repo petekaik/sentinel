@@ -1,0 +1,18 @@
+# Python bytecode. `.dockerignore` records why this is functional rather than
+# cosmetic: compose bind-mounts ./app read-only, so a stale .pyc in the checkout
+# can shadow a module and run code that is not the code on disk.
+__pycache__/
+*.pyc
+
+# The operator's file, created ONCE on Storage-NAS from .env.example and never
+# overwritten by a deploy. It holds the NAS paths and the store location.
+.env
+
+# The private half of the monitor's service key. IT IS NOT IN THIS REPO BY
+# DESIGN -- it lives in ~/.ssh/cubox-monitor_ed25519, because a key that grants
+# login to every box does not belong in a tree that gets a remote. deploy.sh
+# reads it from there; MONITOR_KEY= moves it.
+ssh/
+
+# The SQLite store, if anyone ever runs the container from a checkout.
+data/

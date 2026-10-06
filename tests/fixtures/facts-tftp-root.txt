@@ -1,0 +1,8 @@
+imx6q-cubox-i.dtb
+imx6q-cubox-i.dtb.orig
+initrd.img
+initrd.img.orig
+initrd.img.v10
+initrd.img.v8
+initrd.img.v9
+zImage

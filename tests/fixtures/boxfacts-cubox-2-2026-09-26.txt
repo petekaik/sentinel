@@ -1,0 +1,88 @@
+hostname         cubox-2
+now              2026-09-26T07:39:01Z
+epoch            1790408341
+uptime_s         62979
+boot_id          00000000-0000-4000-8000-000000000002
+kernel           6.1.0-50-armmp
+debian           12.15
+rootfs_dev       198.51.100.20:/cubpxe/nfsroot
+rootfs_fstype    nfs
+worker_etc       2d85bda959825faa9b6e8d4fb0d5fe1f
+worker_lib       
+worker_paths     config.default transcode-ctl worker.sh 
+transcode_ctl    48f12b090899d311e511d6e3875eff83
+unit_state       active / enabled
+unit_main_start  Fri 2026-09-25 18:51:18 UTC
+unit_restarts    0
+unit_active_state active
+run_marker       present
+stall_watch      9
+pass_lock        held
+heartbeat_mnt    1790385490
+last_end_mtime   1790408133
+heartbeat_tmp    
+config_md5       9879d33037eabe1b911fcdc24123a533
+cfg              TOTAL 2
+cfg              MAX_ATTEMPTS 3
+cfg              FASTPATH 1
+cfg              MIN_BYTES 1048576
+cfg              RECENT_MIN 15
+cfg              AUDIO_BR 192k
+cfg              CAP_SEG 60
+cfg              IDLE_JOBS 10
+cfg              IDLE_EMPTY 300
+cfg              FREE_FACTOR 3
+cfg              CAPTURE_BUFFERS 64
+cfg              STALL_POLL 15
+cfg              STALL_SAMPLES 20
+cfg              SRC_ROOT /mnt/recordings
+cfg              STORAGE_IP 198.51.100.10
+cfg              TRANSCODED_PATH /share/CACHEDEV1_DATA/Programs/pvr/media/transcoded
+mountstack       /mnt/recordings|SOURCE="systemd-1" FSTYPE="autofs" OPTIONS="rw,relatime,fd=49,pgrp=1,timeout=60,minproto=5,maxproto=5,direct,pipe_ino=12841"
+mountstack       /mnt/transcoded|SOURCE="systemd-1" FSTYPE="autofs" OPTIONS="rw,relatime,fd=50,pgrp=1,timeout=600,minproto=5,maxproto=5,direct,pipe_ino=12844"
+mountstack       /mnt/transcoded|SOURCE="198.51.100.10:/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded" FSTYPE="nfs" OPTIONS="rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,soft,nolock,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=198.51.100.10,mountvers=3,mountport=56651,mountproto=tcp,local_lock=all,addr=198.51.100.10"
+mountstack       /mnt/state|SOURCE="198.51.100.20:/cubpxe/state/cubox-2" FSTYPE="nfs" OPTIONS="rw,relatime,vers=3,rsize=32768,wsize=32768,namlen=255,hard,nolock,proto=tcp,port=2049,timeo=600,retrans=3,sec=sys,local_lock=all,addr=198.51.100.20"
+mountstack       /build|SOURCE="tmpfs" FSTYPE="tmpfs" OPTIONS="rw,relatime,size=65536k,mode=755"
+mountstack       /run|SOURCE="tmpfs" FSTYPE="tmpfs" OPTIONS="rw,nosuid,nodev,noexec,relatime,size=206004k,mode=755"
+state_readdir_rc 0
+state_sentinel   cubox-2
+state_files      claim-cubox-2.txt config config.bak-20260926 failed log run skiplist 
+skiplist_lines   2
+log_path         log/cubox-2-worker.log
+log_lines        216
+log_mtime        1790408133
+log_last         2026-09-26T07:35:32Z cubox-2 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+failed_dir_count 0
+fstab_md5        1298131cb69adf8c6f0ff2b16bceda36
+fstab            198.51.100.10:/share/CACHEDEV1_DATA/Programs/pvr/media/recordings /mnt/recordings nfs vers=3,tcp,ro,nolock,noauto,x-systemd.automount,x-systemd.idle-timeout=60 0 0
+fstab            198.51.100.10:/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded /mnt/transcoded nfs vers=3,tcp,rw,soft,nolock,noauto,x-systemd.automount,x-systemd.idle-timeout=600 0 0
+state_fstab_md5  1298131cb69adf8c6f0ff2b16bceda36
+meminfo_total    2060028
+meminfo_avail    1963044
+meminfo_free     1865480
+meminfo_buffers  0
+meminfo_cached   93864
+cma_total        262144
+cma_free         259980
+loadavg          0.08 0.02 0.01 1/117 3350
+thermal_zones    0
+cooling_devices  3
+thermal_mdeg     
+tmpfs            /etc 65536 2104 63432 4%
+tmpfs            /tmp 131072 2092 128980 2%
+tmpfs            /var/tmp 65536 0 65536 0%
+tmpfs            /var/log 65536 8 65528 1%
+tmpfs            /build 65536 4 65532 1%
+coda_vpu         coda_vpu
+video_nodes      /dev/video0 /dev/video1 /dev/video10 /dev/video11 /dev/video12 /dev/video2 /dev/video3 /dev/video4 /dev/video5 /dev/video6 /dev/video7 /dev/video8 /dev/video9 
+ffmpeg           ffmpeg version 7.1.4 Copyright (c) 2000-2026 the FFmpeg developers
+v4l2m2m          5
+vpu_firmware     vpu_fw_imx6q.bin 
+failed_count     0
+state_save_timer_active active
+state_save_last  Sat 2026-09-26 07:25:27 UTC
+state_save_next  17h 31min 5.665531s
+state_save_cond  yes
+state_save_result success
+state_save_exit  Sat 2026-09-26 07:25:28 UTC
+worker_env_fail  0

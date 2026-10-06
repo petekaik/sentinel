@@ -1,0 +1,84 @@
+=== state export tree (cubox-1) ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+drwxr-xr-x    5 admin    administ      4096 Sep 26 09:56 .
+drwxr-xr-x    5 admin    administ      4096 Sep 26 09:39 ..
+-rw-r--r--    1 admin    administ       426 Sep 26 09:56 claim-cubox-1.txt
+-rw-r--r--    1 admin    administ     16947 Sep 26 09:43 config
+-rw-r--r--    1 admin    administ     10340 Sep 26 02:38 config.bak-20260926
+-rw-r--r--    1 admin    administ      9133 Sep 25 17:11 config.pre-total2
+drwxr-xr-x    2 admin    administ      4096 Sep 26 07:25 failed
+drwxr-xr-x    2 admin    administ      4096 Sep 24 11:41 log
+drwxr-xr-x    2 admin    administ      4096 Sep 26 05:40 run
+-rw-r--r--    1 admin    administ       376 Sep 25 21:46 skiplist
+--- run/
+drwxr-xr-x    2 admin    administ      4096 Sep 26 05:40 .
+drwxr-xr-x    5 admin    administ      4096 Sep 26 09:56 ..
+-rw-r--r--    1 admin    administ        67 Sep 26 05:40 cubox-1.job
+-rw-r--r--    1 admin    administ       130 Sep 26 09:56 cubox-1.last
+
+=== worker log: last 60 lines ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+2026-09-26T05:20:55Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:20:55Z cubox-1 space ok: 293497856K free, largest source 940 MiB
+2026-09-26T05:20:56Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T05:25:57Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:25:57Z cubox-1 space ok: 293497856K free, largest source 940 MiB
+2026-09-26T05:25:58Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T05:30:59Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:30:59Z cubox-1 space ok: 293493760K free, largest source 940 MiB
+2026-09-26T05:31:00Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T05:36:00Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:36:01Z cubox-1 space ok: 293496832K free, largest source 940 MiB
+2026-09-26T05:36:02Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T05:41:02Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:41:03Z cubox-1 space ok: 293495808K free, largest source 940 MiB
+2026-09-26T05:41:04Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T05:46:04Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:46:05Z cubox-1 space ok: 293491712K free, largest source 940 MiB
+2026-09-26T05:46:06Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T05:51:06Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:51:07Z cubox-1 space ok: 293495808K free, largest source 940 MiB
+2026-09-26T05:51:08Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T05:56:08Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T05:56:09Z cubox-1 space ok: 293494784K free, largest source 940 MiB
+2026-09-26T05:56:09Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:01:10Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:01:10Z cubox-1 space ok: 293493760K free, largest source 940 MiB
+2026-09-26T06:01:11Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:06:12Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:06:12Z cubox-1 space ok: 293492736K free, largest source 940 MiB
+2026-09-26T06:06:13Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:11:14Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:11:14Z cubox-1 space ok: 293493760K free, largest source 940 MiB
+2026-09-26T06:11:15Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:16:16Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:16:16Z cubox-1 space ok: 293492736K free, largest source 940 MiB
+2026-09-26T06:16:17Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:21:18Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:21:18Z cubox-1 space ok: 293491712K free, largest source 940 MiB
+2026-09-26T06:21:19Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:26:19Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:26:20Z cubox-1 space ok: 293490688K free, largest source 940 MiB
+2026-09-26T06:26:21Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:31:21Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:31:22Z cubox-1 space ok: 293486592K free, largest source 940 MiB
+2026-09-26T06:31:23Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:36:23Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:36:24Z cubox-1 space ok: 293485568K free, largest source 940 MiB
+2026-09-26T06:36:25Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:41:25Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:41:26Z cubox-1 space ok: 295732224K free, largest source 940 MiB
+2026-09-26T06:41:27Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:46:27Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:46:28Z cubox-1 space ok: 295731200K free, largest source 940 MiB
+2026-09-26T06:46:29Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:51:29Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:51:30Z cubox-1 space ok: 295731200K free, largest source 940 MiB
+2026-09-26T06:51:31Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0
+2026-09-26T06:56:31Z cubox-1 === pass start mode=loop host=cubox-1 index=0 total=2 out=/mnt/transcoded ===
+2026-09-26T06:56:32Z cubox-1 space ok: 295731200K free, largest source 940 MiB
+2026-09-26T06:56:33Z cubox-1 pass summary [live]: sources=12 done=6 mine=6 not-mine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 env-fail=0

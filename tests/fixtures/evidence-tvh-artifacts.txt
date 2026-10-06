@@ -1,0 +1,26 @@
+=== tvh log: adapter/tuner/dvr lines (last 400 lines filtered) ===
+
+=== docker ps format ===
+sh: docker: command not found
+
+=== media volume df ===
+Filesystem           1K-blocks      Used Available Use% Mounted on
+/dev/mapper/cachedev1
+                     806458304 510187148 295730484  63% /share/CACHEDEV1_DATA
+
+=== dvb device nodes ===
+total 0
+drwxr-xr-x  4 admin administrators    80 Sep 17 12:12 .
+drwxr-xr-x 18 admin administrators 20580 Sep 17 12:36 ..
+drwxr-xr-x  2 admin administrators   120 Sep 17 12:12 adapter0
+drwxr-xr-x  2 admin administrators   120 Sep 17 12:12 adapter1
+--- adapter0:
+demux0
+dvr0
+frontend0
+net0
+--- adapter1:
+demux0
+dvr0
+frontend0
+net0

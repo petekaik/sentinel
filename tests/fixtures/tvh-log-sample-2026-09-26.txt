@@ -1,0 +1,67 @@
+=== tvh log sample: adapter/dvr/subscription lines ===
+2026-09-25 20:43:50.238 [   INFO] dvr:  2  MPEG2AUDIO        fin                             96000        ?         
+2026-09-25 20:43:50.238 [   INFO] dvr:  3  MPEG2AUDIO        dut                             96000        ?         
+2026-09-25 20:43:50.238 [   INFO] dvr:  4  DVBSUB            fin                                                    
+2026-09-25 20:43:50.238 [   INFO] dvr:  5  DVBSUB            fin                                                    
+2026-09-25 20:43:50.238 [   INFO] dvr:  6  HBBTV                                                                    
+2026-09-25 20:43:50.936 [WARNING] dvr: Unable to change directory permissions to "775" for "/recordings/Radion-sinfoniaorkesterin-konsertti" (keeping "755")
+2026-09-25 20:43:50.936 [   INFO] dvr: /recordings/Radion-sinfoniaorkesterin-konsertti/Radion-sinfoniaorkesterin-konsertti_-_Hannu-Lintu,-kapellim.ts from adapter: "Silicon Labs Si2168 #1 : DVB-T #0", network: "DVB-T Finland", mux: "562MHz", provider: "Yleisradio Oy", service: "Yle Teema & Fem HD"
+2026-09-25 20:43:50.936 [   INFO] dvr:  #  type              lang  resolution  aspect ratio  sample rate  channels
+2026-09-25 20:43:50.936 [   INFO] dvr:  1  H264                    ?           ?                                    
+2026-09-25 20:43:50.936 [   INFO] dvr:  2  AC3               fin                             96000        ?         
+2026-09-25 20:43:50.936 [   INFO] dvr:  3  TELETEXT                                                                 
+2026-09-25 20:43:50.936 [   INFO] dvr:  4  HBBTV                                                                    
+2026-09-25 20:43:50.936 [   INFO] dvr:  5  AC3               dut                             96000        ?         
+2026-09-25 20:43:50.936 [   INFO] dvr:  6  DVBSUB            fin                                                    
+2026-09-25 20:43:50.936 [   INFO] dvr:  7  DVBSUB            fin                                                    
+2026-09-25 20:14:25.757 [   INFO] subscription: 005B: "DVR: Unelma-asunto auringon alta" subscribing on channel "MTV Ava", weight: 500, adapter: "Silicon Labs Si2168 #0 : DVB-T #0", network: "DVB-T Finland", mux: "514MHz", provider: "MTV Sisällöt Oy", service: "MTV Ava HD", profile="pass", username="pete"
+2026-09-25 20:14:31.757 [WARNING] subscription: 005B: service instance is bad, reason: No input detected
+2026-09-25 20:14:33.757 [ NOTICE] subscription: 005B: No input source available for subscription "DVR: Unelma-asunto auringon alta" to channel "MTV Ava"
+2026-09-25 20:14:33.757 [  ERROR] dvr: Recording unable to start: "Unelma-asunto auringon alta": No input detected
+2026-09-25 20:20:53.007 [   INFO] subscription: 005C: "DVR: Vain elämää" subscribing on channel "Nelonen", weight: 500, adapter: "Silicon Labs Si2168 #0 : DVB-T #0", network: "DVB-T Finland", mux: "562MHz", provider: "Sanoma Oyj", service: "Nelonen HD", profile="pass", username="pete"
+2026-09-25 20:20:59.006 [WARNING] subscription: 005C: service instance is bad, reason: No input detected
+2026-09-25 20:21:01.006 [ NOTICE] subscription: 005C: No input source available for subscription "DVR: Vain elämää" to channel "Nelonen"
+2026-09-25 20:21:01.006 [  ERROR] dvr: Recording unable to start: "Vain elämää": No input detected
+2026-09-25 20:35:00.002 [   INFO] subscription: 005B: "DVR: Unelma-asunto auringon alta" unsubscribing from "MTV Ava", username="pete"
+2026-09-25 20:35:00.003 [   INFO] dvr: "Unelma-asunto auringon alta" on "MTV Ava": End of program: Time missed
+2026-09-25 20:42:52.810 [   INFO] subscription: 0061: "DVR: Radion sinfoniaorkesterin konsertti" subscribing on channel "Yle Teema & Fem", weight: 500, adapter: "Silicon Labs Si2168 #0 : DVB-T #0", network: "DVB-T Finland", mux: "562MHz", provider: "Yleisradio Oy", service: "Yle Teema & Fem HD", profile="pass", username="pete"
+2026-09-25 20:42:52.810 [ NOTICE] subscription: 005C: No input source available for subscription "DVR: Vain elämää" to channel "Nelonen"
+2026-09-25 20:42:58.807 [WARNING] subscription: 0061: service instance is bad, reason: No input detected
+2026-09-25 20:43:00.807 [ NOTICE] subscription: 0061: No input source available for subscription "DVR: Radion sinfoniaorkesterin konsertti" to channel "Yle Teema & Fem"
+2026-09-25 20:43:00.807 [  ERROR] dvr: Recording unable to start: "Radion sinfoniaorkesterin konsertti": No input detected
+2026-09-25 20:43:49.532 [   INFO] subscription: 0061: "DVR: Radion sinfoniaorkesterin konsertti" subscribing on channel "Yle Teema & Fem", weight: 500, adapter: "Silicon Labs Si2168 #1 : DVB-T #0", network: "DVB-T Finland", mux: "562MHz", provider: "Yleisradio Oy", service: "Yle Teema & Fem HD", profile="pass", username="pete"
+2026-09-25 20:43:49.532 [   INFO] subscription: 005C: "DVR: Vain elämää" subscribing on channel "Nelonen", weight: 500, adapter: "Silicon Labs Si2168 #1 : DVB-T #0", network: "DVB-T Finland", mux: "562MHz", provider: "Sanoma Oyj", service: "Nelonen HD", profile="pass", username="pete"
+2026-09-25 20:45:41.892 [   INFO] subscription: 0061: "DVR: Radion sinfoniaorkesterin konsertti" unsubscribing from "Yle Teema & Fem", username="pete"
+2026-09-25 20:45:41.893 [   INFO] dvr: "Radion sinfoniaorkesterin konsertti" on "Yle Teema & Fem": End of program: Completed OK
+2026-09-25 20:45:41.922 [   INFO] dvr: entry 7fbc28d58ff564c5413007d93dc75e71 "Radion sinfoniaorkesterin konsertti" on "Yle Teema & Fem" starting at 2026-10-02 19:59:30, with broadcast id "<noid>", scheduled for recording by "pete"
+2026-09-25 20:45:47.363 [   INFO] subscription: 005C: "DVR: Vain elämää" unsubscribing from "Nelonen", username="pete"
+2026-09-25 20:45:47.366 [   INFO] dvr: "Vain elämää" on "Nelonen": End of program: Completed OK
+2026-09-25 20:45:47.367 [   INFO] dvr: entry 6e7102d94e05f8db1e3fbd8cd4b4435a "Vain elämää" on "Nelonen" starting at 2026-09-26 08:59:30, with broadcast id "<noid>", scheduled for recording by "pete"
+2026-09-25 20:46:04.247 [   INFO] dvr: delete entry 1ced4e98dcb038c838294be388a5ea3e "Elokuva: Salainen agentti 86" on "TV5" start time 2026-09-25 18:44:30, scheduled for recording by "pete", retention "On file removal" removal "7 days"
+2026-09-25 20:46:04.249 [   INFO] dvr: delete entry 191a371da491aad8b6911785922c3487 "Vain elämää" on "Nelonen" start time 2026-09-25 19:59:30, scheduled for recording by "pete", retention "On file removal" removal "7 days"
+2026-09-25 20:46:04.250 [   INFO] dvr: delete entry 9bda739ede32c0f567d3bc3b544d60dc "Radion sinfoniaorkesterin konsertti" on "Yle Teema & Fem" start time 2026-09-25 19:59:30, scheduled for recording by "pete", retention "On file removal" removal "7 days"
+2026-09-25 21:01:44.793 [   INFO] dvr: delete entry 6a6c72ff263494ca54c6afc5e7c3ea31 "Unelma-asunto auringon alta" on "MTV Ava" start time 2026-09-25 19:29:30, scheduled for recording by "pete", retention "On file removal" removal "7 days"
+2026-09-26 02:04:00.964 [   INFO] mpegts: 674MHz in DVB-T Finland - tuning on Silicon Labs Si2168 #1 : DVB-T #0
+2026-09-26 02:04:00.966 [   INFO] subscription: 0062: "epggrab" subscribing to mux "674MHz", weight: 4, adapter: "Silicon Labs Si2168 #1 : DVB-T #0", network: "DVB-T Finland", service: "Raw PID Subscription"
+2026-09-26 02:04:00.966 [   INFO] mpegts: 562MHz in DVB-T Finland - tuning on Silicon Labs Si2168 #0 : DVB-T #0
+2026-09-26 02:04:00.966 [   INFO] subscription: 0063: "epggrab" subscribing to mux "562MHz", weight: 4, adapter: "Silicon Labs Si2168 #0 : DVB-T #0", network: "DVB-T Finland", service: "Raw PID Subscription"
+2026-09-26 02:05:05.862 [   INFO] subscription: 0062: "epggrab" unsubscribing
+2026-09-26 02:05:06.863 [   INFO] mpegts: 514MHz in DVB-T Finland - tuning on Silicon Labs Si2168 #1 : DVB-T #0
+2026-09-26 02:05:06.863 [   INFO] subscription: 0065: "epggrab" subscribing to mux "514MHz", weight: 4, adapter: "Silicon Labs Si2168 #1 : DVB-T #0", network: "DVB-T Finland", service: "Raw PID Subscription"
+2026-09-26 02:05:48.635 [   INFO] subscription: 0065: "epggrab" unsubscribing
+2026-09-26 02:14:05.964 [WARNING] epggrab: EIT: EPG Grabber - data completion timeout for 562MHz in DVB-T Finland
+2026-09-26 02:14:05.964 [   INFO] subscription: 0063: "epggrab" unsubscribing
+
+=== tvh log: newest 12 lines of any kind ===
+2026-09-26 07:14:18.049 [   INFO] epgdb: save start
+2026-09-26 07:14:18.097 [   INFO] epgdb: stored (size 336471)
+2026-09-26 08:14:18.000 [   INFO] epgdb: snapshot start
+2026-09-26 08:14:18.044 [   INFO] epgdb: queued to save (size 1347468)
+2026-09-26 08:14:18.044 [   INFO] epgdb:   broadcasts 3132
+2026-09-26 08:14:18.044 [   INFO] epgdb: save start
+2026-09-26 08:14:18.104 [   INFO] epgdb: stored (size 336471)
+2026-09-26 09:14:18.000 [   INFO] epgdb: snapshot start
+2026-09-26 09:14:18.037 [   INFO] epgdb: queued to save (size 1347468)
+2026-09-26 09:14:18.037 [   INFO] epgdb:   broadcasts 3132
+2026-09-26 09:14:18.037 [   INFO] epgdb: save start
+2026-09-26 09:14:18.085 [   INFO] epgdb: stored (size 336471)

@@ -1,0 +1,36 @@
+=== docker binary locations ===
+lrwxrwxrwx 1 admin administrators 42 Jan 19  2026 /share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker -> /lib/container-station/wrapper/usr-bin-elf
+ls: cannot access /usr/local/bin/docker: No such file or directory
+
+=== docker socket ===
+srw-rw---- 1 admin administrators 0 Sep 17 12:13 /var/run/docker.sock
+ls: cannot access /share/CACHEDEV1_DATA/.qpkg/container-station/var/run/docker.sock: No such file or directory
+
+=== container-station dirs ===
+bin
+container-station.sh
+data
+desktop
+etc
+homes
+kernel-module
+lib
+opt
+run
+script
+start-stop.log
+system-docker
+tmp
+usr
+var
+version
+www
+
+=== container log location ===
+total 36
+drwxrwxrwx  5 admin    administrators 4096 Sep 25 20:12 .
+drwxrwxrwx 43 admin    administrators 4096 Sep 22 17:42 ..
+drwxrwxrwx  2 admin    administrators 4096 Sep 25 20:12 .AppleDB
+-rw-rw-rw-  1 admin    administrators 6148 Apr 23 19:47 .DS_Store
+drwxr-xr-x  8 admin    administrators 4096 Jun 29  2023 container-station-data
+drwxr-xr-x  5 petekaik             20 4096 Sep 16 17:18 tvhproxy

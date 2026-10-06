@@ -1,0 +1,49 @@
+=== run/cubox-1.job ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+2026-09-26T02:40:08Z cubox-1 Futurama/Futurama_2026-09-23_17-25.ts
+=== run/cubox-1.last ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+2026-09-26T06:56:33Z|mode=live|sources=12 done=6 mine=6 notmine=6 jobs=0 failed=0 skipped=0 deferred=0 recent=0 would=0 envfail=0
+=== claim-cubox-1.txt (first 6) ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+986d2d7ca3bc67ae5737a63549cb8ad3 Futurama/Futurama_2026-09-19_10-30.ts
+353b1ac8ad43505d7bad809978f98001 Futurama/Futurama_2026-09-22_17-00.ts
+fb5b4cf2c6b8bbe18e2cd3d0b2e39b89 Futurama/Futurama_2026-09-22_17-30.ts
+0d048e8ec593d4ec735fe34b007b2f48 Futurama/Futurama_2026-09-23_16-55.ts
+0a16fdf692d008e93f16866b58ab436c Futurama/Futurama_2026-09-23_17-25.ts
+96a1ccd67519ce918bc42ccf5e9d6f7f Futurama/Futurama_2026-09-24_17-00.ts
+=== skiplist ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+fb5b4cf2c6b8bbe18e2cd3d0b2e39b89 1 2026-09-25T00:52:42Z Futurama/Futurama_2026-09-22_17-30.ts
+2ba64a3d649150901625bdb548621268 1 2026-09-25T03:57:51Z Futurama/Futurama_2026-09-19_11-00.ts
+2f459a068805be27cf1cb51baf4b228c 1 2026-09-25T07:03:00Z Futurama/Futurama_2026-09-18_17-00.ts
+986d2d7ca3bc67ae5737a63549cb8ad3 2 2026-09-25T18:46:42Z Futurama/Futurama_2026-09-19_10-30.ts
+=== failed/ ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+drwxr-xr-x    2 admin    administ      4096 Sep 26 07:25 .
+drwxr-xr-x    5 admin    administ      4096 Sep 26 09:56 ..
+-rw-r--r--    1 admin    administ   2232634 Sep 25 06:57 2ba64a3d649150901625bdb548621268.log
+-rw-r--r--    1 admin    administ   1991366 Sep 25 10:03 2f459a068805be27cf1cb51baf4b228c.log
+-rw-r--r--    1 admin    administ     69183 Sep 25 17:12 8005edcb06b7aa503bdd3335694e7077.log
+-rw-r--r--    1 admin    administ      1579 Sep 24 08:06 faststart-test.log
+-rw-r--r--    1 admin    administ     80105 Sep 23 21:39 probe.log.stale-0923
+-rw-r--r--    1 admin    administ      5494 Sep 24 08:58 rss.log
+-rw-r--r--    1 admin    administ     13591 Sep 24 08:40 stall-watch.log
+=== cubox-2 run/ ===
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+drwxr-xr-x    2 admin    administ      4096 Sep 26 04:18 .
+drwxr-xr-x    5 admin    administ      4096 Sep 26 09:55 ..
+-rw-r--r--    1 admin    administ        67 Sep 26 04:18 cubox-2.job
+-rw-r--r--    1 admin    administ       130 Sep 26 09:55 cubox-2.last

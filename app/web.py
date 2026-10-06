@@ -451,8 +451,11 @@ def build_status(cfg, conn, now=None):
 # ---------------------------------------------------------------------------
 
 CSS = """
-:root { --bg:#12151a; --fg:#e6e9ef; --dim:#8b94a3; --line:#252b35;
-        --green:#2ea043; --amber:#d29922; --red:#da3633; --grey:#6e7681; }
+:root { --bg:#0e1216; --panel:#161c22; --fg:#e6edf3; --dim:#8b949e;
+        --line:#232c35; --ok:#3fb950; --warn:#e3b341; --fail:#f85149;
+        --unknown:#7d8590;
+        --green:var(--ok); --amber:var(--warn); --red:var(--fail);
+        --grey:var(--unknown); }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg);
        font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
@@ -462,6 +465,20 @@ h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em;
      color:var(--dim); margin:26px 0 8px; border-bottom:1px solid var(--line);
      padding-bottom:5px; }
 .sub { color:var(--dim); font-size:12px; }
+.hero { padding:14px 0 4px; }
+.hero .hage { font-size:38px; line-height:1.05; font-weight:600;
+              letter-spacing:-.02em; }
+.hero.fresh .hage { color:var(--fg); }
+.hero.lagging .hage { color:var(--warn); }
+.hero.stale .hage, .hero.none .hage { color:var(--fail); }
+.hero .hsub { font-size:12.5px; color:var(--dim); margin-top:2px; }
+.hero .hscale { display:flex; justify-content:space-between;
+                font-size:10.5px; color:var(--dim); margin:9px 0 4px; }
+.hero .hbar { height:6px; border-radius:3px; background:#1b2229;
+              border:1px solid var(--line); overflow:hidden; }
+.hero .hbar i { display:block; height:100%; background:var(--green); }
+.hero.lagging .hbar i { background:var(--warn); }
+.hero.stale .hbar i { background:var(--fail); }
 .banner { padding:10px 13px; border-radius:5px; margin:12px 0 0;
           border:1px solid var(--line); font-weight:600; }
 .banner.red { background:#3a1416; border-color:var(--red); color:#ffb4b0; }
@@ -511,14 +528,54 @@ def _esc(s):
     return html.escape("" if s is None else str(s), quote=False)
 
 
+def _span(seconds):
+    """A duration, without the "ago". For thresholds and scales.
+
+    Extracted rather than typed a second time: `_age` and the hero's scale end
+    must agree about what "3.0 min" means, and two formatters drift.
+    """
+    if seconds < 90:
+        return "%.0fs" % seconds
+    if seconds < 5400:
+        return "%.1f min" % (seconds / 60.0)
+    return "%.1f h" % (seconds / 3600.0)
+
+
 def _age(seconds):
     if seconds is None:
         return "never"
-    if seconds < 90:
-        return "%.0fs ago" % seconds
-    if seconds < 5400:
-        return "%.1f min ago" % (seconds / 60.0)
-    return "%.1f h ago" % (seconds / 3600.0)
+    return _span(seconds) + " ago"
+
+
+def _freshness(state):
+    """The hero: the age of the last collection, against the stale threshold.
+
+    WHY THE AGE AND NOT THE VERDICT. This is a dead-man switch, so the first
+    question is never "how is the fleet" but "is this page still being told
+    anything". Everything below the hero is only as current as this number, and
+    a page that leads with a verdict is a page that leads with a claim it may no
+    longer be able to make.
+
+    The bar is drawn in POLL INTERVALS because that is the unit the threshold is
+    actually stated in -- "three intervals" -- and reading the margin off a
+    number is arithmetic the operator should not have to do at 2am.
+    """
+    st = state["staleness"]
+    if st == "none":
+        # NO BAR, deliberately. A track at 0% reads as "0s ago", and "never
+        # collected" is the opposite of that.
+        return ("<div class='hero none'><div class=hage>never</div>"
+                "<div class=hsub>no collection has ever been recorded</div>"
+                "</div>")
+    age = state["last_age_s"]
+    limit = state["stale_after_s"]
+    pct = max(0.0, min(100.0, 100.0 * age / limit)) if limit else 100.0
+    return ("<div class='hero %s'><div class=hage>%s</div>"
+            "<div class=hscale><span>current</span><span>stale at %s</span></div>"
+            "<div class=hbar role=img aria-label='last collection %s, stale past "
+            "%s'><i style='width:%.1f%%'></i></div></div>"
+            % (st, _esc(_age(age)), _esc(_span(limit)), _esc(_age(age)),
+               _esc(_span(limit)), pct))
 
 
 def render_html(state, cfg):
@@ -531,6 +588,9 @@ def render_html(state, cfg):
     a("<h1>CuBox fleet monitor</h1>")
     a("<div class=sub>Storage-NAS TVH/DVB &middot; Backup-NAS &middot; "
       "cubox-1 / cubox-2 &middot; refreshed on every load, nothing is cached</div>")
+
+    # ---- the hero: how current this page is --------------------------------
+    a(_freshness(state))
 
     # ---- the staleness banner, FIRST, and it degrades the whole page ---------
     st = state["staleness"]

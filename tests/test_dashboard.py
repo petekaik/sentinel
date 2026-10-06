@@ -96,8 +96,16 @@ class Dash:
         passes or fails on a few milliseconds of Python. Pinning `now` is what
         makes "exactly 3 intervals is NOT stale" a statement about the code.
         """
+        # THE NEWEST EPOCH, not MAX(ts). `build_state` reads the last collection
+        # by `epoch_seq`, and a backdated history makes the two disagree: the
+        # newest epoch carries the SMALLEST ts, so MAX(ts) picks an older row
+        # than the one the page renders. Then "age_s after the last collection"
+        # is a lie -- an age of 0 would render as the backdate of some earlier
+        # epoch, and the bar's arithmetic would measure the gap between two
+        # epochs instead of the age the caller asked for.
         ts = self.conn.execute(
-            "SELECT MAX(ts) AS ts FROM collector_run").fetchone()["ts"]
+            "SELECT ts FROM collector_run ORDER BY epoch_seq DESC LIMIT 1"
+        ).fetchone()["ts"]
         return web.build_state(self.cfg, self.conn, now=ts + age_s)
 
     def html(self):
@@ -941,6 +949,83 @@ def test_status_api_is_a_stable_contract(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 8. The freshness hero leads, and tracks the state it leads with
+# ---------------------------------------------------------------------------
+
+
+def test_the_freshness_hero_tracks_the_staleness_it_leads_with(results):
+    """Four states, four heroes, and the bar drawn in poll intervals."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir, interval=60)          # stale_after_s == 180
+        d.epoch()
+        fresh = d.html()
+        d.epoch(age_s=60 * 2)
+        lagging = d.html()
+        d.epoch(age_s=60 * web.STALE_INTERVALS + 1)
+        stale = d.html()
+        # The brief's `Dash(os.path.join(tmpdir, "empty"))` needs the directory
+        # to exist first: sqlite will not create a database in a missing path,
+        # and the empty-store board is the whole point of this case.
+        os.makedirs(os.path.join(tmpdir, "empty"), exist_ok=True)
+        never = Dash(os.path.join(tmpdir, "empty")).html()
+
+        for name, html in (("fresh", fresh), ("lagging", lagging),
+                           ("stale", stale), ("none", never)):
+            present = [s for s in ("fresh", "lagging", "stale", "none")
+                       if "hero %s" % s in html]
+            results.check(
+                "the %s board renders exactly one hero state, and it is %s"
+                % (name, name),
+                present == [name],
+                "hero states found on the %s page: %s -- the hero exists to lead "
+                "with the staleness, so a hero that does not track it is worse "
+                "than no hero" % (name, present))
+
+        # THE BAR IS DRAWN IN POLL INTERVALS, so these are exact: `state_at`
+        # pins `now` against the stored ts and the arithmetic is a division.
+        for age, want, why in (
+                (0, "width:0.0%", "an age of zero leaves the track empty"),
+                (90, "width:50.0%",
+                 "half of the 180s threshold fills exactly half the track"),
+                (181, "width:100.0%",
+                 "an age PAST the threshold clamps at 100% -- a bar that "
+                 "overflows its track is a bar that cannot be read")):
+            html = web.render_html(d.state_at(age), d.cfg)
+            results.check(
+                "at age %ds the bar is %s (%s)" % (age, want, why),
+                want in html,
+                "expected %r in the hero; the rendered hero was:\n%s"
+                % (want, html[html.find("class='hero"):][:300]))
+
+        results.check(
+            "a board with no collection ever draws NO bar and says 'never'",
+            # `class=hbar`, not `hbar`: the hero's stylesheet rule (`.hero
+            # .hbar`) is inlined into every page, so a bare substring search
+            # for `hbar` is satisfied by the CSS that defines the bar this
+            # check exists to prove absent. The element is what is asserted.
+            "class='hero none" in never and "class=hbar" not in never,
+            "staleness=none drew a bar -- an empty track reads as '0s ago', "
+            "which is the one thing 'never collected' is not")
+
+        results.check(
+            "the hero states the age and the threshold it is measured against",
+            "stale at 3.0 min" in fresh and "class=hage" in fresh,
+            "the hero does not state the threshold the bar is drawn against, so "
+            "the bar has no scale and its length means nothing:\n%s"
+            % fresh[fresh.find("class='hero"):][:300])
+
+        # NON-VACUOUS HALF: the degradation sentences still exist, unchanged.
+        results.check(
+            "the hero did not replace the staleness banners it sits above",
+            "banner red" in stale and "AS IT WAS" in stale
+            and "NO COLLECTION HAS EVER BEEN RECORDED" in never,
+            "the hero displaced the sentences that degrade the whole document")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_stale_says_so_and_cannot_also_be_ok,
@@ -951,7 +1036,8 @@ TESTS = (test_empty_store_is_loud,
          test_collector_rows_are_visible,
          test_informational_rows_carry_no_colour,
          test_status_api_is_three_valued,
-         test_status_api_is_a_stable_contract)
+         test_status_api_is_a_stable_contract,
+         test_the_freshness_hero_tracks_the_staleness_it_leads_with)
 
 
 def main():

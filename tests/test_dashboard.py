@@ -1045,6 +1045,98 @@ def test_the_freshness_hero_tracks_the_staleness_it_leads_with(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 9. The band, and the three ways of having no colour
+# ---------------------------------------------------------------------------
+
+
+def test_the_band_never_says_ok_on_a_stale_or_colourless_page(results):
+    """Staleness dominates the band, and the three empty cases differ."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir, interval=60)
+        d.epoch()
+        targets = [(c.target, c.id) for c in registry_instances(d.cfg)
+                   if c.spec and not getattr(c, "informational", False)]
+        for target, cid in targets:
+            d.check(target, cid, store.Status.OK, "fine (test)")
+        fresh = d.html()
+        results.check(
+            "a fresh all-green board bands OK",
+            "band ok" in fresh,
+            "the band did not read ok on a fresh board where every check is OK "
+            "-- if this is wrong the assertions below prove nothing")
+
+        # STALE, with every stored row still green. This is the dangerous one.
+        d.epoch(age_s=60 * web.STALE_INTERVALS + 1)
+        for target, cid in targets:
+            d.check(target, cid, store.Status.OK, "fine (test)")
+        stale = d.html()
+        results.check(
+            "a stale page whose stored rows are green bands UNKNOWN, not OK",
+            "band unknown" in stale and "band ok" not in stale,
+            "the band read OK beside the red STALE banner -- the coloured rows "
+            "describe the fleet as it WAS, and a green band on them is the false "
+            "green this page exists to prevent")
+
+        # NO COLOUR AT ALL: nothing graded, nothing green.
+        #
+        # THE SUBDIRECTORY BOARD NEEDS ITS DIRECTORY FIRST -- the same brief
+        # defect Task 1's hero test records one function above. `store.connect`
+        # opens the path with sqlite3, which will NOT create a database inside a
+        # directory that does not exist, so `Dash(<missing dir>)` dies with
+        # sqlite3.OperationalError and takes the whole run with it. All three
+        # subdirectory boards in this test (grey, mixed, red) are affected, and
+        # without the makedirs the three zero-colour cases could not exist.
+        os.makedirs(os.path.join(tmpdir, "grey"), exist_ok=True)
+        e = Dash(os.path.join(tmpdir, "grey"))
+        e.epoch()
+        grey = e.html()
+        results.check(
+            "a board with no coloured row bands UNKNOWN and says so in words",
+            "band unknown" in grey
+            and "nothing reported a colour" in grey,
+            "a page where no check reported a colour did not say so plainly")
+
+        # SOME GREEN, SOME GREY. The verdict stays ok -- that is the platform's
+        # existing rule and not this design's business -- but the grey count
+        # must be stated at the top, never folded away behind the green one.
+        os.makedirs(os.path.join(tmpdir, "mixed"), exist_ok=True)
+        g = Dash(os.path.join(tmpdir, "mixed"))
+        g.epoch()
+        g.check(targets[0][0], targets[0][1], store.Status.OK, "fine (test)")
+        mixed = g.html()
+        band = mixed[mixed.find("class='band"):][:220]
+        results.check(
+            "a partly-unknown board states the grey count in the band itself",
+            "band ok" in mixed and "reported nothing" in band,
+            "the band on a board with 1 green and %d unknown rows reads %r -- so "
+            "'we could not ask' is presented as if it were the same as 'it "
+            "answered green', which is the collapse this project is built "
+            "against" % (len(targets) - 1, band))
+
+        # THE THIRD CASE: rows ARE red or amber, so they are listed and neither
+        # empty-case sentence appears. All three cases must be three strings.
+        os.makedirs(os.path.join(tmpdir, "red"), exist_ok=True)
+        r = Dash(os.path.join(tmpdir, "red"))
+        r.epoch()
+        r.check(targets[0][0], targets[0][1], store.Status.FAIL,
+                "38.2 hours, past the limit (test)")
+        r.check(targets[1][0], targets[1][1], store.Status.WARN, "near (test)")
+        red = r.html()
+        results.check(
+            "a board with red and amber rows lists them and prints no empty note",
+            "No check reported a colour" not in red
+            and "reported nothing" not in red
+            and "38.2 hours, past the limit (test)" in red
+            and "band fail" in red,
+            "the red/amber case did not render as the list -- the three "
+            "zero-colour cases are three different documents and this one is "
+            "not an empty note")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_stale_says_so_and_cannot_also_be_ok,
@@ -1056,7 +1148,8 @@ TESTS = (test_empty_store_is_loud,
          test_informational_rows_carry_no_colour,
          test_status_api_is_three_valued,
          test_status_api_is_a_stable_contract,
-         test_the_freshness_hero_tracks_the_staleness_it_leads_with)
+         test_the_freshness_hero_tracks_the_staleness_it_leads_with,
+         test_the_band_never_says_ok_on_a_stale_or_colourless_page)
 
 
 def main():

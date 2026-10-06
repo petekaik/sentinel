@@ -305,6 +305,96 @@ def _rag_counts(items):
     return out
 
 
+def _band_verdict(state):
+    """The band's verdict and its reason. Staleness DOMINATES, exactly as it
+    does in `build_status`.
+
+    WITHOUT THIS BRANCH THE BAND IS A LIAR. A page past three poll intervals
+    still carries the last epoch's coloured rows, and every one of them
+    describes the fleet as it was. A band reading OK above the red STALE banner
+    is the false green this page exists to prevent, and the API already refuses
+    it -- the page must not be the weaker of the two readers.
+    """
+    if state["staleness"] in ("none", "stale"):
+        return "unknown", ("the last collection is too old to say anything about "
+                           "now, whatever the rows below still read")
+    items = _verdict_items(state)
+    verdict, _why = _verdict(items)
+    n = _rag_counts(items)
+    if verdict == "fail":
+        why = "%d checks are red, %d amber" % (n["red"], n["amber"])
+    elif verdict == "warn":
+        why = "%d amber, and nothing red" % n["amber"]
+    elif verdict == "ok":
+        why = "%d checks green, none red or amber" % n["green"]
+        if n["grey"]:
+            # THE BAND MUST NOT LET A READER BELIEVE THE BOARD IS FULLY KNOWN.
+            # The verdict is still ok -- that is the platform's existing rule
+            # and changing it is not this design's business -- but a board where
+            # 15 checks could not be asked is not the same board as one where 15
+            # answered green, and the band is what a phone reads first.
+            #
+            # This sentence and the section note below it overlap deliberately.
+            # Two honest statements on a monitoring page beat one folded-away
+            # count, and the note is where the counts are spelled out.
+            why += "; %d reported nothing" % n["grey"]
+    else:
+        why = "nothing reported a colour"
+    return verdict, why
+
+
+def _verdict_band(state):
+    verdict, why = _band_verdict(state)
+    return ("<div class='band %s'><div class=bst>%s</div>"
+            "<div class=bwhy>%s</div></div>"
+            % (verdict, _esc(verdict.upper()), _esc(why)))
+
+
+def _whats_wrong(state):
+    """The graded rows that are actually a problem, or the honest statement
+    that there are none.
+
+    THE THREE EMPTY CASES ARE THREE DIFFERENT SENTENCES. "No check is red" and
+    "no check reported anything" are not the same fact, and a page that renders
+    one string for both collapses "we could not ask" into "it is fine" -- which
+    is the collapse this whole project is built to prevent.
+    """
+    items = _verdict_items(state)
+    n = _rag_counts(items)
+    flagged = [i for i in items if _status(i["status"]).rag in ("red", "amber")]
+    if flagged:
+        flagged.sort(key=lambda i: (0 if _status(i["status"]).rag == "red" else 1,
+                                    i["target"], i["check_id"]))
+        out = []
+        for it in flagged:
+            rag = _status(it["status"]).rag
+            out.append(
+                "<div class='wcard %s'><div class=wtop>"
+                "<span class='pill %s'>%s</span>"
+                "<span class=wt>%s</span>"
+                "<span class=wc>%s</span></div>"
+                "<div class=wd>%s</div></div>"
+                % (rag, rag, _esc(it["status"]), _esc(it["target"]),
+                   _esc(it["title"]), _esc(it["detail"])))
+        return "".join(out)
+    if n["green"] == 0:
+        return ("<div class=note>No check reported a colour. This is UNKNOWN, "
+                "not a clean fleet.</div>")
+    if n["grey"]:
+        return ("<div class=note>No check is red or amber. %d reported green; "
+                "%d reported nothing and are UNKNOWN.</div>"
+                % (n["green"], n["grey"]))
+    return "<div class=note>No check is red or amber.</div>"
+
+
+def _whats_wrong_section(state):
+    n = len([i for i in _verdict_items(state)
+             if _status(i["status"]).rag in ("red", "amber")])
+    return ("<h2>%s</h2>%s"
+            % (_esc("What's wrong (%d)" % n if n else "What's wrong"),
+               _whats_wrong(state)))
+
+
 def build_status(cfg, conn, now=None):
     """The integration API: a compact, stable status document."""
     state = build_state(cfg, conn, now=now)
@@ -521,6 +611,27 @@ tr.green td:first-child { border-left:3px solid var(--green); }
 .note { background:#171b21; border:1px solid var(--line); border-radius:5px;
         padding:9px 11px; color:var(--dim); font-size:12px; margin:7px 0; }
 a { color:#6cb6ff; }
+.band { padding:11px 13px; border-radius:5px; margin:12px 0 0;
+        border:1px solid var(--line); border-left-width:6px; }
+.band .bst { font-size:19px; font-weight:700; letter-spacing:.01em; }
+.band .bwhy { font-size:12.5px; color:var(--dim); margin-top:1px; }
+.band.ok { border-left-color:var(--ok); background:#101a12; }
+.band.warn { border-left-color:var(--warn); background:#1d1a10; }
+.band.fail { border-left-color:var(--fail); background:#1f1113; }
+.band.unknown { border-left-color:var(--unknown); background:var(--panel); }
+.band.ok .bst { color:#8fdc9f; }
+.band.warn .bst { color:#e8c46a; }
+.band.fail .bst { color:#ff9d99; }
+.band.unknown .bst { color:#a8b0bd; }
+.wcard { border:1px solid var(--line); border-left-width:5px; border-radius:5px;
+         padding:10px 12px; background:var(--panel); margin:7px 0; }
+.wcard.red { border-left-color:var(--red); }
+.wcard.amber { border-left-color:var(--amber); }
+.wcard .wtop { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; }
+.wcard .wt { font-size:13px; }
+.wcard .wc { font-size:11.5px; color:var(--dim); }
+.wcard .wd { font-size:12px; color:var(--dim); margin-top:5px;
+             overflow-wrap:anywhere; }
 """
 
 
@@ -591,6 +702,11 @@ def render_html(state, cfg):
 
     # ---- the hero: how current this page is --------------------------------
     a(_freshness(state))
+
+    # ---- the band: the verdict, with staleness dominating it ----------------
+    a(_verdict_band(state))
+
+    a(_whats_wrong_section(state))
 
     # ---- the staleness banner, FIRST, and it degrades the whole page ---------
     st = state["staleness"]

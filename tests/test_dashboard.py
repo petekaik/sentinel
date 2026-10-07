@@ -982,12 +982,19 @@ def test_the_freshness_hero_tracks_the_staleness_it_leads_with(results):
             # carries `'hero none'` as a class string, so a document-wide search
             # for "hero %s" now finds it on EVERY board -- measured: a fresh
             # board counted ['fresh', 'none'], and this check went red the moment
-            # the failure branch started neutralising the hero. The script's own
-            # text is asserted in the reactive-layer test; what this loop is
+            # the failure branch started neutralising the hero. What this loop is
             # about is the hero the renderer draws, so the scripts come out
-            # first. That the page then still finds exactly one state is what
-            # makes this a scoping change and not a weakening: a hero that
-            # stopped tracking staleness still reds it.
+            # first -- and they are the ONLY thing it removes, because the
+            # document carries exactly one <script>. That the page then still
+            # finds exactly one state is what makes this a scoping change and not
+            # a weakening: a hero that stopped tracking staleness still reds it.
+            #
+            # AND THE SCRIPT'S OWN UNREACHABLE BRANCH IS ASSERTED NOWHERE. The
+            # reactive-layer test asserts the fetch literal, the catch, the
+            # disclosure restore and the scroll -- not the hero reset. A rename
+            # there is caught by READING this file, not by a check. That is the
+            # accepted ceiling for a suite that cannot execute JavaScript, and it
+            # is named here so nobody infers coverage this comment used to imply.
             page = re.sub(r"<script.*?</script>", "", html, flags=re.S)
             present = [s for s in ("fresh", "lagging", "stale", "none")
                        if "hero %s" % s in page]

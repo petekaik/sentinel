@@ -61,7 +61,7 @@ def _val(text):
         return text[1:-1].replace("\\\\", "\\")
     if len(text) >= 2 and text[0] == text[-1] == "'":
         return text[1:-1].replace("''", "'")
-    return text
+    return text.split(" #", 1)[0].rstrip()
 
 
 _RULE_KEYS = ("domain", "resources", "networks", "policy")
@@ -136,7 +136,7 @@ def _rules(authelia):
                 key = name
             consumed += 1
         elif indent == 8 and cur is not None and key:
-            if not text.startswith("- "):
+            if not text.startswith("- ") or not isinstance(cur.get(key), set):
                 continue
             cur[key].add(_val(text[2:]))
             consumed += 1
@@ -229,6 +229,21 @@ def test_the_proxy_keeps_its_two_deliberate_holes(results):
         "with the catch-all open the whole dashboard is public"
         % (default_policy, len(catch_all),
            sorted({r["policy"] for r in catch_all})))
+    # ORDER IS PART OF THE MEANING. Authelia evaluates the rules top-down and the
+    # FIRST MATCH WINS, so any rule that matches every path swallows every rule
+    # below it. Moving the catch-all one line up kills BOTH deliberate holes at
+    # once -- /healthz starts demanding two factors, so a broken login can no
+    # longer be told from a dead monitor, and the LAN's curl reads an HTML login
+    # page instead of JSON -- and every check above stayed green without this one.
+    # Measured: the catch-all moved to the front of `rules:` gave 9 checks, 0
+    # failed, on the real suite in a scratch tree.
+    results.check(
+        "the catch-all is the last rule, so the two holes above it are reachable",
+        len(catch_all) == 1 and catch_all[0] is rules[-1],
+        "the rule that matches every path is not last, and Authelia evaluates the "
+        "rules top-down with the first match winning -- a catch-all that is not "
+        "last swallows both deliberate holes, so /healthz and the LAN's curl both "
+        "end up needing two factors")
     results.check(
         "the proxy and the auth service are both declared",
         {"nginx-proxy-manager", "authelia"} <= _services(compose),

@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import threading
@@ -1712,6 +1713,14 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
             # `raw[-12:-8]` is b'\x00\x00\x00\x00' and `raw[-8:-4]` is b'IEND'.
             # The earlier form asserted a slice that can never hold it, so this
             # check could only ever fail.
+            # DECLARED VS ACTUAL, and this is the residual instance of the class
+            # two neighbouring checks were fixed for. The manifest tells iOS the
+            # icon is 180x180; nothing compared that to the file. A mismatch is
+            # rescaled or ignored SILENTLY, which is the fallback that never says
+            # so. `man` is the parsed manifest from the check above, and on a
+            # parse failure it has no "icons" key -- so this fails CLOSED.
+            declared = ({i["src"]: i.get("sizes") for i in man.get("icons", [])}
+                        if isinstance(man, dict) else {})
             for path in [p for p in web.shell.ASSETS if p.endswith(".png")]:
                 code, hdrs, raw = _get_bytes(base + path)
                 results.check(
@@ -1721,6 +1730,16 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
                     "code=%s first8=%r last8=%r -- iOS will not accept an SVG "
                     "here, and a truncated file falls back to a screenshot "
                     "without saying so" % (code, raw[:8], raw[-8:]))
+                w, h = (struct.unpack(">II", raw[16:24]) if len(raw) >= 24
+                        else (0, 0))
+                results.check(
+                    "%s is the size the manifest declares" % path,
+                    code == 200 and w > 0
+                    and declared.get(path) == "%dx%d" % (w, h),
+                    "the manifest declares %r for this path and the file's own "
+                    "IHDR says %dx%d -- iOS trusts the declaration, so a "
+                    "mismatch is rescaled or ignored without saying so"
+                    % (declared.get(path), w, h))
             # THE ORDERING THAT MAKES THE SHELL WORTH ANYTHING, and it was the
             # one structural claim this task made with no guard behind it. The
             # shell branch sits ahead of the store precisely so the installed app
@@ -1847,9 +1866,10 @@ def test_the_refresh_script_has_the_hooks_it_looks_for(results):
         results.check(
             "the script restores disclosure by the ids the renderer emits",
             "d.id" in html and "id='sec-checks'" in html
-            and "d.open = true" in html,
-            "the script does not snapshot and restore by id, so an open section "
-            "snaps shut every interval -- or reopens the wrong one")
+            and "st[d.id] = d.open" in html and "d.open = st[id]" in html,
+            "the script does not snapshot and restore disclosure by id, so an "
+            "open section snaps shut every interval -- or reopens the wrong one, "
+            "or comes back open after the reader closed it")
         results.check(
             "the scroll position survives the swap",
             "scrollY" in html and "scrollTo" in html,

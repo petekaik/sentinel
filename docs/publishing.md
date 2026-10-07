@@ -133,10 +133,15 @@ nginx a name it does not know is substituted as **empty**, so the redirect would
 silently point at `https://` and send you back to a login page you had already
 passed.
 
-It goes in the proxy host's **Advanced** tab, as an internal `location` that
-`location /` reaches through `auth_request`. `/api/verify` is Authelia 4.38's
-endpoint and **is slated for removal in v5**, which is why this value is filled
-in from the step here rather than hardcoded in prose anywhere else.
+The mechanism is `auth_request`: an internal `location` on the proxy host that
+`location /` consults, and the value above is what that location passes to
+Authelia's verify endpoint. **If this NPM version has a forward-auth field that
+fills that location in for you, use it instead of hand-writing one** — the value
+is the same either way, and whether the wiring is live and whether the LAN rule
+is actually scoped are the two things the test in the next section settles.
+`/api/verify` is Authelia 4.38's endpoint and **is slated for removal in v5**,
+which is why this value is filled in here rather than hardcoded in prose
+anywhere else.
 
 No special case for `/healthz` is needed on the NPM side, and none should be
 added: NPM asks Authelia about every request and **Authelia decides**, per the
@@ -157,27 +162,47 @@ file and nowhere else. So, in the same **Advanced** tab on the proxy host:
 proxy_set_header X-Forwarded-For $remote_addr;
 ```
 
-**Then prove it. The snippet above is the instruction; this test is the
-authority on whether it works.** Run it from a machine that is **not** on
+**Then prove it. The snippet above is the instruction; these two commands are the
+authority on whether it works.** Run both from a machine that is **not** on
 `198.51.100.0/24` — a phone on cellular, or any host outside the LAN:
 
 ```bash
+# 1. A request claiming to be from the LAN. This is the one that matters.
 curl -s -o /dev/null -w '%{http_code}\n' \
-     -H 'X-Forwarded-For: 169.254.1.2' https://${DOMAIN}/api/status.json
+     -H 'X-Forwarded-For: 198.51.100.5' https://${DOMAIN}/api/status.json
+
+# 2. A request with no header at all.
+curl -s -o /dev/null -w '%{http_code}\n' https://${DOMAIN}/api/status.json
 ```
 
-**It must print `302`. A `200` means the rule matched and the API is public.**
-The test exploits the very trust the header relies on: a request claiming to
-come from `169.254.1.2` — link-local, not the LAN — must be turned away by the
-login redirect.
+**Both must print `302`. A `200` from either one means the API is public.**
 
-**If it prints `200`, close the API hole entirely:** delete the `/api` rule from
-`proxy/authelia/configuration.yml` and leave `/healthz` as the only bypass. A
-hole that cannot be shown to be scoped is not scoped, and the direct
-`http://198.51.100.11:8787/api/status.json` path in step 5 keeps working without
-it. Say here that it was closed and why — and expect the suite's "exactly two
-rules bypass authentication" check to fail from then on, deliberately: that is
-the guard reporting the decision, not a test to bend back.
+The first command is the test, and it is a test because it can fail. A client
+claiming a **LAN** address is the exact forgery the line exists to defeat: if
+nginx forwards the client's header to the subrequest, Authelia reads
+`198.51.100.5`, matches the `/api` rule, and answers `200` to the whole internet.
+With the line reaching the subrequest, the client's claim is replaced by the real
+source address — which is not on the LAN — and the answer is the login redirect.
+A `302` therefore proves both halves at once: the request was turned away, so
+Authelia was asked and the LAN rule did not match.
+
+**This replaces an earlier version of this test that claimed `169.254.1.2`, and
+why it was replaced is worth keeping.** That address is outside the LAN whether
+the scoping holds or not, so a forwarded header made it print `302` on a
+completely unscoped hole: its expected-pass value and its failure value were the
+same number. Following it could have left the fleet-status API world-readable
+while reading as proof that it was scoped.
+
+**If either command prints `200`, first check where the line landed.** It has to
+reach the location that `auth_request` dispatches to — the subrequest — not the
+request to sentinel; if it is in the wrong place, move it and run the two
+commands again. **If they still print `200`, close the API hole entirely:**
+delete the `/api` rule from `proxy/authelia/configuration.yml` and leave
+`/healthz` as the only bypass. A hole that cannot be shown to be scoped is not
+scoped, and the direct `http://198.51.100.11:8787/api/status.json` path in step 5
+keeps working without it. Say here that it was closed and why — and expect the
+suite's "exactly two rules bypass authentication" check to fail from then on,
+deliberately: that is the guard reporting the decision, not a test to bend back.
 
 ## 4. Enroll the passkey
 

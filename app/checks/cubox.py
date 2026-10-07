@@ -467,7 +467,7 @@ class JobHeartbeat(_BoxCheck):
 
     id = "heartbeat_age_min"
     spec = "heartbeat_age_min"
-    title = "age of the current job"
+    title = "Age of the current job"
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -602,7 +602,7 @@ class OrphanParts(_BoxCheck):
 
     id = "orphan_parts"
     spec = "orphan_parts"
-    title = "job temps with no pass in flight"
+    title = "Job temps with no pass in flight"
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
@@ -930,7 +930,7 @@ class StateDirOnTmpfs(_BoxCheck):
 class WorkerDrift(_BoxCheck):
     id = "worker_drift"
     spec = None
-    title = "worker.sh matches the generation this box applied"
+    title = "Worker.sh matches the generation this box applied"
 
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)

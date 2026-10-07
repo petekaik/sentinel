@@ -119,7 +119,7 @@ class EnvFailLines(_BoxLogCheck):
 
     id = "env_fail_lines"
     spec = "env_fail_lines"
-    title = "environment failures (worker refused to act)"
+    title = "Environment failures (worker refused to act)"
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -214,7 +214,7 @@ class JobFailures(_BoxLogCheck):
 
     id = "job_failures"
     spec = "job_failures"
-    title = "transcode job failures"
+    title = "Transcode job failures"
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -269,7 +269,7 @@ class Strikes(_BoxLogCheck):
 
     id = "strikes"
     spec = "strikes"
-    title = "files with failed attempts and no output yet"
+    title = "Files with failed attempts and no output yet"
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -357,7 +357,7 @@ class RetiredFiles(_BoxLogCheck):
 
     id = "retired_files"
     spec = "retired_files"
-    title = "files retired at MAX_ATTEMPTS (will never transcode)"
+    title = "Files retired at MAX_ATTEMPTS (will never transcode)"
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -413,7 +413,7 @@ class StateOnTmpfs(_BoxLogCheck):
 
     id = "state_on_tmpfs"
     spec = None                      # logic-only: any occurrence is a fault
-    title = "worker is persisting state to tmpfs (NOT durable)"
+    title = "Worker is persisting state to tmpfs (NOT durable)"
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -479,7 +479,7 @@ class PassCadence(_BoxLogCheck):
 
     id = "pass_cadence_min"
     spec = "pass_cadence_min"
-    title = "time since last pass start"
+    title = "Time since last pass start"
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -633,7 +633,7 @@ class LogParserWatch(_BoxLogCheck):
 
     id = "log_parse_failures"
     spec = "log_parse_failures"
-    title = "worker log lines this parser does not recognise"
+    title = "Worker log lines this parser does not recognise"
 
     def run(self, ctx):
         se, wl = self._log(ctx)
@@ -682,7 +682,7 @@ class StateExportPresent(Check):
     id = "state_export_present"
     spec = None
     target = "backup"
-    title = "per-device state exports readable"
+    title = "Per-device state exports readable"
 
     def run(self, ctx):
         unreadable, gone, present = [], [], []
@@ -739,7 +739,7 @@ class StateExportFresh(Check):
     id = "state_export_fresh"
     spec = None
     target = "backup"
-    title = "state export log advancing (proxy for a stale mount)"
+    title = "State export log advancing (proxy for a stale mount)"
 
     def run(self, ctx):
         rows = []

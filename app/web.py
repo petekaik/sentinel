@@ -762,10 +762,11 @@ summary:focus-visible { outline:2px solid #6cb6ff; outline-offset:2px; }
 # DOM: the server stays the only thing that knows how to draw this page.
 #
 # TWO FAILURE MODES ARE DESIGNED IN, because both are the stale-sample defect in
-# new clothes. If the fetch fails, the banner flips to UNKNOWN naming the
-# monitor as unreachable -- a page that has stopped being able to check must not
-# go on asserting health. If the swap brings a stale page, that page carries its
-# own red banner and arrives stating its own age.
+# new clothes. If the fetch fails, the band AND the hero above it both flip to
+# UNKNOWN, naming the monitor as unreachable -- a page that has stopped being
+# able to check must not go on asserting health, and the freshness claim is the
+# one that asserts it loudest. If the swap brings a stale page, that page carries
+# its own red banner and arrives stating its own age.
 REFRESH_JS = """
 (function () {
   var el = document.getElementById('live');
@@ -776,21 +777,38 @@ REFRESH_JS = """
     // BY ID, NOT BY POSITION. The incidents section appears and disappears as
     // incidents open and resolve, so an index shifts and the wrong section
     // reopens -- a bug that only shows up on the one day it matters.
-    var ids = [];
+    //
+    // BOTH STATES, NOT ONLY THE OPEN ONES. Recording only the open sections meant
+    // a section the reader had COLLAPSED came back open every interval: the swap
+    // reinstates the server's own default and nothing ever closes it again. A
+    // section the reader shut is a decision, and the swap has to carry it the
+    // same way it carries an open one.
+    var st = {};
     el.querySelectorAll('details').forEach(function (d) {
-      if (d.open && d.id) { ids.push(d.id); }
+      if (d.id) { st[d.id] = d.open; }
     });
-    return ids;
+    return st;
   }
 
-  function restore(ids) {
-    ids.forEach(function (id) {
+  function restore(st) {
+    Object.keys(st).forEach(function (id) {
       var d = el.querySelector('#' + CSS.escape(id));
-      if (d) { d.open = true; }
+      if (d) { d.open = st[id]; }
     });
   }
 
   function unreachable() {
+    // THE HERO TOO, NOT ONLY THE BAND. The band carries the verdict, but the
+    // hero carries the freshness claim above it, and leaving the hero alone puts
+    // "12s ago" with a green bar directly over "cannot reach the monitor" -- a
+    // page asserting a fresh reading it can no longer take.
+    var h = el.querySelector('.hero');
+    if (h) {
+      h.className = 'hero none';
+      h.innerHTML = '<div class=hage>unknown</div>' +
+                    '<div class=hsub>this page can no longer reach the ' +
+                    'monitor</div>';
+    }
     var b = el.querySelector('.band');
     if (b) {
       b.className = 'band unknown';
@@ -802,7 +820,17 @@ REFRESH_JS = """
 
   function tick() {
     if (document.hidden) { return; }
-    fetch('/', {cache: 'no-store'}).then(function (r) {
+    // A PROXY THAT HANGS IS NOT A PROXY THAT REFUSES. A refused connection
+    // reaches the catch at once; one that accepts and never answers leaves the
+    // fetch pending forever, so neither branch below ever runs and the page
+    // keeps its old, green self. Twice the poll interval, so a slow-but-working
+    // poll can never trip it.
+    var ctl = (typeof AbortController === 'function')
+                ? new AbortController() : null;
+    var to = ctl ? setTimeout(function () { ctl.abort(); },
+                              Math.max(3000, ms * 2)) : null;
+    fetch('/', {cache: 'no-store',
+                signal: ctl ? ctl.signal : undefined}).then(function (r) {
       if (!r.ok) { throw new Error('http ' + r.status); }
       return r.text();
     }).then(function (text) {
@@ -814,7 +842,9 @@ REFRESH_JS = """
       el.innerHTML = fresh.innerHTML;
       restore(prev);
       window.scrollTo(0, y);
-    }).catch(unreachable);
+    }).catch(unreachable).then(function () {
+      if (to) { clearTimeout(to); }
+    });
   }
 
   function arm() {
@@ -932,12 +962,12 @@ def render_html(state, cfg):
     # ---- the band: the verdict, with staleness dominating it ----------------
     a(_verdict_band(state))
 
-    # ---- the strip: one segment per graded check, grouped by target --------
-    a(_tally_strip(state))
-
-    a(_whats_wrong_section(state))
-
-    # ---- the staleness banner, FIRST, and it degrades the whole page ---------
+    # ---- the staleness banner: directly under the band, so that everything
+    # BELOW it is the fleet's rows and the sentence it carries about them is
+    # true. Above it sit only the hero (this page's age) and the band (which
+    # staleness already dominates, so it cannot assert a green fleet). It used to
+    # sit after the wrong-rows section, and then "EVERYTHING BELOW DESCRIBES THE
+    # FLEET AS IT WAS" excluded the one section an operator reads first.
     st = state["staleness"]
     if st == "none":
         a("<div class='banner none'>NO COLLECTION HAS EVER BEEN RECORDED. The "
@@ -965,6 +995,11 @@ def render_html(state, cfg):
 
     if state["last"] and state["last"].get("note"):
         a("<div class=note>collector note: %s</div>" % _esc(state["last"]["note"]))
+
+    # ---- the strip: one segment per graded check, grouped by target --------
+    a(_tally_strip(state))
+
+    a(_whats_wrong_section(state))
 
     tally = _tally(state)
     a("<div class=sub style='margin-top:8px'>%d green &middot; %d amber &middot; "

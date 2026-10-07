@@ -926,7 +926,7 @@ def test_parity_and_its_blind_spot(results):
 # tests/fixtures/worker.box-cubox-{1,2}-2026-09-26.sh. The first case below proves
 # that rather than trusting the constant -- a constant typed twice is how a test
 # comes to agree with a bug (item 84).
-BOX_WORKER_MD5 = "2d85bda959825faa9b6e8d4fb0d5fe1f"
+BOX_WORKER_MD5 = "7211f889ebec68cec1af153924fb1548"
 
 
 def test_worker_drift_grades_against_the_boxes_own_generation(results):

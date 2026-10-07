@@ -35,6 +35,15 @@ CUBOX_IDS = ("cubox-1", "cubox-2")
 # Measured 2026-09-26. The CuBoxes run as root (their authorized_keys is baked
 # into the read-only rootfs from mac_id.pub); Backup-NAS's admin user is the QTS
 # administrator account, and the export path below is under its share.
+#
+# THE ADDRESSES ARE PLACEHOLDERS FROM RFC 5737's DOCUMENTATION RANGE, and a
+# deployment MUST override every one of them -- MONITOR_HOST_<NAME>_ADDR in the
+# gitignored .env, which is the commented block .env.example carries. They are
+# not defaults anybody should run against: a monitor left on 198.51.100.0/24
+# reports the whole fleet UNKNOWN. That is the honest answer (absent data is
+# never green) and it is also indistinguishable from the outage this exists to
+# catch, so an override is part of deploying, not an optimisation. The real
+# addresses are deployment values and are deliberately not in this repo.
 _DEFAULT_HOSTS = {
     "cubox-1": ("198.51.100.31", "root"),
     "cubox-2": ("198.51.100.32", "root"),
@@ -162,6 +171,9 @@ class Config:
         # the same 401 as no password, so credentials need their own probe to be
         # believed.
         self.tvh_user = _env("TVH_USER", "", e)
+        # A documentation-range placeholder for the same reason _DEFAULT_HOSTS
+        # carries them: TVH_URL is a deployment value, and set against this one
+        # the TVH checks report UNKNOWN rather than a wrong grade.
         self.tvh_url = _env("TVH_URL", "http://198.51.100.12:9981", e)
         # How much of the container log one collection reads. This is a WINDOW
         # SIZE, not a detail: the DVR-pairing check pairs a recording's

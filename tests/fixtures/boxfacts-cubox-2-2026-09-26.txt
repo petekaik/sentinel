@@ -7,7 +7,7 @@ kernel           6.1.0-50-armmp
 debian           12.15
 rootfs_dev       198.51.100.20:/cubpxe/nfsroot
 rootfs_fstype    nfs
-worker_etc       2d85bda959825faa9b6e8d4fb0d5fe1f
+worker_etc       7211f889ebec68cec1af153924fb1548
 worker_lib       
 worker_paths     config.default transcode-ctl worker.sh 
 transcode_ctl    48f12b090899d311e511d6e3875eff83

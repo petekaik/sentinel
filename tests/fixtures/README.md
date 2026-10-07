@@ -6,6 +6,22 @@ from the real artifact rather than restated (item 45: a check is a restatement o
 the code it searches for until it is written by different code). A fixture typed
 from memory tests the memory, not the fleet.
 
+**AND EVERY ONE OF THEM HAS SINCE BEEN SANITISED**, on 2026-10-07: the real
+home-LAN addresses and the two `boot_id` values were replaced with placeholders
+throughout, because this tree was being prepared for publication. The
+substitution was mechanical and applied uniformly — to the fixtures, the code
+and the docs together — so the *relationships* a parser reads are intact: a
+fixture that records a mount coming from `198.51.100.10` still records a mount
+coming from the same host the code was rewritten to expect.
+
+What is lost is precisely what the paragraph above is about. These are no longer
+verbatim captures, so they can still prove a parser agrees with itself and can no
+longer prove it agrees with the fleet. `tests/test_shared_layer.py`'s
+`BOX_WORKER_MD5` was recomputed over the sanitised file: it still catches a
+fixture edited on its own, but it is now the digest of a redacted artifact and
+says nothing about what a box actually runs. **Re-capture from a live box before
+trusting any conclusion drawn from these.**
+
 Re-capture any of these with the commands in each row.
 
 | File | Source | How it was captured |

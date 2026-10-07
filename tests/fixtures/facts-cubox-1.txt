@@ -9,7 +9,7 @@ rootfs_fstype   nfs
 vmlinuz         vmlinuz-6.1.0-50-armmp 
 initrd          /boot/initrd.img-6.1.0-50-armmp 19546619 Sep 25 13:42|
 --- the worker and its unit
-worker_etc      2d85bda959825faa9b6e8d4fb0d5fe1f
+worker_etc      7211f889ebec68cec1af153924fb1548
 worker_lib      
 worker_paths    config.default transcode-ctl worker.sh 
 unit_state      active / enabled

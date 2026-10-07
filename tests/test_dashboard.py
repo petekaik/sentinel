@@ -978,8 +978,19 @@ def test_the_freshness_hero_tracks_the_staleness_it_leads_with(results):
 
         for name, html in (("fresh", fresh), ("lagging", lagging),
                            ("stale", stale), ("none", never)):
+            # THE RENDERED PAGE, NOT THE SCRIPT THAT SWAPS IT. `REFRESH_JS`
+            # carries `'hero none'` as a class string, so a document-wide search
+            # for "hero %s" now finds it on EVERY board -- measured: a fresh
+            # board counted ['fresh', 'none'], and this check went red the moment
+            # the failure branch started neutralising the hero. The script's own
+            # text is asserted in the reactive-layer test; what this loop is
+            # about is the hero the renderer draws, so the scripts come out
+            # first. That the page then still finds exactly one state is what
+            # makes this a scoping change and not a weakening: a hero that
+            # stopped tracking staleness still reds it.
+            page = re.sub(r"<script.*?</script>", "", html, flags=re.S)
             present = [s for s in ("fresh", "lagging", "stale", "none")
-                       if "hero %s" % s in html]
+                       if "hero %s" % s in page]
             results.check(
                 "the %s board renders exactly one hero state, and it is %s"
                 % (name, name),

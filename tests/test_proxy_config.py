@@ -273,14 +273,19 @@ def test_the_proxy_keeps_its_two_deliberate_holes(results):
     runbook = _read("docs", "publishing.md")
     results.check(
         "the runbook says how the LAN bypass is made to actually hold",
-        "X-Forwarded-For" in runbook and "198.51.100.5" in runbook,
+        "proxy_set_header X-Forwarded-For $remote_addr;" in runbook
+        and "198.51.100.5" in runbook,
         "the runbook does not carry the X-Forwarded-For instruction and a test "
         "that claims a LAN address from outside the LAN -- a forward-auth "
         "subrequest comes from nginx, so without that header Authelia matches "
         "NPM's own address, which is inside 198.51.100.0/24, and 'LAN only' "
-        "silently means everyone. THE ADDRESS IT CLAIMS IS A LAN ONE ON PURPOSE: "
-        "169.254.1.2 is turned away whether or not the scoping holds, so a test "
-        "using it prints its pass value on a broken hole and can only ever pass")
+        "silently means everyone. THE INSTRUCTION IS ASSERTED, NOT THE TOKEN: a "
+        "bare 'X-Forwarded-For' stays present in the prose and in the curl "
+        "header after the line itself is deleted -- measured green at 10 checks, "
+        "0 failed -- so it could not fail on the deletion it names. THE ADDRESS "
+        "THE TEST CLAIMS IS A LAN ONE ON PURPOSE: 169.254.1.2 is turned away "
+        "whether or not the scoping holds, so a test using it prints its pass "
+        "value on a broken hole and can only ever pass")
 
 
 TESTS = (test_the_proxy_keeps_its_two_deliberate_holes,)

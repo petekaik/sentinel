@@ -86,6 +86,17 @@ def _rows(conn, sql, args=()):
     return rows, len(rows)
 
 
+# THE NEWEST EPOCH'S ROWS, in one statement, and NAMED rather than inlined
+# because `tests/test_dashboard.py` asserts that the store can serve it with an
+# index. A check that re-typed this SQL would agree with any change to it
+# (items 84, 58) -- and the failure it guards is invisible: without
+# `check_run_epoch` this is a full scan, correct in every output and slow enough
+# that the page looks like a dead monitor. See the index in store.py's SCHEMA.
+NEWEST_EPOCH_SQL = ("SELECT target, check_id, status, detail, ts, epoch_seq "
+                    "FROM check_run "
+                    "WHERE epoch_seq = (SELECT MAX(epoch_seq) FROM check_run)")
+
+
 def build_state(cfg, conn, now=None):
     """Everything the page renders, as plain data. No HTML, no side effects."""
     now = now if now is not None else time.time()
@@ -109,10 +120,7 @@ def build_state(cfg, conn, now=None):
     classes = checks.registry(*checks.all_modules())
     claimed, deferred, unclaimed = thresholds.audit(specs, classes)
 
-    current, n_current = _rows(
-        conn, "SELECT target, check_id, status, detail, ts, epoch_seq "
-              "FROM check_run "
-              "WHERE epoch_seq = (SELECT MAX(epoch_seq) FROM check_run)")
+    current, n_current = _rows(conn, NEWEST_EPOCH_SQL)
     by_key = {(r["target"], r["check_id"]): r for r in current}
 
     incidents, n_incidents = _rows(

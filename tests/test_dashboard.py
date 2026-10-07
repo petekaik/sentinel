@@ -1901,6 +1901,46 @@ def test_the_refresh_script_has_the_hooks_it_looks_for(results):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+
+def test_the_newest_epoch_read_uses_an_index(results):
+    """The dead-man switch cannot take ten seconds to answer.
+
+    WHY THIS IS A TEST RATHER THAN A COMMENT ON THE INDEX. The query is CORRECT
+    either way; what changes is how long the page takes, and that failure has no
+    symptom in any output this suite otherwise reads. Measured on the live store
+    2026-10-07 at 807,263 `check_run` rows and 425 MB: 5.8 s for this one
+    statement, build_state at 10-14 s -- slower than the container's own 5 s
+    healthcheck, so a monitor collecting perfectly reported as a dead one. That
+    is the confusion this whole platform exists to prevent, and it arrives with
+    no red anything.
+
+    THE PLAN, NOT A STOPWATCH, is what makes the assertion deterministic:
+    `SCAN check_run` is what SQLite says when it has no usable index, on a table
+    of any size -- measured on an empty store as well as a populated one, since
+    a timing threshold here would be a test that fails on a busy NAS instead of
+    on a missing index.
+
+    THE SQL IS IMPORTED, NOT RE-TYPED: `web.NEWEST_EPOCH_SQL` is the statement
+    build_state runs, so this cannot stay green while guarding a different query
+    than the one that got slow (items 84, 58).
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = make_cfg(os.path.join(tmpdir, "monitor.sqlite"))
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        plan = [r[3] for r in
+                conn.execute("EXPLAIN QUERY PLAN " + web.NEWEST_EPOCH_SQL)]
+        conn.close()
+    results.check(
+        "the newest-epoch read is an indexed lookup, not a full scan",
+        not any(p.startswith("SCAN check_run") for p in plan),
+        "the store has no index on check_run(epoch_seq) that the newest-epoch "
+        "read can use, so the query every dashboard request runs scans the whole "
+        "table -- plan: %r. It stays correct and gets slower with every epoch, "
+        "which is why nothing else notices: the page takes seconds to answer, "
+        "and a live monitor then reads as a dead one" % (plan,))
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
@@ -1918,7 +1958,8 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_strip_makes_all_grey_a_different_shape_from_all_green,
          test_the_page_names_the_platform_and_never_colours_alone,
          test_the_app_shell_may_cache_and_nothing_else_may,
-         test_the_refresh_script_has_the_hooks_it_looks_for)
+         test_the_refresh_script_has_the_hooks_it_looks_for,
+         test_the_newest_epoch_read_uses_an_index)
 
 
 def main():

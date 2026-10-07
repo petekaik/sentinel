@@ -164,6 +164,18 @@ CREATE TABLE IF NOT EXISTS check_run (
 );
 CREATE INDEX IF NOT EXISTS check_run_lookup ON check_run (target, check_id, epoch_seq);
 
+-- AND ONE ON `epoch_seq` ALONE, because `check_run_lookup` cannot serve the read
+-- that happens on EVERY dashboard request: its leading column is `target`, so the
+-- `epoch_seq` equality in web.py's newest-epoch query -- and the `MAX(epoch_seq)`
+-- subquery inside it -- both degrade to a FULL SCAN of the whole table. Measured
+-- on the live store 2026-10-07 at 807,263 rows / 425 MB: 5.8 s for that single
+-- query and 10-14 s for the page build. That is long enough that the dashboard
+-- answered after its own 5 s healthcheck had already given up, so a running
+-- monitor reported as a dead one -- the exact confusion this platform exists to
+-- prevent. With this index the same query is 0.006 s, and it stays a lookup as
+-- the table grows rather than a scan that grows with it.
+CREATE INDEX IF NOT EXISTS check_run_epoch ON check_run (epoch_seq);
+
 -- Deliberately SEPARATE from check outcomes. This is what makes "no data" and
 -- "no problem" distinguishable after the fact: it records that we TRIED, even
 -- when the attempt yielded nothing to check.

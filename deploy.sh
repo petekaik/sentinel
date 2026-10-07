@@ -194,13 +194,13 @@ PUB="$KEY.pub"
 # skip the comparison, because skipping it reports a working credential for a
 # key every CuBox would refuse. That is items 46/62 -- "I could not ask" and
 # "the answer is no" get different remedies, so they get different messages.
-FLEET_REPO="${FLEET_REPO:-$HOME/projects/pvr-cubox-plan}"
+FLEET_REPO="${FLEET_REPO:-$HOME/projects/pvr-cubox-fleet}"
 FLEET_PUB="$FLEET_REPO/configs/rootfs/monitor_id.pub"
 [ -s "$FLEET_PUB" ] || die "cannot read $FLEET_PUB
        That file is the fleet's record of the public key its image installs, and
        without it this script cannot tell whether the monitor's key would be
        accepted by a CuBox. It lives in the FLEET repo -- set
-       FLEET_REPO=/path/to/pvr-cubox-plan if it is not at the default location.
+       FLEET_REPO=/path/to/pvr-cubox-fleet if it is not at the default location.
        This is NOT a licence to skip the check: a monitor whose key no longer
        matches the fleet reports every box as UNKNOWN and looks like an outage."
 cmp -s "$PUB" "$FLEET_PUB" || die \

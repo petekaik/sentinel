@@ -43,7 +43,7 @@ new text parsed puts a parser in `parsers.py`.
 ## Rules that keep it honest
 
 These are the platform's whole value, and each has a measured failure behind it in
-`~/projects/pvr-cubox-plan/docs/08-forensic-lessons.md` — read the item before
+`~/projects/pvr-cubox-fleet/docs/08-forensic-lessons.md` — read the item before
 touching the area.
 
 - **Absent data is never green.** Three-valued grading: OK / WARN / FAIL / UNKNOWN,
@@ -58,7 +58,7 @@ touching the area.
   resolve — item 75, which reported five consecutive `ok` observations against a
   row still `open`.
 - **A check may depend on the fleet; the fleet must not depend on the check** —
-  item 90. Nothing in `pvr-cubox-plan` may call into here.
+  item 90. Nothing in `pvr-cubox-fleet` may call into here.
 - **A reference copy of anything the fleet owns is a second authority that goes
   stale.** `worker_drift` compares against the box's own applied-generation
   MANIFEST, not a snapshot this repo keeps — item 90, thirteen hours of both
@@ -97,7 +97,7 @@ Fixing these buys nothing until a second adapter exists. Revisit when Unifi land
 
 ## Cross-repo
 
-The only dependency on `pvr-cubox-plan` is `deploy.sh`'s check that this monitor's
+The only dependency on `pvr-cubox-fleet` is `deploy.sh`'s check that this monitor's
 **public** key matches the one the fleet image installs —
 `configs/rootfs/monitor_id.pub`, whose fact is T1 content and stays the fleet's.
 `FLEET_REPO=` relocates the checkout; a missing checkout **fails loudly**, because

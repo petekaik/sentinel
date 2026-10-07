@@ -3,7 +3,7 @@
 A monitoring platform: it watches hosts, stores what it saw, and exposes a status
 API — plus a deliberately narrow set of remedies it is allowed to perform.
 
-**Tenant #1 is the CuBox fleet** (`pvr-cubox-plan`): two SolidRun i4Pro nodes, a
+**Tenant #1 is the CuBox fleet** (`pvr-cubox-fleet`): two SolidRun i4Pro nodes, a
 Storage-NAS, a Backup-NAS and a TVHeadend container. The platform is not built
 around them — they are the first adapter. Unifi gear and home automation are next.
 
@@ -64,7 +64,7 @@ does not belong in a tree that gets a remote.
 | Variable | Default | Why you would set it |
 |---|---|---|
 | `MONITOR_KEY` | `~/.ssh/cubox-monitor_ed25519` | the key lives somewhere else |
-| `FLEET_REPO` | `~/projects/pvr-cubox-plan` | the fleet checkout is elsewhere |
+| `FLEET_REPO` | `~/projects/pvr-cubox-fleet` | the fleet checkout is elsewhere |
 
 `FLEET_REPO` exists for exactly one check: the monitor's **public** key must match
 the one the fleet image installs into `authorized_keys`
@@ -74,7 +74,7 @@ fleet, so this repo reads it rather than owning it. If the checkout is missing,
 box as UNKNOWN and looks like an outage, which is not a thing to skip past.
 
 **The dependency runs one way.** The monitor may depend on the fleet; the fleet
-must not depend on the monitor (item 90). Nothing in `pvr-cubox-plan` calls into
+must not depend on the monitor (item 90). Nothing in `pvr-cubox-fleet` calls into
 here.
 
 ## Tests

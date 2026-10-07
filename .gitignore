@@ -16,3 +16,8 @@ ssh/
 
 # The SQLite store, if anyone ever runs the container from a checkout.
 data/
+
+# Claude Code's per-checkout config. It records which plugins are enabled on
+# THIS machine, which is not a fact about this repo and not something to commit
+# by accident -- a stray `git add -A` would otherwise carry it.
+.claude/

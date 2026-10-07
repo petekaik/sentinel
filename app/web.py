@@ -655,7 +655,18 @@ CSS = """
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--fg);
        font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
-.wrap { max-width:1200px; margin:0 auto; padding:18px 16px 60px; }
+/* THE PAGE INSETS ITSELF, BECAUSE THE VIEWPORT META ASKS IT TO. `viewport-fit=cover`
+   and the black-translucent status bar put the document UNDER the Dynamic Island
+   and the home indicator on purpose, so the page must keep its own content out
+   from behind them -- and `env()` is only non-zero in exactly that configuration.
+   Measured on an iPhone 15 Pro, installed to the home screen 2026-10-07: without
+   this, the title and the target list sat behind the camera housing. Left and
+   right are for landscape, where the island eats one edge. */
+.wrap { max-width:1200px; margin:0 auto;
+        padding:calc(18px + env(safe-area-inset-top, 0px))
+                calc(16px + env(safe-area-inset-right, 0px))
+                calc(60px + env(safe-area-inset-bottom, 0px))
+                calc(16px + env(safe-area-inset-left, 0px)); }
 h1 { font-size:17px; margin:0 0 2px; }
 h2 { font-size:15px; font-weight:600; color:var(--fg); margin:22px 0 8px;
      border-bottom:1px solid var(--line); padding-bottom:5px; }
@@ -694,10 +705,18 @@ h2 { font-size:15px; font-weight:600; color:var(--fg); margin:22px 0 8px;
 .tile .badge { float:right; font-size:10px; padding:1px 6px; border-radius:9px;
                background:#232a34; color:var(--dim); }
 table { width:100%; border-collapse:collapse; font-size:12.5px; }
+/* EVERY TABLE SCROLLS INSIDE ITSELF, NEVER THE PAGE. The incident table is seven
+   columns wide and carries a free-text `detail`, so on a 393 pt screen it forced
+   the DOCUMENT wider and the whole page scrolled sideways under the reader's
+   thumb -- measured on an iPhone 15 Pro 2026-10-07. `overflow-wrap` makes the
+   ordinary case wrap instead; the wrapper is for the genuinely unbreakable token
+   (a path, a digest), where scrolling one table beats scrolling the page. */
+.scroll { overflow-x:auto; }
 th { text-align:left; color:var(--dim); font-weight:500; font-size:11px;
      letter-spacing:.05em; padding:5px 7px;
      border-bottom:1px solid var(--line); }
-td { padding:5px 7px; border-bottom:1px solid #1c212a; vertical-align:top; }
+td { padding:5px 7px; border-bottom:1px solid #1c212a; vertical-align:top;
+     overflow-wrap:anywhere; }
 tr.red td:first-child { border-left:3px solid var(--fail); }
 tr.amber td:first-child { border-left:3px solid var(--warn); }
 tr.grey td:first-child { border-left:3px solid var(--unknown); }
@@ -744,6 +763,14 @@ a { color:#6cb6ff; }
 .strip .seg.red { background:var(--fail); }
 .strip .seg.grey { background:var(--unknown); }
 details { margin:9px 0; border-top:1px solid var(--line); padding-top:8px; }
+/* The pull-to-refresh strip. Height 0 until a pull gives it one, and NO TRANSITION
+   WHILE THE FINGER IS DOWN -- a transition on a height that tracks a thumb lags
+   it. `.settle` is added for the release only. Empty by default, so an element
+   whose script never ran is invisible rather than a claim about anything. */
+.pull { height:0; overflow:hidden; display:flex; align-items:center;
+        justify-content:center; font-size:11.5px; color:var(--dim); }
+.pull.settle { transition:height .18s ease; }
+.pull.ready, .pull.busy { color:var(--fg); }
 summary { cursor:pointer; font-size:13px; color:var(--fg); padding:5px 0;
           list-style:none; }
 summary::-webkit-details-marker { display:none; }
@@ -827,7 +854,7 @@ REFRESH_JS = """
   }
 
   function tick() {
-    if (document.hidden) { return; }
+    if (document.hidden) { return Promise.resolve(); }
     // A PROXY THAT HANGS IS NOT A PROXY THAT REFUSES. A refused connection
     // reaches the catch at once; one that accepts and never answers leaves the
     // fetch pending forever, so neither branch below ever runs and the page
@@ -837,7 +864,7 @@ REFRESH_JS = """
                 ? new AbortController() : null;
     var to = ctl ? setTimeout(function () { ctl.abort(); },
                               Math.max(3000, ms * 2)) : null;
-    fetch('/', {cache: 'no-store',
+    return fetch('/', {cache: 'no-store',
                 signal: ctl ? ctl.signal : undefined}).then(function (r) {
       if (!r.ok) { throw new Error('http ' + r.status); }
       return r.text();
@@ -859,6 +886,68 @@ REFRESH_JS = """
     if (timer) { clearInterval(timer); }
     timer = document.hidden ? null : setInterval(tick, ms);
   }
+
+  // ---- pull to refresh ----------------------------------------------------
+  //
+  // WHY THE GESTURE EXISTS AT ALL, given the interval above: an INDICATOR, not
+  // freshness. The page is already current within a second of the app coming
+  // back to the foreground, but nothing on screen says so, and a reader who has
+  // just been told the fleet is on fire should not have to trust that.
+  //
+  // IT CALLS tick(), IT DOES NOT FETCH. One fetch path means one failure path:
+  // a pull that cannot reach the monitor lands in the same `unreachable()` the
+  // interval uses, so the band goes UNKNOWN exactly as it would have, and there
+  // is no second copy of "what to show when the fetch dies" to get wrong.
+  //
+  // IT CAN ONLY START AT THE TOP (`window.scrollY <= 0`), so it never competes
+  // with scrolling. The listeners are PASSIVE and nothing is preventDefaulted:
+  // the gesture reads the finger, it does not take it.
+  var pull = document.getElementById('pull');
+  var PULL_MAX = 34;        // the strip's height when fully drawn
+  var PULL_ARM = 60;        // finger travel, not drawn height, that arms it
+  var startY = null, armed = false, pulling = false;
+
+  function draw(h, cls, text) {
+    if (!pull) { return; }
+    pull.style.height = h + "px";
+    pull.className = "pull" + (cls ? " " + cls : "");
+    pull.textContent = text;
+  }
+
+  document.addEventListener('touchstart', function (e) {
+    if (pulling || e.touches.length !== 1) { return; }
+    startY = (window.scrollY <= 0) ? e.touches[0].clientY : null;
+    armed = false;
+  }, {passive: true});
+
+  document.addEventListener('touchmove', function (e) {
+    if (startY === null || e.touches.length !== 1) { return; }
+    var dy = e.touches[0].clientY - startY;
+    if (dy <= 0) {                     // the finger went up: a scroll, stand down
+      startY = null;
+      armed = pulling = false;
+      draw(0, "settle", "");
+      return;
+    }
+    pulling = true;
+    armed = dy >= PULL_ARM;
+    draw(Math.min(dy * 0.5, PULL_MAX), armed ? "ready" : "",
+         armed ? "release to refresh" : "pull to refresh");
+  }, {passive: true});
+
+  document.addEventListener('touchend', function () {
+    if (startY === null) { return; }
+    startY = null;
+    if (!pulling) { return; }
+    pulling = false;
+    if (!armed) { draw(0, "settle", ""); return; }
+    armed = false;
+    // "refreshing" is the only claim the strip makes, and it stops when the
+    // fetch stops -- including when the fetch fails, by which time the band has
+    // taken over and says something true about the fleet instead.
+    draw(PULL_MAX, "settle busy", "refreshing");
+    tick().then(function () { draw(0, "settle", ""); });
+  }, {passive: true});
 
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden) { tick(); }
@@ -952,6 +1041,10 @@ def render_html(state, cfg):
     a("<meta name=theme-color content='#0e1216'>")
     a("<style>%s</style>" % CSS)
     a("<div class=wrap>")
+    # OUTSIDE #live, DELIBERATELY. The reactive layer swaps #live's innerHTML every
+    # interval, so an indicator inside it is detached by the first refresh and the
+    # gesture then writes into a node nobody can see -- a control that works once.
+    a("<div class=pull id=pull></div>")
     a("<h1>sentinel</h1>")
     # THE TARGET LIST IS DERIVED, NOT TYPED. §4.6's subtitle names the four
     # tenants, and writing those four names here as a literal would be a CuBox
@@ -960,8 +1053,14 @@ def render_html(state, cfg):
     watched = sorted({r["target"] for r in
                       state["tiles"] + state["extra"] + state["others"]
                       + state["informational"]})
-    a("<div class=sub>Watching %s. Refreshed on every load, and nothing here "
-      "is cached.</div>" % _esc(", ".join(watched) or "nothing yet"))
+    # THE SUBTITLE NAMES THE CADENCE, because "refreshed on every load" was the
+    # whole truth once and now reads as "nothing happens while you watch" -- the
+    # page updates itself in place and the one reader who asked was told
+    # otherwise by this line. It is the interval, the moment the app returns to
+    # the foreground, and a pull, in that order of importance.
+    a("<div class=sub>Watching %s. Refreshed on load and every %ds while it is "
+      "open &mdash; nothing here is cached.</div>"
+      % (_esc(", ".join(watched) or "nothing yet"), cfg.interval))
     a("<div id=live>")
 
     # ---- the hero: how current this page is --------------------------------
@@ -1029,8 +1128,8 @@ def render_html(state, cfg):
              "too -- so an empty list means no check is currently reporting a "
              "problem <em>and</em> none is frozen.</div>")
     else:
-        _inc("<table><tr><th>Sev</th><th>Target</th><th>Check</th><th>State</th>"
-             "<th>Since</th><th>Obs</th><th>Detail</th></tr>")
+        _inc("<div class=scroll><table><tr><th>Sev</th><th>Target</th><th>Check</th>"
+             "<th>State</th><th>Since</th><th>Obs</th><th>Detail</th></tr>")
         for i in state["incidents"]:
             sev = i["severity"] or "grey"
             _inc("<tr class=%s><td><span class='pill %s'>%s</span></td>"
@@ -1040,7 +1139,7 @@ def render_html(state, cfg):
                     _esc(i["check_id"]), _esc(i["state"]),
                     _esc(_age(state["now"] - i["first_seen"])),
                     i["observed_count"], _esc(i["last_detail"] or "")))
-        _inc("</table>")
+        _inc("</table></div>")
     incidents_html = "\n".join(incidents)
 
     # ---- the RAG tiles, then every check the registry does not own ----------
@@ -1067,7 +1166,7 @@ def render_html(state, cfg):
     _tc("<h2>All checks by target</h2>")
     for target in sorted(by_target):
         items = sorted(by_target[target], key=lambda x: x["check_id"])
-        _tc("<table><tr><th colspan=3>%s (%d checks)</th></tr>"
+        _tc("<div class=scroll><table><tr><th colspan=3>%s (%d checks)</th></tr>"
             % (_esc(target), len(items)))
         for it in items:
             colour = _status(it["status"]).rag
@@ -1078,7 +1177,7 @@ def render_html(state, cfg):
                 "</tr>"
                 % (colour, colour, _esc(it["status"]), _esc(it["check_id"]), src,
                    _esc(it["detail"])))
-        _tc("</table>")
+        _tc("</table></div>")
     tiles_and_checks_html = "\n".join(tacc)
 
     # ---- informational -----------------------------------------------------
@@ -1088,7 +1187,8 @@ def render_html(state, cfg):
         _inf("<h2>Informational &mdash; not health metrics</h2>")
         _inf("<div class=note>These are reported so the row EXISTS, and no colour "
              "is assigned. A missing row would read as &ldquo;fine&rdquo;.</div>")
-        _inf("<table><tr><th>Target</th><th>Reading</th><th>Detail</th></tr>")
+        _inf("<div class=scroll><table><tr><th>Target</th><th>Reading</th>"
+             "<th>Detail</th></tr>")
         for it in state["informational"]:
             # The unit is appended only when there IS one: "%s %s" with an empty
             # unit leaves a trailing space in the cell, which is invisible on the
@@ -1100,7 +1200,7 @@ def render_html(state, cfg):
                  "<td class=detail>%s</td></tr>"
                  % (_esc(it["target"]), _esc(it["title"]), _esc(val),
                     _esc(it["detail"])))
-        _inf("</table>")
+        _inf("</table></div>")
     informational_html = "\n".join(iacc)
 
     # ---- thresholds with no check behind them ------------------------------
@@ -1127,10 +1227,10 @@ def render_html(state, cfg):
         "busy database rather than an error, which is the same shape as this "
         "project's <code>done 0 / orphan 18</code> gate that printed "
         "&ldquo;Coverage is complete&rdquo;.</div>")
-    _ev("<table><tr><th>Table</th><th>Rows</th></tr>")
+    _ev("<div class=scroll><table><tr><th>Table</th><th>Rows</th></tr>")
     for name, n in sorted(state["counts"]["tables"].items()):
         _ev("<tr><td>%s</td><td>%s</td></tr>" % (_esc(name), _esc(n)))
-    _ev("</table>")
+    _ev("</table></div>")
     _ev("<div class=foot>interval %ds &middot; stale past %ds &middot; "
         "database %s &middot; rendered %s &middot; "
         "<a href='/api/status.json'>/api/status.json</a> (versioned, for "

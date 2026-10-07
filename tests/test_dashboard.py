@@ -1941,6 +1941,77 @@ def test_the_newest_epoch_read_uses_an_index(results):
         "and a live monitor then reads as a dead one" % (plan,))
 
 
+def test_the_page_fits_a_phone_without_being_asked(results):
+    """What the phone reported, and the mechanisms that fix it.
+
+    Measured on an iPhone 15 Pro with the app on the home screen, 2026-10-07:
+    the title and the target list sat BEHIND the Dynamic Island, and the live
+    incident table pushed the whole document wider than the screen so the page
+    scrolled sideways under the reader's thumb.
+
+    BOTH ARE CONSEQUENCES OF A DECISION ALREADY MADE, not of a missing one.
+    `viewport-fit=cover` plus a black-translucent status bar put the document
+    under the island deliberately, which obliges the page to inset itself with
+    `env()`; and a seven-column table with a free-text cell has no way to fit
+    393 pt unless something gives. The checks below assert the mechanism, since
+    neither has any output that would look wrong in a terminal.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        # A LIVE INCIDENT, because the incident table is the one that overflowed
+        # and it only renders when there is one: asserting "every table has a
+        # scroll container" over a page that never draws that table would be a
+        # guard that cannot fail on the bug it was written for.
+        for _ in range(store.CONFIRM_POLLS):
+            d.seq += 1
+            store.sync_incident(d.conn, d.seq, "cubox-1", "disk_free_gb",
+                                "/mnt/recordings", store.Status.FAIL,
+                                "the recording volume is down to 0.4 GiB free "
+                                "and tvheadend is still writing to it")
+        html = d.html()
+        css = web.CSS
+
+        wrap = css.split(".wrap {", 1)[1].split("}", 1)[0]
+        insets = [i for i in ("top", "right", "bottom", "left")
+                  if "env(safe-area-inset-%s" % i in wrap]
+        results.check(
+            "the page insets itself clear of the iPhone's status bar and edges",
+            len(insets) == 4 and "calc(" in wrap,
+            "the .wrap rule does not carry all four env(safe-area-inset-*) "
+            "terms -- found %r. `viewport-fit=cover` and the black-translucent "
+            "status bar put the document UNDER the island on purpose, so a page "
+            "that does not inset itself hides its own title behind the camera "
+            "housing, which is what the phone reported" % (insets,))
+
+        tables = len(re.findall(r"<table", html))
+        wrapped = len(re.findall(r"<div class=scroll><table", html))
+        results.check(
+            "every table scrolls inside itself, never the page",
+            tables == wrapped and tables >= 1
+            and "overflow-x:auto" in css.split(".scroll {", 1)[1].split("}")[0],
+            "%d table(s) in the page, %d inside a .scroll container -- a table "
+            "that is not wrapped pushes the DOCUMENT wider than the screen, so "
+            "the whole page scrolls sideways instead of the one region that "
+            "cannot fit. The incident table is seven columns and carries free "
+            "text, which is what the phone reported." % (tables, wrapped))
+
+        script = html.split("<script id=refresh>", 1)[1]
+        results.check(
+            "the pull gesture reuses the one fetch path instead of adding a second",
+            "id=pull" in html and ".pull {" in css
+            and script.count("fetch(") == 1
+            and "touchmove" in script and "tick().then" in script,
+            "the pull-to-refresh gesture does not reuse tick(): a second "
+            "`fetch(` in the script (found %d) means a second copy of 'what to "
+            "show when the fetch dies', and the band would then be able to "
+            "disagree with the strip about whether the monitor answered"
+            % (script.count("fetch("),))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
@@ -1959,7 +2030,8 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_page_names_the_platform_and_never_colours_alone,
          test_the_app_shell_may_cache_and_nothing_else_may,
          test_the_refresh_script_has_the_hooks_it_looks_for,
-         test_the_newest_epoch_read_uses_an_index)
+         test_the_newest_epoch_read_uses_an_index,
+         test_the_page_fits_a_phone_without_being_asked)
 
 
 def main():

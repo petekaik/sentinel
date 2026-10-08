@@ -32,43 +32,63 @@ deliberately delivers **the driver only** — no capture service, no `ser2net`, 
 
 ## 2. What this depends on, and how we know
 
-The dependency is a **cable**, not a merged manifest. Measured on Storage-NAS
-2026-10-08 by the session building the driver modules:
+The dependency is a **cable plus a loaded driver** — and as of 2026-10-08 the console
+works. Measured on Storage-NAS by the session building the driver modules:
 
 | Fact | State |
 |---|---|
-| QTS ships `usbserial`, `ftdi_sio`, `pl2303`, `cp210x` under `/lib/modules/5.10.60-qnap/` | **measured present** |
-| Which is missing | only **`ch341`** — the one module the builder adds |
-| Serial stack on the NAS | `lsmod` shows `usbserial 40960 1 pl2303` |
-| `/dev/ttyUSB*` on Storage-NAS | **none — no cable is attached to the NAS** |
-| `qnap-driver-builder` restructure (manifests, `lib-drivers.sh`, `load-modules.sh`, `2_build_modules.sh`) | landed (`e2dc6c3`), in a **different checkout from the NAS's** |
-| That loader installed on Storage-NAS | **no** — the NAS runs another checkout |
-| Build run end-to-end | **not** recorded |
+| Adapter | FTDI **FT230X**, USB `0403:6015`, NAS bus 1 device 1-2 |
+| Driver | cross-built `ftdi_sio.ko`, `insmod`ed **by hand from `/tmp`** |
+| `/dev/ttyUSB0` | **exists**; link verified both ways at 115200 8N1 — the box answered `cubox-2 login:` |
+| Persistence | **no** — nothing was installed into the NAS's modules or its loader, so the tty dies at the next NAS reboot |
+| QTS ships `usbserial`, `ftdi_sio`, `pl2303`, `cp210x` under `/lib/modules/5.10.60-qnap/` | measured present |
+| Which is missing | only **`ch341`** — the one module that repo adds |
+| Adapters on the NAS bus | **one** — the FT230X. cubox-1's cable is not seen at all, not even unbindable |
+| `qnap-driver-builder` loader installed on Storage-NAS | **no** — the NAS runs a different checkout |
 
 Three consequences, each of which changes the plan:
 
-1. **The builder is not the gate for three of the four chips.** An FTDI, PL2303 or
-   CP210x adapter should enumerate today, with nothing built and nothing installed.
-   Testing that costs one cable, and it should be done **before** any build is treated
-   as a prerequisite.
-2. **`ch341` is the whole dependency.** And because QTS ships `usbserial`, a failed
-   `insmod ch341` is *not* an unresolved-dependency problem — it is a genuine failure,
-   so the check must FAIL rather than sit UNKNOWN. This supersedes the prediction the
-   builder's design doc made in its open item 4, which named the module at risk as
-   `ftdi_sio`; `ftdi_sio` is QTS's own and is not the module being compiled.
-3. **Reboot survival is not what it looks like on this NAS.** QTS wipes
-   `/lib/modules/<ver>/extra` every boot, but these modules live in the *standard* path,
-   where a chip driver can be autoloaded from the device's modalias — expected Linux
-   behaviour, not yet measured here. The DVB stack's persistence in the meantime is a
-   QNAP `user_cmd` watchdog cron (`/etc/config/user_cmd/dvb-watchdog.cron`, every 5
-   minutes), because the `/etc/rcS.d/S98dvb-loader` symlink its loader expects is absent.
-   So "survives a reboot" must be *observed* for the chip in hand, not inferred from the
-   loader.
+1. **Shipping the module is not loading it.** QTS ships `ftdi_sio.ko` and never loads it:
+   the FT230X sat on the bus **unbound**, with no `/dev/ttyUSB0`, until the module was
+   loaded by hand. There is no modalias autoload to rely on here, so "attach a cable and
+   it works" is **false**. The gate is a *loaded* module — not a compiled one, and not an
+   attached cable. The earlier draft collapsed those three into one.
+2. **The current load is not persistent, and that is the expected live state.** A hand
+   `insmod` from `/tmp` disappears at the next NAS reboot, and nothing in the NAS's own
+   module tree or loader was touched. That is precisely the state `serial_adapter`'s third
+   row exists to report: bridge enumerated, nothing bound → **FAIL**. It is not a false
+   alarm — the out-of-band path really is gone until something loads the module — and it
+   will appear after every NAS reboot, which is when an operator most wants to know.
+3. **`ch341` is the only chip that needs a build**, and because QTS ships `usbserial`, a
+   failed `insmod ch341` is not an unresolved-dependency problem — it is a genuine
+   failure, so the check must FAIL rather than sit UNKNOWN. This supersedes the builder's
+   design doc open item 4, which named `ftdi_sio` as the module at risk; `ftdi_sio` is
+   QTS's own, and per consequence 1 is not the module at issue anyway.
 
-**The dependency is not a gate on building this.** `SERIAL_REQUIRED` defaults to
-`0` (section 7), so sentinel is correct and honest before any cable is attached: it
-reports UNKNOWN, which is the true answer, rather than a false green. That is the
-whole point of the three-valued rule.
+**The dependency is not a gate on building this**, and `SERIAL_REQUIRED` defaults to `0`
+(section 7). Before the module is loaded, sentinel reports UNKNOWN on "no bridge on the
+bus" and FAIL on "bridge present, nothing bound" — both true, neither a false green.
+
+**`SERIAL_TARGET_BOX` is `cubox-2`.** Only one adapter enumerates and it is on cubox-2's
+header; cubox-1's cable is absent from the USB bus entirely, so nothing on the NAS can see
+it. That is a physical problem — cable, port or box power — and not something this design
+can work around.
+
+### 2.1 The host tooling trap, measured
+
+Item 18's recipes are for macOS. The NAS equivalents do not exist:
+
+- **QTS has no `stty`, `picocom` or `screen`, and busybox's `stty` applet is absent.**
+  `stty -F /dev/ttyUSB0 115200 raw; cat /dev/ttyUSB0` — the recipe the builder's design
+  doc carries — **reads zero bytes and is indistinguishable from a dead cable.**
+- What works *on the host* is Python 2.7 at `/usr/local/bin/python`, with `termios` and
+  `select` (`B115200`, `CS8|CREAD|CLOCAL`, zeroed `iflag`/`oflag`/`lflag`).
+
+This is a second, independent reason the serial code belongs **in the sentinel
+container**: the container has Python 3 and stdlib `termios`, whereas the host has a
+Python 2.7 that is EOL and a language this repo does not write. It also corrects the
+earlier "there is no python on QTS" reasoning — the host does have 2.7 — into the
+stronger claim: the host has the *wrong* interpreter and no usable terminal tool.
 
 ## 3. Decisions taken
 
@@ -191,7 +211,9 @@ Neither has been measured. The design is safe in either direction, and
 New module. Pure stdlib: `os`, `termios`, `select`, `time`, `json`. Alpine's
 `python:3.12` carries `termios`, so `tcsendbreak` is available; that is assumed
 from the base image's documented stdlib-only posture and **checked at first run**
-(section 9).
+(section 9). This is not a stylistic preference: section 2.1 measures that the NAS
+has no `stty` to shell out to, and that the `stty -F … ; cat` recipe reads zero bytes
+while looking exactly like a dead cable.
 
 The split follows sentinel's rule that a target needing new transports puts them
 in `probes.py`: **`probes.py` gains the tty transport** — open, read-to-deadline,
@@ -351,7 +373,7 @@ addition to the approved scope I want called out for review.
 |---|---|---|
 | `SERIAL_DEVICE` | `/dev/ttyUSB0` | The tty to open. The only path serial code touches |
 | `SERIAL_BAUD` | `115200` | Item 18 measures this; it is not a guess |
-| `SERIAL_TARGET_BOX` | `cubox-1` | Which box the adapter is wired to |
+| `SERIAL_TARGET_BOX` | `cubox-2` | Which box the adapter is wired to. Measured: cubox-2's header, and it is the only adapter on the NAS bus |
 | `SERIAL_REQUIRED` | `0` | Whether absence is a fault (on-demand tool by default) |
 | `SERIAL_CAPTURE_DIR` | `/data/serial` | Where captures and the arm file live |
 | `SERIAL_ARM_MAX_MIN` | `30` | Ceiling on an arm window |
@@ -415,26 +437,26 @@ no framework, no socket.
 4. **Capture thread in `main.py`** — with the liveness flag and the journal line.
 5. **`parsers.parse_serial_capture` + the `capture` table + dashboard section.**
 6. **`deploy.sh` subcommands.**
-7. **First run on the NAS**, with a cable attached — this waits on nobody's build: see
-   section 11.
+7. **First run on the NAS** — the console is already up on cubox-2, non-persistently, so
+   this waits on nobody's build: see section 11.
 
 Steps 1–3 are independently useful and each leaves the tree consistent. Step 2 is
 the only one that touches a working path.
 
 ## 11. Enabling it on the NAS
 
-**The trigger is a cable, not a build.** For an FTDI, PL2303 or CP210x adapter there is
-nothing to deploy first — QTS ships those drivers, and `pl2303` is already loaded. Attach
-the cable and look:
+**The console works today, and it is not persistent.** On 2026-10-08 a hand `insmod` of
+`ftdi_sio` had `/dev/ttyUSB0` up and cubox-2 answering `cubox-2 login:` at 115200 8N1.
+Nothing was installed, so a NAS reboot takes it away again and `serial_adapter` reports
+FAIL until the module is loaded. Confirm the state before arming anything:
 
 ```sh
 ls -l /dev/ttyUSB0
-dmesg | grep -iE 'usbserial|ftdi_sio|ch341|pl2303|cp210x'
+lsmod | grep -E 'usbserial|ftdi_sio|ch341|pl2303|cp210x'
 ```
 
-Only a `ch341` adapter needs `qnap-driver-builder`, and only then is installing the loader
-on this NAS the thing to prove. Establish which case you are in **before** treating a build
-as a prerequisite.
+Making it durable — handing the module to whatever loader this NAS actually has — is
+`qnap-driver-builder`'s work, not this design's.
 
 Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
 
@@ -445,9 +467,10 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
 3. On a running box, no reboot: the kernel-speaks marker from item 18
    (`echo SERIALPROBE-$$ > /dev/kmsg` on the box) proves the capture path without
    a power cycle.
-4. Reboot the NAS once with the cable attached and confirm the tty comes back — and
-   *how*, whether by autoload, by the watchdog, or by a loader. Do not infer this from
-   the loader that is absent (section 2, consequence 3).
+4. Reboot the NAS once with the cable attached and confirm what actually happens: on
+   current evidence the tty does **not** come back (section 2, consequence 2), and
+   `serial_adapter` should be seen reporting FAIL at that moment. That FAIL is the
+   acceptance test for the third row, not a defect.
 5. BREAK is exercised last, on a box that is already being rebooted, never as a
    first test.
 
@@ -461,9 +484,9 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
    other three are QTS's own modules in QTS's own path, where a failure is a different
    fault with a different cause. `serial_adapter` FAILs either way and names which case
    it saw.
-3. **Which chip the adapter uses is unknown.** The check's allowlist covers all four chips
-   plus the generic `usbserial`; the manifest keeps all four rather than narrowing to one
-   — confirmed 2026-10-08, so the two agree. `dmesg` names the one that binds.
+3. **The chip is known now** — FTDI FT230X (`0403:6015`), binding `ftdi_sio`. The check's
+   allowlist still covers all four chips plus the generic `usbserial`, and the manifest
+   keeps all four rather than narrowing to one, so the two agree.
 4. **`CLOCAL` behaviour on the QTS tty is assumed from Linux semantics.** Item 18
    measured the macOS equivalent, not this. If an open hangs, that is the field to
    revisit, and the open is non-blocking so a hang is a bug rather than a lock-up.
@@ -478,7 +501,9 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
    from the parse alone.
 8. **`termios` on musl is assumed, not verified.** Checked at first run (section 9).
 9. **The journal row on BREAK is an addition to the approved scope** — see 6.5.
-10. **Reboot survival is unmeasured** (section 2, consequence 3). The modules sit in the
-    standard path, so autoload on plug is expected but has not been observed here, and the
-    boot symlink the older loader expects is absent on this NAS. Step 4 of section 11 is
-    the measurement.
+10. **The tty does not survive a NAS reboot, and the check will say so.** The only working
+    load so far is a hand `insmod` from `/tmp`. `serial_adapter` reports FAIL in that state
+    by design, so the dashboard shows the out-of-band path down after every NAS reboot
+    until a loader owns the module. Making it durable is `qnap-driver-builder`'s work; the
+    FAIL in the meantime is the check working, and it is the acceptance test for the third
+    row (section 11, step 4).

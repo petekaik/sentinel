@@ -3,7 +3,7 @@
 **Date:** 2026-10-08
 **Status:** design approved in conversation; awaiting spec review
 **Repo:** `sentinel`
-**Depends on:** `qnap-driver-builder`'s `usb-serial` manifest being built, installed and loaded on Storage-NAS
+**Depends on:** a USB-TTL cable attached to Storage-NAS — and, for a `ch341`-based adapter only, on `qnap-driver-builder`'s `usb-serial` manifest being built and loaded
 
 ## 1. Why
 
@@ -18,11 +18,13 @@ Today that capability lives on the operator's Mac and is driven by hand
 (`screen`, then a `python3` snippet for the BREAK). It is unavailable exactly when
 it is needed most: a box that will not boot far enough to answer ssh or netconsole.
 
-The blocker was that Storage-NAS had no USB-serial driver. QNAP's stock QTS kernel
-omits it, as it omits the DVB modules — so the same repository now builds both, and
-`drivers/usb-serial/manifest.sh` exists. Once those modules are loaded the NAS
-enumerates `/dev/ttyUSB0`, and the console can be reached from the host that
-already runs the monitor.
+The blocker was assumed to be that QTS omits the USB-serial driver, as it omits the
+DVB modules. That assumption is **mostly wrong**, and the measurement is in section 2:
+QTS 5.2.9 already ships `usbserial`, `ftdi_sio`, `pl2303` and `cp210x` in the standard
+module path, and `pl2303` is loaded on Storage-NAS right now. Only `ch341` is absent,
+and that is the single module `qnap-driver-builder` adds. So for an FTDI, PL2303 or
+CP210x cable there is **no dependency on the builder at all** — the console becomes
+reachable from the host that already runs the monitor the moment a cable is attached.
 
 This spec is the sentinel half. Per that repo's own section 2, the driver side
 deliberately delivers **the driver only** — no capture service, no `ser2net`, no
@@ -30,37 +32,43 @@ deliberately delivers **the driver only** — no capture service, no `ser2net`, 
 
 ## 2. What this depends on, and how we know
 
-The dependency is a **deployed device node**, not a merged manifest. Verified
-2026-10-08:
+The dependency is a **cable**, not a merged manifest. Measured on Storage-NAS
+2026-10-08 by the session building the driver modules:
 
 | Fact | State |
 |---|---|
-| `qnap-driver-builder` restructure (manifests, `lib-drivers.sh`, `load-modules.sh`, `2_build_modules.sh`) | **landed** (`e2dc6c3`) |
-| `drivers/usb-serial/manifest.sh` (usbserial, ftdi_sio, ch341, pl2303, cp210x) | present |
-| Build run end-to-end from that tree | **not** recorded |
-| Modules installed on Storage-NAS by `scripts/load-modules.sh` | **not** recorded |
-| `/dev/ttyUSB0` enumerated on Storage-NAS | **not observed** |
+| QTS ships `usbserial`, `ftdi_sio`, `pl2303`, `cp210x` under `/lib/modules/5.10.60-qnap/` | **measured present** |
+| Which is missing | only **`ch341`** — the one module the builder adds |
+| Serial stack on the NAS | `lsmod` shows `usbserial 40960 1 pl2303` |
+| `/dev/ttyUSB*` on Storage-NAS | **none — no cable is attached to the NAS** |
+| `qnap-driver-builder` restructure (manifests, `lib-drivers.sh`, `load-modules.sh`, `2_build_modules.sh`) | landed (`e2dc6c3`), in a **different checkout from the NAS's** |
+| That loader installed on Storage-NAS | **no** — the NAS runs another checkout |
+| Build run end-to-end | **not** recorded |
 
-`qnap-driver-builder`'s own design doc, open item 4, predicts the failure this
-design must survive: *"`insmod ftdi_sio` can still fail if QTS's kernel lacks
-something `usbserial` needs. That is a `dmesg` check on the first run, not
-something this design can promise."* Section 6.3 turns that prediction into a
-check rather than leaving it as a risk.
+Three consequences, each of which changes the plan:
+
+1. **The builder is not the gate for three of the four chips.** An FTDI, PL2303 or
+   CP210x adapter should enumerate today, with nothing built and nothing installed.
+   Testing that costs one cable, and it should be done **before** any build is treated
+   as a prerequisite.
+2. **`ch341` is the whole dependency.** And because QTS ships `usbserial`, a failed
+   `insmod ch341` is *not* an unresolved-dependency problem — it is a genuine failure,
+   so the check must FAIL rather than sit UNKNOWN. This supersedes the prediction the
+   builder's design doc made in its open item 4, which named the module at risk as
+   `ftdi_sio`; `ftdi_sio` is QTS's own and is not the module being compiled.
+3. **Reboot survival is not what it looks like on this NAS.** QTS wipes
+   `/lib/modules/<ver>/extra` every boot, but these modules live in the *standard* path,
+   where a chip driver can be autoloaded from the device's modalias — expected Linux
+   behaviour, not yet measured here. The DVB stack's persistence in the meantime is a
+   QNAP `user_cmd` watchdog cron (`/etc/config/user_cmd/dvb-watchdog.cron`, every 5
+   minutes), because the `/etc/rcS.d/S98dvb-loader` symlink its loader expects is absent.
+   So "survives a reboot" must be *observed* for the chip in hand, not inferred from the
+   loader.
 
 **The dependency is not a gate on building this.** `SERIAL_REQUIRED` defaults to
-`0` (section 7), so sentinel is correct and honest before the driver lands: it
+`0` (section 7), so sentinel is correct and honest before any cable is attached: it
 reports UNKNOWN, which is the true answer, rather than a false green. That is the
 whole point of the three-valued rule.
-
-The NAS-side proof, which this design consumes rather than performs:
-
-```sh
-ls -l /dev/ttyUSB0
-dmesg | grep -iE 'usbserial|ftdi_sio|ch341|pl2303|cp210x'
-```
-
-…and that it survives a reboot, since QTS wipes `/lib/modules/<ver>/extra` on
-every boot and only `load-modules.sh` re-installs it.
 
 ## 3. Decisions taken
 
@@ -258,9 +266,15 @@ Reads the local device path, like `dvb_adapter_count`. Four outcomes:
 | No tty, but a USB-serial bridge **is** enumerated on the bus with nothing bound | **FAIL** — the driver did not bind |
 | Path not visible in the container at all | **UNKNOWN** — worded like `dvb_adapter_count`, naming the pass-through |
 
-The third row is the point of the check. It is `qnap-driver-builder`'s open item 4
-become an observation: a bridge on the bus with no driver is not "no adapter", it
-is the module load that did not happen, and the two must not share a branch.
+The third row is the point of the check: a bridge on the bus with no driver bound is not
+"no adapter", it is a module that did not bind, and the two must not share a branch.
+
+Because QTS ships four of the five modules (section 2), this row now means something
+narrower and more useful than when the check was designed. For an FTDI/PL2303/CP210x
+adapter it is a failure of *QTS's own module*, which should never happen. For a `ch341`
+adapter it is the one failure `qnap-driver-builder` exists to fix, and — because
+`usbserial` is already present — it cannot be excused as an unresolved dependency. Either
+way it is a real FAIL with a named cause, which is what the row is for.
 
 `subject` is the literal `"serial"` on every path.
 
@@ -381,7 +395,7 @@ no framework, no socket.
 - **The arm file is tested malformed**, expired, absent, and for the wrong box.
 - **Parser fixtures are synthetic and labelled synthetic.** Every other fixture in
   this repo reads "captured verbatim from the live fleet"; this one cannot say that
-  until the driver is deployed, and a fixture that claims provenance it does not
+  until a cable is attached to the NAS, and a fixture that claims provenance it does not
   have is worse than a synthetic one that admits it. Replacing them with a real
   capture is a follow-up once the tty exists.
 - **Every guard is mutation-tested**: reverted in a scratch copy, suite red.
@@ -396,25 +410,31 @@ no framework, no socket.
    confirm `dvb_adapter_count` is still green on a deploy. This is the step that can
    take the monitor down, so it is its own step and its own deploy.
 3. **`config.py` + `checks.conf` + `checks/serial.py`** — `serial_adapter` first,
-   because it is the check that reports whether the dependency landed. Register the
+   because it is the check that reports whether a cable enumerates at all. Register the
    module in `checks.all_modules()`.
 4. **Capture thread in `main.py`** — with the liveness flag and the journal line.
 5. **`parsers.parse_serial_capture` + the `capture` table + dashboard section.**
 6. **`deploy.sh` subcommands.**
-7. **First run on the NAS**, once the driver is deployed: see section 11.
+7. **First run on the NAS**, with a cable attached — this waits on nobody's build: see
+   section 11.
 
 Steps 1–3 are independently useful and each leaves the tree consistent. Step 2 is
 the only one that touches a working path.
 
 ## 11. Enabling it on the NAS
 
-Nothing here is green until the driver is real. The trigger is an observed
-enumeration, not a merged manifest:
+**The trigger is a cable, not a build.** For an FTDI, PL2303 or CP210x adapter there is
+nothing to deploy first — QTS ships those drivers, and `pl2303` is already loaded. Attach
+the cable and look:
 
 ```sh
 ls -l /dev/ttyUSB0
 dmesg | grep -iE 'usbserial|ftdi_sio|ch341|pl2303|cp210x'
 ```
+
+Only a `ch341` adapter needs `qnap-driver-builder`, and only then is installing the loader
+on this NAS the thing to prove. Establish which case you are in **before** treating a build
+as a prerequisite.
 
 Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
 
@@ -425,7 +445,10 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
 3. On a running box, no reboot: the kernel-speaks marker from item 18
    (`echo SERIALPROBE-$$ > /dev/kmsg` on the box) proves the capture path without
    a power cycle.
-4. BREAK is exercised last, on a box that is already being rebooted, never as a
+4. Reboot the NAS once with the cable attached and confirm the tty comes back — and
+   *how*, whether by autoload, by the watchdog, or by a loader. Do not infer this from
+   the loader that is absent (section 2, consequence 3).
+5. BREAK is exercised last, on a box that is already being rebooted, never as a
    first test.
 
 ## 12. Open items and risks
@@ -433,11 +456,14 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
 1. **`/dev:/dev` versus `devices:` is unverified on this NAS.** Believed necessary
    because a missing `devices:` path fails creation; not measured. `dvb_adapter_count`
    is the regression test, and the fallback is stated in 6.1.
-2. **The driver may not bind at all.** `qnap-driver-builder` open item 4. In that
-   case `serial_adapter` reports FAIL and says so — which is the design working, not
-   failing.
-3. **Which chip the adapter uses is unknown**, so the check's driver allowlist covers
-   all four the manifest ships. `dmesg` names the one that bound; narrow then.
+2. **A `ch341` adapter may not bind.** It is the only chip that needs a build, and the
+   only one whose failure is a genuine `insmod` failure rather than a missing file. The
+   other three are QTS's own modules in QTS's own path, where a failure is a different
+   fault with a different cause. `serial_adapter` FAILs either way and names which case
+   it saw.
+3. **Which chip the adapter uses is unknown.** The check's allowlist covers all four chips
+   plus the generic `usbserial`; the manifest keeps all four rather than narrowing to one
+   — confirmed 2026-10-08, so the two agree. `dmesg` names the one that binds.
 4. **`CLOCAL` behaviour on the QTS tty is assumed from Linux semantics.** Item 18
    measured the macOS equivalent, not this. If an open hangs, that is the field to
    revisit, and the open is non-blocking so a hang is a bug rather than a lock-up.
@@ -452,3 +478,7 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
    from the parse alone.
 8. **`termios` on musl is assumed, not verified.** Checked at first run (section 9).
 9. **The journal row on BREAK is an addition to the approved scope** — see 6.5.
+10. **Reboot survival is unmeasured** (section 2, consequence 3). The modules sit in the
+    standard path, so autoload on plug is expected but has not been observed here, and the
+    boot symlink the older loader expects is absent on this NAS. Step 4 of section 11 is
+    the measurement.

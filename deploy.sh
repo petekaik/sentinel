@@ -107,6 +107,42 @@ remote() { ssh "${SSH_OPTS[@]}" "$STORAGE_USER@$STORAGE_IP" "$@"; }
 rcopy()  { scp -q "${SSH_OPTS[@]}" -r "$@"; }
 dc()     { remote "cd '$MONITOR_DIR' && '$MONITOR_DOCKER' compose $*"; }
 
+# THE FLEET'S ADDRESSES COME FROM THE NAS'S OWN .env, NOT FROM LITERALS HERE.
+#
+# This used to read `for pair in "cubox-1:198.51.100.31" ...` -- the documentation-range
+# placeholders -- so the known_hosts build below dialled nothing, got no host key back,
+# and killed the deploy with "known_hosts is incomplete" on a fleet that was perfectly
+# reachable. Commit 3a27744 sanitised the real addresses out of the tree and left these
+# two as bare literals with no override, unlike STORAGE_IP and BACKUP_IP beside them.
+#
+# The consequence was worse than a broken deploy, and was measured 2026-10-09: because
+# nothing could deploy, the NAS kept running a tree from BEFORE the sanitisation, with the
+# real addresses still in its config.py. The monitor looked healthy while the repo could
+# no longer reproduce it, and the first successful sync would have replaced that file and
+# turned every host check UNKNOWN at the next restart.
+#
+# The fix is NOT a second default here. The NAS's .env is the copy the CONTAINER reads
+# and the only authority for these addresses; a literal here would be exactly the stale
+# duplicate this repo warns about (item 90's shape). The placeholder fallback survives
+# only so an unreadable .env fails the way everything else in this file does.
+#
+# `|| true` on the substitution, because `ssh` exiting non-zero inside an assignment
+# aborts the script under `set -e` -- and a missing .env line is not a reason to die
+# before saying which line was missing.
+nas_env_var() {   # $1=NAME -> the value, or empty
+    remote "grep -E '^$1=' '$MONITOR_DIR/.env' 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r'" || true
+}
+CUBOX1_IP="$(nas_env_var MONITOR_HOST_CUBOX_1_ADDR)"
+CUBOX2_IP="$(nas_env_var MONITOR_HOST_CUBOX_2_ADDR)"
+CUBOX1_IP="${CUBOX1_IP:-198.51.100.31}"
+CUBOX2_IP="${CUBOX2_IP:-198.51.100.32}"
+
+# The backup host already had an override, but its DEFAULT is a placeholder like the two
+# above, so the .env is consulted for it too. Kept after `remote()` is defined, because it
+# has to be read over ssh; the earlier assignment at the top of this file is the fallback.
+_ENV_BACKUP_IP="$(nas_env_var MONITOR_HOST_BACKUP_ADDR)"
+BACKUP_IP="${_ENV_BACKUP_IP:-$BACKUP_IP}"
+
 # A ONE-OFF COMMAND INSIDE THE COLLECTOR'S OWN CONTAINER.
 #
 # This was `docker compose run --rm --no-deps monitor ...`, and THAT CANNOT WORK
@@ -482,7 +518,7 @@ known_host_line() {   # $1=address $2=alias -> "type key", or nothing
 TMP_KH="$(mktemp)"
 trap 'rm -f "$TMP_KH"' EXIT
 KH_FAIL=0
-for pair in "cubox-1:198.51.100.31" "cubox-2:198.51.100.32" "backup:$BACKUP_IP"; do
+for pair in "cubox-1:$CUBOX1_IP" "cubox-2:$CUBOX2_IP" "backup:$BACKUP_IP"; do
     hname="${pair%%:*}"
     ip="${pair##*:}"
     tline="$(known_host_line "$ip" "$hname")"

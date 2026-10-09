@@ -38,8 +38,8 @@ works. Measured on Storage-NAS by the session building the driver modules:
 | Fact | State |
 |---|---|
 | Adapters | **two** FTDI FT230X, both `0403:6015`, both bound to `ftdi_sio` |
-| — on cubox-2 | serial **`SYNTH002`**, USB port `1-2`, enumerates as `/dev/ttyUSB0` |
-| — on cubox-1 | serial **`SYNTH001`**, USB port `1-1.2`, enumerates as `/dev/ttyUSB1` |
+| — on cubox-2 | chip serial from the NAS `.env`, USB port `1-2`, enumerates as `/dev/ttyUSB0` |
+| — on cubox-1 | chip serial from the NAS `.env`, USB port `1-1.2`, enumerates as `/dev/ttyUSB1` |
 | Both links | verified 2026-10-09: writing CR drew `cubox-2 login:` and `cubox-1 login:` at 115200 8N1 |
 | Persistence | **works** — all five modules, `ch341` included, load unattended, re-applied by a 5-minute watchdog cron |
 | QTS ships `usbserial`, `ftdi_sio`, `pl2303`, `cp210x` under `/lib/modules/5.10.60-qnap/` | measured present |
@@ -403,11 +403,12 @@ addition to the approved scope I want called out for review.
 | `SERIAL_CAPTURE_MAX_MB` | `32` | Byte cap; a boot log is KB, so this is a runaway guard |
 | `SERIAL_KEEP_DAYS` | `30` | Retention for raw captures |
 
-The measured mapping is `cubox-1` → `SYNTH001` and `cubox-2` → `SYNTH002`; `SYNTH001` is the
-adapter item 18 records from macOS as `/dev/cu.usbserial-SYNTH001`. These are deployment
-values and belong in the NAS's `.env` beside the addresses, but the spec records them
-because the *mapping* is the design fact: swapping two physical cables must be a config
-edit, and trusting `ttyUSB0` is how the wrong box gets rebooted.
+The chip serials themselves are **deployment data and live in the NAS's gitignored
+`.env`** (`SERIAL_<BOX>_SERIAL`), never in this repository: a chip serial names a specific
+piece of the operator's hardware, and every file here is published. What the spec needs to
+record is the *shape* — one adapter per box, identified by chip serial rather than by device
+number — because the mapping is the design fact: swapping two physical cables must be a
+config edit, and trusting `ttyUSB0` is how the wrong box gets rebooted.
 
 `checks.conf` gains `[serial_adapter]` and `[serial_capture]`, each with a `note`
 recording why the boundary is where it is. **Both must land in the same change as

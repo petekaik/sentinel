@@ -23,6 +23,7 @@
 - **Every guard gets mutation-tested** before the task is considered done: revert the guard in a scratch copy and watch the suite go red.
 - **Never commit with `--no-verify`.** A `check-secrets.sh` pre-commit hook scans staged files and will refuse machine-specific paths and addresses. Reword, or mark a deliberate exception with a trailing `secretscan:ignore` comment.
 - **Measured values, not guesses:** baud `115200` 8N1; `SERIAL_WATCHDOG_GRACE_S` default `360` (the loader is a 5-minute cron); the two adapters are FTDI FT230X `0403:6015`.
+- **Chip serials are deployment data, never repository content.** An FT230X serial names a specific piece of the operator's hardware, so the real values live only in the NAS's gitignored `.env` (`SERIAL_<BOX>_SERIAL`). `.env.example` carries commented placeholders; tests use synthetic values. `README.md`, `CLAUDE.md` and every doc in this repo are published to GitHub and must stay free of addresses, usernames, credentials, keys and machine-specific paths.
 - **Commit messages** end with `Co-Authored-By: Claude Code <noreply@anthropic.com>`.
 
 ## Review Focus
@@ -69,8 +70,10 @@ symlink chain, and the resolver resolves it, so these tests build the same shape
 tempdir with os.symlink rather than checking in symlinks whose targets would be
 machine-specific paths.
 
-The two serials and ports are the MEASURED ones (2026-10-09): SYNTH001 on port 1-1.2 is
-cubox-1, SYNTH002 on port 1-2 is cubox-2.
+THE SERIALS IN THIS FILE ARE SYNTHETIC, DELIBERATELY. A real chip serial names a specific
+piece of the operator's hardware, so the live values live in the NAS's gitignored .env
+(SERIAL_<BOX>_SERIAL) and the tests only need two values that differ from each other. What
+is measured is the SHAPE: one FT230X per box, each exposing a serial in sysfs.
 """
 
 import os
@@ -158,10 +161,13 @@ cubox-1 reboots cubox-2.
 QTS provides no /dev/serial/by-id/ -- measured 2026-10-09, the directory does not exist
 -- so there is no symlink to bind to and identity has to come from sysfs. Each FT230X
 carries its own serial at /sys/bus/usb/devices/<port>/serial, stable across enumeration
-order. Measured on Storage-NAS from the host AND from inside the sentinel container:
+order.
 
-    ttyUSB0 -> serial=SYNTH002 port=1-2      (cubox-2)
-    ttyUSB1 -> serial=SYNTH001 port=1-1.2    (cubox-1)
+THE SERIALS THEMSELVES ARE DEPLOYMENT DATA, NOT CODE. A chip serial names a specific piece
+of the operator's hardware, so the real values live in the NAS's gitignored .env as
+SERIAL_<BOX>_SERIAL, and never in this repository. What was measured on Storage-NAS
+2026-10-09, from the host and from inside the sentinel container, is the SHAPE: two FT230X
+adapters, one per box, each exposing its serial at the path above.
 
 THE RULE THIS MODULE ENFORCES: NEVER GUESS. `resolve` returns None rather than a best
 guess, and callers must refuse rather than fall back to a device number. An absent
@@ -568,25 +574,51 @@ Insert immediately after the `self.dvb_adapters = ...` assignment:
 Run: `./test.sh serial`
 Expected: PASS — `11 checks, 0 failed`.
 
-- [ ] **Step 5: Mutation-test the guards**
+- [ ] **Step 5: Add commented placeholders to `.env.example`**
+
+A chip serial names a specific piece of the operator's hardware, so the repository carries
+a placeholder and the value lives in the NAS's `.env` only. Append to `.env.example`:
+
+```sh
+# ---------------------------------------------------------------------------
+# The CuBox serial consoles
+# ---------------------------------------------------------------------------
+# The FT230X chip serial of each box's console adapter. THESE ARE DEPLOYMENT VALUES, NOT
+# SECRETS AND NOT CODE: read each one on Storage-NAS from
+# /sys/bus/usb/devices/<port>/serial and put the real value in .env, which is gitignored.
+#
+# They identify the console ADAPTER, which is what lets sentinel tell the two boxes apart
+# when the kernel swaps ttyUSB0 and ttyUSB1 -- so they must be read, never guessed, and
+# must not be published.
+#
+# Left commented on purpose: config.py treats an unset serial as UNCONFIGURED, which is a
+# distinct, visible state rather than a silent fall back to a device number.
+#SERIAL_CUBOX_1_SERIAL=<chip serial of cubox-1's adapter>
+#SERIAL_CUBOX_2_SERIAL=<chip serial of cubox-2's adapter>
+```
+
+- [ ] **Step 6: Mutation-test the guards**
 
 - Change `.strip()` on `_val` → `test_a_configured_serial_is_normalised_before_comparison` should still pass (that guard is in `resolve`), so instead confirm `test_config_maps_each_box_to_its_chip_serial` fails if you drop the `if _val:` guard by storing the empty string.
 - Change `"360"` to `"60"` → `test_config_defaults_are_the_measured_ones` must fail.
 - Change `_bool("SERIAL_REQUIRED", False, e)` to `True` → same test must fail.
 
-- [ ] **Step 6: Verify nothing else broke**
+- [ ] **Step 7: Verify nothing else broke**
 
 Run: `./test.sh`
 Expected: PASS — every suite, 0 failed. `config.Config` is constructed by every suite, so a syntax or attribute error here surfaces everywhere.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add app/config.py tests/test_serial_identity.py
+git add app/config.py tests/test_serial_identity.py .env.example
 git commit -m "feat: configure each box's serial identity, with sysfs and proc overridable" -m "SERIAL_<BOX>_SERIAL maps a box to its chip serial using config.py's existing
 '-' -> '_' idiom. SERIAL_REQUIRED stays False by default because a missing adapter is
 the expected state for an operator tool, and SERIAL_WATCHDOG_GRACE_S defaults to 360 s
 because the loader is a five-minute cron.
+
+A chip serial names a specific piece of the operator's hardware, so .env.example carries
+commented placeholders and the real values live only in the NAS's gitignored .env.
 
 SERIAL_SYSFS and SERIAL_PROC are the seams that let the whole identity path be tested
 offline against a synthetic tree and a synthetic uptime." -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
@@ -797,7 +829,7 @@ direction = high_is_good
 green = 2
 amber = 1
 target = storage
-note = HOW MANY OF THE FLEET'S CONSOLE ADAPTERS COULD BE IDENTIFIED BY CHIP SERIAL, not how many device nodes exist. Two, because there is one FT230X per box. A ttyUSB NUMBER is not an identity -- the kernel assigns them in enumeration order and a reboot can swap them, which would send a SysRq BREAK to the wrong box -- so a box counts only when /sys reports an adapter carrying ITS configured serial. green=2 is the wiring as measured 2026-10-09 (cubox-1 SYNTH001 on port 1-1.2, cubox-2 SYNTH002 on port 1-2). Absence is UNKNOWN rather than red while SERIAL_REQUIRED=0, because item 18 records the adapter as an operator tool, and a NAS that booted within SERIAL_WATCHDOG_GRACE_S is UNKNOWN because the loader is a five-minute cron rather than a boot hook.
+note = HOW MANY OF THE FLEET'S CONSOLE ADAPTERS COULD BE IDENTIFIED BY CHIP SERIAL, not how many device nodes exist. Two, because there is one FT230X per box. A ttyUSB NUMBER is not an identity -- the kernel assigns them in enumeration order and a reboot can swap them, which would send a SysRq BREAK to the wrong box -- so a box counts only when /sys reports an adapter carrying ITS configured serial. green=2 is the one-adapter-per-box wiring as measured 2026-10-09. Absence is UNKNOWN rather than red while SERIAL_REQUIRED=0, because item 18 records the adapter as an operator tool, and a NAS that booted within SERIAL_WATCHDOG_GRACE_S is UNKNOWN because the loader is a five-minute cron rather than a boot hook.
 ```
 
 - [ ] **Step 4: Write `app/checks/serial.py`**
@@ -983,7 +1015,7 @@ in checks.conf, claimed by this check so --showconf stays clean." -m "Co-Authore
 
 ## Live verification (after Task 3)
 
-The container can already read `/sys` — measured 2026-10-09, `cat /sys/bus/usb/devices/1-2/serial` returns `SYNTH002` from inside `sentinel` — so this row goes live **without touching `compose.yml`**. Nothing here needs the `/dev` bind mount, which belongs to the capture plan.
+The container can already read `/sys` — measured 2026-10-09, a chip serial is readable from inside `sentinel` with `cat /sys/bus/usb/devices/<port>/serial` — so this row goes live **without touching `compose.yml`**. Nothing here needs the `/dev` bind mount, which belongs to the capture plan.
 
 On the NAS, once `.env` carries the two serials:
 

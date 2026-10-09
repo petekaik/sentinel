@@ -113,6 +113,13 @@ def _build_sysfs(tmpdir, entries):
 def _sysfs(entries):
     tmpdir = tempfile.mkdtemp(prefix="sentinel-sysfs-")
     _build_sysfs(tmpdir, entries)
+    # class/tty MUST exist even when it is empty. A missing directory means the
+    # container cannot see sysfs at all, which is a DIFFERENT outcome from "no adapter
+    # is attached" -- and a fixture that conflates the two makes the absent case pass
+    # for the wrong reason. Measured: without this line the SERIAL_REQUIRED=1 test
+    # reported UNKNOWN instead of FAIL, and the "no adapter" test was green because
+    # sysfs was unreadable rather than because nothing was attached.
+    os.makedirs(os.path.join(tmpdir, "class", "tty"), exist_ok=True)
     return tmpdir
 
 
@@ -1023,8 +1030,8 @@ Expected: the offline suite passes; `--showconf` exits 0, reporting no unclaimed
 
 - [ ] **Step 8: Mutation-test the guards**
 
-- Remove the `if ambiguous:` branch → `test_an_ambiguous_serial_is_fail_never_unknown` must fail.
-- Move the grace check *below* the `not adapters` check → `test_the_reboot_grace_reports_unknown_not_fail` must fail (that test sets `SERIAL_REQUIRED=1`, so the absent branch cannot swallow the case first).
+- Remove the `if ambiguous:` branch → `test_an_ambiguous_serial_is_fail_never_unknown` must fail. **This needed the test sharpened first, and running the mutation is what revealed it:** written as originally drafted, BOTH boxes sat on the duplicated serial, so the resolved count was zero and zero already FAILs on its own — deleting the branch left the suite GREEN and proved nothing. The test now leaves the other box resolvable, so the count is 1 (a WARN) and only the ambiguity branch can produce the FAIL.
+- Move the grace check *below* the `not adapters` check → `test_the_reboot_grace_reports_unknown_not_fail` must fail. **The claim in the first draft was wrong**, and measured: both branches return UNKNOWN, so no status assertion can pin their order, and the drafted test set `SERIAL_REQUIRED=1`, which makes the absent branch unreachable anyway. The test now also covers `SERIAL_REQUIRED=0` inside the grace and asserts the *message* ("watchdog" and not "no adapter attached"), which is the only thing the order actually changes — and the only thing an operator reads.
 - Change `subject="serial"` to `subject="serial-%s" % box` on the missing path only → `test_the_adapter_check_reports_one_subject_on_every_path` must fail.
 - Replace `float(n)` with `2.0` in the `result_from_spec` call → `test_a_missing_box_adapter_is_graded_by_the_threshold_data` must fail.
 
@@ -1065,3 +1072,13 @@ Expected: `serial_adapter` OK, naming `cubox-1 at /dev/ttyUSB1` and `cubox-2 at 
 **Placeholder scan.** No `TBD`/`TODO`/"handle edge cases". Every code step carries the code.
 
 **Type consistency.** `Adapter` fields (`serial`, `port`, `tty`, `device`), the five `OUTCOME` constants, the `(adapters, why)` and `(adapter, outcome, why)` return shapes, and the config attribute names (`serial_sysfs`, `serial_proc`, `serial_baud`, `serial_serials`, `serial_device`, `serial_required`, `serial_watchdog_grace_s`) are used identically in every task and test.
+
+## Divergence recorded during execution
+
+Three things the plan got wrong were found by running the suite and the mutation tests rather than by re-reading it. **The code and tests are the authority; the bodies above for these three are superseded.**
+
+1. **The `sysfs` fixture did not create an empty `class/tty`.** `_sysfs([])` left the directory absent, so "no adapter attached" and "sysfs is unreadable" collapsed into one state. Two tests were passing for the wrong reason — the assertion on the *reason text* is what caught it. `_sysfs` now always creates the directory, with a comment explaining why. This is the same defect shape as the rule the whole repo is built on: "the answer is no" must never share a branch with "I could not ask".
+2. **The walk-bound claim was wrong** (Task 1). Recorded in that task's mutation list above; a new test, `test_a_device_link_escaping_the_sysfs_root_is_not_attributed`, pins it.
+3. **Two Task 3 tests had to be sharpened** — the ambiguity test and the grace test — because each passed for the wrong reason and neither survived its own mutation. Recorded in Task 3's mutation list above.
+
+The pattern worth carrying forward: **all three were invisible to review and only appeared when a guard was reverted.** That is the argument for the mutation step, not a formality on top of it.

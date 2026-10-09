@@ -58,6 +58,13 @@ def _build_sysfs(tmpdir, entries):
 def _sysfs(entries):
     tmpdir = tempfile.mkdtemp(prefix="sentinel-sysfs-")
     _build_sysfs(tmpdir, entries)
+    # class/tty MUST exist even when it is empty. A missing directory means the
+    # container cannot see sysfs at all, which is a DIFFERENT outcome from "no adapter
+    # is attached" -- and a fixture that conflates the two makes the absent case pass
+    # for the wrong reason. Measured: without this line the SERIAL_REQUIRED=1 test
+    # reported UNKNOWN instead of FAIL, and the "no adapter" test was green because
+    # sysfs was unreadable rather than because nothing was attached.
+    os.makedirs(os.path.join(tmpdir, "class", "tty"), exist_ok=True)
     return tmpdir
 
 
@@ -254,6 +261,211 @@ def test_config_defaults_are_the_measured_ones(results):
         "got %r / %r" % (cfg.serial_sysfs, cfg.serial_proc))
 
 
+def _run_check(cfg, check_id="serial_adapter"):
+    """The check, looked up through expand() -- so one that is not registered fails
+    here rather than passing (checks.all_modules is the one home for the list)."""
+    specs = thresholds.load(cfg.checks_conf)
+    classes = checks.registry(*checks.all_modules())
+    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None, check_classes=classes)
+    for chk in checks.expand(classes, cfg.cubox_ids):
+        if chk.id == check_id:
+            return chk.timed(ctx)
+    raise AssertionError("check %r is not registered for storage" % check_id)
+
+
+def _proc_with_uptime(tmpdir, seconds):
+    os.makedirs(tmpdir, exist_ok=True)
+    with open(os.path.join(tmpdir, "uptime"), "w") as fh:
+        fh.write("%d.00 100.00\n" % seconds)
+    return tmpdir
+
+
+def test_the_adapter_check_names_both_boxes_when_they_resolve(results):
+    root = _sysfs([("ttyUSB0", "1-2", "SYNTH002"), ("ttyUSB1", "1-1.2", "SYNTH001")])
+    try:
+        cfg = _cfg_for(None, {"SERIAL_SYSFS": root,
+                              "SERIAL_PROC": _proc_with_uptime(
+                                  os.path.join(root, "proc"), 99999),
+                              "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+                              "SERIAL_CUBOX_2_SERIAL": "SYNTH002"})
+        res = _run_check(cfg)
+        results.check(
+            "both boxes resolve, and the row is OK",
+            res.status is store.Status.OK,
+            "got %s (%s)" % (res.status, res.detail))
+        results.check(
+            "the evidence names each box's DEVICE, so a swap is visible in the row",
+            "/dev/ttyUSB0" in str(res.evidence) and "/dev/ttyUSB1" in str(res.evidence),
+            "a row that reports only a count cannot show that the two boxes traded "
+            "numbers. got %r" % (res.evidence,))
+    finally:
+        shutil.rmtree(root)
+
+
+def test_a_missing_box_adapter_is_graded_by_the_threshold_data(results):
+    """One of two adapters present: the boundary is in checks.conf, not in the check."""
+    root = _sysfs([("ttyUSB0", "1-2", "SYNTH002")])
+    try:
+        cfg = _cfg_for(None, {"SERIAL_SYSFS": root,
+                              "SERIAL_PROC": _proc_with_uptime(
+                                  os.path.join(root, "proc"), 99999),
+                              "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+                              "SERIAL_CUBOX_2_SERIAL": "SYNTH002"})
+        res = _run_check(cfg)
+        results.check(
+            "one of two resolved is not OK",
+            res.status is not store.Status.OK,
+            "got %s (%s)" % (res.status, res.detail))
+        results.check(
+            "and the detail names cubox-1 and its serial, not just a shortfall",
+            "cubox-1" in res.detail and "SYNTH001" in res.detail,
+            "with a fleet of two, 'one of them' is useless. got %r" % (res.detail,))
+    finally:
+        shutil.rmtree(root)
+
+
+def test_no_adapter_at_all_is_unknown_when_not_required(results):
+    root = _sysfs([])
+    try:
+        cfg = _cfg_for(None, {"SERIAL_SYSFS": root,
+                              "SERIAL_REQUIRED": "0",
+                              "SERIAL_PROC": _proc_with_uptime(
+                                  os.path.join(root, "proc"), 99999),
+                              "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+                              "SERIAL_CUBOX_2_SERIAL": "SYNTH002"})
+        res = _run_check(cfg)
+        results.check(
+            "no adapter attached, SERIAL_REQUIRED=0 -> UNKNOWN, never FAIL",
+            res.status is store.Status.UNKNOWN,
+            "grading this FAIL is a permanent alarm on a healthy fleet (item 72), and "
+            "item 18 records the adapter as an on-demand tool. got %s (%s)"
+            % (res.status, res.detail))
+        cfg2 = _cfg_for(None, {"SERIAL_SYSFS": root,
+                               "SERIAL_REQUIRED": "1",
+                               "SERIAL_PROC": _proc_with_uptime(
+                                   os.path.join(root, "proc"), 99999),
+                               "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+                               "SERIAL_CUBOX_2_SERIAL": "SYNTH002"})
+        res2 = _run_check(cfg2)
+        results.check(
+            "and SERIAL_REQUIRED=1 makes the same state a fault",
+            res2.status is store.Status.FAIL,
+            "the operator who wires one permanently must be able to say so. got %s"
+            % (res2.status,))
+    finally:
+        shutil.rmtree(root)
+
+
+def test_the_reboot_grace_reports_unknown_not_fail(results):
+    """The loader is a 5-minute cron, so a NAS that booted 30 s ago is not broken."""
+    root = _sysfs([])
+    try:
+        cfg = _cfg_for(None, {"SERIAL_SYSFS": root,
+                              "SERIAL_REQUIRED": "1",
+                              "SERIAL_PROC": _proc_with_uptime(
+                                  os.path.join(root, "proc"), 30),
+                              "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+                              "SERIAL_CUBOX_2_SERIAL": "SYNTH002"})
+        res = _run_check(cfg)
+        results.check(
+            "inside the grace, an unresolved adapter is UNKNOWN",
+            res.status is store.Status.UNKNOWN,
+            "sentinel polls every 60 s and escalates after three epochs, so failing here "
+            "opens an incident on every single NAS reboot. got %s (%s)"
+            % (res.status, res.detail))
+        results.check(
+            "and the reason says the watchdog has not run yet",
+            "watchdog" in res.detail.lower(),
+            "an operator must be able to tell 'not yet' from 'broken'. got %r"
+            % (res.detail,))
+
+        # ORDER, PINNED BY THE MESSAGE RATHER THAN THE STATUS. Above, SERIAL_REQUIRED=1
+        # means the absent branch can never fire, so the grace is the only path. This
+        # case makes BOTH reachable, because that is the only way to pin their order --
+        # they return the same status, so only the sentence differs, and the sentence is
+        # the point: "not yet" and "no adapter attached" mean different things to
+        # someone standing in front of a NAS that just rebooted.
+        cfg0 = _cfg_for(None, {"SERIAL_SYSFS": root,
+                               "SERIAL_REQUIRED": "0",
+                               "SERIAL_PROC": _proc_with_uptime(
+                                   os.path.join(root, "proc"), 30),
+                               "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+                               "SERIAL_CUBOX_2_SERIAL": "SYNTH002"})
+        res0 = _run_check(cfg0)
+        results.check(
+            "and inside the grace it says 'watchdog', not 'no adapter attached'",
+            "watchdog" in res0.detail.lower()
+            and "no usb-serial adapter is attached" not in res0.detail.lower(),
+            "both branches return UNKNOWN, so the STATUS cannot pin the order and the "
+            "mutation test showed a swap stayed green without this. got %r"
+            % (res0.detail,))
+    finally:
+        shutil.rmtree(root)
+
+
+def test_an_ambiguous_serial_is_fail_never_unknown(results):
+    """A duplication must OUTRANK the count.
+
+    THIS TEST HAD TO BE SHARPENED, and running the mutation is why. With BOTH boxes on
+    the duplicated serial the count is zero, and zero already FAILs on its own -- so
+    deleting the ambiguity branch left this test GREEN and it proved nothing. The case
+    that distinguishes them is one box duplicated while the OTHER resolves: the count is
+    1, which the threshold data grades WARN, so only the ambiguity branch can make it
+    FAIL. That is also the realistic shape -- one adapter misconfigured, not both.
+    """
+    root = _sysfs([("ttyUSB0", "1-2", "SAME"),
+                   ("ttyUSB1", "1-1.2", "SAME"),
+                   ("ttyUSB2", "1-3", "SYNTH002")])
+    try:
+        cfg = _cfg_for(None, {"SERIAL_SYSFS": root,
+                              "SERIAL_PROC": _proc_with_uptime(
+                                  os.path.join(root, "proc"), 99999),
+                              "SERIAL_CUBOX_1_SERIAL": "SAME",
+                              "SERIAL_CUBOX_2_SERIAL": "SYNTH002"})
+        res = _run_check(cfg)
+        results.check(
+            "a duplicated serial is FAIL, because it is a defect someone introduced",
+            res.status is store.Status.FAIL,
+            "UNKNOWN would say 'I could not ask', but we DID ask and got two answers; "
+            "WARN would be the count speaking, since the other box did resolve. "
+            "got %s (%s)" % (res.status, res.detail))
+        results.check(
+            "and the reason names the box that could not be identified",
+            "cubox-1" in res.detail and "SAME" in res.detail,
+            "an operator needs to know WHICH box is ambiguous. got %r" % (res.detail,))
+    finally:
+        shutil.rmtree(root)
+
+
+def test_the_adapter_check_reports_one_subject_on_every_path(results):
+    """Item 75: the incident key is (target, check_id, subject), so a path reporting a
+    different subject files against a key with no incident attached."""
+    root = _sysfs([("ttyUSB0", "1-2", "SYNTH002")])
+    subjects = []
+    try:
+        for env, uptime in (
+            ({}, 99999),                                             # partial resolve
+            ({"SERIAL_REQUIRED": "1"}, 30),                          # inside the grace
+            ({"SERIAL_REQUIRED": "1",
+              "SERIAL_SYSFS": "/nonexistent-sysfs-for-test"}, 99999),  # unreadable
+            ({"SERIAL_CUBOX_1_SERIAL": "", "SERIAL_CUBOX_2_SERIAL": ""}, 99999),
+        ):
+            e = {"SERIAL_SYSFS": root,
+                 "SERIAL_PROC": _proc_with_uptime(os.path.join(root, "proc"), uptime),
+                 "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+                 "SERIAL_CUBOX_2_SERIAL": "SYNTH002"}
+            e.update(env)
+            subjects.append(_run_check(_cfg_for(None, e)).subject)
+    finally:
+        shutil.rmtree(root)
+    results.check(
+        "every path reports subject 'serial'",
+        set(subjects) == {"serial"},
+        "got %r. A subject that differs on one path leaves the incident unable to "
+        "resolve on recovery (item 75, measured live once already)."
+        % (sorted(set(subjects)),))
+
+
 TESTS = (test_resolution_follows_the_serial_not_the_number,
          test_an_absent_serial_is_absent_and_never_a_guess,
          test_ambiguous_serials_are_refused,
@@ -263,4 +475,10 @@ TESTS = (test_resolution_follows_the_serial_not_the_number,
          test_a_configured_serial_is_normalised_before_comparison,
          test_no_serial_configured_is_its_own_outcome,
          test_config_maps_each_box_to_its_chip_serial,
-         test_config_defaults_are_the_measured_ones)
+         test_config_defaults_are_the_measured_ones,
+         test_the_adapter_check_names_both_boxes_when_they_resolve,
+         test_a_missing_box_adapter_is_graded_by_the_threshold_data,
+         test_no_adapter_at_all_is_unknown_when_not_required,
+         test_the_reboot_grace_reports_unknown_not_fail,
+         test_an_ambiguous_serial_is_fail_never_unknown,
+         test_the_adapter_check_reports_one_subject_on_every_path)

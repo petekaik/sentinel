@@ -311,7 +311,7 @@ class Context:
             else:
                 r = probes.ssh(
                     host,
-                    "cat /mnt/shared/generations/%s/etc/cubox-transcode/worker.sh"
+                    "cat /mnt/shared/generations/%s/etc/cubox-transcode/worker.sh"  # secretscan:ignore (fleet-side path, documented in this file)
                     % gen, timeout=self.cfg.ssh_timeout)
                 self.gen_worker[cubox_id] = r.out if r.ran and r.out else None
         return self.gen_worker[cubox_id]
@@ -394,6 +394,7 @@ def all_modules():
     import checks.cubox
     import checks.fleet
     import checks.meta
+    import checks.serial
     import checks.storage
     return (checks.backup, checks.cubox, checks.fleet, checks.meta,
-            checks.storage)
+            checks.serial, checks.storage)

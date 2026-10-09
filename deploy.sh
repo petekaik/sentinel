@@ -143,6 +143,19 @@ CUBOX2_IP="${CUBOX2_IP:-198.51.100.32}"
 _ENV_BACKUP_IP="$(nas_env_var MONITOR_HOST_BACKUP_ADDR)"
 BACKUP_IP="${_ENV_BACKUP_IP:-$BACKUP_IP}"
 
+# The dashboard's own address, read from the same place. MONITOR_IP is what the health
+# check CURLS, so a placeholder here makes a perfectly healthy container report as a
+# failed start -- which is exactly what it did on 2026-10-09:
+#
+#     /healthz -> 000--- after ~40 s of retries
+#     That is past start_period, so this is what a failed start looks like.
+#
+# while the container was up and answering 200 at its real macvlan address. A false
+# failure on every deploy is worse than no check, because it teaches the operator to
+# ignore the one line that would tell them a deploy actually broke.
+_ENV_LOCAL_IPV4="$(nas_env_var LOCAL_IPV4)"
+MONITOR_IP="${_ENV_LOCAL_IPV4:-$MONITOR_IP}"
+
 # A ONE-OFF COMMAND INSIDE THE COLLECTOR'S OWN CONTAINER.
 #
 # This was `docker compose run --rm --no-deps monitor ...`, and THAT CANNOT WORK

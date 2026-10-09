@@ -25,9 +25,12 @@ import test_collect_offline as collect_tests    # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
 import test_incident_lifecycle as incident_tests  # noqa: E402
 import test_proxy_config as proxy_tests         # noqa: E402
+import test_serial_identity as serial_tests     # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
 
 SUITES = (
+    ("serial -- the CuBox console identity: chip serial, not a /dev/ttyUSB number",
+     serial_tests.TESTS),
     ("collect.py -- the collection loop, the escalation state machine, and "
      "the journal cursors",
      collect_tests.TESTS),

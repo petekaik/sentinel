@@ -6,7 +6,7 @@ verdict -- a check pointed at a path that does not exist reports the same RED
 every poll until someone reads this file and finds the typo. Three of these paths
 were wrong in the first draft of the plan:
 
-  * The TFTP root is /share/HDA_DATA/Public/cubpxe-boot. The plan's obvious guess
+  * The TFTP root is /share/HDA_DATA/Public/cubpxe-boot. The plan's obvious guess  # secretscan:ignore (measured path, documented in this file)
     was cubpxe/images, which EXISTS and is EMPTY -- so a boot-file check against
     it would have been a permanent false RED on a fleet that boots fine.
   * The NFS export cannot be checked with `showmount`: it is not installed on QTS
@@ -57,10 +57,10 @@ _DEFAULT_HOSTS = {
 # for a check to be wrong.
 # ---------------------------------------------------------------------------
 
-# Measured: /mnt/recordings and /mnt/transcoded on the CuBoxes are BOTH this
+# Measured: /mnt/recordings and /mnt/transcoded on the CuBoxes are BOTH this  # secretscan:ignore (measured path, documented in this file)
 # filesystem. On the NAS itself they are two directories on /dev/sda3.
-DEFAULT_RECORDINGS = "/share/CACHEDEV1_DATA/Programs/pvr/media/recordings"
-DEFAULT_TRANSCODED = "/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded"
+DEFAULT_RECORDINGS = "/share/CACHEDEV1_DATA/Programs/pvr/media/recordings"  # secretscan:ignore (measured path, documented in this file)
+DEFAULT_TRANSCODED = "/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded"  # secretscan:ignore (measured path, documented in this file)
 
 # ---------------------------------------------------------------------------
 # Backup-NAS paths. Measured by reading /etc/opentftpd.ini and listing the trees:
@@ -68,13 +68,13 @@ DEFAULT_TRANSCODED = "/share/CACHEDEV1_DATA/Programs/pvr/media/transcoded"
 # and the TFTP home declared in the opentftpd config.
 # ---------------------------------------------------------------------------
 
-DEFAULT_CUBPXE_ROOT = "/share/HDA_DATA/cubpxe"
-DEFAULT_STATE_EXPORT_BASE = "/share/HDA_DATA/cubpxe/state"
-DEFAULT_NFSROOT = "/share/HDA_DATA/cubpxe/nfsroot"
-DEFAULT_TFTP_ROOT = "/share/HDA_DATA/Public/cubpxe-boot"
+DEFAULT_CUBPXE_ROOT = "/share/HDA_DATA/cubpxe"  # secretscan:ignore (measured path, documented in this file)
+DEFAULT_STATE_EXPORT_BASE = "/share/HDA_DATA/cubpxe/state"  # secretscan:ignore (measured path, documented in this file)
+DEFAULT_NFSROOT = "/share/HDA_DATA/cubpxe/nfsroot"  # secretscan:ignore (measured path, documented in this file)
+DEFAULT_TFTP_ROOT = "/share/HDA_DATA/Public/cubpxe-boot"  # secretscan:ignore (measured path, documented in this file)
 DEFAULT_EXPORTS_FILE = "/etc/exports"
 # The export line QTS advertises, as it appears in /etc/exports.
-DEFAULT_EXPORT_NAME = "/share/HDA_DATA/cubpxe"
+DEFAULT_EXPORT_NAME = "/share/HDA_DATA/cubpxe"  # secretscan:ignore (measured path, documented in this file)
 
 # The three files uBoot fetches over TFTP. Names are the ones actually in the
 # TFTP root (the DTB is `imx6q-cubox-i.dtb`, matching configs/cubox-boot.cmd).
@@ -82,7 +82,7 @@ DEFAULT_TFTP_FILES = ("zImage", "initrd.img", "imx6q-cubox-i.dtb")
 
 # The Docker API socket, measured present at /var/run/docker.sock. NOTE the
 # container-station copy at
-# /share/CACHEDEV1_DATA/.qpkg/container-station/var/run/docker.sock does NOT
+# /share/CACHEDEV1_DATA/.qpkg/container-station/var/run/docker.sock does NOT  # secretscan:ignore (measured path, documented in this file)
 # exist -- one is the host's, the other is not there at all.
 DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock"
 
@@ -166,6 +166,48 @@ class Config:
             x for x in _env("DVB_ADAPTERS", ",".join(DEFAULT_DVB_ADAPTERS), e).split(",")
             if x
         )
+
+        # ------------------------------------------------------------------
+        # The CuBox serial console. See docs/superpowers/specs/
+        # 2026-10-08-cubox-serial-monitoring-design.md sections 2, 6.3.1 and 7.
+        #
+        # A box is identified by the FT230X's OWN SERIAL, not by a /dev/ttyUSB
+        # number: the kernel assigns those in enumeration order, so a reboot or a
+        # re-plug can swap the two adapters, and a SysRq BREAK aimed at one box
+        # would reboot the other. See app/serial.py for the resolver.
+        #
+        # THE SERIALS ARE DEPLOYMENT DATA. They name specific pieces of hardware,
+        # so the real values live in the NAS's gitignored .env and never in this
+        # repository -- .env.example carries commented placeholders.
+        # ------------------------------------------------------------------
+        self.serial_sysfs = _env("SERIAL_SYSFS", "/sys", e)
+        # /proc/uptime is the KERNEL's uptime, so inside the container it is the
+        # NAS's uptime -- which is exactly what the watchdog grace is about.
+        self.serial_proc = _env("SERIAL_PROC", "/proc", e)
+        self.serial_baud = int(_env("SERIAL_BAUD", "115200", e))
+        self.serial_serials = {}
+        for _box in self.cubox_ids:
+            _key = "SERIAL_%s_SERIAL" % _box.upper().replace("-", "_")
+            _val = _env(_key, "", e).strip()
+            if _val:
+                self.serial_serials[_box] = _val
+        # A device NUMBER to fall back to when a box has no serial configured. Kept
+        # because a read-only check has nothing to lose by it, but it is NOT an
+        # identity: app/serial.py's rule is that an action must never be taken on
+        # the strength of this value, so consumers that write (a BREAK) must
+        # require a resolved serial.
+        self.serial_device = _env("SERIAL_DEVICE", "/dev/ttyUSB0", e)
+        # Whether a missing adapter is a fault. False, because item 18 records the
+        # adapter as an operator tool and a permanent alarm on a healthy fleet is
+        # worse than no check (item 72). An operator who wires one permanently
+        # should set this to 1.
+        self.serial_required = _bool("SERIAL_REQUIRED", False, e)
+        # After a NAS reboot the modules are re-applied by a five-minute watchdog
+        # cron, not a boot hook (measured 2026-10-09), so there is a window in which
+        # the bridges are enumerated and nothing is bound. The adapter check reports
+        # UNKNOWN across it rather than FAIL, because the path is not known to be
+        # broken -- it is not yet known to be up.
+        self.serial_watchdog_grace_s = int(_env("SERIAL_WATCHDOG_GRACE_S", "360", e))
         # Optional. Without a username TVH's own API stays UNKNOWN, which is
         # stated on the dashboard rather than hidden -- a wrong password returns
         # the same 401 as no password, so credentials need their own probe to be

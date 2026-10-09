@@ -23,9 +23,13 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import Results                       # noqa: E402
+from harness import CHECKS_CONF, Results          # noqa: E402
 
-import serial                                     # noqa: E402
+import checks                                    # noqa: E402
+import config as config_mod                      # noqa: E402
+import serial                                    # noqa: E402
+import store                                     # noqa: E402
+import thresholds                                # noqa: E402
 
 
 def _build_sysfs(tmpdir, entries):
@@ -55,6 +59,17 @@ def _sysfs(entries):
     tmpdir = tempfile.mkdtemp(prefix="sentinel-sysfs-")
     _build_sysfs(tmpdir, entries)
     return tmpdir
+
+
+def _cfg_for(tmpdir, env):
+    """A Config over the repo's real checks.conf, with only the serial keys set."""
+    base = {
+        "CUBOX_IDS": "cubox-1,cubox-2",
+        "MONITOR_DB": os.path.join(tmpdir or tempfile.gettempdir(), "monitor.sqlite"),
+        "MONITOR_CHECKS": CHECKS_CONF,
+    }
+    base.update(env)
+    return config_mod.Config(env=base)
 
 
 def test_resolution_follows_the_serial_not_the_number(results):
@@ -204,6 +219,41 @@ def test_a_device_link_escaping_the_sysfs_root_is_not_attributed(results):
         shutil.rmtree(outside)
 
 
+def test_config_maps_each_box_to_its_chip_serial(results):
+    """The mapping uses config.py's existing box-name idiom, so cubox-1 -> the
+    underscore form the host variables already use (MONITOR_HOST_CUBOX_1_ADDR)."""
+    cfg = _cfg_for(tmpdir=None, env={"SERIAL_CUBOX_1_SERIAL": "SYNTH001"})
+    results.check(
+        "SERIAL_<BOX>_SERIAL is read with '-' mapped to '_'",
+        cfg.serial_serials == {"cubox-1": "SYNTH001"},
+        "got %r. If this is empty, every box falls through to UNCONFIGURED and the row "
+        "never grades anything." % (cfg.serial_serials,))
+    results.check(
+        "a box with no serial configured is ABSENT from the mapping, not set to ''",
+        "cubox-2" not in cfg.serial_serials,
+        "an empty string would be indistinguishable from a configured-but-blank value. "
+        "got %r" % (cfg.serial_serials,))
+
+
+def test_config_defaults_are_the_measured_ones(results):
+    cfg = _cfg_for(tmpdir=None, env={})
+    results.check(
+        "baud defaults to the measured 115200 and the grace to 360 s",
+        cfg.serial_baud == 115200 and cfg.serial_watchdog_grace_s == 360,
+        "the grace is 360 because the loader is a 5-minute cron; a shorter one reports "
+        "FAIL on a NAS that rebooted a minute ago. got %r / %r"
+        % (cfg.serial_baud, cfg.serial_watchdog_grace_s))
+    results.check(
+        "SERIAL_REQUIRED defaults to False, because the adapter was an operator tool",
+        cfg.serial_required is False,
+        "defaulting to True makes an unplugged cable a permanent FAIL on a healthy "
+        "fleet (item 72). got %r" % (cfg.serial_required,))
+    results.check(
+        "the sysfs and proc roots are overridable, which is what makes the suite offline",
+        cfg.serial_sysfs == "/sys" and cfg.serial_proc == "/proc",
+        "got %r / %r" % (cfg.serial_sysfs, cfg.serial_proc))
+
+
 TESTS = (test_resolution_follows_the_serial_not_the_number,
          test_an_absent_serial_is_absent_and_never_a_guess,
          test_ambiguous_serials_are_refused,
@@ -211,4 +261,6 @@ TESTS = (test_resolution_follows_the_serial_not_the_number,
          test_a_chip_with_no_serial_is_listed_but_never_matches,
          test_a_device_link_escaping_the_sysfs_root_is_not_attributed,
          test_a_configured_serial_is_normalised_before_comparison,
-         test_no_serial_configured_is_its_own_outcome)
+         test_no_serial_configured_is_its_own_outcome,
+         test_config_maps_each_box_to_its_chip_serial,
+         test_config_defaults_are_the_measured_ones)

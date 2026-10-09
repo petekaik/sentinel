@@ -37,14 +37,15 @@ works. Measured on Storage-NAS by the session building the driver modules:
 
 | Fact | State |
 |---|---|
-| Adapter | FTDI **FT230X**, USB `0403:6015`, NAS bus 1 device 1-2 |
-| Driver | cross-built `ftdi_sio.ko`, `insmod`ed **by hand from `/tmp`** |
-| `/dev/ttyUSB0` | **exists**; link verified both ways at 115200 8N1 — the box answered `cubox-2 login:` |
-| Persistence | **no** — nothing was installed into the NAS's modules or its loader, so the tty dies at the next NAS reboot |
+| Adapters | **two** FTDI FT230X, both `0403:6015`, both bound to `ftdi_sio` |
+| — on cubox-2 | serial **`SYNTH002`**, USB port `1-2`, enumerates as `/dev/ttyUSB0` |
+| — on cubox-1 | serial **`SYNTH001`**, USB port `1-1.2`, enumerates as `/dev/ttyUSB1` |
+| Both links | verified 2026-10-09: writing CR drew `cubox-2 login:` and `cubox-1 login:` at 115200 8N1 |
+| Persistence | **works** — all five modules, `ch341` included, load unattended, re-applied by a 5-minute watchdog cron |
 | QTS ships `usbserial`, `ftdi_sio`, `pl2303`, `cp210x` under `/lib/modules/5.10.60-qnap/` | measured present |
-| Which is missing | only **`ch341`** — the one module that repo adds |
-| Adapters on the NAS bus | **one** — the FT230X. cubox-1's cable is not seen at all, not even unbindable |
-| `qnap-driver-builder` loader installed on Storage-NAS | **no** — the NAS runs a different checkout |
+| Which is missing from QTS | only **`ch341`** — the one module that repo adds |
+| `/dev/serial/by-id/` | **absent** — there is no stable symlink to bind to |
+| `qnap-driver-builder` loader installed on Storage-NAS | **no** — the NAS runs a different checkout; its own watchdog does the loading |
 
 Three consequences, each of which changes the plan:
 
@@ -53,12 +54,15 @@ Three consequences, each of which changes the plan:
    loaded by hand. There is no modalias autoload to rely on here, so "attach a cable and
    it works" is **false**. The gate is a *loaded* module — not a compiled one, and not an
    attached cable. The earlier draft collapsed those three into one.
-2. **The current load is not persistent, and that is the expected live state.** A hand
-   `insmod` from `/tmp` disappears at the next NAS reboot, and nothing in the NAS's own
-   module tree or loader was touched. That is precisely the state `serial_adapter`'s third
-   row exists to report: bridge enumerated, nothing bound → **FAIL**. It is not a false
-   alarm — the out-of-band path really is gone until something loads the module — and it
-   will appear after every NAS reboot, which is when an operator most wants to know.
+2. **Persistence works, but it is a 5-minute watchdog, not a boot hook.** The modules are
+   re-applied by a cron entry — `dvb-watchdog.sh`, every five minutes, tagged
+   `#qnap-driver-builder:watchdog` in the NAS's crontab — while the boot-time `/etc/rcS.d`
+   tree carries nothing for DVB or serial. So after a NAS reboot there is a window of up to
+   five minutes in which the bridges are enumerated and nothing is bound — precisely the
+   state `serial_adapter`'s third row reports as **FAIL**. Sentinel polls at 60 s and
+   escalates after three epochs, so that window would open a genuine incident and then
+   resolve it. The grade is honest, because the path really is down, but it is *predictable*,
+   and section 6.3.1 adds a grace so a reboot does not read as a fault.
 3. **`ch341` is the only chip that needs a build**, and because QTS ships `usbserial`, a
    failed `insmod ch341` is not an unresolved-dependency problem — it is a genuine
    failure, so the check must FAIL rather than sit UNKNOWN. This supersedes the builder's
@@ -69,10 +73,16 @@ Three consequences, each of which changes the plan:
 (section 7). Before the module is loaded, sentinel reports UNKNOWN on "no bridge on the
 bus" and FAIL on "bridge present, nothing bound" — both true, neither a false green.
 
-**`SERIAL_TARGET_BOX` is `cubox-2`.** Only one adapter enumerates and it is on cubox-2's
-header; cubox-1's cable is absent from the USB bus entirely, so nothing on the NAS can see
-it. That is a physical problem — cable, port or box power — and not something this design
-can work around.
+**The fleet is now wired one adapter per box, and a tty number is not an identity.** Both
+CuBoxes have their own FT230X on the NAS, and `/dev/ttyUSB0`/`1` are assigned by USB
+enumeration order — so a reboot, a re-plug, or the hub at `1-1` coming up a moment later can
+**swap them**. That matters more here than in most designs: a capture armed for the wrong
+box records the wrong console, and `--serial-break` would **reboot the wrong box**.
+
+QTS provides no `/dev/serial/by-id/` to bind to, so identity has to come from sysfs. Each
+FT230X carries its own serial at `/sys/bus/usb/devices/<port>/serial`, which is stable
+across enumeration order, so the design resolves **serial → tty** at use time instead of
+trusting a device number (sections 6.3.1 and 7).
 
 ### 2.1 The host tooling trap, measured
 
@@ -98,8 +108,8 @@ stronger claim: the host has the *wrong* interpreter and no usable terminal tool
 | Does anything fire automatically? | **No. Operator-only.** `heal.py` is not built and no automatic action is added. |
 | Capture model | **Armed window owned by a container thread** — survives an ssh drop, and allows arm-now / power-cycle-later. |
 | Where a capture goes | **Ingested**: raw file is the record, parsed highlights reach the store and dashboard. |
-| How the device enters the container | **Bind-mount `/dev`**, because the adapter is on-demand (section 6.1). |
-| Is the adapter permanently wired? | **No** — item 18: an operator tool, attached on demand. Hence a configured target box, and hence absence is not a fault. |
+| How the device enters the container | **Bind-mount `/dev`**, because an adapter may be unplugged at any time (section 6.1). |
+| Is the adapter permanently wired? | **Now yes — one per box.** Item 18 treated serial as an on-demand operator tool, but both CuBoxes have their own FT230X on the NAS as of 2026-10-09. `SERIAL_REQUIRED` therefore becomes a real choice rather than a default; it stays `0` until the operator calls the wiring permanent. |
 
 The operator-only decision is not merely caution. `architecture.md` already lists
 **"CuBox reboots (loses unsaved state)"** under *Deliberately alert-only*, and a
@@ -238,7 +248,7 @@ as completion.
 8N1 set in the same `tcsetattr` as the write, because BREAK is a long low on the
 line and baud-independent but the `b` that follows is not. No `s` (sync) first:
 item 18 records that on a hung shutdown `/` is a read-only NFS mount, the tmpfs
-layers are RAM, and `/mnt/state` has already unmounted, so a bare `b` is safe and
+layers are RAM, and the box's state mount has already unmounted, so a bare `b` is safe and
 a `sync` on a dead network can itself block.
 
 **Arm state.** A JSON file, `SERIAL_ARM_FILE`, default `/data/serial/arm.json`:
@@ -299,6 +309,18 @@ adapter it is the one failure `qnap-driver-builder` exists to fix, and — becau
 way it is a real FAIL with a named cause, which is what the row is for.
 
 `subject` is the literal `"serial"` on every path.
+
+**Resolution, and the reboot grace.** A box's tty is resolved from its configured FTDI
+serial by reading `/sys/bus/usb/devices/*/serial` (section 2), never from a device number,
+so a swapped enumeration cannot attribute one box's console to another — and cannot send a
+BREAK to the wrong box. And because the loader is a 5-minute cron, a NAS that booted within
+`SERIAL_WATCHDOG_GRACE_S` reports **UNKNOWN** ("bridges not yet loaded; the watchdog has not
+run") rather than FAIL. UNKNOWN is the honest grade there: the path is not known to be
+broken, it is merely not yet known to be up.
+
+One row covers the NAS's serial paths (`target = storage`), and its detail names *which*
+box is missing rather than just counting, since a fleet of two makes "one of them" useless.
+`serial_capture` is `per_box`, so each box's captures land against that box.
 
 `SERIAL_REQUIRED=1` flips the second row to FAIL, for the operator who *has*
 permanently wired the adapter. Default `0`, because item 18 says it is an
@@ -371,14 +393,21 @@ addition to the approved scope I want called out for review.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SERIAL_DEVICE` | `/dev/ttyUSB0` | The tty to open. The only path serial code touches |
+| `SERIAL_DEVICE` | `/dev/ttyUSB0` | The tty to open, and **only** a fallback for when no serial is configured for a box |
 | `SERIAL_BAUD` | `115200` | Item 18 measures this; it is not a guess |
-| `SERIAL_TARGET_BOX` | `cubox-2` | Which box the adapter is wired to. Measured: cubox-2's header, and it is the only adapter on the NAS bus |
+| `SERIAL_<BOX>_SERIAL` | see below | The FT230X serial belonging to that box — the *identity*, not the device number |
+| `SERIAL_WATCHDOG_GRACE_S` | `360` | After a NAS boot, hold the adapter check at UNKNOWN this long, because the loader is a 5-minute cron (section 2, consequence 2) |
 | `SERIAL_REQUIRED` | `0` | Whether absence is a fault (on-demand tool by default) |
 | `SERIAL_CAPTURE_DIR` | `/data/serial` | Where captures and the arm file live |
 | `SERIAL_ARM_MAX_MIN` | `30` | Ceiling on an arm window |
 | `SERIAL_CAPTURE_MAX_MB` | `32` | Byte cap; a boot log is KB, so this is a runaway guard |
 | `SERIAL_KEEP_DAYS` | `30` | Retention for raw captures |
+
+The measured mapping is `cubox-1` → `SYNTH001` and `cubox-2` → `SYNTH002`; `SYNTH001` is the
+adapter item 18 records from macOS as `/dev/cu.usbserial-SYNTH001`. These are deployment
+values and belong in the NAS's `.env` beside the addresses, but the spec records them
+because the *mapping* is the design fact: swapping two physical cables must be a config
+edit, and trusting `ttyUSB0` is how the wrong box gets rebooted.
 
 `checks.conf` gains `[serial_adapter]` and `[serial_capture]`, each with a `note`
 recording why the boundary is where it is. **Both must land in the same change as
@@ -445,20 +474,20 @@ the only one that touches a working path.
 
 ## 11. Enabling it on the NAS
 
-**The console works today, and it is not persistent.** On 2026-10-08 a hand `insmod` of
-`ftdi_sio` had `/dev/ttyUSB0` up and cubox-2 answering `cubox-2 login:` at 115200 8N1.
-Nothing was installed, so a NAS reboot takes it away again and `serial_adapter` reports
-FAIL until the module is loaded. Confirm the state before arming anything:
+**Both consoles work, and the driver persists.** Verified 2026-10-09: two FT230X adapters,
+`/dev/ttyUSB0` on cubox-2 and `/dev/ttyUSB1` on cubox-1, each bound to `ftdi_sio`, and
+writing CR drew `cubox-2 login:` and `cubox-1 login:` respectively at 115200 8N1. All five
+modules, `ch341` included, load unattended and are re-applied within five minutes of any
+boot. Confirm before arming anything:
 
 ```sh
-ls -l /dev/ttyUSB0
+ls -l /dev/ttyUSB*
 lsmod | grep -E 'usbserial|ftdi_sio|ch341|pl2303|cp210x'
 ```
 
-Making it durable — handing the module to whatever loader this NAS actually has — is
-`qnap-driver-builder`'s work, not this design's.
+Durability is `qnap-driver-builder`'s work and it is done; nothing here waits on it.
 
-Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
+Then, with each adapter attached to its box's console header:
 
 1. `./deploy.sh --serial-status` — device present, driver named.
 2. `./deploy.sh --serial-arm -m 5`, power-cycle the box, `./deploy.sh --serial-read`
@@ -467,10 +496,9 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
 3. On a running box, no reboot: the kernel-speaks marker from item 18
    (`echo SERIALPROBE-$$ > /dev/kmsg` on the box) proves the capture path without
    a power cycle.
-4. Reboot the NAS once with the cable attached and confirm what actually happens: on
-   current evidence the tty does **not** come back (section 2, consequence 2), and
-   `serial_adapter` should be seen reporting FAIL at that moment. That FAIL is the
-   acceptance test for the third row, not a defect.
+4. Reboot the NAS once and watch the grace: `serial_adapter` should sit UNKNOWN until the
+   watchdog has run (≤5 minutes), then go OK naming both ttys. A FAIL that outlives the
+   grace is the third row doing its job, not a defect.
 5. BREAK is exercised last, on a box that is already being rebooted, never as a
    first test.
 
@@ -484,9 +512,9 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
    other three are QTS's own modules in QTS's own path, where a failure is a different
    fault with a different cause. `serial_adapter` FAILs either way and names which case
    it saw.
-3. **The chip is known now** — FTDI FT230X (`0403:6015`), binding `ftdi_sio`. The check's
-   allowlist still covers all four chips plus the generic `usbserial`, and the manifest
-   keeps all four rather than narrowing to one, so the two agree.
+3. **Both chips are known** — FTDI FT230X (`0403:6015`), binding `ftdi_sio`. The check's
+   allowlist still covers all four chips plus the generic `usbserial`, and the manifest keeps
+   all four rather than narrowing to one, so the two agree.
 4. **`CLOCAL` behaviour on the QTS tty is assumed from Linux semantics.** Item 18
    measured the macOS equivalent, not this. If an open hangs, that is the field to
    revisit, and the open is non-blocking so a hang is a bug rather than a lock-up.
@@ -501,9 +529,13 @@ Then, with the adapter attached to `SERIAL_TARGET_BOX`'s header:
    from the parse alone.
 8. **`termios` on musl is assumed, not verified.** Checked at first run (section 9).
 9. **The journal row on BREAK is an addition to the approved scope** — see 6.5.
-10. **The tty does not survive a NAS reboot, and the check will say so.** The only working
-    load so far is a hand `insmod` from `/tmp`. `serial_adapter` reports FAIL in that state
-    by design, so the dashboard shows the out-of-band path down after every NAS reboot
-    until a loader owns the module. Making it durable is `qnap-driver-builder`'s work; the
-    FAIL in the meantime is the check working, and it is the acceptance test for the third
-    row (section 11, step 4).
+10. **A NAS reboot blinds the console for up to five minutes,** because the loader is a
+    5-minute cron and not a boot hook (section 2, consequence 2). The check holds UNKNOWN
+    across that window rather than FAILing, which keeps a reboot from opening an incident —
+    but it does mean the out-of-band path is genuinely unavailable for a few minutes after
+    every boot, and nothing in this design can shorten that.
+11. **Identity rides on a sysfs read.** Resolving serial → tty (section 6.3.1) is what stops a
+    swapped enumeration from rebooting the wrong box, so a change in QTS's sysfs layout would
+    remove a *safety* property rather than a convenience. The check asserts the serial it
+    resolved, so a layout change surfaces as an unexplained mismatch rather than as a
+    silently wrong mapping.

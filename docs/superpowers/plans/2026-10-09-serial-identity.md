@@ -388,11 +388,43 @@ def test_no_serial_configured_is_its_own_outcome(results):
             "reported as absent. got %r (%s)" % (outcome, why))
 
 
+def test_a_device_link_escaping_the_sysfs_root_is_not_attributed(results):
+    """THE BOUND ON THE WALK IS LOAD-BEARING, AND THIS IS WHY.
+
+    `sysfs` is injectable so the suite can run against a synthetic tree. If the walk up
+    from a tty's `device` link is not bounded by the root it was given, a link that
+    escapes the fake tree keeps climbing into the REAL /sys on the host -- and on
+    Storage-NAS that means matching a live adapter's serial from inside a test that
+    promised no fleet access. So a link pointing outside the root must be attributed to
+    nothing at all, not followed.
+    """
+    outside = tempfile.mkdtemp(prefix="sentinel-not-sysfs-")
+    for fname, val in (("idVendor", "0403"), ("serial", "SYNTH001")):
+        with open(os.path.join(outside, fname), "w") as fh:
+            fh.write(val + "\n")
+    root = tempfile.mkdtemp(prefix="sentinel-sysfs-")
+    cls = os.path.join(root, "class", "tty", "ttyUSB0")
+    os.makedirs(cls)
+    os.symlink(outside, os.path.join(cls, "device"))
+    try:
+        adapters, why = serial.list_adapters(sysfs=root)
+        results.check(
+            "a device link pointing outside the sysfs root is not followed",
+            adapters == [] and why is None,
+            "got %r (%s). An unbounded walk escapes a synthetic tree and can read the "
+            "host's real USB tree, which would let an offline test match a live "
+            "adapter." % (adapters, why))
+    finally:
+        shutil.rmtree(root)
+        shutil.rmtree(outside)
+
+
 TESTS = (test_resolution_follows_the_serial_not_the_number,
          test_an_absent_serial_is_absent_and_never_a_guess,
          test_ambiguous_serials_are_refused,
          test_unreadable_sysfs_is_unreadable_not_absent,
          test_a_chip_with_no_serial_is_listed_but_never_matches,
+         test_a_device_link_escaping_the_sysfs_root_is_not_attributed,
          test_a_configured_serial_is_normalised_before_comparison,
          test_no_serial_configured_is_its_own_outcome)
 ```
@@ -409,7 +441,7 @@ This is the repo's rule: a test that cannot fail is not evidence. In a scratch c
 - Delete the `len(hits) > 1` branch in `resolve` → `test_ambiguous_serials_are_refused` must fail.
 - Change `if adapters is None: return None, UNREADABLE` to return `([])`, `OK` → `test_unreadable_sysfs_is_unreadable_not_absent` must fail.
 - Drop the `.strip()` in `want = serial_str.strip()` → `test_a_configured_serial_is_normalised_before_comparison` must fail.
-- Change `while p.startswith(root)` to `while p != "/"` so the walk leaves the tree → `test_a_chip_with_no_serial_is_listed_but_never_matches` must fail.
+- Change `while p.startswith(root)` to `while p != "/"` so the walk leaves the tree → `test_a_device_link_escaping_the_sysfs_root_is_not_attributed` must fail. **This one was measured rather than assumed.** The first draft of this plan named the *no-serial* test here, and running the mutation showed that test stays GREEN: the walk finds `idVendor` before the bound ever matters, so the bound was unpinned and the claim was wrong. The escaping-link test is what actually pins it — and it matters, because the injectable `sysfs` root is the seam that lets this suite run offline at all.
 
 If any of these stays green, the test is a restatement of the code rather than a check on it (items 84, 58).
 

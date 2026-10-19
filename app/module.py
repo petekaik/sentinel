@@ -84,3 +84,19 @@ class Module:
         if self._after_epoch is not None:
             return self._after_epoch(ctx, conn, seq, dry_run)
         return None
+
+
+def owned_check_ids(mod):
+    """Every incident check id `mod` owns: its Check classes plus `extra_check_ids`.
+
+    OWNERSHIP IS BY CHECK ID, NEVER BY TARGET. Two modules can share a
+    reporting target (`storage`, `fleet`), so a target set cannot say whose
+    incident a row is. This lives here rather than in `collect.py` because the
+    remedy engine is a SECOND reader of the same rule, and a top-level `import
+    collect` from `heal.py` would create a duplicate `collect` module when
+    `collect.py` runs as `__main__`. The `checks` import is lazy to keep this
+    module import-light.
+    """
+    import checks
+    return ({c.id for c in checks.registry(*mod.check_classes())}
+            | set(getattr(mod, "extra_check_ids", ())))

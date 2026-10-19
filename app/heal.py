@@ -15,7 +15,7 @@ exists to prevent. The return value says "executed", never "fixed".
 import time
 
 import actions
-import collect
+import module
 import store
 
 
@@ -79,9 +79,23 @@ def attempt(action, incident, ctx, policy, conn, seq,
                            % recent}
 
     # 1. DRY RUN FIRST, ALWAYS. A dry run that cannot say what it would do
-    # means the action is not understood well enough to run. It is recorded as
-    # a dry run with no exit status, because no process exited.
-    dr = (dry_run_fn or action.dry_run)(ctx, incident)
+    # means the action is not understood well enough to run. A REFUSAL OR AN
+    # EXCEPTION IS A FAILED ATTEMPT: it advances the incident's counter and
+    # cooldown, so a permanently failing dry run cools down and eventually
+    # latches instead of being retried every epoch forever.
+    try:
+        dr = (dry_run_fn or action.dry_run)(ctx, incident)
+    except Exception as exc:                       # noqa: BLE001 - isolated
+        detail = "dry-run raised %s: %s" % (type(exc).__name__, exc)
+        if conn is not None:
+            store.record_remedy(
+                conn, incident["key"], action.id,
+                evidence={"subject": incident.get("subject"), "seq": seq,
+                          "detail": detail},
+                dry_run=True, exit_status="error")
+            store.note_remedy_attempt(conn, incident["key"], detail)
+        return {"executed": False, "why": detail}
+
     if not dr.ok:
         if conn is not None:
             store.record_remedy(
@@ -89,11 +103,30 @@ def attempt(action, incident, ctx, policy, conn, seq,
                 evidence={"subject": incident.get("subject"), "seq": seq,
                           "detail": dr.detail},
                 dry_run=True, exit_status=None)
+            store.note_remedy_attempt(conn, incident["key"], dr.detail)
         return {"executed": False, "why": "dry-run failed: %s" % dr.detail}
 
     # 2. EXECUTE. The command's own exit status is recorded, not interpreted:
     # `out.ok` only distinguishes a failed process from a completed one.
-    out = (run_fn or action.run)(ctx, incident)
+    #
+    # AN EXCEPTION MUST NOT ESCAPE. `collect_once` calls `consider()` before it
+    # writes the epoch record and without a try, so a raising handler would
+    # lose the whole epoch and, worse, leave no audit row and no attempt
+    # counter -- a handler that raises after a side effect would be re-executed
+    # every epoch forever. The exception is recorded as a failed attempt
+    # (`exit_status="error"`), which is what makes the retry bounded.
+    try:
+        out = (run_fn or action.run)(ctx, incident)
+    except Exception as exc:                       # noqa: BLE001 - isolated
+        detail = "run raised %s: %s" % (type(exc).__name__, exc)
+        if conn is not None:
+            store.record_remedy(
+                conn, incident["key"], action.id,
+                evidence={"subject": incident.get("subject"), "seq": seq,
+                          "dry_run": dr.detail, "detail": detail},
+                dry_run=False, exit_status="error")
+            store.note_remedy_attempt(conn, incident["key"], detail)
+        return {"executed": False, "why": detail}
 
     if conn is not None:
         store.record_remedy(
@@ -116,9 +149,10 @@ def consider(cfg, conn, seq, results, ctx):
     any incident is read; `SENTINEL_REMEDIATION` (`policy["enabled"]`) is the
     per-epoch master switch and is enforced by `actions.allowed`, per action.
 
-    A module whose authority is `off` is not considered at all. `off` is the
-    default, so "an operator named this module" is a precondition for its
-    actions existing on this path.
+    There is NO module-level authority skip: `actions.allowed()` is asked per
+    action, which is what lets an action-level override
+    (`<MODULE>_ACTION_<ID>_AUTHORITY`) lift one action out of a module-level
+    `off` -- the override works "in either direction", as `config.py` documents.
     """
     if not getattr(cfg, "remedies_enabled", False):
         return []
@@ -141,8 +175,6 @@ def consider(cfg, conn, seq, results, ctx):
     out = []
     for mod in getattr(ctx, "modules", ()):
         policy = cfg.authority(mod.id)
-        if policy.get("authority") == "off":
-            continue
         declared = {a.id: a for a in mod.actions()}
         if not declared:
             continue
@@ -153,7 +185,7 @@ def consider(cfg, conn, seq, results, ctx):
         cap = min(a.limits.max_attempts for a in declared.values())
 
         for inc in store.live_incidents_for_checks(
-                conn, collect.owned_check_ids(mod)):
+                conn, module.owned_check_ids(mod)):
             key = inc["key"]
 
             # ALREADY LATCHED IS A TERMINAL STATE FOR THIS ENGINE. The reader
@@ -175,16 +207,25 @@ def consider(cfg, conn, seq, results, ctx):
                             {"executed": False, "why": "stale evidence"}))
                 continue
 
+            # FIND THE ACTION FIRST, THEN SPEND THE BUDGET. A module that
+            # permits nothing -- off, advisory, propose, engine off, unmatched
+            # triggers -- must not mutate the incident's attempt counter or
+            # latch it: a latch is a decision about an action this module was
+            # allowed to take, and there is none.
+            action = None
+            for cand in declared.values():
+                if actions.allowed(cand, inc, policy)[0]:
+                    action = cand
+                    break
+            if action is None:
+                continue
+
             if inc.get("remedy_attempts", 0) >= cap:
                 store.latch_remedy(conn, key, "remedy attempts exhausted")
                 out.append((key, None,
                             {"executed": False, "why": "latched"}))
                 continue
 
-            for action in declared.values():
-                allowed, _why = actions.allowed(action, inc, policy)
-                if allowed:
-                    out.append((key, action.id,
-                                attempt(action, inc, ctx, policy, conn, seq)))
-                    break
+            out.append((key, action.id,
+                        attempt(action, inc, ctx, policy, conn, seq)))
     return out

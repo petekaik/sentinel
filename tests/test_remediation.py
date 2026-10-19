@@ -306,16 +306,27 @@ def test_authority_off_never_executes(results):
     with tempfile.TemporaryDirectory() as tmp:
         conn = _fresh_conn(tmp)
         _open_row(conn)
-        # The action-level override is what makes this test bite: without the
-        # module-level skip, `actions.allowed` would honour `full` for "a" and
-        # execute. `off` means the operator has not named the module, so its
-        # actions are not on this path at all.
+        cfg = _Cfg({"authority": "off", "allow": (), "destructive": False})
+        out = heal.consider(cfg, conn, 4, [_Ran()], _Ctx([_Mod([a])]))
+        results.check("consider executes nothing when the module is off",
+                      out == [] and ran == [],
+                      "out=%r ran=%r" % (out, ran))
+
+
+def test_an_action_override_lifts_a_module_out_of_off(results):
+    """`config.py`: the override works "in either direction"."""
+    heal = _heal()
+    ran = []
+    a = _act(run=lambda ctx, inc: (ran.append(1)
+                                   or actions.Result(True, "done")))
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        _open_row(conn)
         cfg = _Cfg({"authority": "off", "allow": (), "destructive": False,
                     "overrides": {"a": "full"}})
         out = heal.consider(cfg, conn, 4, [_Ran()], _Ctx([_Mod([a])]))
-        results.check("consider skips a module whose authority is off, even "
-                      "with an action-level override",
-                      out == [] and ran == [],
+        results.check("a per-action full override runs despite a module-level off",
+                      ran == [1] and out and out[0][2]["executed"],
                       "out=%r ran=%r" % (out, ran))
 
 
@@ -349,9 +360,16 @@ def test_a_collector_dry_run_never_executes(results):
     with tempfile.TemporaryDirectory() as tmp:
         conn = _fresh_conn(tmp)
         _open_row(conn)
+        # Both halves of the dry-run OR, individually.
         out = heal.consider(_Cfg(_policy()), conn, 4, [_Ran()],
                             _Ctx([_Mod([a])], dry_run=True))
-        results.check("a dry run aborts even when consider is called directly",
+        results.check("ctx.cfg.dry_run aborts even when consider is called "
+                      "directly", out == [] and ran == [],
+                      "out=%r ran=%r" % (out, ran))
+
+        out = heal.consider(_Cfg(_policy(), dry_run=True), conn, 5, [_Ran()],
+                            _Ctx([_Mod([a])]))
+        results.check("cfg.dry_run aborts on its own too",
                       out == [] and ran == [],
                       "out=%r ran=%r" % (out, ran))
 
@@ -377,12 +395,113 @@ def test_a_failed_dry_run_is_audited_as_a_dry_run(results):
         out = heal.attempt(a, row, None, _policy(), conn, 4)
         rec = conn.execute(
             "SELECT * FROM remedy ORDER BY id DESC LIMIT 1").fetchone()
+        after = conn.execute("SELECT * FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()
         results.check("a dry-run refusal is recorded as dry_run=1, no exit "
                       "status and no execution",
                       not out["executed"] and rec is not None
                       and rec["remedy"] == "a" and rec["dry_run"] == 1
                       and rec["exit_status"] is None,
                       "out=%r rec=%r" % (out, dict(rec) if rec else None))
+        results.check("a failed dry-run is a FAILED ATTEMPT: counted and "
+                      "cooling down",
+                      after["remedy_attempts"] == 1
+                      and after["remedy_last_at"] is not None,
+                      "attempts=%r last=%r"
+                      % (after["remedy_attempts"], after["remedy_last_at"]))
+        again = heal.attempt(a, dict(after), None, _policy(), conn, 5)
+        results.check("so it cannot be retried every epoch",
+                      not again["executed"] and "cooldown" in again["why"],
+                      "out=%r" % (again,))
+
+
+def test_a_permitting_nothing_module_does_not_spend_the_budget(results):
+    """The latch is a decision about an allowed action; with none, leave it."""
+    heal = _heal()
+    ran = []
+    a = _act(run=lambda ctx, inc: (ran.append(1)
+                                   or actions.Result(True, "done")),
+             limits=actions.Limits(max_attempts=2))
+    policy = {"authority": "full", "allow": (), "destructive": True}
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        conn.execute("UPDATE incident SET remedy_attempts = 2 WHERE key = ?",
+                     (row["key"],))
+        # SENTINEL_REMEDIATION=0 permits nothing; the incident is at the cap
+        # but must not be latched by a module that may not act at all.
+        out = heal.consider(_Cfg(dict(policy, enabled=False)), conn, 4,
+                            [_Ran()], _Ctx([_Mod([a])]))
+        after = conn.execute("SELECT * FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()
+        results.check("an engine-off module neither runs nor latches",
+                      ran == [] and out == []
+                      and after["state"] == "open"
+                      and after["remedy_attempts"] == 2
+                      and after["remedy_latched"] == 0,
+                      "out=%r state=%r attempts=%r latched=%r"
+                      % (out, after["state"], after["remedy_attempts"],
+                         after["remedy_latched"]))
+
+
+def test_a_raising_run_is_isolated_audited_and_counted(results):
+    heal = _heal()
+
+    def boom(ctx, inc):
+        raise RuntimeError("kaboom")
+
+    a = _act(run=boom)
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        # Through the collector seam: an exception must not escape it.
+        out = heal.consider(_Cfg(_policy()), conn, 4, [_Ran()],
+                            _Ctx([_Mod([a])]))
+        rec = conn.execute(
+            "SELECT * FROM remedy ORDER BY id DESC LIMIT 1").fetchone()
+        after = conn.execute("SELECT * FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()
+        results.check("a raising run is a refusal, not an escaped exception",
+                      out and not out[0][2]["executed"]
+                      and "kaboom" in out[0][2]["why"],
+                      "out=%r" % (out,))
+        results.check("a raising run is audited with a TEXT 'error' status and "
+                      "counted as a failed attempt",
+                      rec is not None and rec["dry_run"] == 0
+                      and rec["exit_status"] == "error"
+                      and after["remedy_attempts"] == 1
+                      and after["remedy_last_at"] is not None,
+                      "rec=%r attempts=%r"
+                      % (dict(rec) if rec else None,
+                         after["remedy_attempts"]))
+
+
+def test_a_raising_dry_run_is_isolated_audited_and_counted(results):
+    heal = _heal()
+
+    def boom(ctx, inc):
+        raise RuntimeError("dry boom")
+
+    a = _act(dry_run=boom)
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        out = heal.attempt(a, row, None, _policy(), conn, 4)
+        rec = conn.execute(
+            "SELECT * FROM remedy ORDER BY id DESC LIMIT 1").fetchone()
+        after = conn.execute("SELECT * FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()
+        results.check("a raising dry-run is a refusal, not an escaped exception",
+                      not out["executed"] and "dry boom" in out["why"],
+                      "out=%r" % (out,))
+        results.check("a raising dry-run is recorded as a dry run with "
+                      "'error' and counted",
+                      rec is not None and rec["dry_run"] == 1
+                      and rec["exit_status"] == "error"
+                      and after["remedy_attempts"] == 1,
+                      "rec=%r attempts=%r"
+                      % (dict(rec) if rec else None,
+                         after["remedy_attempts"]))
 
 
 def test_a_latched_incident_is_not_retried(results):
@@ -423,6 +542,30 @@ def test_exhausted_attempts_are_latched(results):
                       % (out, after["state"], after["remedy_latched"]))
 
 
+def test_the_cap_is_the_lowest_budget_among_declared_actions(results):
+    heal = _heal()
+    ran = []
+    short = _act(id="a", run=lambda ctx, inc: (ran.append(1)
+                                               or actions.Result(True, "done")),
+                 limits=actions.Limits(max_attempts=1))
+    long = _act(id="b", run=lambda ctx, inc: (ran.append(2)
+                                              or actions.Result(True, "done")),
+                limits=actions.Limits(max_attempts=5))
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        conn.execute("UPDATE incident SET remedy_attempts = 1 WHERE key = ?",
+                     (row["key"],))
+        out = heal.consider(_Cfg(_policy()), conn, 4, [_Ran()],
+                            _Ctx([_Mod([short, long])]))
+        after = conn.execute("SELECT * FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()
+        results.check("the strictest declared action's budget caps the "
+                      "incident, not the loosest",
+                      ran == [] and after["state"] == "latched",
+                      "out=%r state=%r" % (out, after["state"]))
+
+
 def test_a_latched_incident_is_not_latched_again(results):
     heal = _heal()
     ran = []
@@ -461,9 +604,18 @@ def test_stale_evidence_aborts(results):
                       and "stale evidence" in out[0][2]["why"],
                       "out=%r ran=%r" % (out, ran))
 
+        # The key is (target, check_id, SUBJECT): a result with the same check
+        # but another subject is evidence about a different row, not this one.
+        out = heal.consider(_Cfg(_policy()), conn, 5, [_Ran(subject="other")],
+                            _Ctx([_Mod([a])]))
+        results.check("a same-check result with another subject is stale too",
+                      ran == [] and out
+                      and "stale evidence" in out[0][2]["why"],
+                      "out=%r ran=%r" % (out, ran))
+
         # The positive control: the same fixture with this epoch's observation
-        # DOES execute, so the gate above is not vacuously true.
-        out = heal.consider(_Cfg(_policy()), conn, 5, [_Ran()],
+        # DOES execute, so the gates above are not vacuously true.
+        out = heal.consider(_Cfg(_policy()), conn, 6, [_Ran()],
                             _Ctx([_Mod([a])]))
         results.check("a fresh observation lets the same incident through",
                       ran == [1] and out and out[0][2]["executed"],
@@ -589,12 +741,17 @@ TESTS = (test_off_by_default,
          test_config_authority_reads_action_level_overrides,
          test_action_declarations_are_validated,
          test_authority_off_never_executes,
+         test_an_action_override_lifts_a_module_out_of_off,
          test_both_engine_switches_are_gates,
+         test_a_permitting_nothing_module_does_not_spend_the_budget,
          test_a_collector_dry_run_never_executes,
          test_a_failed_dry_run_aborts_before_run,
          test_a_failed_dry_run_is_audited_as_a_dry_run,
+         test_a_raising_dry_run_is_isolated_audited_and_counted,
+         test_a_raising_run_is_isolated_audited_and_counted,
          test_a_latched_incident_is_not_retried,
          test_exhausted_attempts_are_latched,
+         test_the_cap_is_the_lowest_budget_among_declared_actions,
          test_a_latched_incident_is_not_latched_again,
          test_stale_evidence_aborts,
          test_success_is_not_claimed_by_exit_status,

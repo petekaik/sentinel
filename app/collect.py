@@ -46,6 +46,7 @@ import traceback
 
 import checks
 import config as config_mod
+from module import owned_check_ids
 import modules as module_loader
 import store
 import thresholds
@@ -411,17 +412,11 @@ def _fleet_view(ctx):
     return ctx.module_cfg.get("fleet")
 
 
-def owned_check_ids(mod):
-    """Every incident check id `mod` owns.
-
-    THE MODULE'S CHECK CLASSES PLUS WHAT THE COLLECTOR EMITS FOR IT. Target
-    sets cannot answer this: modules share reporting targets, and a target is
-    a vocabulary, not ownership. The collector-emitted ids (`host_unreachable`,
-    `journal_capture`, ...) are declared by the module because no Check class
-    owns them.
-    """
-    return ({c.id for c in checks.registry(*mod.check_classes())}
-            | set(getattr(mod, "extra_check_ids", ())))
+# `owned_check_ids` is imported from `module.py`: it is the module contract's
+# own rule (its Check classes plus the ids the collector emits for it), and the
+# remedy engine reads the same rule. Keeping the one definition there means
+# `heal.py` never has to import this file -- which would duplicate the module
+# when collect.py runs as `__main__`.
 
 
 def freeze_disabled_modules(conn, seq, enabled, all_modules=None):

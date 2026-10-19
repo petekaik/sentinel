@@ -191,8 +191,12 @@ class Config:
         return actions.Authority(
             authority=_env("%s_AUTHORITY" % prefix, "off",
                            self.env).strip().lower(),
+            # LOWERCASED, like the action ids it is compared against. An
+            # operator typing FLEET_ALLOW=STATE_MOUNT_CYCLE (the shape the
+            # action's own env key uses) must not silently match nothing and
+            # leave the allow-list empty.
             allow=tuple(
-                x.strip()
+                x.strip().lower()
                 for x in _env("%s_ALLOW" % prefix, "", self.env).split(",")
                 if x.strip()),
             destructive=_bool("%s_ALLOW_DESTRUCTIVE" % prefix, False,

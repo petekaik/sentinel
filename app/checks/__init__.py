@@ -120,7 +120,8 @@ class Check:
             # healthy check. Reported as unknown-with-a-reason.
             return unknown(
                 self.id, self.target,
-                "no threshold spec %r in checks.conf -- check not evaluated" % self.spec,
+                "no threshold spec %r in the module's thresholds.conf -- check "
+                "not evaluated" % self.spec,
                 subject=subject,
             )
         status, detail = _evaluate(value, spec)

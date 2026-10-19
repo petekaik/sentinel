@@ -221,7 +221,8 @@ def record(conn, seq, results):
             store.record_sample(conn, seq, res.target, metric, value, unit, text)
         try:
             store.record_check(conn, seq, res.target, res.check_id,
-                               res.status, res.detail, res.duration_ms)
+                               res.status, res.detail, res.duration_ms,
+                               subject=res.subject or "")
             store.sync_incident(conn, seq, res.target, res.check_id,
                                 res.subject or "", res.status, res.detail,
                                 res.evidence)
@@ -676,7 +677,7 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     # the file's -- otherwise an approval would not change grading until the
     # next rebuild, which is the thing this mechanism exists to avoid.
     specs = thresholds.load_effective(
-        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled}, conn)
+        thresholds.spec_mapping(cfg, enabled), conn)
     classes = checks.registry(
         *([c for m in enabled for c in m.check_classes()]
           + list(checks.platform_modules())))
@@ -687,7 +688,16 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     attempts = {}
     preload_modules(cfg, ctx, attempts)
 
-    results = evaluate(classes, ctx, checks.expansion_targets(enabled))
+    # `--host` RESTRICTS THE PER-BOX EXPANSION, not just the preload. The
+    # preload already narrows the boxes it contacts; expanding every per_box
+    # check for BOTH boxes anyway then evaluates a box nobody fetched (all
+    # UNKNOWN rows) and lets the escalation record rows for it. Non-box targets
+    # are unaffected -- they are static checks, not expansion targets.
+    targets = checks.expansion_targets(enabled)
+    if hosts_only:
+        wanted = set(hosts_only)
+        targets = tuple(t for t in targets if t in wanted)
+    results = evaluate(classes, ctx, targets)
 
     # THIS ORDER MATTERS. The attempt rows are written BEFORE the escalation
     # reads them, so "3 consecutive failed attempts" counts the attempt that just
@@ -777,6 +787,12 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
 def _load_healer(cfg):
     """heal.py or a LOUD refusal -- never a silently disabled remedy engine.
 
+    THE HEALER IS LOADED EVEN WHEN `MONITOR_REMEDIES=0`. That switch is the
+    EXECUTION kill switch; an `advisory`-level authority is advice rather than
+    execution, and with the healer absent the dashboard would show nothing for
+    it -- an advisory module indistinguishable from `off`. The engine itself
+    reads the switch (`heal.consider`) and executes nothing while it is off.
+
     `MONITOR_REMEDIES=1` with no healer would leave an operator believing
     automated healing is on when nothing runs, which is the "declared but not
     implemented" shape this project has now hit twice (the unclaimed threshold
@@ -790,21 +806,19 @@ def _load_healer(cfg):
     prevent, one level further in. So the seam is named here, once, and a
     healer that cannot be called refuses to start.
     """
-    if not cfg.remedies_enabled:
-        return None
     try:
         import heal
     except ImportError:
         raise SystemExit(
-            "MONITOR_REMEDIES is enabled but app/heal.py does not exist, so NO "
-            "remedy would ever run. Refusing to start rather than appearing to "
-            "heal: an operator who believes automated healing is on will not go "
-            "and look. Unset MONITOR_REMEDIES to collect and alert without it."
+            "app/heal.py does not exist, so neither automated remedies nor "
+            "advisory-level recommendations could ever surface. Refusing to "
+            "start rather than appearing to heal: an operator who believes "
+            "remedies are on will not go and look."
         )
     if not callable(getattr(heal, "consider", None)):
         raise SystemExit(
-            "MONITOR_REMEDIES is enabled and app/heal.py imports, but it has no "
-            "callable consider(cfg, conn, seq, results, ctx) -- the one seam "
+            "app/heal.py imports, but it has no callable "
+            "consider(cfg, conn, seq, results, ctx) -- the one seam "
             "collect_once calls. Nothing would ever run, and the process would "
             "still print 'remedies ENABLED'. Refusing to start."
         )
@@ -864,9 +878,14 @@ def run_forever(cfg, conn, hosts_only=None, should_stop=None):
     use is the only version of this that cannot be forgotten.
     """
     healer = _load_healer(cfg)
-    if healer is not None:
+    if cfg.remedies_enabled:
         sys.stderr.write("remedies ENABLED: every action is recorded with its "
-                         "trigger evidence and its post-check\n")
+                         "trigger evidence and its exit status; success is the "
+                         "next OK observation\n")
+    else:
+        sys.stderr.write("remedies DISABLED (MONITOR_REMEDIES=0): no action "
+                         "executes and no proposal is written; advisory-level "
+                         "recommendations are still surfaced as insights\n")
     while True:
         try:
             summary = collect_once(cfg, conn, hosts_only=hosts_only,
@@ -915,8 +934,7 @@ def main(argv=None):
         # diagnostic, so it must not create or migrate the store, and a locked
         # or absent database falls back to the file-declared bands rather than
         # failing the command that is supposed to explain the configuration.
-        mapping = {m.id: os.path.join(m._path, m.threshold_file)
-                   for m in enabled}
+        mapping = thresholds.spec_mapping(cfg, enabled)
         specs = thresholds.load_many(mapping)
         if os.path.exists(cfg.db_path):
             try:

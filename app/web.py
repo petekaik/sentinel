@@ -39,7 +39,6 @@ a slow query cannot block the collector's writer.
 
 import html
 import json
-import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -138,7 +137,7 @@ def build_state(cfg, conn, now=None):
     # THE BAND THE COLLECTOR GRADES WITH, not the file's band: an approved
     # override is live, and the page must not describe the old one.
     specs = thresholds.load_effective(
-        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled}, conn)
+        thresholds.spec_mapping(cfg, enabled), conn)
     classes = checks.registry(
         *([c for m in enabled for c in m.check_classes()]
           + list(checks.platform_modules())))
@@ -232,6 +231,11 @@ def build_state(cfg, conn, now=None):
     return {
         "now": now,
         "last": last,
+        # The PROCESS kill switch, so the approvals inbox can say WHY it is
+        # empty: "nothing pending" and "nothing could execute anyway" are
+        # different facts, and an empty queue that is empty because the engine
+        # is off looks identical to a fleet with nothing to decide.
+        "remedies_enabled": bool(getattr(cfg, "remedies_enabled", False)),
         "last_age_s": age,
         "staleness": staleness,
         "stale_after_s": cfg.interval * STALE_INTERVALS,
@@ -612,6 +616,12 @@ def build_status(cfg, conn, now=None):
         # "it is fine", which is the entire reason `verdict` is not a boolean.
         "verdict": verdict,
         "verdict_reason": why,
+
+        # Whether an approval could execute at all. Additive: an integrator can
+        # distinguish an empty queue from a disabled engine without parsing
+        # prose. `MONITOR_REMEDIES` is the execution kill switch; advisory
+        # insights are still produced while it is off.
+        "remedies_enabled": state["remedies_enabled"],
 
         # The fleet's own liveness, FIRST among the numbers, because everything
         # after it is only as current as this.
@@ -1277,9 +1287,22 @@ def render_html(state, cfg):
     proposals = state.get("proposals", [])
     _app("<h2>Approvals (%d)</h2>" % len(proposals))
     if not proposals:
-        _app("<div class=note>No pending proposal. A <code>propose</code>-level "
-             "remedy writes one here rather than acting; an empty queue means "
-             "the engine has nothing waiting for a human.</div>")
+        # TWO EMPTY QUEUES. `MONITOR_REMEDIES=0` stops execution at the process
+        # level, so nothing could run even if something were queued. Saying only
+        # "nothing pending" would read as "the fleet needs no decision", which
+        # is the opposite of "the engine is switched off".
+        if state.get("remedies_enabled"):
+            _app("<div class=note>No pending proposal. A "
+                 "<code>propose</code>-level remedy writes one here rather than "
+                 "acting; an empty queue means the engine has nothing waiting "
+                 "for a human.</div>")
+        else:
+            _app("<div class=note>No pending proposal, and automated remedies "
+                 "are DISABLED (<code>MONITOR_REMEDIES=0</code>): an approval "
+                 "could not execute even if one were queued. Set "
+                 "<code>MONITOR_REMEDIES=1</code> to enable execution; "
+                 "advisory-level recommendations are still surfaced above."
+                 "</div>")
     else:
         _app("<div class=scroll><table><tr><th>Key</th><th>Kind</th>"
              "<th>Module</th><th>Rationale</th><th>Expiry</th></tr>")

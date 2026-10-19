@@ -207,6 +207,25 @@ def load_many(mapping):
     return specs
 
 
+def spec_mapping(cfg, modules):
+    """Every threshold file that grades this fleet, in one mapping.
+
+    THE PLATFORM FILE IS NOT DECORATION. `MONITOR_CHECKS` (`cfg.checks_conf`)
+    used to be loaded by nothing after the module split, so a platform/meta spec
+    added there would silently never apply -- the declared-but-not-implemented
+    shape. It is merged here, under the owner id `config`, for every runtime
+    reader (collector, dashboard, approvals); `load_many()` refuses a spec id
+    that appears in more than one file, so the two sources cannot disagree.
+    """
+    mapping = {}
+    conf = getattr(cfg, "checks_conf", None)
+    if conf:
+        mapping["config"] = conf
+    for mod in modules:
+        mapping[mod.id] = os.path.join(mod._path, mod.threshold_file)
+    return mapping
+
+
 def apply_overrides(specs, overrides):
     """Return a COPY of `specs` with each approved override's band applied.
 

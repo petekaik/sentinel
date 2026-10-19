@@ -103,7 +103,8 @@ class SpecCoverage(Check):
         if unclaimed:
             return fail(
                 self.id, self.target,
-                "%d of %d thresholds in checks.conf are claimed by NO CHECK and "
+                "%d of %d thresholds in the enabled modules' thresholds.conf "
+                "files are claimed by NO CHECK and "
                 "declare no reason: %s. A threshold no check reads does nothing "
                 "at all -- it is not a loose bound, it is an absent check -- and "
                 "an absent row reads on the dashboard exactly like a healthy "

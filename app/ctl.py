@@ -49,9 +49,21 @@ def _context(cfg, mods):
     return ctx
 
 
-def _threshold_mapping(mods):
-    return {mid: os.path.join(m._path, m.threshold_file)
-            for mid, m in mods.items()}
+def _threshold_mapping(cfg, mods):
+    """Every threshold file that grades this fleet: platform, then modules.
+
+    The platform's `checks.conf` is loaded alongside the module files, exactly
+    as the collector and the dashboard load it. A platform/meta spec that only
+    an approval path could see would be a second, silent source of truth; the
+    merged loader refuses duplicate ids, so the split stays safe.
+    """
+    mapping = {}
+    conf = getattr(cfg, "checks_conf", None)
+    if conf:
+        mapping["config"] = conf
+    mapping.update({mid: os.path.join(m._path, m.threshold_file)
+                    for mid, m in mods.items()})
+    return mapping
 
 
 def _payload(row):
@@ -105,6 +117,20 @@ def _approve_action(cfg, conn, mod, payload, row, actor, ctx):
             "incident %r is no longer live; the proposal was marked expired, "
             "not left pending" % (key,))
 
+    # THE EVIDENCE MUST BE FROM THE NEWEST EPOCH. An incident row can outlive
+    # the observation that produced it, and approving it would authorize an
+    # action against a condition nobody measured in the latest collection. The
+    # refusal leaves the proposal PENDING: fresh evidence may arrive next epoch,
+    # and this is not a decision about the proposal.
+    if not store.evidence_in_newest_epoch(conn, incident["target"],
+                                          incident["check_id"],
+                                          incident.get("subject", "")):
+        raise ProposalRefused(
+            "no check_run row for %s/%s in the newest epoch: the incident's "
+            "evidence is stale, so this approval would act on an observation "
+            "nothing produced this epoch; the proposal is left pending"
+            % (incident["target"], incident["check_id"]))
+
     # SENTINEL_REMEDIATION is enforced by the ladder itself: `approval_policy`
     # carries `enabled` through, and `allowed()` refuses on it. Not repeating
     # that check here is deliberate -- one gate, one home.
@@ -127,15 +153,33 @@ def _approve_action(cfg, conn, mod, payload, row, actor, ctx):
         # an approval deliberately cannot lift either of them.
         raise ProposalRefused("the ladder refuses this action: %s" % why)
 
-    res = heal.attempt(action, incident, ctx, approval, conn, seq=0)
-    if not res["executed"]:
+    # CLAIM, THEN EXECUTE. The conditional UPDATE is what stops two concurrent
+    # approvals from both running the action: only the process that moved the
+    # row out of `pending` owns the execution. A refusal RELEASES the claim, so
+    # a failed approval stays pending and can be retried.
+    if store.claim_proposal(conn, row["id"], actor) != 1:
         raise ProposalRefused(
-            "not executed: %s; the proposal is left pending" % res["why"])
-    store.mark_proposal_executed(conn, row["id"])
+            "proposal %s is no longer pending -- another approval claimed it"
+            % (row["id"],))
+    executed = False
+    try:
+        res = heal.attempt(action, incident, ctx, approval, conn, seq=0,
+                           module_id=mod.id)
+        if not res["executed"]:
+            raise ProposalRefused(
+                "not executed: %s; the proposal is left pending" % res["why"])
+        # PAST THIS LINE THE ACTION RAN. A release here would make a retry a
+        # second execution of a side effect that already happened.
+        executed = True
+        store.mark_proposal_executed(conn, row["id"])
+    except BaseException:
+        if not executed:
+            store.release_proposal(conn, row["id"])
+        raise
     return "proposal %d: %s %s" % (row["id"], action.id, res["why"])
 
 
-def _approve_threshold(conn, mods, row, payload, actor):
+def _approve_threshold(cfg, conn, mods, row, payload, actor):
     spec_id = payload.get("spec_id")
     green = payload.get("green")
     amber = payload.get("amber")
@@ -148,7 +192,7 @@ def _approve_threshold(conn, mods, row, payload, actor):
         raise ProposalRefused(
             "module %r is disabled or unknown" % (module,))
 
-    specs = thresholds.load_effective(_threshold_mapping(mods), conn)
+    specs = thresholds.load_effective(_threshold_mapping(cfg, mods), conn)
     spec = specs.get(spec_id)
     if spec is None:
         raise ProposalRefused("unknown threshold spec %r" % (spec_id,))
@@ -214,10 +258,27 @@ def _approve_threshold(conn, mods, row, payload, actor):
             "change of %s exceeds the %s bound (25%% of the band width %s)"
             % (step, max_step, abs(float(spec.amber) - float(spec.green))))
 
-    store.set_threshold_override(
-        conn, spec_id=spec_id, module=module, green=green, amber=amber,
-        actor=actor, previous=previous, proposal_id=row["id"])
-    store.mark_proposal_executed(conn, row["id"])
+    # CLAIM BEFORE THE WRITE, exactly as the action path does: two concurrent
+    # approvals of one threshold proposal must not both apply a band.
+    if store.claim_proposal(conn, row["id"], actor) != 1:
+        raise ProposalRefused(
+            "proposal %s is no longer pending -- another approval claimed it"
+            % (row["id"],))
+    applied = False
+    try:
+        store.set_threshold_override(
+            conn, spec_id=spec_id, module=module, green=green, amber=amber,
+            actor=actor, previous=previous, proposal_id=row["id"])
+        applied = True
+        store.mark_proposal_executed(conn, row["id"])
+    except BaseException:
+        # If the override was already written, releasing would leave it live
+        # under a pending proposal; the pair (override, state) is only
+        # consistent once the mark lands, so a mark failure is left approved
+        # for the operator to inspect rather than silently reopened.
+        if not applied:
+            store.release_proposal(conn, row["id"])
+        raise
     return ("proposal %d: %s now grades green=%s amber=%s (was green=%s "
             "amber=%s)" % (row["id"], spec_id, green, amber,
                            previous["green"], previous["amber"]))
@@ -269,7 +330,7 @@ def approve_proposal(cfg, conn, mods, proposal_id, actor, ctx=None):
                 cfg, conn, mod, payload, row, actor,
                 ctx if ctx is not None else _context(cfg, mods))
         elif row["kind"] == "threshold_change":
-            detail = _approve_threshold(conn, mods, row, payload, actor)
+            detail = _approve_threshold(cfg, conn, mods, row, payload, actor)
         else:
             raise ProposalRefused(
                 "proposal kind %r cannot be approved" % (row["kind"],))
@@ -319,7 +380,7 @@ def revert_threshold(cfg, conn, mods, spec_id, actor="operator"):
         if store.remove_threshold_override(conn, spec_id) is None:
             raise ProposalRefused("no threshold override for %r" % (spec_id,))
         spec = thresholds.load_effective(
-            _threshold_mapping(mods), conn).get(spec_id)
+            _threshold_mapping(cfg, mods), conn).get(spec_id)
         if spec is None:
             detail = ("reverted %s: override removed; the spec is not in an "
                       "enabled module's threshold file" % (spec_id,))
@@ -361,6 +422,14 @@ def main(argv=None):
     ap.add_argument("--thresholds", action="store_true")
     ap.add_argument("--revert-threshold", metavar="SPEC_ID")
     args = ap.parse_args(argv)
+
+    # A DECIDING VERB UNDER --dry-run IS REFUSED, NOT SILENTLY EXECUTED. The
+    # flag promises nothing changes; an approval, a rejection and a threshold
+    # revert all change something by definition. Accepting the combination and
+    # ignoring the flag is the worst of both. `--run` keeps its meaning.
+    if args.dry_run and (args.approve or args.reject or args.revert_threshold):
+        print("--dry-run is not supported for this verb", file=sys.stderr)
+        return 2
 
     cfg = config_mod.Config()
 

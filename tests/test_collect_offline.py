@@ -405,8 +405,41 @@ def test_transport_argv_is_the_measured_one(results):
                       "argv=%s" % argv)
 
 
+def test_a_raising_healer_cannot_lose_the_epoch_record(results):
+    """`consider` runs before `record_collector_run` and has no other try.
+
+    The engine catches its own handler calls, but a raise from module code or a
+    store read would otherwise escape and take the epoch record with it --
+    exactly the condition that makes the dashboard's staleness banner blame the
+    fleet for a monitor fault.
+    """
+    import shutil
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with Fleet(tmpdir) as f:
+            class Boom:
+                def consider(self, cfg, conn, seq, _results, ctx):
+                    raise RuntimeError("healer exploded")
+
+            out = collect.collect_once(f.cfg, f.conn, healer=Boom())
+            row = store.last_collection(f.conn)
+            results.check(
+                "a raising healer is reported in the epoch's notes, not raised",
+                any("healing failed" in n and "healer exploded" in n
+                    for n in out["notes"]),
+                "notes=%r -- an exception escaping here loses the epoch record"
+                % (out["notes"],))
+            results.check(
+                "the epoch record is still written after the healer failed",
+                row is not None and row["epoch_seq"] == out["seq"],
+                "row=%r seq=%r" % (row, out["seq"]))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_outage_keeps_its_history, test_blip_leaves_no_trace,
-         test_unknown_is_never_green, test_transport_argv_is_the_measured_one)
+         test_unknown_is_never_green, test_transport_argv_is_the_measured_one,
+         test_a_raising_healer_cannot_lose_the_epoch_record)
 
 
 def main():

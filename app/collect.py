@@ -509,8 +509,20 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     #
     # SKIPPED ENTIRELY ON A DRY RUN. Item 55: the mode whose whole contract is
     # "claims nothing" must not be able to take an action.
+    #
+    # AND IT IS ISOLATED. Every handler call inside `consider` is already
+    # bounded and caught by the engine, but the seam can still raise from
+    # module code or a store read -- and this call sits BEFORE
+    # `record_collector_run` with no other try, so an escaping exception would
+    # lose the epoch record (the dashboard's stale banner and `--once`'s
+    # traceback). The epoch proceeds and the failure is named in its notes.
     if healer is not None and not (dry_run or cfg.dry_run):
-        healer.consider(cfg, conn, seq, results, ctx)
+        try:
+            healer.consider(cfg, conn, seq, results, ctx)
+        except Exception as exc:                   # noqa: BLE001 - isolated
+            lines = str(exc).splitlines()
+            ctx.note("healing failed: %s"
+                     % (lines[0] if lines else type(exc).__name__))
 
     duration_ms = int((_now() - t0) * 1000)
     if not (dry_run or cfg.dry_run):

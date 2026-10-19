@@ -504,6 +504,96 @@ def test_a_raising_dry_run_is_isolated_audited_and_counted(results):
                          after["remedy_attempts"]))
 
 
+def test_a_hung_run_times_out_and_is_counted(results):
+    heal = _heal()
+
+    def hang(ctx, inc):
+        time.sleep(0.3)
+        return actions.Result(True, "too late")
+
+    a = _act(run=hang,
+             limits=actions.Limits(timeout_s=0.05, max_attempts=2))
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        t0 = time.time()
+        out = heal.attempt(a, row, None, _policy(), conn, 4)
+        elapsed = time.time() - t0
+        rec = conn.execute(
+            "SELECT * FROM remedy ORDER BY id DESC LIMIT 1").fetchone()
+        after = conn.execute("SELECT * FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()
+        results.check("a hung run cannot hold the epoch hostage",
+                      not out["executed"] and "timed out" in out["why"]
+                      and elapsed < 0.25,
+                      "out=%r elapsed=%.3f" % (out, elapsed))
+        results.check("a timeout is audited as 'timeout' and counted",
+                      rec is not None and rec["dry_run"] == 0
+                      and rec["exit_status"] == "timeout"
+                      and after["remedy_attempts"] == 1
+                      and after["remedy_last_at"] is not None,
+                      "rec=%r attempts=%r"
+                      % (dict(rec) if rec else None,
+                         after["remedy_attempts"]))
+
+
+def test_a_hung_dry_run_times_out_before_the_run(results):
+    heal = _heal()
+    ran = []
+
+    def hang(ctx, inc):
+        time.sleep(0.3)
+        return actions.Result(True, "too late")
+
+    a = _act(dry_run=hang,
+             run=lambda ctx, inc: (ran.append(1)
+                                   or actions.Result(True, "done")),
+             limits=actions.Limits(timeout_s=0.05, max_attempts=2))
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        out = heal.attempt(a, row, None, _policy(), conn, 4)
+        rec = conn.execute(
+            "SELECT * FROM remedy ORDER BY id DESC LIMIT 1").fetchone()
+        results.check("a hung dry-run is refused before the run",
+                      not out["executed"] and "timed out" in out["why"]
+                      and ran == [], "out=%r ran=%r" % (out, ran))
+        results.check("the dry-run timeout is recorded as dry_run=1",
+                      rec is not None and rec["dry_run"] == 1
+                      and rec["exit_status"] == "timeout",
+                      "rec=%r" % (dict(rec) if rec else None,))
+
+
+def test_a_store_failure_cannot_mask_the_handler_error(results):
+    heal = _heal()
+
+    class _Rows:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _BadStore:
+        """Answers the hourly SELECT, fails every write."""
+
+        def execute(self, sql, args=()):
+            if "COUNT(*)" in sql:
+                return _Rows((0,))
+            raise RuntimeError("store is gone")
+
+    def boom(ctx, inc):
+        raise RuntimeError("kaboom")
+
+    out = heal.attempt(_act(run=boom), _inc(), None, _policy(),
+                       _BadStore(), 1)
+    results.check("a failing audit write cannot mask the original error or "
+                  "escape the engine",
+                  not out["executed"] and "kaboom" in out["why"]
+                  and "store is gone" not in out["why"],
+                  "out=%r" % (out,))
+
+
 def test_a_latched_incident_is_not_retried(results):
     heal = _heal()
     ran = []
@@ -749,6 +839,9 @@ TESTS = (test_off_by_default,
          test_a_failed_dry_run_is_audited_as_a_dry_run,
          test_a_raising_dry_run_is_isolated_audited_and_counted,
          test_a_raising_run_is_isolated_audited_and_counted,
+         test_a_hung_dry_run_times_out_before_the_run,
+         test_a_hung_run_times_out_and_is_counted,
+         test_a_store_failure_cannot_mask_the_handler_error,
          test_a_latched_incident_is_not_retried,
          test_exhausted_attempts_are_latched,
          test_the_cap_is_the_lowest_budget_among_declared_actions,

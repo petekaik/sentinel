@@ -12,11 +12,65 @@ condition cleared, and collapsing the two is the false-green shape this platform
 exists to prevent. The return value says "executed", never "fixed".
 """
 
+import threading
 import time
 
 import actions
 import module
 import store
+
+
+def _call_bounded(fn, ctx, incident, timeout_s):
+    """Run one action callable, bounded by `action.limits.timeout_s`.
+
+    Returns `("ok", value)`, `("error", exception)` or `("timeout", None)`.
+
+    A DAEMON THREAD, NOT A KILL. Python cannot stop a running thread, so a call
+    that does not return is ABANDONED: it keeps running and may still finish its
+    side effect. The point is to bound the EPOCH, not the thread -- this fleet's
+    history is hard NFS mounts and D-state, and the collector must write its
+    record and let the next epoch proceed. `timeout_s=None` means no bound.
+
+    The handler's own exception is carried back rather than raised: the caller
+    audits it and returns a refusal, so nothing escapes into `collect_once`.
+    """
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn(ctx, incident)
+        except BaseException as exc:                # noqa: BLE001 - carried back
+            box["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
+        return "timeout", None
+    if "error" in box:
+        return "error", box["error"]
+    return "ok", box.get("value")
+
+
+def _record_failure(conn, incident, action, seq, dry_run, exit_status, detail):
+    """Best-effort audit for a timeout or a raising handler.
+
+    THE STORE IS A DEPENDENCY THAT CAN FAIL TOO (it lives on the NAS). A failure
+    here must not mask the handler error that brought us here, and must not
+    escape into `collect_once`, which calls `consider` without a try. So this is
+    deliberately best-effort: the refusal is returned either way.
+    """
+    if conn is None:
+        return
+    try:
+        store.record_remedy(
+            conn, incident["key"], action.id,
+            evidence={"subject": incident.get("subject"), "seq": seq,
+                      "detail": detail},
+            dry_run=dry_run, exit_status=exit_status)
+        store.note_remedy_attempt(conn, incident["key"], detail)
+    except Exception:                               # noqa: BLE001 - best effort
+        pass
 
 
 def _remedies_last_hour(conn, key):
@@ -78,23 +132,24 @@ def attempt(action, incident, ctx, policy, conn, seq,
                     "why": "per-hour cap reached (%d in the last hour)"
                            % recent}
 
-    # 1. DRY RUN FIRST, ALWAYS. A dry run that cannot say what it would do
-    # means the action is not understood well enough to run. A REFUSAL OR AN
-    # EXCEPTION IS A FAILED ATTEMPT: it advances the incident's counter and
-    # cooldown, so a permanently failing dry run cools down and eventually
-    # latches instead of being retried every epoch forever.
-    try:
-        dr = (dry_run_fn or action.dry_run)(ctx, incident)
-    except Exception as exc:                       # noqa: BLE001 - isolated
-        detail = "dry-run raised %s: %s" % (type(exc).__name__, exc)
-        if conn is not None:
-            store.record_remedy(
-                conn, incident["key"], action.id,
-                evidence={"subject": incident.get("subject"), "seq": seq,
-                          "detail": detail},
-                dry_run=True, exit_status="error")
-            store.note_remedy_attempt(conn, incident["key"], detail)
+    # 1. DRY RUN FIRST, ALWAYS, BOUNDED BY THE ACTION'S TIMEOUT. A dry run that
+    # cannot say what it would do means the action is not understood well
+    # enough to run. A REFUSAL, TIMEOUT OR EXCEPTION IS A FAILED ATTEMPT: it
+    # advances the incident's counter and cooldown, so a permanently failing
+    # dry run cools down and eventually latches instead of being retried every
+    # epoch forever.
+    timeout_s = action.limits.timeout_s
+    state, value = _call_bounded(dry_run_fn or action.dry_run, ctx, incident,
+                                 timeout_s)
+    if state == "timeout":
+        detail = "dry-run timed out after %ss" % timeout_s
+        _record_failure(conn, incident, action, seq, True, "timeout", detail)
         return {"executed": False, "why": detail}
+    if state == "error":
+        detail = "dry-run raised %s: %s" % (type(value).__name__, value)
+        _record_failure(conn, incident, action, seq, True, "error", detail)
+        return {"executed": False, "why": detail}
+    dr = value
 
     if not dr.ok:
         if conn is not None:
@@ -109,24 +164,24 @@ def attempt(action, incident, ctx, policy, conn, seq,
     # 2. EXECUTE. The command's own exit status is recorded, not interpreted:
     # `out.ok` only distinguishes a failed process from a completed one.
     #
-    # AN EXCEPTION MUST NOT ESCAPE. `collect_once` calls `consider()` before it
-    # writes the epoch record and without a try, so a raising handler would
-    # lose the whole epoch and, worse, leave no audit row and no attempt
-    # counter -- a handler that raises after a side effect would be re-executed
-    # every epoch forever. The exception is recorded as a failed attempt
-    # (`exit_status="error"`), which is what makes the retry bounded.
-    try:
-        out = (run_fn or action.run)(ctx, incident)
-    except Exception as exc:                       # noqa: BLE001 - isolated
-        detail = "run raised %s: %s" % (type(exc).__name__, exc)
-        if conn is not None:
-            store.record_remedy(
-                conn, incident["key"], action.id,
-                evidence={"subject": incident.get("subject"), "seq": seq,
-                          "dry_run": dr.detail, "detail": detail},
-                dry_run=False, exit_status="error")
-            store.note_remedy_attempt(conn, incident["key"], detail)
+    # NOTHING MAY ESCAPE, AND NOTHING MAY BLOCK FOREVER. `collect_once` calls
+    # `consider()` before it writes the epoch record and without a try, so a
+    # raising handler would lose the whole epoch and, worse, leave no audit row
+    # and no attempt counter -- a handler that raises after a side effect would
+    # be re-executed every epoch forever. A HUNG handler is the same fault with
+    # a worse symptom: it blocks the epoch itself. Both are recorded as a
+    # failed attempt, which is what makes the retry bounded.
+    state, value = _call_bounded(run_fn or action.run, ctx, incident,
+                                 timeout_s)
+    if state == "timeout":
+        detail = "run timed out after %ss" % timeout_s
+        _record_failure(conn, incident, action, seq, False, "timeout", detail)
         return {"executed": False, "why": detail}
+    if state == "error":
+        detail = "run raised %s: %s" % (type(value).__name__, value)
+        _record_failure(conn, incident, action, seq, False, "error", detail)
+        return {"executed": False, "why": detail}
+    out = value
 
     if conn is not None:
         store.record_remedy(

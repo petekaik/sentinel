@@ -38,7 +38,11 @@ app/modules/<id>/
 ├── checks/          # Check subclasses
 ├── settings.py      # the module's own env-backed view, if it needs one
 ├── preload.py       # context() (config only) + preload() (all I/O, once)
-└── thresholds.conf  # threshold specs, beside the code that reads them
+├── thresholds.conf  # threshold specs, beside the code that reads them
+├── commands.py      # optional: operator-invoked commands
+├── actions.py       # optional: remediation actions
+├── advisors.py      # optional: advisor implementations (NOT intelligence.py)
+└── README.md        # optional: what it watches and what it may do
 ```
 
 `MODULE` members are the whole contract:
@@ -57,6 +61,16 @@ app/modules/<id>/
 | `extra_check_ids` | incident ids the collector emits for this module and no `Check` class owns |
 | `commands`, `actions`, `advisors` | declared surfaces; all three default to empty, so a module that offers none says nothing |
 
+**The advisor surface is `advisors()`, and that name is authoritative.** The design doc
+calls it `intelligence()`; the code does not, and `app/intelligence.py` is the platform's
+reference advisor, not a module hook. A module that implements `intelligence()` is offering
+nothing and says nothing about it — the silent-no-op shape discovery exists to prevent.
+`app/module.py::Module.advisors()` is the contract.
+
+`owned_check_ids(mod)` (in `module.py`) is the **one** ownership rule: the module's `Check`
+class ids plus `extra_check_ids`. Both readers — the collector's disabled-module freeze and
+`heal.py` — import it rather than restating it. Ownership is by check id, never by target.
+
 Settings and thresholds belong to the module, not the platform. `config.py`
 holds only what every deployment shares (interval, ssh timeout, db path, dry
 run); addresses, paths and box ids live in the module's `settings.py`, and every
@@ -71,6 +85,53 @@ would read as a healthy fleet. `checks.platform_modules()` returns the
 own check modules and pass the whole set through `checks.registry(...)`. It owns
 `spec_coverage` and `modules_enabled`; no module may declare them, and they
 still run when every module is disabled.
+
+### Command, remediation and advisor surfaces
+
+A module declares these as data; the platform owns dispatch, execution and every write.
+
+- **Commands** (`Command(id, title, handler, args, danger, resources, timeout_s)`) are
+  operator-invoked and never automatic. `commands.dispatch()` refuses before the handler
+  when the module is disabled, an argument is invalid, or a declared resource is held; a
+  refusal writes no audit row. Resources are cross-process `flock` files under
+  `MONITOR_LOCK_DIR`, because `--run` is a new process each time. `box` arguments are a
+  closed key set, and serial actions refuse without a chip-serial-resolved adapter.
+- **Actions** are executed only by `heal.attempt()`. `actions.allowed()` is the pure
+  ladder: confirmed incident → trigger → engine switch → level → scoped allow-list →
+  destructive switch. The level is per module and overridable per action;
+  `SENTINEL_REMEDIATION` is the engine switch, `MONITOR_REMEDIES` the process kill switch,
+  and both default off.
+- **Advisors** get a read-only `Snapshot` and may only return insights. The runner gives
+  each a fresh snapshot, caps `history_days` with `SENTINEL_ADVISOR_MAX_HISTORY_DAYS`,
+  records an `advisor_run` row for every run (error, overrun included), and never lets an
+  advisor alter the epoch. The reference advisor is the default; `SENTINEL_ADVISORS=none`
+  is the explicit off switch; an explicit list replaces the default.
+
+### Authority and threshold overrides
+
+| Key | Default | Meaning |
+|---|---|---|
+| `MONITOR_REMEDIES` | `0` | process kill switch; no engine, no execution |
+| `SENTINEL_REMEDIATION` | `1` | engine master switch; a module still needs a level |
+| `<MODULE>_AUTHORITY` | `off` | `off`, `advisory`, `propose`, `scoped`, `full` |
+| `<MODULE>_ALLOW` | empty | the allow-list `scoped` may execute |
+| `<MODULE>_ALLOW_DESTRUCTIVE` | `0` | required for a destructive action even under `full` |
+| `<MODULE>_ACTION_<ID>_AUTHORITY` | module level | one action up or down, either direction |
+
+A `propose`-level action writes a pending proposal; approval is **authority, not a
+bypass** and re-passes every gate.
+
+| Threshold layer | Where | Who writes it |
+|---|---|---|
+| baseline | `modules/<id>/thresholds.conf` (and `checks.conf` for platform/meta) | a human, by edit |
+| pending change | `proposal` row, kind `threshold_change` | the collector, from a reference-advisor suggestion |
+| live band | `threshold_override` row (`spec_id`, `module`, `green`, `amber`, `actor`, `applied_at`, `previous_json`, `proposal_id`) | approval only; `--revert-threshold` deletes it |
+
+The effective band is reloaded every epoch (`thresholds.load_effective`), so a live
+override changes grading with no rebuild. An approval moves only the failing edge, by at
+most 25% of the band's width; `green` never moves. `--revert-threshold` reports the band
+the file declares *after* the delete, not `previous_json` — a chained approval's
+`previous_json` names another override, not the file.
 
 **Platform code never imports a specific module.** `import modules` (the
 loader), `from modules import discover`, and `modules.discover` /
@@ -124,16 +185,29 @@ touching the area.
 
 ## Where the platform ends and the fleet module begins
 
-Generic: `store.py`, `probes.py`, `parsers.py` (shared protocol/format helpers),
-`thresholds.py`, `web.py`, `main.py`, `dismiss.py`, `checks/meta.py`, the
-`checks/__init__.py` framework, and `modules/__init__.py` (discovery).
+Generic: `module.py` (the contract), `store.py`, `probes.py`, `parsers.py` (shared
+protocol/format helpers), `thresholds.py`, `web.py`, `main.py`, `dismiss.py`,
+`commands.py` (dispatch, locks, audit), `actions.py` (the pure ladder), `heal.py`
+(the only executor), `advisors.py` (snapshot and runner), `intelligence.py` (the
+reference advisor), `llm_advisor.py` (the optional seam, transport absent),
+`ctl.py` (the operator CLI), `checks/meta.py`, the `checks/__init__.py` framework,
+and `modules/__init__.py` (discovery).
 
 The CuBox fleet is `app/modules/fleet/`: its checks, `parsers.py`, `settings.py`,
 `export.py`, the journal capture, the two shell probes (`boxfacts.sh`,
-`backupfacts.sh`) and its `thresholds.conf`. What remains at the top level is
-generic: `checks/__init__.py` still owns `Context` and its `preload_*`
-installers — the caches every module installs finished fact blocks through — and
-`config.py` keeps only what every deployment shares.
+`backupfacts.sh`), its `thresholds.conf`, its `commands.py` (serial status/arm/
+disarm/read/break) and its `actions.py` (`state_mount_cycle`, `transcode_restart`).
+What remains at the top level is generic: `checks/__init__.py` still owns `Context`
+and its `preload_*` installers — the caches every module installs finished fact
+blocks through — and `config.py` keeps only what every deployment shares.
+
+Platform env keys (everything else is a module `Setting`): `MONITOR_SSH_KEY`,
+`MONITOR_KNOWN_HOSTS`, `MONITOR_SSH_TIMEOUT`, `MONITOR_DB`, `MONITOR_CHECKS`,
+`MONITOR_LOCK_DIR`, `MONITOR_PORT`, `MONITOR_INTERVAL`, `MONITOR_DRY_RUN`,
+`MONITOR_REMEDIES`, `SENTINEL_MODULES`, `<ID>_ENABLED`, `SENTINEL_REMEDIATION`,
+`SENTINEL_ADVISORS`, `SENTINEL_ADVISOR_MAX_HISTORY_DAYS`, `SENTINEL_PROPOSAL_TTL_H`
+and `SENTINEL_LLM_{PROVIDER,ENDPOINT,KEY,MODEL}`. No deployed key was renamed by the
+module migration; the fleet keeps `MONITOR_HOST_*`, `RECORDINGS_PATH`, `SERIAL_*`, etc.
 
 **The three CuBox-shaped holes that used to live in `collect.py` are closed.**
 `preload()` no longer knows host kinds — each module declares its own `preload`;

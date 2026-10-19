@@ -37,6 +37,11 @@
 #   ./deploy.sh --revert-threshold SPEC_ID
 #                                  # drop one override, restoring the file band
 #
+# There is no --modules verb (the design document proposed one): discovery and
+# enablement are reported by --showconf, the dashboard renders one section per
+# module (and a stated note for a disabled one), and --list-commands names each
+# command's module.
+#
 # Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER
 #
 # WHY A SCRIPT AT ALL, when `docker compose up -d` would nearly do. Three things

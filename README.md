@@ -63,13 +63,21 @@ it from the fleet rather than keeping a copy that goes stale.
 
 ## Architecture
 
-One container, three concerns, one image.
+One container, four concerns, one image.
 
 | Process | Role |
 |---|---|
-| collector | a loop on `MONITOR_INTERVAL` (default 60 s). Probes every host once, evaluates every check, writes samples, verdicts and incidents |
-| dashboard | a read-only HTTP server serving the RAG page and the JSON endpoints |
-| healer | called by the collector *after* the epoch's evidence is durable — **not yet written** |
+| collector | a loop on `MONITOR_INTERVAL` (default 60 s). Probes every host once, evaluates every check, and writes samples, verdicts and incidents |
+| dashboard | a read-only HTTP server serving the RAG page, the JSON endpoints, the Recommendations list and the Approvals inbox |
+| healer | called by the collector *after* the epoch's evidence is durable; executes an action only when that module's authority ladder permits it, every gate passes, and a dry run has succeeded |
+| advisors | run *after* the epoch record is written; each gets a fresh, bounded, read-only snapshot of the store and may only emit insights and proposed changes — never a write to a check, an incident or a threshold |
+
+The healer's ordering is not cosmetic: a remedy acts on the epoch's evidence, so that
+evidence has to be in the store first (a post-check of `unknown` can still be explained
+afterwards). Advisors run later still, after `collector_run` records the epoch, so an
+advisor that hangs or overruns cannot take away the dashboard's proof that the monitor is
+alive. A dry run skips both — the mode whose contract is "claims nothing" must not be able
+to act or advise.
 
 The collector runs *on* the Storage-NAS, so its checks for that host are local
 (`/proc`, `df`, the share paths) and its Docker and TVH checks go through the
@@ -97,29 +105,55 @@ thing.
 |---|---|
 | collector, dashboard, store, checks, `checks.conf`, offline suite | **built and running** |
 | 71 check instances across 4 hosts; ~75 checks per epoch | **built** |
-| `app/heal.py` — the remedy engine | **NOT WRITTEN** |
+| module contract and discovery; the fleet behind `app/modules/fleet/` | **built** |
+| operator commands, resource locks and the command audit (`app/commands.py`, `app/ctl.py`) | **built** |
+| remediation engine and the authority ladder (`app/heal.py`, `app/actions.py`) | **built; off by default** |
+| advisors (`app/advisors.py`, `app/intelligence.py`) | **built; the reference advisor runs by default** |
+| proposal queue and live threshold overrides (`app/ctl.py`, `store.py`) | **built** |
+| LLM advisor seam (`app/llm_advisor.py`) | **registered only when configured; transport intentionally NOT implemented** |
 
-**No remedy has ever executed**, because the remedy engine does not exist.
-Remedies are off by default, and enabling them without it makes the process
-refuse to start rather than pretend. `dismiss` is not a remedy — it is an
-operator verb and it changes nothing about the fleet.
+**No remedy has executed on the live fleet.** The engine exists, but it is off in two
+independent places: `MONITOR_REMEDIES=0` is the process kill switch, and the fleet module
+ships at authority `off`. Both are deliberate defaults. Enabling remedies without a
+callable engine makes the process refuse to start rather than pretend. `dismiss` is not a
+remedy — it is an operator verb and it changes nothing about the fleet.
+
+**The LLM advisor's transport is intentionally absent.** Configuring `SENTINEL_LLM_*`
+registers a selectable advisor and, when selected, records an explicit "not implemented"
+error row. It never makes a network call, and configuration alone never puts it on the
+default path — the default selector is `reference`.
 
 ## Layout
 
 ```
 app/           the platform + the adapters (see CLAUDE.md for the seam)
-  checks/      one module per TARGET: cubox, storage, backup, fleet, meta
+  module.py    the Module/Setting contract
+  modules/     discovered target packages; fleet/ is tenant #1
+  checks/      the check framework and the platform's own meta checks
   web.py       the dashboard, both JSON endpoints, /healthz
-  store.py     SQLite: samples, verdicts, incidents, attempts, journal
+  store.py     SQLite: samples, verdicts, incidents, attempts, journal,
+               command_run, advisor_run, insight, proposal, threshold_override
   collect.py   the epoch loop: preload everything, then evaluate
+  commands.py  operator commands, cross-process resource locks, the audit
+  actions.py   action declarations and the pure authority-ladder decision
+  heal.py      the remedy engine: the only code that executes an action
+  advisors.py  advisor types and the read-only, windowed Snapshot
+  intelligence.py  the reference statistical advisor
+  llm_advisor.py   the optional LLM seam (transport deliberately absent)
+  ctl.py       the operator CLI behind the command/proposal/insight verbs
 tests/         the offline suite (no network, enforced)
   fixtures/    captured fleet artifacts -- see the provenance README
-checks.conf    every threshold, as data -- restart to apply, never rebuild
+checks.conf    platform/meta thresholds, as data -- restart to apply
 compose.yml    the deployed unit
 deploy.sh      the whole deploy interface
 test.sh        the offline suite's entry point
 docs/          architecture.md, and the publishing runbook
 ```
+
+Each module lives under `app/modules/<id>/` and carries its own `thresholds.conf`,
+`settings.py`, `preload.py`, `checks/`, and — when it has them — `commands.py`,
+`actions.py` and `advisors.py`. Module discovery is by package, not by a list in a
+platform file.
 
 ## Running it
 
@@ -138,9 +172,28 @@ Deploying is separate, because it is not "docker compose up":
 ./deploy.sh                    # sync, build ON THE NAS, start, health-check
 ./deploy.sh --status           # what is running, and what it sees
 ./deploy.sh --once --dry-run   # one collection that writes NOTHING to the store
-./deploy.sh --showconf         # config + threshold coverage
+./deploy.sh --showconf         # config, modules and threshold coverage
 ./deploy.sh --logs             # follow the container log
 ./deploy.sh --dismiss          # list the live incidents
+
+# Commands — explicit operator operations, never automatic
+./deploy.sh --list-commands    # module commands, their args and danger level
+./deploy.sh --list-runs        # the command audit
+./deploy.sh --run fleet.serial_status
+./deploy.sh --run fleet.serial_arm --arg box=cubox-1 --arg min=5
+./deploy.sh --run fleet.serial_break --arg box=cubox-1 --dry-run
+
+# Proposals — the human decision a propose-level action waits on
+./deploy.sh --proposals        # the queue; a lapsed row shows as expired
+./deploy.sh --approve 3        # still passes every engine gate and ladder check
+./deploy.sh --reject 3         # decided; it can never execute
+
+# Advisors and live threshold bands
+./deploy.sh --insights         # advisor insights, newest first
+./deploy.sh --advisors         # configured advisors and their last run
+./deploy.sh --remedies         # the remedy audit (newest 20)
+./deploy.sh --thresholds       # active overrides, with the file band beside them
+./deploy.sh --revert-threshold <spec_id>   # restore the band the file declares
 ```
 
 Three things travel with the image and are not in it — the ssh key,
@@ -164,6 +217,30 @@ Two escape hatches:
 |---|---|---|
 | `MONITOR_KEY` | `~/.ssh/cubox-monitor_ed25519` | the key lives somewhere else |
 | `FLEET_REPO` | `~/projects/pvr-cubox-fleet` | the fleet checkout is elsewhere |
+
+### What the monitor may do, and what it may advise
+
+Everything here defaults to the cautious answer. The full ladder, every gate and the
+approval flow are in [`docs/architecture.md`](docs/architecture.md).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SENTINEL_MODULES` | all discovered | comma-separated module ids to enable; a selector naming an unknown id is a startup error |
+| `<ID>_ENABLED` | `1` | disable one module without editing the selector; its live incidents freeze, never resolve |
+| `MONITOR_LOCK_DIR` | `/tmp/sentinel-locks` | where command resource locks (flock files) live; must be writable by every process that dispatches |
+| `MONITOR_REMEDIES` | `0` | process-level kill switch for the healer; off means no action can execute |
+| `SENTINEL_REMEDIATION` | `1` | engine master switch *within* the ladder; a module still needs an authority level above `off` |
+| `<MODULE>_AUTHORITY` | `off` | per-module level: `off`, `advisory`, `propose`, `scoped`, `full` |
+| `<MODULE>_ALLOW` | empty | the allow-list `scoped` executes from |
+| `<MODULE>_ALLOW_DESTRUCTIVE` | `0` | a destructive action needs this even under `full` |
+| `<MODULE>_ACTION_<ID>_AUTHORITY` | module level | override one action up or down |
+| `SENTINEL_ADVISORS` | `reference` | comma-separated `module.advisor` / bare advisor ids; `none` is the explicit off switch |
+| `SENTINEL_ADVISOR_MAX_HISTORY_DAYS` | `30` | the cap on history any advisor may read; negative refuses to start |
+| `SENTINEL_PROPOSAL_TTL_H` | `24` | hours an operator has to decide a proposal; zero or negative refuses to start |
+| `SENTINEL_LLM_PROVIDER`, `SENTINEL_LLM_ENDPOINT`, `SENTINEL_LLM_KEY`, `SENTINEL_LLM_MODEL` | empty | the LLM seam. Configuring provider **and** endpoint makes it selectable; it never joins the default selector. No transport ships in this delivery |
+
+`SENTINEL_LLM_KEY` is the only secret in `.env`, and it is never written to the store, a
+log line or `--showconf`.
 
 **Addresses and other deployment values are not in this repo.** The defaults in
 `app/config.py` are RFC 5737 documentation placeholders, and a deployment

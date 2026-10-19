@@ -730,10 +730,12 @@ def live_incidents(conn):
 def live_incidents_for_targets(conn, targets):
     """Confirmed incidents against any of `targets` -- the rows a layer owns.
 
-    A module's `targets` is its whole reporting vocabulary, so this is how the
-    collector finds every incident a module was responsible for when that module
-    is disabled. Deliberately CONFIRMED_STATES, like `live_incidents`: a
-    `pending` row was never an incident.
+    Deliberately CONFIRMED_STATES, like `live_incidents`: a `pending` row was
+    never an incident.
+
+    NOT AN OWNERSHIP SELECTOR. Modules share reporting targets, so freezing by
+    target would claim another module's rows -- use `live_incidents_for_checks`
+    with the ids the module declares.
     """
     if not targets:
         return []
@@ -744,13 +746,34 @@ def live_incidents_for_targets(conn, targets):
     return [dict(r) for r in rows]
 
 
+def live_incidents_for_checks(conn, check_ids):
+    """Confirmed incidents for any of `check_ids` -- rows a MODULE owns.
+
+    OWNERSHIP IS BY CHECK ID, NOT BY TARGET. Two modules can share a reporting
+    target (`storage`, `fleet`), so selecting rows by target would let one
+    module's disablement freeze another module's incidents and stamp the wrong
+    reason into them. The module declares the ids it owns (its Check classes
+    plus `extra_check_ids`); this selects exactly those.
+    """
+    if not check_ids:
+        return []
+    marks = ", ".join("?" for _ in check_ids)
+    rows = conn.execute(
+        "SELECT * FROM incident WHERE state IN (%s) AND check_id IN (%s)"
+        % (CONFIRMED_SQL, marks), tuple(check_ids)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def freeze_incident(conn, seq, row, reason):
     """Fold an UNKNOWN observation into the row that owns it.
 
     A disabled module runs no checks, so no observation can ever resolve its
     incidents -- freezing is the honest state, and it is done through the same
     state machine (and so the same severity cap) as a genuinely unobservable
-    check. It NEVER resolves: UNKNOWN is not the answer "fine".
+    check. It NEVER resolves: UNKNOWN is not the answer "fine". A `latched` row
+    is left alone by that state machine -- it is waiting on a human, not on a
+    poll -- and the dashboard's disabled note says so rather than implying the
+    freeze covered it.
     """
     return sync_incident(conn, seq, row["target"], row["check_id"],
                          row["subject"], Status.UNKNOWN, reason, None)

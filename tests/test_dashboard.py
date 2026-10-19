@@ -2060,7 +2060,7 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
     """A disabled module must be stated, and must not leave a green section."""
     tmpdir = tempfile.mkdtemp()
     try:
-        d = Dash(tmpdir, SENTINEL_MODULES="no_such_module")
+        d = Dash(tmpdir, FLEET_ENABLED="0")
         d.epoch()
         state, html = d.state(), d.html()
         st = web.build_status(d.cfg, d.conn)
@@ -2079,10 +2079,12 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
             "the page does not say the module is disabled or what happened to "
             "its incidents")
         results.check(
-            "no tile from the disabled module is rendered",
-            "mem_available_mb" not in html and "tile green" not in html,
-            "a check from a disabled module still renders -- or a green tile "
-            "was drawn on a fleet with no module running")
+            "no tile, and no empty section, is rendered for the disabled module",
+            "mem_available_mb" not in html and "tile green" not in html
+            and "<h2>CuBox fleet" not in html,
+            "a check from a disabled module still renders, or a titled empty "
+            "section was drawn for a module that is not running -- an empty "
+            "section reads exactly like a healthy one")
         results.check(
             "a wholly disabled fleet does not band green",
             "band unknown" in html and "band ok" not in html,

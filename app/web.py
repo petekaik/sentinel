@@ -1181,8 +1181,9 @@ def render_html(state, cfg):
     # so the reason it is absent is stated rather than inferred.
     for m in state.get("disabled_modules", []):
         _tc("<div class=note>Module %s is DISABLED by configuration. Its "
-            "checks are not running and its incidents are frozen, not "
-            "resolved.</div>" % _esc(m["title"]))
+            "checks are not running; its incidents are frozen, not resolved "
+            "(a latched incident still waits for a human).</div>"
+            % _esc(m["title"]))
 
     def _grid(items):
         _tc("<div class=grid>")

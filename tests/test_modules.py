@@ -360,11 +360,11 @@ def test_platform_files_do_not_import_a_specific_module(results):
 def test_module_selection_reads_the_env(results):
     """`SENTINEL_MODULES` selects, `<ID>_ENABLED=0` disables, both default open."""
     import config as config_mod
-    cfg = config_mod.Config(env={"SENTINEL_MODULES": "fleet,other",
+    cfg = config_mod.Config(env={"SENTINEL_MODULES": "fleet",
                                  "FLEET_ENABLED": "0"})
     results.check(
         "SENTINEL_MODULES is parsed into an id tuple",
-        cfg.module_ids == ("fleet", "other"),
+        cfg.module_ids == ("fleet",),
         "module_ids=%r" % (cfg.module_ids,))
     results.check(
         "<ID>_ENABLED=0 disables that module, and an unset key defaults to on",
@@ -373,6 +373,20 @@ def test_module_selection_reads_the_env(results):
         "fleet_enabled=%r other_enabled=%r -- a missing key must not silently "
         "disable a module" % (cfg.module_enabled("fleet"),
                               cfg.module_enabled("other")))
+    # A MISSPELT SELECTOR IS A STARTUP ERROR, NOT AN EMPTY FLEET. Silently
+    # ignoring the id disables everything, and an empty fleet reads as a
+    # healthy one on every platform-only row.
+    ghost = config_mod.Config(env={"SENTINEL_MODULES": "fleet,ghost"})
+    try:
+        loader.discover_enabled(ghost)
+    except loader.ModuleError as exc:
+        named = "ghost" in str(exc)
+        detail = str(exc)
+    else:
+        named, detail = False, "discovery accepted an unknown module id"
+    results.check(
+        "an unknown id in SENTINEL_MODULES is a ModuleError naming it",
+        named, detail)
     results.check(
         "discovery honours the flag, so the disabled module's checks never run",
         [m.id for m in loader.discover_enabled(cfg)] == [],
@@ -434,6 +448,84 @@ def test_a_disabled_module_freezes_its_incidents(results):
     conn.close()
 
 
+def test_a_disabled_module_freezes_only_its_own_checks(results):
+    """Ownership is by CHECK ID, not by target: modules can share a target."""
+    import sqlite3
+    import types
+    import collect
+    import store
+    from module import Module
+    from checks import Check
+
+    class AlphaCheck(Check):
+        id = "alpha_metric"
+        target = "storage"
+        spec = None
+
+    class BetaCheck(Check):
+        id = "beta_metric"
+        target = "storage"
+        spec = None
+
+    # BOTH MODULES SHARE THE TARGET `storage`. They differ only in the check
+    # ids they own, which is exactly the discrimination this test demands.
+    alpha = Module(id="alpha", title="Alpha", targets=("storage",),
+                   checks=(types.SimpleNamespace(AlphaCheck=AlphaCheck),))
+    beta = Module(id="beta", title="Beta", targets=("storage",),
+                  checks=(types.SimpleNamespace(BetaCheck=BetaCheck),),
+                  extra_check_ids=("beta_collector_row",))
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    store.init(conn)
+    seq = store.next_epoch_seq(conn)
+    for cid in ("alpha_metric", "beta_metric", "beta_collector_row"):
+        for _ in range(store.CONFIRM_POLLS):
+            store.sync_incident(conn, seq, "storage", cid, "sub",
+                                store.Status.FAIL, "bad")
+    collect.freeze_disabled_modules(conn, seq, [alpha], [alpha, beta])
+    rows = {r["check_id"]: r for r in conn.execute(
+        "SELECT check_id, state, resolved_at, last_detail FROM incident")}
+
+    results.check(
+        "disabling one module leaves a shared target's other module untouched",
+        rows["alpha_metric"]["state"] == "open"
+        and rows["alpha_metric"]["resolved_at"] is None
+        and "beta" not in (rows["alpha_metric"]["last_detail"] or ""),
+        "alpha_metric=%r -- a target-keyed freeze would claim another module's "
+        "incident and stamp the wrong reason into it"
+        % (dict(rows["alpha_metric"]),))
+    results.check(
+        "the disabled module's own check rows are frozen",
+        rows["beta_metric"]["state"] == "unknown"
+        and rows["beta_metric"]["resolved_at"] is None,
+        "beta_metric=%r" % (dict(rows["beta_metric"]),))
+    results.check(
+        "its collector-emitted rows are owned by the declared ids too",
+        rows["beta_collector_row"]["state"] == "unknown"
+        and rows["beta_collector_row"]["resolved_at"] is None,
+        "beta_collector_row=%r -- no Check class owns these, so without "
+        "extra_check_ids nobody freezes them when the module is disabled"
+        % (dict(rows["beta_collector_row"]),))
+    conn.close()
+
+
+def test_spec_coverage_never_reads_green_on_an_empty_audit(results):
+    """The other half of a disabled fleet: no thresholds is not full coverage."""
+    import config as config_mod
+    import store
+    from checks.meta import SpecCoverage
+    cfg = config_mod.Config(env={})
+    res = SpecCoverage().run(checks.Context(cfg, {}, {}, check_classes=[]))
+    results.check(
+        "an empty threshold audit is UNKNOWN, not full coverage",
+        res.status is store.Status.UNKNOWN
+        and "nothing to audit" in res.detail.lower(),
+        "status=%r detail=%r -- with this branch reverted a wholly disabled "
+        "fleet bands OK, because one green platform row outranks the grey one"
+        % (res.status, res.detail))
+
+
 def test_the_collector_freezes_a_disabled_modules_incidents_every_epoch(results):
     """The helpers are useless unless collect_once actually calls them, per epoch."""
     import sqlite3
@@ -444,8 +536,10 @@ def test_the_collector_freezes_a_disabled_modules_incidents_every_epoch(results)
     conn.row_factory = sqlite3.Row
     store.init(conn)
     seq = store.next_epoch_seq(conn)
+    # A REAL fleet check id: ownership is by check id, so a synthetic one is
+    # owned by nobody and the freeze would (correctly) leave it alone.
     for _ in range(store.CONFIRM_POLLS):
-        store.sync_incident(conn, seq, "cubox-1", "disk_free_gb", "mnt",
+        store.sync_incident(conn, seq, "cubox-1", "mem_available_mb", "host",
                             store.Status.FAIL, "low")
     cfg = config_mod.Config(env={"FLEET_ENABLED": "0"})
 
@@ -524,6 +618,8 @@ TESTS = (test_discovery_finds_and_orders_modules,
          test_preload_failure_opens_no_attempt_and_names_the_cause,
          test_module_selection_reads_the_env,
          test_a_disabled_module_freezes_its_incidents,
+         test_a_disabled_module_freezes_only_its_own_checks,
+         test_spec_coverage_never_reads_green_on_an_empty_audit,
          test_the_collector_freezes_a_disabled_modules_incidents_every_epoch,
          test_a_fleet_with_no_modules_does_not_read_green,
          test_spec_coverage_is_registered_once_by_the_platform,

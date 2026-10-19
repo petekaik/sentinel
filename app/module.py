@@ -28,7 +28,7 @@ class Module:
     def __init__(self, id, title, order=100, settings=(), targets=(),
                  threshold_file="thresholds.conf", context=None, preload=None,
                  checks=(), commands=None, actions=None, advisors=None,
-                 after_epoch=None):
+                 after_epoch=None, extra_check_ids=()):
         for value, want, name in ((id, str, "id"), (title, str, "title"),
                                   (order, int, "order")):
             if not isinstance(value, want):
@@ -48,6 +48,14 @@ class Module:
         self._actions = actions or (lambda: [])
         self._advisors = advisors or (lambda: [])
         self._after_epoch = after_epoch
+
+        # CHECK IDS THE MODULE OWNS THAT ARE NOT Check CLASSES. The collector
+        # emits a few incidents itself (`host_unreachable`, `journal_capture`),
+        # and they belong to whichever module knows what those targets are.
+        # Ownership is by check id, NEVER by target: two modules can share a
+        # reporting target (`storage`, `fleet`), so a target set cannot say
+        # whose incident a row is.
+        self.extra_check_ids = tuple(extra_check_ids)
 
     def context(self, ctx):
         """Install config-only module state. MUST NOT do I/O."""

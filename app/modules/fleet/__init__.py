@@ -26,4 +26,10 @@ MODULE = Module(
     checks=(fleet_checks.cubox, fleet_checks.fleet, fleet_checks.storage,
             fleet_checks.backup, fleet_checks.serial),
     after_epoch=after_epoch,
+    # The incidents collect.py emits for the fleet, and no Check class owns.
+    # `monitor_local_access` is deliberately absent: it is the platform refusing
+    # to be blind about its own runtime, so disabling the fleet must not freeze
+    # the row that reports the monitor itself.
+    extra_check_ids=("host_unreachable", "host_auth_failed", "monitor_config",
+                     "journal_capture"),
 )

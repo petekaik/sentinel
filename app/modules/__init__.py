@@ -76,8 +76,21 @@ def discover_enabled(cfg):
     """
     selected = tuple(x for x in getattr(cfg, "module_ids", ()) if x)
     enabled_fn = getattr(cfg, "module_enabled", None)
+    discovered = discover()
+    # A SELECTOR THAT NAMES NOTHING IS A TYPO, NOT A DISABLEMENT. Silently
+    # ignoring an unknown id would turn `SENTINEL_MODULES=sytem` (one letter
+    # short) into a green fleet with no module running -- the loader's own
+    # loud-failure rule, applied to the selector.
+    known = {m.id for m in discovered}
+    unknown = [x for x in selected if x not in known]
+    if unknown:
+        raise ModuleError(
+            "SENTINEL_MODULES names module id(s) that do not exist: %s "
+            "(discovered: %s). A misspelt selector would otherwise silently "
+            "disable everything and read as a healthy fleet."
+            % (", ".join(sorted(unknown)), ", ".join(sorted(known))))
     out = []
-    for mod in discover():
+    for mod in discovered:
         mod._path = _package_path(mod.id)
         if selected and mod.id not in selected:
             continue

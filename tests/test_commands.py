@@ -34,9 +34,9 @@ def _ctx_for(lock_dir):
     return types.SimpleNamespace(cfg=types.SimpleNamespace(lock_dir=lock_dir))
 
 
-def _boom():
+def _boom(resources=()):
     return commands.Command(
-        id="boom", title="Boom", args=[],
+        id="boom", title="Boom", args=[], resources=list(resources),
         handler=lambda ctx, a, dry_run=False: (_ for _ in ()).throw(
             RuntimeError("kaboom")))
 
@@ -136,18 +136,33 @@ def test_the_resource_is_held_for_the_whole_handler(results):
 
 
 def test_the_lock_is_released_when_the_handler_fails(results):
-    """A failed handler must not wedge the resource until the process exits."""
+    """A crashing handler must not wedge the resource until the process exits.
+
+    The fixture DECLARES a resource: with none, `reserve` never touches a lock
+    and the check is green under every mutation, including no release at all.
+    Re-acquisition is attempted in-process, because the flock itself can be
+    released by CPython's refcounting when the failed generator is collected;
+    `_HELD` is not collected, so a skipped release is decisive here.
+    """
     tmp = tempfile.mkdtemp()
     try:
-        commands.dispatch("fleet", _boom(), {}, actor="test", ctx=_ctx_for(tmp))
+        commands.dispatch("fleet", _boom(resources=["dev:x"]), {}, actor="test",
+                          ctx=_ctx_for(tmp))
     except commands.CommandError:
         pass
-    free = _child(tmp)
+    reclaimed = False
+    try:
+        with commands.reserve(["dev:x"], lock_dir=tmp):
+            reclaimed = True
+    except commands.CommandError as exc:
+        detail = str(exc)
+    else:
+        detail = ""
     results.check(
         "a handler exception releases the resource it held",
-        free == 0,
-        "child rc after the failure: %r (want 0) -- a release only on the "
-        "normal path leaves every later command locked out" % (free,))
+        reclaimed,
+        "re-acquired=%r (%s) -- a release only on the normal path leaves every "
+        "later command locked out" % (reclaimed, detail))
 
 
 def test_an_interrupted_handler_still_releases_the_lock(results):
@@ -269,6 +284,12 @@ def test_an_unusable_lock_directory_refuses_instead_of_escaping(results):
     try:
         commands.dispatch("fleet", _cmd([]), {"box": "a"}, actor="test",
                           ctx=_ctx_for(blocker))
+    except commands.CommandFailed as exc:
+        # dispatch's generic handler catch would also carry the path in the
+        # message, so the MESSAGE alone cannot distinguish "refused because the
+        # lock directory is unusable" from "the handler ran and failed".
+        named = False
+        detail = "reported as a handler FAILURE, not a refusal: %s" % exc
     except commands.CommandError as exc:
         named = blocker in str(exc)
         detail = str(exc)
@@ -368,7 +389,6 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_a_held_resource_refuses_the_second_command,
          test_the_resource_lock_spans_processes,
          test_the_resource_is_held_for_the_whole_handler,
-         test_the_lock_is_released_when_the_handler_fails,
          test_the_lock_directory_comes_from_the_context_config,
          test_a_refusal_writes_no_audit_row,
          test_refusal_and_failure_are_different_types,
@@ -377,9 +397,11 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_audit_row_is_written,
          test_the_audit_keeps_a_head_and_the_full_sha,
          test_the_command_run_table_is_in_the_store_summary,
-         # LAST: a missing release leaks the process-global _HELD set, which
-         # would make every later test refuse for the wrong reason. Running it
-         # at the end keeps the failure attributed to the guard that broke.
+         # LAST TWO: a missing release leaks the process-global _HELD set,
+         # which would make every later test refuse for the wrong reason.
+         # Running them at the end keeps the failure attributed to the guard
+         # that broke.
+         test_the_lock_is_released_when_the_handler_fails,
          test_an_interrupted_handler_still_releases_the_lock)
 
 

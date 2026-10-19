@@ -38,6 +38,18 @@ class CommandFailed(CommandError):
     """
 
 
+class _LockRefused(CommandError):
+    """Raised ONLY by `reserve`, so dispatch can tell the two apart.
+
+    Without this marker, `reserve` and the handler share one `with` and one
+    exception type: a handler crash and a held resource look identical, and
+    dispatch must either audit a refusal or swallow a failure. The marker lets
+    the handler run INSIDE the lock's try block (so an exception really does
+    propagate through reserve's `finally`), while a lock refusal still leaves
+    before any audit row is written.
+    """
+
+
 class Arg:
     def __init__(self, name, choices=None, default=None, required=True):
         self.name = name
@@ -97,7 +109,7 @@ def reserve(resources, lock_dir=None):
         return
     clash = [r for r in resources if r in _HELD]
     if clash:
-        raise CommandError("resource already held: %s" % ", ".join(clash))
+        raise _LockRefused("resource already held: %s" % ", ".join(clash))
     directory = lock_dir or os.environ.get("MONITOR_LOCK_DIR") or DEFAULT_LOCK_DIR
     try:
         os.makedirs(directory, exist_ok=True)
@@ -105,7 +117,7 @@ def reserve(resources, lock_dir=None):
         # An unusable MONITOR_LOCK_DIR is an operator/configuration error and
         # must read as a refusal, not as a traceback out of the CLI. Nothing is
         # held at this point.
-        raise CommandError("cannot create lock directory %r: %s"
+        raise _LockRefused("cannot create lock directory %r: %s"
                            % (directory, exc))
     handles = []
     try:
@@ -116,12 +128,12 @@ def reserve(resources, lock_dir=None):
             except OSError as exc:
                 # The finally below releases whatever earlier resources this
                 # call already took.
-                raise CommandError("cannot open lock file %r: %s" % (path, exc))
+                raise _LockRefused("cannot open lock file %r: %s" % (path, exc))
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
                 handle.close()
-                raise CommandError("resource already held: %s" % name)
+                raise _LockRefused("resource already held: %s" % name)
             handles.append(handle)
         _HELD.update(resources)
         yield
@@ -155,16 +167,20 @@ def dispatch(module, cmd, argv, actor="operator", dry_run=False, conn=None,
         raise CommandError("module is disabled; command %r refused" % cmd.id)
     args = _validated(cmd, argv)
     t0 = time.time()
-    # The lock is acquired OUTSIDE the handler's except block so a held
-    # resource stays a refusal (no audit row, no handler call) rather than
-    # being recorded as a command that failed.
-    with reserve(cmd.resources, lock_dir=_lock_dir_for(ctx)):
-        try:
+    # THE HANDLER RUNS INSIDE THE LOCK'S try, so a handler exception propagates
+    # through reserve and its `finally` is what releases the resource. (Caught
+    # inside the `with`, a crash exits the context normally and a missing
+    # exception-path release would be invisible -- and real on Ctrl-C.)
+    # `_LockRefused` leaves here as a refusal: no handler call, no audit row.
+    try:
+        with reserve(cmd.resources, lock_dir=_lock_dir_for(ctx)):
             res = cmd.handler(ctx, args, dry_run=dry_run)
             status = 0 if res.ok else 1
-        except Exception as exc:                       # noqa: BLE001 - audited
-            res = Result(ok=False, detail=str(exc))
-            status = 1
+    except _LockRefused:
+        raise
+    except Exception as exc:                           # noqa: BLE001 - audited
+        res = Result(ok=False, detail=str(exc))
+        status = 1
     if conn is not None:
         store.record_command_run(
             conn, module=module, command=cmd.id, actor=actor, argv=args,

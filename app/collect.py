@@ -464,6 +464,59 @@ def _note_advisor_problem(conn, ctx, advisor, module, detail):
                  % (advisor, line[-1] if line else "unknown"))
 
 
+def _propose_thresholds(cfg, conn, ctx, runs):
+    """Translate threshold suggestions into proposals a human can approve.
+
+    THE ADVISOR STAYS WRITE-FREE. It returned data; the collector is the writer,
+    exactly as it is for incident rows. Without this the threshold-approval path
+    in `ctl.py` is unreachable -- an insight that says "tighten amber" with no
+    route to a proposal is a recommendation nobody can act on.
+
+    ONE PENDING PROPOSAL PER SPEC. The reference advisor runs every epoch, so a
+    row per suggestion would fill the queue with copies of one idea. An existing
+    pending row (or one still inside its TTL) means the human has not decided
+    yet; writing another changes nothing except the queue length.
+    """
+    if conn is None:
+        return []
+    specs = getattr(ctx, "specs", None) or {}
+    ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
+    written = []
+    for run in runs or ():
+        for insight in run.get("insights") or ():
+            if getattr(insight, "kind", "") != "threshold_suggestion":
+                continue
+            try:
+                evidence = insight.evidence or {}
+                proposed = evidence.get("proposed") or {}
+                green = proposed.get("green")
+                amber = proposed.get("amber")
+                spec = specs.get(getattr(insight, "check_id", ""))
+                if spec is None or green is None or amber is None:
+                    continue
+                module = getattr(spec, "owner", None)
+                if not module:
+                    # A spec with no owning module cannot be approved: the
+                    # approval path resolves it through that module's file.
+                    continue
+                if store.pending_threshold_proposal(conn, spec.id) is not None:
+                    continue
+                pid = store.record_proposal(
+                    conn, module=module, kind="threshold_change",
+                    payload={"spec_id": spec.id, "module": module,
+                             "green": green, "amber": amber},
+                    rationale="%s: %s" % (run.get("advisor", "advisor"),
+                                          insight.title),
+                    expires_at=time.time() + ttl_s)
+                written.append(pid)
+            except Exception as exc:               # noqa: BLE001 - isolated
+                line = str(exc).splitlines()
+                ctx.note("could not record a threshold proposal from %r: %s"
+                         % (run.get("advisor", "advisor"),
+                            line[0] if line else type(exc).__name__))
+    return written
+
+
 def run_advisors_for_epoch(cfg, conn, ctx):
     """Run the selected advisors of the enabled modules. NEVER raises.
 
@@ -559,10 +612,14 @@ def run_advisors_for_epoch(cfg, conn, ctx):
                 conn, ctx, want, module,
                 "selector names no advisor: %r" % want)
 
-        return advisors.run_advisors(
+        runs = advisors.run_advisors(
             picked, conn, ctx,
             history_cap_days=getattr(cfg, "advisor_max_history_days", 30),
             specs=getattr(ctx, "specs", None))
+        # AFTER the insights are durable. A proposal whose evidence was never
+        # stored is a decision nobody can audit.
+        _propose_thresholds(cfg, conn, ctx, runs)
+        return runs
     except Exception as exc:                       # noqa: BLE001 - isolated
         lines = str(exc).splitlines()
         ctx.note("advisors could not run: %s"
@@ -814,13 +871,25 @@ def main(argv=None):
         enabled = module_loader.discover_enabled(cfg)
         # The effective band, overrides included, so the coverage report
         # describes what the NEXT epoch will grade with rather than what the
-        # files alone say.
-        show_conn = store.connect(cfg.db_path)
-        store.init(show_conn)
-        specs = thresholds.load_effective(
-            {m.id: os.path.join(m._path, m.threshold_file) for m in enabled},
-            show_conn)
-        show_conn.close()
+        # files alone say. READ-ONLY, AND BEST-EFFORT: --showconf is a
+        # diagnostic, so it must not create or migrate the store, and a locked
+        # or absent database falls back to the file-declared bands rather than
+        # failing the command that is supposed to explain the configuration.
+        mapping = {m.id: os.path.join(m._path, m.threshold_file)
+                   for m in enabled}
+        specs = thresholds.load_many(mapping)
+        if os.path.exists(cfg.db_path):
+            try:
+                show_conn = store.connect(cfg.db_path, read_only=True)
+                try:
+                    specs = thresholds.load_effective(mapping, show_conn)
+                finally:
+                    show_conn.close()
+            except Exception as exc:              # noqa: BLE001 - diagnostic
+                line = str(exc).splitlines()
+                print("\nthreshold overrides not read (%s); the coverage below "
+                      "is the file-declared bands"
+                      % (line[0] if line else type(exc).__name__))
         classes = checks.registry(
             *([c for m in enabled for c in m.check_classes()]
               + list(checks.platform_modules())))

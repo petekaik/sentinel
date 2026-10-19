@@ -286,6 +286,7 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
         t0 = time.time()
         snap = Snapshot(conn, max_days=history_cap_days, specs=specs)
         status, detail = "ok", ""
+        insights = []
         try:
             days = min(int(getattr(adv, "history_days", 7)),
                        int(history_cap_days))
@@ -310,7 +311,12 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
                  "detail": detail,
                  "duration_ms": duration_ms,
                  "requested_days": snap.requested_days,
-                 "available_days": snap.available_days}
+                 "available_days": snap.available_days,
+                 # The insights themselves travel back so the collector can
+                 # translate a threshold suggestion into a proposal. Additive:
+                 # the advisor remains write-free and the runner remains the
+                 # only writer of insight rows.
+                 "insights": insights}
         out.append(entry)
 
         if conn is not None:

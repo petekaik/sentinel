@@ -205,8 +205,22 @@ def _propose(cfg, conn, module_id, action, inc, key):
     what makes a fresh proposal after the TTL a new decision rather than a
     resurrection of a stale one.
     """
-    if store.pending_action_proposal(conn, key, action.id) is not None:
-        return None
+    last = store.last_action_proposal(conn, key, action.id)
+    if last is not None:
+        if last["state"] == "pending":
+            return None
+        # A DECIDED PROPOSAL BUYS THE ACTION ITS COOLDOWN. Approval executes
+        # the action but the incident can still be open on the next epoch;
+        # writing a fresh proposal immediately would cycle the queue and end in
+        # approvals refused for an exhausted attempt budget.
+        # Executed and rejected are DECISIONS about the action. Expiry is not:
+        # the deadline lapsed without anyone deciding, so a still-broken
+        # incident is entitled to a fresh proposal immediately.
+        if last["state"] in ("executed", "rejected"):
+            stamp = (last.get("executed_at") or last.get("decided_at")
+                     or last["ts"])
+            if time.time() - float(stamp) < action.limits.cooldown_s:
+                return None
     ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
     payload = {"action_id": action.id, "incident_key": key,
                "target": inc.get("target"), "check_id": inc.get("check_id"),
@@ -313,18 +327,25 @@ def consider(cfg, conn, seq, results, ctx):
                             cand, inc, actions.approval_policy(policy,
                                                                cand.id))[0]):
                     proposal_for = cand
-            if action is None:
-                if proposal_for is not None:
-                    _propose(cfg, conn, mod.id, proposal_for, inc, key)
-                    out.append((key, proposal_for.id,
-                                {"executed": False,
-                                 "why": "propose: awaiting operator approval"}))
+            # THE CAP/LATCH GATE COMES BEFORE THE PROPOSE BRANCH. A module
+            # permitted to propose still spends the incident's one attempt
+            # budget; checking only on the execution path let a propose-level
+            # action keep writing proposals against an incident every executor
+            # had already given up on. A module that permits NOTHING (action and
+            # proposal_for both None) still leaves the counter untouched.
+            if action is None and proposal_for is None:
                 continue
-
             if inc.get("remedy_attempts", 0) >= cap:
                 store.latch_remedy(conn, key, "remedy attempts exhausted")
                 out.append((key, None,
                             {"executed": False, "why": "latched"}))
+                continue
+
+            if action is None:
+                _propose(cfg, conn, mod.id, proposal_for, inc, key)
+                out.append((key, proposal_for.id,
+                            {"executed": False,
+                             "why": "propose: awaiting operator approval"}))
                 continue
 
             out.append((key, action.id,

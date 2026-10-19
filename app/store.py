@@ -713,23 +713,40 @@ def expire_proposals(conn, now=None):
     return cur.rowcount
 
 
-def pending_action_proposal(conn, incident_key, action_id):
-    """The pending proposal for one `(incident, action)`, if any.
+def _proposal_payload(row):
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
-    Payload is JSON, so the filter is applied here rather than in SQL: SQLite's
-    JSON1 is not something this otherwise stdlib-only appliance should depend on.
-    The pending set is small by construction (one per live incident/action).
+
+def last_action_proposal(conn, incident_key, action_id):
+    """The newest proposal for one `(incident, action)`, whatever its state.
+
+    The healer needs the DECIDED history as well as the pending set: an
+    approved proposal that executed leaves the incident open, and without this
+    the next epoch would write a fresh proposal immediately -- a queue that
+    cycles and later approvals that refuse on an exhausted attempt budget.
     """
     rows = conn.execute(
-        "SELECT * FROM proposal WHERE state = 'pending' AND kind = 'action' "
-        "ORDER BY id").fetchall()
+        "SELECT * FROM proposal WHERE kind = 'action' ORDER BY id DESC"
+    ).fetchall()
     for row in rows:
-        try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, ValueError):
-            continue
+        payload = _proposal_payload(row)
         if (payload.get("incident_key") == incident_key
                 and payload.get("action_id") == action_id):
+            return dict(row)
+    return None
+
+
+def pending_threshold_proposal(conn, spec_id):
+    """The pending `threshold_change` proposal for one spec, if any."""
+    rows = conn.execute(
+        "SELECT * FROM proposal WHERE state = 'pending' "
+        "AND kind = 'threshold_change' ORDER BY id DESC").fetchall()
+    for row in rows:
+        if _proposal_payload(row).get("spec_id") == spec_id:
             return dict(row)
     return None
 

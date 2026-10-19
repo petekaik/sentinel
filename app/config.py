@@ -97,8 +97,15 @@ class Config:
         self.advisor_ids = tuple(
             x.strip() for x in _env("SENTINEL_ADVISORS", "", e).split(",")
             if x.strip())
-        self.advisor_max_history_days = int(
-            _env("SENTINEL_ADVISOR_MAX_HISTORY_DAYS", "30", e))
+        cap = int(_env("SENTINEL_ADVISOR_MAX_HISTORY_DAYS", "30", e))
+        if cap < 0:
+            # REFUSED, not clamped: a negative cap would silently mean "no
+            # advisor may see any history", which no operator wrote and no
+            # symptom would name. A config that cannot do what it says must
+            # refuse to start.
+            raise ValueError(
+                "SENTINEL_ADVISOR_MAX_HISTORY_DAYS must be >= 0, got %d" % cap)
+        self.advisor_max_history_days = cap
 
     def module_enabled(self, module_id):
         return _bool("%s_ENABLED" % module_id.upper(), True, self.env)

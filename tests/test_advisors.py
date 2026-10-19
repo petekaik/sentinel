@@ -235,7 +235,7 @@ def test_the_snapshot_offers_no_write_path(results):
     public = {n for n in dir(s) if not n.startswith("_")}
     allowed = {"check_runs", "samples", "incidents", "logs", "thresholds",
                "settings", "window", "requested_days", "available_days",
-               "now", "caps", "truncated"}
+               "now", "caps", "truncated", "max_days"}
     results.check(
         "only the read API is public on a snapshot",
         public <= allowed, "unexpected public names: %r" % sorted(public - allowed))
@@ -494,9 +494,11 @@ def test_insights_carry_the_window_and_each_run_is_recorded(results):
             "the insight records its advisor and the honest window",
             len(rows) == 1 and rows[0]["advisor"] == "good"
             and evidence["window"]["requested_days"] == 9
-            and 0 < evidence["window"]["available_days"] <= 2.0,
+            and 0 < evidence["window"]["available_days"] <= 2.0
+            and evidence["window"]["cap_days"] == 30,
             "rows=%r evidence=%r. The insight must say what window produced it, "
-            "and available must be the history that exists, never the request."
+            "and available must be the history that exists, never the request. "
+            "The enforced cap travels with the evidence too."
             % (rows, evidence))
         results.check(
             "a truncated snapshot is recorded in the insight evidence",
@@ -559,6 +561,20 @@ class _FakeModule:
         return list(self._advs)
 
 
+def test_a_negative_history_cap_refuses_to_start(results):
+    try:
+        config_mod.Config(env={"SENTINEL_ADVISOR_MAX_HISTORY_DAYS": "-1"})
+        detail = "no exception"
+    except ValueError as exc:
+        detail = str(exc)
+    results.check(
+        "a negative history cap refuses to start rather than clamping silently",
+        "SENTINEL_ADVISOR_MAX_HISTORY_DAYS" in detail,
+        "detail=%r. Clamping to 0 would silently mean 'no advisor may see any "
+        "history', a state no operator wrote and no symptom would name."
+        % (detail,))
+
+
 def test_the_selector_gates_advisors_and_accepts_both_forms(results):
     tmp, conn = _store()
     try:
@@ -591,6 +607,327 @@ def test_the_selector_gates_advisors_and_accepts_both_forms(results):
                 "and the run row needs the owning module." % (out,))
     finally:
         _close(tmp, conn)
+
+
+def test_a_selector_that_names_nothing_is_a_loud_error(results):
+    tmp, conn = _store()
+    try:
+        ctx = _FakeCtx([_FakeModule("fleet", [])])
+        cfg = config_mod.Config(env={"SENTINEL_ADVISORS": "fleet.refrence"})
+        out = collect.run_advisors_for_epoch(cfg, conn, ctx)
+        rows = conn.execute("SELECT * FROM advisor_run").fetchall()
+        results.check(
+            "a misspelled selector records an error row and a note",
+            out == [] and len(rows) == 1
+            and rows[0]["advisor"] == "fleet.refrence"
+            and rows[0]["module"] == "fleet"
+            and rows[0]["status"] == "error"
+            and "selector names no advisor" in (rows[0]["detail"] or "")
+            and any("selector names no advisor" in n for n in ctx.notes),
+            "out=%r rows=%r notes=%r. A typo that runs nothing and says nothing "
+            "is a green dashboard over an advisor that never ran."
+            % (out, [dict(r) for r in rows], ctx.notes))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_malformed_advisor_is_skipped_and_the_rest_still_run(results):
+    from dataclasses import dataclass
+
+    tmp, conn = _store()
+    try:
+        class NoId:
+            @property
+            def id(self):
+                raise RuntimeError("no id")
+
+        @dataclass(frozen=True)
+        class Frozen(advisors.Advisor):
+            id: str = "frozen"
+
+        class Runs(advisors.Advisor):
+            id = "runs"
+            history_days = 1
+
+            def advise(self, ctx, snapshot):
+                return []
+
+        ctx = _FakeCtx([_FakeModule("fleet", [NoId(), Frozen(), Runs()])])
+        cfg = config_mod.Config(
+            env={"SENTINEL_ADVISORS": "runs,frozen"})
+        out = collect.run_advisors_for_epoch(cfg, conn, ctx)
+        runs = {r["advisor"]: r["status"] for r in
+                conn.execute("SELECT * FROM advisor_run").fetchall()}
+        results.check(
+            "a bad advisor object is recorded and skipped, the good one runs",
+            [e["advisor"] for e in out] == ["runs"]
+            and runs.get("runs") == "ok"
+            and runs.get("NoId") == "error"
+            and runs.get("frozen") == "error",
+            "out=%r runs=%r notes=%r. One malformed object must not abort the "
+            "selection for every other advisor."
+            % (out, runs, ctx.notes))
+    finally:
+        _close(tmp, conn)
+
+
+def test_malformed_insight_evidence_is_refused_not_stored(results):
+    tmp, conn = _store()
+    try:
+        class BadEvidence(advisors.Advisor):
+            id = "bad-evidence"
+            history_days = 1
+
+            def advise(self, ctx, snapshot):
+                return [advisors.Insight(module="fleet", kind="report",
+                                         title="t", body="b", evidence=None)]
+
+        out = advisors.run_advisors([BadEvidence()], conn=conn, ctx=None,
+                                    history_cap_days=30)
+        row = conn.execute("SELECT * FROM advisor_run").fetchone()
+        results.check(
+            "a non-dict evidence field is an error and the insight is not stored",
+            out[0]["status"] == "error" and "evidence" in out[0]["detail"]
+            and store.list_insights(conn) == []
+            and row["status"] == "error",
+            "out=%r insights=%r. Replacing malformed evidence with {} stores "
+            "an insight whose provenance was silently discarded."
+            % (out, store.list_insights(conn)))
+    finally:
+        _close(tmp, conn)
+
+
+def test_an_over_budget_run_is_recorded_and_not_ok(results):
+    tmp, conn = _store()
+    try:
+        class Slow(advisors.Advisor):
+            id = "slow"
+            history_days = 1
+
+            def advise(self, ctx, snapshot):
+                time.sleep(0.03)
+                return []
+
+        out = advisors.run_advisors([Slow()], conn=conn, ctx=None,
+                                    budget_ms=1, history_cap_days=30)
+        row = conn.execute("SELECT * FROM advisor_run").fetchone()
+        results.check(
+            "an overrun is status 'budget', ok False, and recorded",
+            (out[0]["status"] == "budget" and out[0]["ok"] is False
+             and "budget exceeded" in out[0]["detail"]
+             and row["status"] == "budget"
+             and "(budget exceeded" in (row["detail"] or "")),
+            "out=%r row=%r. A run that took longer than its budget is not a "
+            "success; the epoch record already exists, so the overrun is a "
+            "fact to report, not a reason to kill anything."
+            % (out, dict(row)))
+    finally:
+        _close(tmp, conn)
+
+
+def test_each_advisor_gets_a_fresh_snapshot(results):
+    tmp, conn = _store()
+    try:
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)",
+            (time.time() - DAY, 1, "cubox-1", "c", "ok"))
+
+        class Trunc(advisors.Advisor):
+            id = "trunc"
+            history_days = 1
+
+            def advise(self, ctx, snapshot):
+                since, _ = snapshot.window(self.history_days)
+                snapshot.check_runs(since, 0)      # truncated, never returned
+                return []
+
+        class Observer(advisors.Advisor):
+            id = "observer"
+            history_days = 9
+
+            def advise(self, ctx, snapshot):
+                self.seen = {"truncated": dict(snapshot.truncated),
+                             "requested": snapshot.requested_days}
+                return []
+
+        observer = Observer()
+        advisors.run_advisors([Trunc(), observer], conn=conn, ctx=None,
+                              history_cap_days=30)
+        results.check(
+            "one advisor's reads are invisible to the next advisor",
+            observer.seen == {"truncated": {}, "requested": 9},
+            "seen=%r. A shared snapshot would let the first advisor's "
+            "truncation and window leak into every later one." % (observer.seen,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_snapshot_cap_is_enforced_not_just_reported(results):
+    tmp, conn = _store()
+    try:
+        now = time.time()
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 90 * DAY, 1, "cubox-1", "c", "ok"))
+
+        class Greedy(advisors.Advisor):
+            id = "greedy"
+            history_days = 90
+
+            def advise(self, ctx, snapshot):
+                self.since, self.available = snapshot.window(90)
+                return [advisors.Insight(module="fleet", kind="report",
+                                         title="t", body="b")]
+
+        greedy = Greedy()
+        advisors.run_advisors([greedy], conn=conn, ctx=None,
+                              history_cap_days=30)
+        evidence = json.loads(store.list_insights(conn)[0]["evidence_json"])
+        results.check(
+            "an advisor asking 90 days under a 30-day cap reads only 30",
+            (evidence["window"]["requested_days"] == 90
+             and evidence["window"]["available_days"] == 30.0
+             and evidence["window"]["cap_days"] == 30
+             and greedy.since >= now - 30 * DAY - 5),
+            "evidence=%r since=%r. The cap must clamp the span actually read, "
+            "not merely be reported; requested keeps the advisor's ask."
+            % (evidence, greedy.since))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_store_insert_failure_is_caught(results):
+    tmp, conn = _store()
+    try:
+        class One(advisors.Advisor):
+            id = "one"
+            history_days = 1
+
+            def advise(self, ctx, snapshot):
+                return [advisors.Insight(module="fleet", kind="report",
+                                         title="t", body="b")]
+
+        saved = store.record_insight
+
+        def deny(*args, **kwargs):
+            raise RuntimeError("insert denied")
+
+        store.record_insight = deny
+        try:
+            out = advisors.run_advisors([One()], conn=conn, ctx=None,
+                                        history_cap_days=30)
+        finally:
+            store.record_insight = saved
+        row = conn.execute("SELECT * FROM advisor_run").fetchone()
+        results.check(
+            "a failing insight insert is an error row, not an escape",
+            (out[0]["status"] == "error" and "insert denied" in out[0]["detail"]
+             and row["status"] == "error"),
+            "out=%r row=%r. A store fault must not propagate out of the "
+            "runner and take the epoch with it."
+            % (out, dict(row)))
+
+        saved_run = store.record_advisor_run
+
+        def deny_run(*args, **kwargs):
+            raise RuntimeError("run insert denied")
+
+        store.record_advisor_run = deny_run
+        try:
+            out = advisors.run_advisors([One()], conn=conn, ctx=None,
+                                        history_cap_days=30)
+        finally:
+            store.record_advisor_run = saved_run
+        results.check(
+            "a failing run-row insert is reported, never raised",
+            out[0]["status"] == "ok"
+            and "advisor_run record failed" in out[0]["detail"],
+            "out=%r. The outcome is in the returned detail when the row itself "
+            "cannot be written." % (out,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_dry_run_epoch_runs_no_advisor(results):
+    import shutil
+    import tempfile
+    import modules as loader
+    import test_collect_offline as collect_tests
+
+    class Counter(advisors.Advisor):
+        id = "counter"
+        history_days = 1
+        calls = 0
+
+        def advise(self, ctx, snapshot):
+            type(self).calls += 1
+            return []
+
+    Counter.calls = 0
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with collect_tests.Fleet(tmpdir) as f:
+            fleet_mod = [m for m in loader.discover() if m.id == "fleet"][0]
+            saved = fleet_mod._advisors
+            fleet_mod._advisors = lambda: [Counter()]
+            old_ids = f.cfg.advisor_ids
+            f.cfg.advisor_ids = ("counter",)
+            try:
+                collect.collect_once(f.cfg, f.conn, dry_run=True)
+            finally:
+                fleet_mod._advisors = saved
+                f.cfg.advisor_ids = old_ids
+            rows = f.conn.execute("SELECT COUNT(*) AS n FROM advisor_run") \
+                .fetchone()["n"]
+            results.check(
+                "the mode whose contract is 'claims nothing' runs no advisor",
+                Counter.calls == 0 and rows == 0,
+                "calls=%r rows=%r. An advisor writes insights; a dry run must "
+                "not reach it at all." % (Counter.calls, rows))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_the_runner_reads_the_epoch_that_just_finished(results):
+    import shutil
+    import tempfile
+    import modules as loader
+    import test_collect_offline as collect_tests
+
+    class Reader(advisors.Advisor):
+        id = "reader"
+        history_days = 1
+        epochs = set()
+
+        def advise(self, ctx, snapshot):
+            since, _ = snapshot.window(self.history_days)
+            type(self).epochs = {
+                r["epoch_seq"] for r in snapshot.check_runs(since, 1000)}
+            return []
+
+    Reader.epochs = set()
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with collect_tests.Fleet(tmpdir) as f:
+            fleet_mod = [m for m in loader.discover() if m.id == "fleet"][0]
+            saved = fleet_mod._advisors
+            fleet_mod._advisors = lambda: [Reader()]
+            old_ids = f.cfg.advisor_ids
+            f.cfg.advisor_ids = ("reader",)
+            try:
+                out = collect.collect_once(f.cfg, f.conn)
+            finally:
+                fleet_mod._advisors = saved
+                f.cfg.advisor_ids = old_ids
+            results.check(
+                "advisors run after this epoch's evidence is durable",
+                out["seq"] in Reader.epochs,
+                "epoch=%r seen=%r. An advisor that cannot see the rows just "
+                "written is advising on yesterday's fleet."
+                % (out["seq"], Reader.epochs))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_a_raising_advisor_cannot_lose_the_epoch_record(results):
@@ -642,7 +979,17 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_failing_advisor_is_isolated_and_recorded,
          test_insights_carry_the_window_and_each_run_is_recorded,
          test_the_history_cap_is_applied_to_every_advisor,
+         test_a_negative_history_cap_refuses_to_start,
          test_the_selector_gates_advisors_and_accepts_both_forms,
+         test_a_selector_that_names_nothing_is_a_loud_error,
+         test_a_malformed_advisor_is_skipped_and_the_rest_still_run,
+         test_malformed_insight_evidence_is_refused_not_stored,
+         test_an_over_budget_run_is_recorded_and_not_ok,
+         test_each_advisor_gets_a_fresh_snapshot,
+         test_the_snapshot_cap_is_enforced_not_just_reported,
+         test_a_store_insert_failure_is_caught,
+         test_a_dry_run_epoch_runs_no_advisor,
+         test_the_runner_reads_the_epoch_that_just_finished,
          test_a_raising_advisor_cannot_lose_the_epoch_record)
 
 

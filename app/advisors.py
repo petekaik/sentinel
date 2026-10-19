@@ -34,11 +34,16 @@ class Insight:
 class Snapshot:
     """Read-only, windowed views of the store. No writes, no database handle."""
 
-    def __init__(self, conn, now=None, caps=None):
+    def __init__(self, conn, now=None, caps=None, max_days=None):
         self._conn = conn
         self.now = now if now is not None else time.time()
         self.requested_days = 0
         self.available_days = 0.0
+        # THE WINDOW CAP IS ENFORCED HERE, not just passed to `window()` by the
+        # runner. An advisor that ignores the runner's call and asks for 3650
+        # days itself must still get no more history than the platform allows.
+        # None means uncapped (a direct snapshot in a test or a diagnostic).
+        self.max_days = None if max_days is None else int(max_days)
         self.caps = {"rows": 5000, "log_bytes": 200000}
         if caps:
             self.caps.update(caps)
@@ -51,10 +56,16 @@ class Snapshot:
     def window(self, days):
         """(since_ts, available_days) for a `days` request.
 
-        `available_days` is min(actual history, requested), rounded -- 0.0 when
-        `check_run` holds nothing, never the number that was asked for.
+        `requested_days` keeps the advisor's ASK. `available_days` is
+        min(actual history, min(asked, max_days)), rounded -- 0.0 when
+        `check_run` holds nothing, never the number that was asked for. The
+        cap is applied to the span actually read, not merely reported.
         """
         self.requested_days = int(days)
+        effective = self.requested_days
+        if self.max_days is not None:
+            effective = min(effective, self.max_days)
+        effective = max(0, effective)
         if self._conn is None:
             # The runner's no-store path (the isolation tests, and any caller
             # that runs an advisor without a database). No store means no
@@ -64,8 +75,8 @@ class Snapshot:
         row = self._conn.execute("SELECT MIN(ts) FROM check_run").fetchone()
         oldest = row[0] if row and row[0] is not None else self.now
         history = max(0.0, (self.now - oldest) / DAY)
-        self.available_days = round(min(history, float(days)), 2)
-        since = max(oldest, self.now - days * DAY)
+        self.available_days = round(min(history, float(effective)), 2)
+        since = max(oldest, self.now - effective * DAY)
         return since, self.available_days
 
     def _rows(self, name, sql, params=(), limit=None):
@@ -165,13 +176,23 @@ class Advisor:
 
 def _record(conn, advisor_id, insight, snap):
     """Store one insight with the window that actually produced it."""
-    evidence = insight.evidence if isinstance(insight.evidence, dict) else {}
+    if not isinstance(insight.evidence, dict):
+        # REFUSED, not replaced. Coercing a malformed evidence field to {} would
+        # store an insight whose provenance was silently discarded, which is
+        # exactly the "recorded as X while the caller believed Y" failure the
+        # store's field validation exists to prevent. The raise becomes this
+        # advisor's error row; the insight is not stored.
+        raise TypeError("insight evidence must be a dict, got %s"
+                        % type(insight.evidence).__name__)
+    evidence = insight.evidence
     # `setdefault`: an advisor that states its own window (Task 17's reference
     # advisor does) keeps it. If it does not, the runner supplies the honest
-    # numbers rather than leaving the claim unattributable.
+    # numbers -- including the cap actually enforced -- rather than leaving the
+    # claim unattributable.
     evidence.setdefault("window", {
         "requested_days": snap.requested_days,
-        "available_days": snap.available_days})
+        "available_days": snap.available_days,
+        "cap_days": snap.max_days})
     if snap.truncated:
         evidence.setdefault("truncated", dict(snap.truncated))
     insight.evidence = evidence
@@ -187,18 +208,20 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30):
     the platform's, not the advisor's.
 
     THE BUDGET IS MEASURED, NOT ENFORCED. The call is synchronous and there is
-    no preemption, so a run that exceeds `budget_ms` is recorded as over budget
-    AFTER it returns. That is deliberate: killing an advisor mid-read would
-    leave a half-written insight, and the epoch does not wait on it anyway.
+    no preemption -- the epoch WAITS for each advisor to return -- so a run
+    that exceeds `budget_ms` is recorded as over budget AFTER it returns.
+    Killing an advisor mid-read would leave a half-written insight, and the
+    epoch record has already been written, so the overrun is a fact about the
+    advisor rather than a reason to truncate one.
 
     AN EXCEPTION, A MALFORMED INSIGHT, OR AN OVERRUN IS RECORDED, NEVER
-    PROPAGATED. The epoch has already stored its evidence before this runs, and
-    an advisor must not be able to take that record down with it.
+    PROPAGATED. The epoch has already stored its evidence and its own record
+    before this runs, and an advisor must not be able to take either down.
     """
     out = []
     for adv in advisors:
         t0 = time.time()
-        snap = Snapshot(conn)
+        snap = Snapshot(conn, max_days=history_cap_days)
         status, detail = "ok", ""
         try:
             days = min(int(getattr(adv, "history_days", 7)),
@@ -219,7 +242,7 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30):
                                                            budget_ms)
         entry = {"advisor": getattr(adv, "id", ""),
                  "module": getattr(adv, "module", ""),
-                 "ok": status != "error",
+                 "ok": status == "ok",
                  "status": status,
                  "detail": detail,
                  "duration_ms": duration_ms,

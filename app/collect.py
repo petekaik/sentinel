@@ -417,6 +417,22 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     seq = store.next_epoch_seq(conn)
 
     enabled = module_loader.discover_enabled(cfg)
+
+    # A DISABLED MODULE RUNS NO CHECKS, SO NOTHING CAN EVER RESOLVE ITS
+    # INCIDENTS. Freeze them -- EVERY epoch, because a freeze is one UNKNOWN
+    # observation, not a terminal transition, and a row left alone is not
+    # re-asserted. Never resolve: disabling a module is a decision about the
+    # monitor, not a positive observation about the fleet. Skipped on a dry run,
+    # whose whole contract is "claims nothing".
+    if not (dry_run or cfg.dry_run):
+        enabled_ids = {m.id for m in enabled}
+        for mod in module_loader.discover():
+            if mod.id in enabled_ids:
+                continue
+            for row in store.live_incidents_for_targets(conn, mod.targets):
+                store.freeze_incident(conn, seq, row,
+                                      "module %r is disabled" % mod.id)
+
     specs = thresholds.load_many(
         {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
     classes = checks.registry(

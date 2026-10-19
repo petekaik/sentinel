@@ -58,6 +58,10 @@ except ImportError:                              # pre-move tree
 FLEET_CONF = os.path.join(ROOT, "app", "modules", "fleet", "thresholds.conf")
 BOXES = ("cubox-1", "cubox-2")
 
+# Platform checks with no fleet input, excluded from the capture baseline (see
+# `_classes`). Their absence is deliberate; adding one here must be justified.
+PARITY_EXCLUDED = ("modules_enabled",)
+
 # The fixture capture's own clock, so `duration_ms`-shaped detail strings do not
 # move between runs. (Nothing in the rows records a wall-clock reading; this
 # constant is here to make that intent explicit.)
@@ -101,8 +105,15 @@ def _classes(module_checks):
                          "broken, so there is nothing to baseline")
     # The platform's own checks run whatever modules are loaded; including them
     # here keeps the baseline's check set identical to the pre-move registry.
-    return checks.registry(*(tuple(module_checks)
-                             + tuple(checks.platform_modules())))
+    #
+    # MONITOR-ONLY CHECKS ARE NOT PART OF THIS BASELINE. `modules_enabled` grades
+    # the loaded module list, not a box capture -- it would add rows that say
+    # nothing about the fleet checks this tool compares, and it would change
+    # SpecCoverage's registry count. The fleet-capture baseline stays exactly the
+    # rows it had; the new check has its own tests in test_modules.py.
+    classes = checks.registry(*(tuple(module_checks)
+                                + tuple(checks.platform_modules())))
+    return [c for c in classes if c.id not in PARITY_EXCLUDED]
 
 
 def _copy_fleet_view(cfg, fleet):

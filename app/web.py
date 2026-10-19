@@ -119,6 +119,18 @@ def build_state(cfg, conn, now=None):
         staleness = "fresh"
 
     enabled = module_loader.discover_enabled(cfg)
+    # WHAT IS OFF IS PART OF THE PAGE. A disabled module that simply vanishes
+    # from the dashboard is indistinguishable from one that never existed, and
+    # the user has no way to learn that its incidents are frozen rather than
+    # resolved. So discovery is asked for the full set and the difference named.
+    enabled_ids = {m.id for m in enabled}
+    disabled = [m for m in module_loader.discover() if m.id not in enabled_ids]
+    module_of = {}
+    for m in enabled:
+        # `check_classes()` returns the module's check MODULES; the registry
+        # enumerates their classes, which are what carry an id.
+        for cls in checks.registry(*m.check_classes()):
+            module_of[cls.id] = m
     specs = thresholds.load_many(
         {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
     classes = checks.registry(
@@ -140,9 +152,11 @@ def build_state(cfg, conn, now=None):
     for chk in checks.expand(classes, checks.expansion_targets(enabled)):
         row = by_key.pop((chk.target, chk.id), None)
         spec = specs.get(chk.spec) if chk.spec else None
+        owner = module_of.get(chk.id)
         item = {
             "target": chk.target,
             "check_id": chk.id,
+            "module": owner.id if owner else None,
             "title": chk.title or chk.id,
             "spec": chk.spec,
             "informational": bool(getattr(chk, "informational", False)),
@@ -191,7 +205,7 @@ def build_state(cfg, conn, now=None):
     # class -- and "we cannot see cubox-1" is exactly the row an operator must
     # never lose because the renderer was built from the wrong list.
     extra = [{"target": t, "check_id": c, "title": c, "status": r["status"],
-              "detail": r["detail"], "from": "collector",
+              "detail": r["detail"], "from": "collector", "module": None,
               "spec": None, "value": None, "unit": "", "has_result": True,
               "informational": False, "spec_note": None,
               "unavailable_reason": None, "claim": None}
@@ -207,6 +221,10 @@ def build_state(cfg, conn, now=None):
         "stale_after_s": cfg.interval * STALE_INTERVALS,
         "interval": cfg.interval,
         "tiles": tiles,
+        "modules": [{"id": m.id, "title": m.title, "order": m.order,
+                     "enabled": True} for m in enabled],
+        "disabled_modules": [{"id": m.id, "title": m.title, "order": m.order,
+                              "enabled": False} for m in disabled],
         "informational": informational,
         "others": others,
         "extra": extra,
@@ -594,6 +612,12 @@ def build_status(cfg, conn, now=None):
                        checks_without_result=len(state["missing"]),
                        worst_total=len(flagged),
                        worst_truncated=len(flagged) > WORST_LIMIT),
+
+        # What is observing the fleet, and what is switched off. Additive: a
+        # consumer that only reads `verdict` is unaffected, and one that sees a
+        # thin board can find out why without a second endpoint.
+        "modules": state["modules"],
+        "disabled_modules": state["disabled_modules"],
 
         # Per-host, so "which box" does not require filtering the flat list. The
         # keys are the targets the collector itself uses, so `backup` and
@@ -1151,20 +1175,45 @@ def render_html(state, cfg):
     # ---- the RAG tiles, then every check the registry does not own ----------
     tacc = []
     _tc = tacc.append
-    _tc("<h2>Critical metrics (%d)</h2>" % len(state["tiles"]))
-    _tc("<div class=grid>")
+
+    # A DISABLED MODULE IS LOUD, ABOVE THE TILES. Its checks are absent by
+    # construction, and an absent section reads exactly like a healthy one --
+    # so the reason it is absent is stated rather than inferred.
+    for m in state.get("disabled_modules", []):
+        _tc("<div class=note>Module %s is DISABLED by configuration. Its "
+            "checks are not running and its incidents are frozen, not "
+            "resolved.</div>" % _esc(m["title"]))
+
+    def _grid(items):
+        _tc("<div class=grid>")
+        for t in items:
+            colour = _status(t["status"]).rag
+            if t["value"] is None:
+                val = "--"
+            else:
+                val = ("%g%s" % (t["value"],
+                                 (" " + t["unit"]) if t["unit"] else ""))
+            _tc("<div class='tile %s'><span class=badge>%s</span>"
+                "<div class=t>%s &middot; %s</div><div class=v>%s</div>"
+                "<div class=d>%s</div></div>"
+                % (colour, _esc(t["target"]), _esc(t["title"]),
+                   _esc(t["status"]), _esc(val), _esc(t["detail"])))
+        _tc("</div>")
+
+    # ONE SECTION PER ENABLED MODULE, in discovery order (module `order`, then
+    # id). A tile whose check belongs to no enabled module is rendered under a
+    # fallback heading rather than dropped -- a vanishing row reads as green.
+    grouped = {}
     for t in state["tiles"]:
-        colour = _status(t["status"]).rag
-        if t["value"] is None:
-            val = "--"
-        else:
-            val = ("%g%s" % (t["value"], (" " + t["unit"]) if t["unit"] else ""))
-        _tc("<div class='tile %s'><span class=badge>%s</span>"
-            "<div class=t>%s &middot; %s</div><div class=v>%s</div>"
-            "<div class=d>%s</div></div>"
-            % (colour, _esc(t["target"]), _esc(t["title"]), _esc(t["status"]),
-               _esc(val), _esc(t["detail"])))
-    _tc("</div>")
+        grouped.setdefault(t.get("module"), []).append(t)
+    for m in state.get("modules", []):
+        items = grouped.pop(m["id"], [])
+        _tc("<h2>%s (%d)</h2>" % (_esc(m["title"]), len(items)))
+        _grid(items)
+    for mid, items in grouped.items():
+        _tc("<h2>%s (%d)</h2>"
+            % (_esc("Critical metrics" if mid is None else mid), len(items)))
+        _grid(items)
     rows = state["extra"] + state["tiles"] + state["others"] + state["informational"]
     by_target = {}
     for r in rows:

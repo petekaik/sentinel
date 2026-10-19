@@ -727,6 +727,35 @@ def live_incidents(conn):
     return [dict(r) for r in rows]
 
 
+def live_incidents_for_targets(conn, targets):
+    """Confirmed incidents against any of `targets` -- the rows a layer owns.
+
+    A module's `targets` is its whole reporting vocabulary, so this is how the
+    collector finds every incident a module was responsible for when that module
+    is disabled. Deliberately CONFIRMED_STATES, like `live_incidents`: a
+    `pending` row was never an incident.
+    """
+    if not targets:
+        return []
+    marks = ", ".join("?" for _ in targets)
+    rows = conn.execute(
+        "SELECT * FROM incident WHERE state IN (%s) AND target IN (%s)"
+        % (CONFIRMED_SQL, marks), tuple(targets)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def freeze_incident(conn, seq, row, reason):
+    """Fold an UNKNOWN observation into the row that owns it.
+
+    A disabled module runs no checks, so no observation can ever resolve its
+    incidents -- freezing is the honest state, and it is done through the same
+    state machine (and so the same severity cap) as a genuinely unobservable
+    check. It NEVER resolves: UNKNOWN is not the answer "fine".
+    """
+    return sync_incident(conn, seq, row["target"], row["check_id"],
+                         row["subject"], Status.UNKNOWN, reason, None)
+
+
 def last_collection(conn):
     row = conn.execute(
         "SELECT ts, epoch_seq, duration_ms, checks_run, errors FROM collector_run "

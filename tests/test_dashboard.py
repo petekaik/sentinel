@@ -55,20 +55,23 @@ import shell                  # noqa: E402
 CACHE = "no-store, no-cache, must-revalidate, max-age=0"
 
 
-def make_cfg(db_path, interval=60):
-    return config_mod.Config(env={
+def make_cfg(db_path, interval=60, **extra):
+    env = {
         "CUBOX_IDS": "cubox-1,cubox-2",
         "MONITOR_DB": db_path,
         "MONITOR_CHECKS": CHECKS_CONF,
         "MONITOR_INTERVAL": str(interval),
-    })
+    }
+    env.update(extra)
+    return config_mod.Config(env=env)
 
 
 class Dash:
     """A store and a config, with no collector in the loop."""
 
-    def __init__(self, tmpdir, interval=60):
-        self.cfg = make_cfg(os.path.join(tmpdir, "monitor.sqlite"), interval)
+    def __init__(self, tmpdir, interval=60, **extra):
+        self.cfg = make_cfg(os.path.join(tmpdir, "monitor.sqlite"), interval,
+                            **extra)
         self.conn = store.connect(self.cfg.db_path)
         store.init(self.conn)
         self.seq = 0
@@ -2013,7 +2016,96 @@ def test_the_page_fits_a_phone_without_being_asked(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 13. Modules: one section per enabled module, a loud note for a disabled one
+# ---------------------------------------------------------------------------
+
+
+def test_each_enabled_module_renders_its_own_section(results):
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        targets = [(c.target, c.id) for c in registry_instances(d.cfg)
+                   if c.spec and not getattr(c, "informational", False)]
+        for target, cid in targets:
+            d.check(target, cid, store.Status.OK, "fine (test)")
+        state, html = d.state(), d.html()
+
+        results.check(
+            "the enabled module is listed with its order and title",
+            [m["id"] for m in state["modules"]] == ["fleet"]
+            and state["modules"][0]["title"] == "CuBox fleet"
+            and state["modules"][0]["enabled"] is True,
+            "modules=%r -- the page model must name what is on"
+            % (state["modules"],))
+        results.check(
+            "each enabled module renders its own titled section",
+            ("<h2>CuBox fleet (%d)</h2>" % len(state["tiles"])) in html,
+            "the tile grid has no section headed by the module's title")
+        results.check(
+            "its tiles carry the module they came from",
+            bool(state["tiles"])
+            and all(t["module"] == "fleet" for t in state["tiles"]),
+            "modules on tiles: %r" % sorted({t["module"] for t in state["tiles"]}))
+        results.check(
+            "no disabled note appears when nothing is disabled",
+            "DISABLED by configuration" not in html,
+            "a page with every module enabled claims one is disabled")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_a_disabled_module_is_loud_and_has_no_tiles(results):
+    """A disabled module must be stated, and must not leave a green section."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir, SENTINEL_MODULES="no_such_module")
+        d.epoch()
+        state, html = d.state(), d.html()
+        st = web.build_status(d.cfg, d.conn)
+
+        results.check(
+            "the page model separates enabled from disabled modules",
+            state["modules"] == []
+            and [m["id"] for m in state["disabled_modules"]] == ["fleet"],
+            "modules=%r disabled=%r -- a disabled module that simply vanishes "
+            "reads exactly like one that never existed"
+            % (state["modules"], state["disabled_modules"]))
+        results.check(
+            "the disabled module is stated in words, above the tiles",
+            "Module CuBox fleet is DISABLED by configuration" in html
+            and "frozen, not resolved" in html,
+            "the page does not say the module is disabled or what happened to "
+            "its incidents")
+        results.check(
+            "no tile from the disabled module is rendered",
+            "mem_available_mb" not in html and "tile green" not in html,
+            "a check from a disabled module still renders -- or a green tile "
+            "was drawn on a fleet with no module running")
+        results.check(
+            "a wholly disabled fleet does not band green",
+            "band unknown" in html and "band ok" not in html,
+            "the band reads OK with no module enabled -- platform-only checks "
+            "are not a clean fleet (SpecCoverage alone returns OK on an empty "
+            "audit)")
+        results.check(
+            "the platform's own rows still run and are grey, not absent",
+            "modules_enabled" in html and ">unknown<" in html,
+            "the platform's checks vanished with the module -- then nothing at "
+            "all would be measuring the disablement")
+        results.check(
+            "the API payload carries the module lists, additively",
+            st["modules"] == []
+            and [m["id"] for m in st["disabled_modules"]] == ["fleet"],
+            "the status API dropped the module lists")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
+         test_each_enabled_module_renders_its_own_section,
+         test_a_disabled_module_is_loud_and_has_no_tiles,
          test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_stale_says_so_and_cannot_also_be_ok,

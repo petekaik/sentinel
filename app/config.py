@@ -76,6 +76,18 @@ class Config:
         self.dry_run = _bool("MONITOR_DRY_RUN", False, e)
         self.remedies_enabled = _bool("MONITOR_REMEDIES", False, e)
 
+        # Module selection. `SENTINEL_MODULES` is a comma-separated id list and
+        # NARROWS the discovered set; an empty value means "every module".
+        # `<ID>_ENABLED=0` disables one without touching the selector, and an
+        # unset key means enabled -- a missing env var must never silently turn
+        # a module off, because the resulting dashboard is a green one.
+        self.module_ids = tuple(
+            x.strip() for x in _env("SENTINEL_MODULES", "", e).split(",")
+            if x.strip())
+
+    def module_enabled(self, module_id):
+        return _bool("%s_ENABLED" % module_id.upper(), True, self.env)
+
     def describe(self):
         """A one-screen summary, for --showconf and for the collector log."""
         lines = ["db / port          : %s / %d" % (self.db_path, self.port)]

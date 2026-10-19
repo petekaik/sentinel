@@ -73,6 +73,23 @@ class SpecCoverage(Check):
                 subject="checks.conf",
             )
 
+        if not ctx.specs:
+            # "0 checked" IS NOT "ALL CLAIMED". With no module loaded there are
+            # no threshold files to merge, and the audit used to return OK on
+            # that empty set -- so a wholly disabled fleet rendered green on the
+            # one check that is supposed to notice nothing is measuring. This is
+            # UNKNOWN, not FAIL: nothing is malformed, there is simply nothing
+            # here to audit.
+            return unknown(
+                self.id, self.target,
+                "NO THRESHOLDS ARE DECLARED, so there is nothing to audit. "
+                "With no module enabled (or a module that declares no threshold "
+                "file) this must not render as full coverage: 0 checked is not "
+                "0 unclaimed. Enable a module, or fix its threshold file.",
+                subject="checks.conf",
+                evidence={"declared": 0, "check_classes": len(classes)},
+            )
+
         claimed, deferred, unclaimed = _audit(ctx.specs, classes)
         n = len(ctx.specs)
         ev = {
@@ -121,6 +138,41 @@ class SpecCoverage(Check):
         res.metric("specs_declared", n, "specs")
         res.metric("specs_unclaimed", 0, "specs")
         return res
+
+
+class ModulesEnabled(Check):
+    """At least one module is observing something, and its name is said.
+
+    THE PLATFORM'S OWN CHECKS SURVIVE A DISABLEMENT. That is deliberate -- a
+    fleet with every module turned off must still have a page, and the page
+    must say why it is empty. But it also means every remaining row can be a
+    green platform row while nothing at all is being measured, which is the
+    "clean fleet while measuring nothing" failure this monitor exists to
+    prevent. So the emptiness itself is a graded fact, and UNKNOWN is its
+    colour: no module enabled is not a fault on any box, it is the monitor
+    being unable to say anything about the fleet.
+    """
+
+    id = "modules_enabled"
+    target = "fleet"
+    spec = None
+
+    def run(self, ctx):
+        ids = [m.id for m in ctx.modules]
+        if not ids:
+            return unknown(
+                self.id, self.target,
+                "NO MODULES ARE ENABLED, so only the platform's own checks are "
+                "running and nothing about the fleet is being observed. This is "
+                "UNKNOWN, not a green board. Set SENTINEL_MODULES, or unset the "
+                "<ID>_ENABLED=0 that disabled a module, to bring one back.",
+                subject="modules",
+            )
+        return ok(
+            self.id, self.target,
+            "%d module(s) enabled: %s" % (len(ids), ", ".join(ids)),
+            subject="modules",
+        )
 
 
 def _audit(specs, classes):

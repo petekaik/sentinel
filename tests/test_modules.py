@@ -262,10 +262,24 @@ def test_preload_failure_opens_no_attempt_and_names_the_cause(results):
         def preload(self, ctx):
             raise RuntimeError("kaboom at pull")
 
+    seen = {"ran": False}
+
+    class Good:
+        id = "good"
+        targets = ("cubox-2",)
+
+        def preload(self, ctx):
+            seen["ran"] = True
+
     cfg = config_mod.Config(env={})
-    ctx = checks.Context(cfg, {}, {}, modules=(Boom(),))
+    ctx = checks.Context(cfg, {}, {}, modules=(Boom(), Good()))
     attempts = {}
     collect.preload_modules(None, ctx, attempts)
+    results.check(
+        "a module that raises does not abort the other modules' preloads",
+        seen["ran"] is True,
+        "the good module never preloaded -- one broken module blinded the "
+        "whole epoch")
     note = " ".join(ctx.notes)
     results.check(
         "a preload crash writes NO attempt row (not for a host, not for 'fleet')",
@@ -343,6 +357,160 @@ def test_platform_files_do_not_import_a_specific_module(results):
         "makes a module removable; break it and the loader is theatre" % bad)
 
 
+def test_module_selection_reads_the_env(results):
+    """`SENTINEL_MODULES` selects, `<ID>_ENABLED=0` disables, both default open."""
+    import config as config_mod
+    cfg = config_mod.Config(env={"SENTINEL_MODULES": "fleet,other",
+                                 "FLEET_ENABLED": "0"})
+    results.check(
+        "SENTINEL_MODULES is parsed into an id tuple",
+        cfg.module_ids == ("fleet", "other"),
+        "module_ids=%r" % (cfg.module_ids,))
+    results.check(
+        "<ID>_ENABLED=0 disables that module, and an unset key defaults to on",
+        cfg.module_enabled("fleet") is False
+        and cfg.module_enabled("other") is True,
+        "fleet_enabled=%r other_enabled=%r -- a missing key must not silently "
+        "disable a module" % (cfg.module_enabled("fleet"),
+                              cfg.module_enabled("other")))
+    results.check(
+        "discovery honours the flag, so the disabled module's checks never run",
+        [m.id for m in loader.discover_enabled(cfg)] == [],
+        "discover_enabled returned %r for a fleet module disabled by FLEET_ENABLED=0"
+        % ([m.id for m in loader.discover_enabled(cfg)],))
+    only_fleet = config_mod.Config(env={"SENTINEL_MODULES": "fleet"})
+    results.check(
+        "the selector still admits a module that is enabled",
+        [m.id for m in loader.discover_enabled(only_fleet)] == ["fleet"],
+        "discover_enabled returned %r for SENTINEL_MODULES=fleet"
+        % ([m.id for m in loader.discover_enabled(only_fleet)],))
+
+
+def test_a_disabled_module_freezes_its_incidents(results):
+    import sqlite3
+    import store
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    store.init(conn)
+    seq = store.next_epoch_seq(conn)
+    for _ in range(store.CONFIRM_POLLS):
+        store.sync_incident(conn, seq, "cubox-1", "disk_free_gb", "mnt",
+                            store.Status.FAIL, "low")
+    rows = store.live_incidents_for_targets(conn, ("cubox-1",))
+    results.check(
+        "a confirmed incident is selected for its target",
+        len(rows) == 1 and rows[0]["target"] == "cubox-1",
+        "rows=%r -- the freeze has nothing to fold into" % (rows,))
+    if not rows:
+        conn.close()
+        return
+    store.freeze_incident(conn, seq, rows[0], "module disabled")
+    row = conn.execute("SELECT state, severity, resolved_at FROM incident "
+                       "WHERE target='cubox-1'").fetchone()
+    results.check(
+        "disabling a module freezes its incidents, never resolves them",
+        row["state"] == "unknown" and row["severity"] == "amber"
+        and row["resolved_at"] is None,
+        "state=%r severity=%r resolved_at=%r" % (row["state"], row["severity"],
+                                                 row["resolved_at"]))
+    # AND IT IS PER EPOCH. One freeze is a single observation; the next epoch
+    # must freeze again, and repeating it must still never resolve.
+    for _ in range(3):
+        seq = store.next_epoch_seq(conn)
+        for r in store.live_incidents_for_targets(conn, ("cubox-1",)):
+            store.freeze_incident(conn, seq, r, "module disabled")
+    row = conn.execute("SELECT state, resolved_at FROM incident "
+                       "WHERE target='cubox-1'").fetchone()
+    results.check(
+        "a disabled module's incidents stay frozen on every later epoch",
+        row["state"] == "unknown" and row["resolved_at"] is None,
+        "state=%r resolved_at=%r after three more freezes -- freezing once "
+        "would let a row fall out of the live set on the next epoch"
+        % (row["state"], row["resolved_at"]))
+    results.check(
+        "the target filter does not sweep an unrelated host's incidents",
+        store.live_incidents_for_targets(conn, ("cubox-2",)) == [],
+        "a freeze selected a target it was not asked for")
+    conn.close()
+
+
+def test_the_collector_freezes_a_disabled_modules_incidents_every_epoch(results):
+    """The helpers are useless unless collect_once actually calls them, per epoch."""
+    import sqlite3
+    import collect
+    import config as config_mod
+    import store
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    store.init(conn)
+    seq = store.next_epoch_seq(conn)
+    for _ in range(store.CONFIRM_POLLS):
+        store.sync_incident(conn, seq, "cubox-1", "disk_free_gb", "mnt",
+                            store.Status.FAIL, "low")
+    cfg = config_mod.Config(env={"FLEET_ENABLED": "0"})
+
+    def incident():
+        return conn.execute(
+            "SELECT state, severity, resolved_at FROM incident "
+            "WHERE target='cubox-1'").fetchone()
+
+    collect.collect_once(cfg, conn)
+    row = incident()
+    results.check(
+        "a collector epoch freezes an incident owned by a disabled module",
+        row["state"] == "unknown" and row["severity"] == "amber"
+        and row["resolved_at"] is None,
+        "state=%r severity=%r resolved_at=%r -- the module's checks never run, "
+        "so its incidents would otherwise stay open forever"
+        % (row["state"], row["severity"], row["resolved_at"]))
+    # ONLY A PER-EPOCH FREEZE RE-FREEZES A ROW THAT WAS OBSERVED BAD AGAIN.
+    # A one-shot freeze at startup would leave this `open`; nothing may resolve
+    # it, because disabling a module is not a positive observation.
+    conn.execute("UPDATE incident SET state='open', severity='red' "
+                 "WHERE target='cubox-1'")
+    collect.collect_once(cfg, conn)
+    row = incident()
+    results.check(
+        "the next epoch freezes it again, and still never resolves it",
+        row["state"] == "unknown" and row["resolved_at"] is None,
+        "state=%r resolved_at=%r -- freezing only once leaves a reopened row "
+        "red on a module that is not being collected at all"
+        % (row["state"], row["resolved_at"]))
+    conn.close()
+
+
+def test_a_fleet_with_no_modules_does_not_read_green(results):
+    """The platform's own checks must say UNKNOWN, not OK, on an empty fleet."""
+    import config as config_mod
+    import store
+    cls = [c for c in check_classes() if c.id == "modules_enabled"]
+    results.check(
+        "the platform registers exactly one modules_enabled check",
+        len(cls) == 1 and cls[0].spec is None and cls[0].target == "fleet",
+        "found %r -- the check must be platform-owned (spec=None) and report "
+        "on the fleet, or disabling every module leaves the board all green"
+        % [c.__name__ for c in cls])
+    if not cls:
+        return                 # the check above already failed; nothing to run
+    cfg = config_mod.Config(env={})
+    none = cls[0]().run(checks.Context(cfg, {}, {}, modules=()))
+    some = cls[0]().run(
+        checks.Context(cfg, {}, {}, modules=loader.discover_enabled(cfg)))
+    results.check(
+        "no enabled modules is UNKNOWN with the reason in words",
+        none.status is store.Status.UNKNOWN and none.subject == "modules"
+        and "no modules" in none.detail.lower(),
+        "status=%r subject=%r detail=%r -- SpecCoverage alone returns OK on an "
+        "empty audit, so without this row a wholly disabled fleet reads green"
+        % (none.status, none.subject, none.detail))
+    results.check(
+        "enabled modules are OK and named",
+        some.status is store.Status.OK and "fleet" in some.detail
+        and some.subject == "modules",
+        "status=%r detail=%r -- this half exists so the UNKNOWN above cannot "
+        "pass on a check hardcoded to grey" % (some.status, some.detail))
+
+
 TESTS = (test_discovery_finds_and_orders_modules,
          test_a_package_without_module_fails_loudly,
          test_a_package_that_raises_on_import_fails_loudly,
@@ -354,6 +522,10 @@ TESTS = (test_discovery_finds_and_orders_modules,
          test_expansion_targets_are_the_per_box_ids,
          test_context_settings_resolve_env_over_default,
          test_preload_failure_opens_no_attempt_and_names_the_cause,
+         test_module_selection_reads_the_env,
+         test_a_disabled_module_freezes_its_incidents,
+         test_the_collector_freezes_a_disabled_modules_incidents_every_epoch,
+         test_a_fleet_with_no_modules_does_not_read_green,
          test_spec_coverage_is_registered_once_by_the_platform,
          test_unpreloaded_facts_are_unavailable_never_empty,
          test_platform_files_do_not_import_a_specific_module)

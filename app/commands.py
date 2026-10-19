@@ -25,7 +25,17 @@ DEFAULT_LOCK_DIR = "/tmp/sentinel-locks"
 
 
 class CommandError(RuntimeError):
-    """The command refused before doing anything, or its handler failed."""
+    """The command refused before it reached the handler."""
+
+
+class CommandFailed(CommandError):
+    """The handler RAN and did not produce a good result.
+
+    A distinct type because "refused before it started" and "ran and failed"
+    are different facts on the audit trail, and the operator CLI must word them
+    differently (`REFUSED` vs `FAILED`). Subclasses CommandError so every
+    caller that only wants "the command did not succeed" still catches it.
+    """
 
 
 class Arg:
@@ -89,11 +99,24 @@ def reserve(resources, lock_dir=None):
     if clash:
         raise CommandError("resource already held: %s" % ", ".join(clash))
     directory = lock_dir or os.environ.get("MONITOR_LOCK_DIR") or DEFAULT_LOCK_DIR
-    os.makedirs(directory, exist_ok=True)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        # An unusable MONITOR_LOCK_DIR is an operator/configuration error and
+        # must read as a refusal, not as a traceback out of the CLI. Nothing is
+        # held at this point.
+        raise CommandError("cannot create lock directory %r: %s"
+                           % (directory, exc))
     handles = []
     try:
         for name in resources:
-            handle = open(_lock_path(name, directory), "a+")
+            path = _lock_path(name, directory)
+            try:
+                handle = open(path, "a+")
+            except OSError as exc:
+                # The finally below releases whatever earlier resources this
+                # call already took.
+                raise CommandError("cannot open lock file %r: %s" % (path, exc))
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
@@ -149,7 +172,9 @@ def dispatch(module, cmd, argv, actor="operator", dry_run=False, conn=None,
             output=getattr(res, "output", "") or "",
             duration_ms=int((time.time() - t0) * 1000))
     if status:
-        raise CommandError(res.detail)
+        # FAILED, not REFUSED: the handler ran, so an audit row exists and an
+        # operator reading `--list-runs` can find it. The same message.
+        raise CommandFailed(res.detail)
     return res
 
 

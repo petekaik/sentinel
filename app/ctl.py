@@ -81,7 +81,12 @@ def main(argv=None):
         res = commands.dispatch(mid, cmd, argv, actor=args.actor,
                                 dry_run=args.dry_run, conn=conn,
                                 module_enabled=True, ctx=ctx)
+    except commands.CommandFailed as exc:
+        # The handler RAN and failed: there is an audit row to look at.
+        print("FAILED: %s" % exc, file=sys.stderr)
+        return 1
     except commands.CommandError as exc:
+        # Refused before anything ran: no audit row, and none is owed.
         print("REFUSED: %s" % exc, file=sys.stderr)
         return 1
     finally:

@@ -26,7 +26,7 @@ THREE RULES THAT GOVERN EVERY CHECK IN THIS MODULE
 
 import os
 
-import parsers
+import modules.fleet.parsers as parsers
 from checks import Check, fail, ok, unknown, warn
 
 
@@ -54,7 +54,7 @@ def output_state(ctx, rel):
     permanent false FAIL; one that guesses "present" hides a genuinely failing
     file. So the caller must propagate None as UNKNOWN.
     """
-    root = ctx.cfg.transcoded_root
+    root = ctx.fleet.transcoded_root
     if not os.path.isdir(root):
         return None, ("the transcoded root %s is not a readable directory from "
                       "the monitor, so a strike cannot be matched against an "
@@ -686,7 +686,7 @@ class StateExportPresent(Check):
 
     def run(self, ctx):
         unreadable, gone, present = [], [], []
-        for cid in ctx.cfg.cubox_ids:
+        for cid in ctx.fleet.cubox_ids:
             se = ctx.export(cid)
             if se is None or not se.ran:
                 unreadable.append("%s: %s" % (cid, (se.why if se else "not attempted")))
@@ -714,7 +714,7 @@ class StateExportPresent(Check):
             return warn(self.id, self.target,
                         "%d of %d state exports readable; %s -- unreadable, so "
                         "whether those exist is UNKNOWN rather than absent"
-                        % (len(present), len(ctx.cfg.cubox_ids),
+                        % (len(present), len(ctx.fleet.cubox_ids),
                            "; ".join(unreadable)),
                         evidence=ev)
         return ok(self.id, self.target,
@@ -744,7 +744,7 @@ class StateExportFresh(Check):
     def run(self, ctx):
         rows = []
         stale = []
-        for cid in ctx.cfg.cubox_ids:
+        for cid in ctx.fleet.cubox_ids:
             se = ctx.export(cid)
             if se is None or not se.ran or se.worker is None:
                 continue
@@ -800,7 +800,7 @@ class SharedLayerParity(Check):
     title = "Both boxes applied the same generation"
 
     def run(self, ctx):
-        ids = list(ctx.cfg.cubox_ids)
+        ids = list(ctx.fleet.cubox_ids)
         if len(ids) < 2:
             return unknown(self.id, self.target,
                            "only %d box(es) configured -- nothing to compare"

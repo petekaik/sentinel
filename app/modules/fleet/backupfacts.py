@@ -26,7 +26,7 @@ READ-ONLY. The script creates nothing, mounts nothing, and its only writes are t
 stdout. This runs every 60 seconds forever against the tightest box in the fleet.
 """
 
-import parsers
+import modules.fleet.parsers as parsers
 import probes
 
 def build_command(cfg):

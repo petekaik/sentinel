@@ -83,6 +83,12 @@ class FleetConfig:
         self.cfg = cfg                      # platform globals (interval, ssh)
         self.cubox_ids = tuple(
             x for x in _env("CUBOX_IDS", "cubox-1,cubox-2", e).split(",") if x)
+        # The host the monitor RUNS ON. Its access path is entirely local (the
+        # docker socket), so "unreachable" is not a thing that can happen to it
+        # and the collector classifies its failures separately. This is DATA
+        # rather than a constant in collect.py: the platform no longer assumes
+        # the monitor runs on the NAS it monitors.
+        self.local_host = _env("MONITOR_LOCAL_HOST", "storage", e)
         # ssh material. One key for everything, one known_hosts file. Both are
         # mounted read-only into the container.
         self.hosts = {}
@@ -128,7 +134,7 @@ class FleetConfig:
         # A box is identified by the FT230X's OWN SERIAL, not by a /dev/ttyUSB
         # number: the kernel assigns those in enumeration order, so a reboot or a
         # re-plug can swap the two adapters, and a SysRq BREAK aimed at one box
-        # would reboot the other. See app/serial.py for the resolver.
+        # would reboot the other. See modules/fleet/serial.py for the resolver.
         #
         # THE SERIALS ARE DEPLOYMENT DATA. They name specific pieces of hardware,
         # so the real values live in the NAS's gitignored .env and never in this
@@ -146,7 +152,7 @@ class FleetConfig:
                 self.serial_serials[box] = v
         # A device NUMBER to fall back to when a box has no serial configured. Kept
         # because a read-only check has nothing to lose by it, but it is NOT an
-        # identity: app/serial.py's rule is that an action must never be taken on
+        # identity: modules/fleet/serial.py's rule is that an action must never be taken on
         # the strength of this value, so consumers that write (a BREAK) must
         # require a resolved serial.
         self.serial_device = _env("SERIAL_DEVICE", "/dev/ttyUSB0", e)
@@ -179,8 +185,7 @@ class FleetConfig:
         self.tvh_log_tail = int(_env("TVH_LOG_TAIL", "20000", e))
 
         # The read-only probe scripts that run ON a CuBox and ON Backup-NAS.
-        # Both default to files beside this module. (Task 4 moves
-        # app/boxfacts.sh and app/backupfacts.sh here.)
+        # Both default to files beside this module.
         #
         # There is deliberately NO expected-worker path here any more (item 90).
         # The drift check used to compare each box against a snapshot of worker.sh

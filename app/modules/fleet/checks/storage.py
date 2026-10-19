@@ -44,7 +44,7 @@ class MediaVolume(Check):
     title = "Media volume used"
 
     def run(self, ctx):
-        path = ctx.cfg.recordings_root
+        path = ctx.fleet.recordings_root
         # statvfs is local, so the only failure is the path being gone -- and
         # that is itself a finding, not an "unknown", because the share is
         # supposed to exist on this host permanently.
@@ -66,12 +66,12 @@ class MediaVolume(Check):
 
         # The transcoded root is reported alongside so a reader can see that the
         # two paths really do share a filesystem, which is the whole point.
-        same = _same_filesystem(path, ctx.cfg.transcoded_root)
+        same = _same_filesystem(path, ctx.fleet.transcoded_root)
         free_gb = (st.get("free") or 0) / 1073741824.0
         res = self.result_from_spec(
             ctx, st["used_pct"], subject="media-volume",
             evidence={**st, "transcoded_same_fs": same,
-                      "transcoded_root": ctx.cfg.transcoded_root})
+                      "transcoded_root": ctx.fleet.transcoded_root})
         res.detail = "%s (%.1f%% used, %.1f GB free)%s" % (
             res.detail, st["used_pct"], free_gb,
             "; transcoded/ is the SAME filesystem"
@@ -119,7 +119,7 @@ class DvbAdapters(Check):
                         "%d adapter(s) present but incomplete: missing %s"
                         % (n, ", ".join(incomplete[:5])), subject="dvb",
                         evidence={"adapters": detailed})
-        expected = len(ctx.cfg.dvb_adapters)
+        expected = len(ctx.fleet.dvb_adapters)
         if n == expected:
             res.detail = ("%s; all have demux0/dvr0/frontend0 "
                           "(presence, not function)" % res.detail)
@@ -134,7 +134,7 @@ class TvhHttp(Check):
 
     def run(self, ctx):
         import probes
-        url = ctx.cfg.tvh_url.rstrip("/") + "/"
+        url = ctx.fleet.tvh_url.rstrip("/") + "/"
         res, why = probes.http_probe(url, timeout=10)
         if res is None:
             return fail(self.id, self.target,
@@ -142,7 +142,7 @@ class TvhHttp(Check):
                         subject="tvh-http")
         code = res["code"]
         ms = float(res["duration_ms"])
-        ev = {"code": code, "url": url, "auth_configured": bool(ctx.cfg.tvh_user)}
+        ev = {"code": code, "url": url, "auth_configured": bool(ctx.fleet.tvh_user)}
 
         if code == 401:
             # The whole reason this check does not use curl -f. An answer, but
@@ -183,7 +183,7 @@ class TvhContainer(Check):
             return unknown(self.id, self.target,
                            "could not read the docker API: %s" % why,
                            subject="docker")
-        name = ctx.cfg.tvh_container
+        name = ctx.fleet.tvh_container
         c = next((x for x in cs if x.get("name") == name), None)
         if c is None:
             return fail(self.id, self.target,
@@ -232,12 +232,12 @@ class TvhLogSignals(Check):
     title = "TVH log: no free adapter, DVR pairing, EPG"
 
     def run(self, ctx):
-        import parsers
+        import modules.fleet.parsers as parsers
         text, why = ctx.tvh_log()
         if text is None:
             return unknown(self.id, self.target,
                            "could not read the %s log: %s"
-                           % (ctx.cfg.tvh_container, why), subject="tvh-log")
+                           % (ctx.fleet.tvh_container, why), subject="tvh-log")
         tl = parsers.parse_tvh_log(text)
         bal = tl.dvr_balance()
         ref = tl.refusal_summary()
@@ -360,7 +360,7 @@ class TvhLogSignals(Check):
                 "started. A dangling subscription could not have been seen. "
                 "Widen TVH_LOG_TAIL (currently %d lines) past one full "
                 "recording to make this check measurable."
-                % (len(bal["orphan_ends"]), ctx.cfg.tvh_log_tail),
+                % (len(bal["orphan_ends"]), ctx.fleet.tvh_log_tail),
                 subject="tvh-log", evidence=ev)
         # "no refused recordings" was hardcoded here and became a LIE the moment
         # refusals were parsed at all: a window can hold old refusals that did
@@ -386,7 +386,7 @@ class EpgFreshness(Check):
     title = "EPG freshness"
 
     def run(self, ctx):
-        import parsers
+        import modules.fleet.parsers as parsers
         text, why = ctx.tvh_log()
         if text is None:
             return unknown(self.id, self.target,
@@ -482,7 +482,7 @@ class TvhTunerSilent(Check):
     title = "DVB tuner reception"
 
     def run(self, ctx):
-        import parsers
+        import modules.fleet.parsers as parsers
         text, why = ctx.tvh_log()
         if text is None:
             return unknown(self.id, self.target,
@@ -595,7 +595,7 @@ class TvhMuxUnreachable(Check):
     title = "DVB mux reachability"
 
     def run(self, ctx):
-        import parsers
+        import modules.fleet.parsers as parsers
         text, why = ctx.tvh_log()
         if text is None:
             return unknown(self.id, self.target,
@@ -671,7 +671,7 @@ def _hours_since(iso, ref_iso):
     call site, found by reading the live status after that fix. Two call sites
     of one wrong helper is the reason the helper now names its source in its
     own name."""
-    import parsers
+    import modules.fleet.parsers as parsers
     a = parsers.tvh_iso_to_epoch(iso)
     b = parsers.tvh_iso_to_epoch(ref_iso)
     if a is None or b is None:

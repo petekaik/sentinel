@@ -1072,8 +1072,8 @@ class WorkerPairParity(Check):
     title = "Both boxes run the same worker"
 
     def run(self, ctx):
-        import boxfacts
-        ids = list(ctx.cfg.cubox_ids)
+        import modules.fleet.boxfacts as boxfacts
+        ids = list(ctx.fleet.cubox_ids)
         if len(ids) < 2:
             return unknown(self.id, self.target,
                            "only %d box(es) configured -- nothing to compare"
@@ -1166,7 +1166,7 @@ def _drift_for(ctx, box_id, facts, ref_text):
     collector under the same deadline as everything else, and its lazy path is
     for tests and --once only.
     """
-    import boxfacts
+    import modules.fleet.boxfacts as boxfacts
     text = ctx.worker_text(box_id)
     if not text:
         return "unknown", ("the box's worker.sh could not be read through the "
@@ -1373,7 +1373,8 @@ class SharedLayerApplied(_BoxCheck):
         if bf is None:
             return unknown(
                 self.id, self.box,
-                "no Backup-NAS host is configured, so the layer's current "
+                "no Backup-NAS fact block is available (no host configured, or the "
+                "module did not preload it), so the layer's current "
                 "generation cannot be read and this box's generation cannot be "
                 "graded", subject=_SHARED_SUBJECT, evidence=ev)
         if not bf.ok():

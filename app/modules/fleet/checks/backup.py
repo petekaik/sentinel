@@ -67,7 +67,8 @@ class _BackupCheck(Check):
         if bf is None:
             return None, unknown(
                 self.id, self.target,
-                "no Backup-NAS host is configured, so %s cannot be asked at all"
+                "no Backup-NAS fact block is available (no host configured, or the module "
+                "did not preload it), so %s cannot be asked at all"
                 % what, subject=subject)
         if not bf.ok():
             return None, unknown(
@@ -89,7 +90,9 @@ class BackupReachable(_BackupCheck):
         bf = ctx.backup_facts()
         if bf is None:
             return unknown(self.id, self.target,
-                           "no Backup-NAS host is configured", subject="backup")
+                           "no Backup-NAS fact block is available (no host configured, or the "
+                           "module did not preload it)",
+                           subject="backup")
         if not bf.ok():
             # UNKNOWN, NOT FAIL -- and that is the whole design of this check.
             #
@@ -229,12 +232,12 @@ class BackupDisk(_BackupCheck):
         if gb is None:
             return unknown(self.id, self.target,
                            "`df -k %s` yielded no parseable line: %r"
-                           % (ctx.cfg.cubpxe_root,
+                           % (ctx.fleet.cubpxe_root,
                               " ".join(bf.sections.get("disk", []))[:160]
                               or "(the disk section was empty)"), subject="disk")
         res = self.result_from_spec(
             ctx, gb, subject="disk",
-            evidence={"df": bf.df, "path": ctx.cfg.cubpxe_root})
+            evidence={"df": bf.df, "path": ctx.fleet.cubpxe_root})
         res.detail = "%s on %s (%s)" % (
             res.detail, bf.df.get("filesystem", "?"), bf.df.get("mount", "?"))
         res.metric("backup_used_pct", bf.df.get("use_pct"), "percent")
@@ -260,7 +263,7 @@ class NfsExportAdvertised(_BackupCheck):
                            % len(bf.sections.get("exports", [])),
                            subject="exports",
                            evidence={"exports": bf.exports_text[:2000]})
-        name = ctx.cfg.export_name
+        name = ctx.fleet.export_name
         if not bf.export_match:
             return fail(self.id, self.target,
                         "%s is NOT exported -- both CuBoxes mount the shared "
@@ -295,16 +298,16 @@ class TftpBootFiles(_BackupCheck):
             return fail(self.id, self.target,
                         "the TFTP root %s does not exist -- uBoot has nothing to "
                         "fetch, so neither CuBox can boot"
-                        % ctx.cfg.tftp_root, subject="tftp",
+                        % ctx.fleet.tftp_root, subject="tftp",
                         evidence={"tftp_dir": False})
-        expected = list(ctx.cfg.tftp_files)
+        expected = list(ctx.fleet.tftp_files)
         # A file the probe never mentioned is NOT a missing file: it means the
         # script stopped before reaching it. Both are reported, separately,
         # because only one of them is a boot failure.
         missing = [n for n in expected if bf.tftp_files.get(n) == 0]
         unobserved = [n for n in expected if n not in bf.tftp_files]
         ev = {"files": {n: bf.tftp_files.get(n) for n in expected},
-              "tftp_root": ctx.cfg.tftp_root}
+              "tftp_root": ctx.fleet.tftp_root}
         if missing:
             return fail(self.id, self.target,
                         "%s is present but ZERO BYTES -- uBoot will fetch an "
@@ -346,16 +349,16 @@ class NfsRootTree(_BackupCheck):
         if err:
             return err
         ev = dict(bf.nfsroot)
-        ev["nfsroot"] = ctx.cfg.nfsroot
+        ev["nfsroot"] = ctx.fleet.nfsroot
         if bf.nfsroot.get("nfsroot_dir") is False:
             return fail(self.id, self.target,
                         "%s does not exist -- both CuBoxes mount their ROOT "
                         "filesystem from here and will not boot"
-                        % ctx.cfg.nfsroot, subject="nfsroot", evidence=ev)
+                        % ctx.fleet.nfsroot, subject="nfsroot", evidence=ev)
         if bf.nfsroot.get("nfsroot_dir") is None:
             return unknown(self.id, self.target,
                            "the probe did not report whether %s exists"
-                           % ctx.cfg.nfsroot, subject="nfsroot", evidence=ev)
+                           % ctx.fleet.nfsroot, subject="nfsroot", evidence=ev)
         # The three sentinels: a tree with no usr/ is not a rootfs, and a tree
         # with no etc/hostname cannot be the image (every CuBox has one, and the
         # boot hook's whole mount check reads it -- cubox-overlay:591-601).
@@ -367,13 +370,13 @@ class NfsRootTree(_BackupCheck):
                         "signature of an interrupted --deploy (the atomic swap "
                         "is nfsroot.new -> nfsroot, so a partial tree should not "
                         "be reachable -- check whether nfsroot.new is left "
-                        "behind)" % (ctx.cfg.nfsroot, ", ".join(absent)),
+                        "behind)" % (ctx.fleet.nfsroot, ", ".join(absent)),
                         subject="nfsroot", evidence=ev)
         top = ", ".join(bf.root_listing[:12]) or "(empty)"
         return ok(self.id, self.target,
                   "%s looks like a rootfs (usr/ and etc/hostname present); "
                   "%s holds: %s"
-                  % (ctx.cfg.nfsroot, ctx.cfg.cubpxe_root, top),
+                  % (ctx.fleet.nfsroot, ctx.fleet.cubpxe_root, top),
                   subject="nfsroot", evidence=ev)
 
 
@@ -387,11 +390,11 @@ class StateExports(_BackupCheck):
         bf, err = self.facts_or_unknown(ctx, "state", "the state exports")
         if err:
             return err
-        want = list(ctx.cfg.cubox_ids)
+        want = list(ctx.fleet.cubox_ids)
         if not bf.state:
             return unknown(self.id, self.target,
                            "the probe reported no state directories at all "
-                           "under %s" % ctx.cfg.state_export_base,
+                           "under %s" % ctx.fleet.state_export_base,
                            subject="state", evidence={"state_base": bf.state_base})
         absent = [c for c in want if bf.state.get(c, {}).get("dir") is False]
         noconf = [c for c in want
@@ -419,7 +422,7 @@ class StateExports(_BackupCheck):
         return ok(self.id, self.target,
                   "state exports present for %s (each with transcode/config) "
                   "under %s" % (", ".join(want), bf.state_base or
-                                ctx.cfg.state_export_base),
+                                ctx.fleet.state_export_base),
                   subject="state", evidence=ev)
 
 

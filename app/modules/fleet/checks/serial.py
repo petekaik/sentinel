@@ -6,7 +6,7 @@ either box's. The boxes' own rows come from the CuBox checks, over ssh.
 
 WHAT IT GRADES. Not "does a tty exist" but "could each box's console adapter be
 IDENTIFIED". A ttyUSB number is an allocation, so the only trustworthy answer comes
-from the chip's own serial (app/serial.py). A box whose adapter cannot be identified is
+from the chip's own serial (app/modules/fleet/serial.py). A box whose adapter cannot be identified is
 a box whose console an operator cannot safely use, and -- more sharply -- a box a BREAK
 must refuse to touch.
 """
@@ -37,9 +37,9 @@ class SerialAdapters(Check):
     title = "CuBox serial consoles identified"
 
     def run(self, ctx):
-        import serial as serial_mod
+        import modules.fleet.serial as serial_mod
 
-        cfg = ctx.cfg
+        cfg = ctx.fleet
         adapters, why = serial_mod.list_adapters(cfg.serial_sysfs)
         if adapters is None:
             return unknown(

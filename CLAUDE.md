@@ -52,7 +52,7 @@ app/modules/<id>/
 | `threshold_file` | the module's own threshold file; `discover_enabled` carries the package path so it is found beside the module |
 | `checks` | the module's check modules; a check with `per_box = True` expands once per box |
 | `context` | config-only hook, **no I/O**, called before every preload |
-| `preload` | **all** remote/local I/O, once per epoch, under the module's own timeout |
+| `preload` | **all** remote/local I/O, once per epoch, under the timeout the module passes (the fleet uses the platform ssh timeout) |
 | `after_epoch` | post-record hook; evidence is durable before it runs |
 | `extra_check_ids` | incident ids the collector emits for this module and no `Check` class owns |
 | `commands`, `actions`, `advisors` | declared surfaces; all three default to empty, so a module that offers none says nothing |
@@ -66,9 +66,11 @@ spec id claimed by two modules is a startup error.
 Selection is platform configuration: `SENTINEL_MODULES=id[,id]` narrows the set
 and `<ID>_ENABLED=0` disables one; both default to all discovered. A selector
 naming an unknown id is a startup error, because silently disabling everything
-would read as a healthy fleet. `checks.platform_modules()` owns `spec_coverage`
-and `modules_enabled`; no module may declare them, and they still run when every
-module is disabled.
+would read as a healthy fleet. `checks.platform_modules()` returns the
+`checks.meta` **module** (not check classes); callers add it to the modules'
+own check modules and pass the whole set through `checks.registry(...)`. It owns
+`spec_coverage` and `modules_enabled`; no module may declare them, and they
+still run when every module is disabled.
 
 **Platform code never imports a specific module.** `import modules` (the
 loader), `from modules import discover`, and `modules.discover` /
@@ -128,8 +130,10 @@ Generic: `store.py`, `probes.py`, `parsers.py` (shared protocol/format helpers),
 
 The CuBox fleet is `app/modules/fleet/`: its checks, `parsers.py`, `settings.py`,
 `export.py`, the journal capture, the two shell probes (`boxfacts.sh`,
-`backupfacts.sh`) and its `thresholds.conf`. Nothing fleet-shaped is left at the
-top level, and `config.py` keeps only what every deployment shares.
+`backupfacts.sh`) and its `thresholds.conf`. What remains at the top level is
+generic: `checks/__init__.py` still owns `Context` and its `preload_*`
+installers — the caches every module installs finished fact blocks through — and
+`config.py` keeps only what every deployment shares.
 
 **The three CuBox-shaped holes that used to live in `collect.py` are closed.**
 `preload()` no longer knows host kinds — each module declares its own `preload`;

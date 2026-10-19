@@ -474,7 +474,7 @@ about it.
 | `threshold_file` | the module's own threshold file, found beside the package |
 | `checks` | the module's check modules; a `per_box = True` check expands once per box |
 | `context` | config-only hook, **no I/O**, installed before every preload |
-| `preload` | **all** remote/local I/O, once per epoch, under the module's own timeout |
+| `preload` | **all** remote/local I/O, once per epoch, under the timeout the module passes (the fleet uses the platform ssh timeout) |
 | `after_epoch` | post-record hook, run after the evidence is durable |
 | `extra_check_ids` | incident ids the collector emits for this module and no `Check` class owns |
 | `commands`, `actions`, `advisors` | declared surfaces; all three default to empty, so a module that offers none says nothing |
@@ -492,9 +492,11 @@ set and `<ID>_ENABLED=0` disables one; both default to every discovered module.
 A selector naming an unknown id is a startup error — silently ignoring it would
 disable everything and read as a healthy fleet. A disabled module's incidents
 are **frozen every epoch**, never resolved, and its checks simply do not run.
-`checks.platform_modules()` returns the platform's own checks
-(`spec_coverage`, `modules_enabled`); no module may declare them, and they keep
-running when every module is disabled, so an empty fleet cannot read green.
+`checks.platform_modules()` returns the `checks.meta` **module** (not check
+classes); callers add it to the modules' own check modules and pass the whole
+set through `checks.registry(...)`. It owns `spec_coverage` and
+`modules_enabled`; no module may declare them, and they keep running when every
+module is disabled, so an empty fleet cannot read green.
 
 **The platform never imports a specific module.** `import modules` (the loader),
 `from modules import discover`, and `modules.discover` / `modules.discover_enabled`

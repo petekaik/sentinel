@@ -336,18 +336,34 @@ def test_unpreloaded_facts_are_unavailable_never_empty(results):
 
 # THE LOADER'S OWN API, and the only names a platform file may reach through
 # `modules.`. `discover`/`discover_enabled` are functions on the loader package,
-# not module directories; `from modules import discover` has no `modules.` prefix
-# at all, which is why it never needed an entry here.
+# not module directories, and `ModuleError` is its exception.
 _LOADER_API = frozenset(("discover", "discover_enabled", "ModuleError"))
+_MODULES_ATTR = r"\bmodules\.([A-Za-z_]\w*)"
+_FROM_MODULES = r"^\s*from\s+modules\s+import\s+(.+)$"
 
 
-def _specific_module_imports(text):
-    """(line number, line) for every import that reaches a module by name."""
+def _specific_module_uses(text):
+    """(line number, line) for every use of a module by name.
+
+    NOT JUST IMPORT LINES. `x = modules.fleet`, `import os, modules.fleet`,
+    `importlib.import_module("modules.fleet")` and `from modules import fleet`
+    all cross the boundary, and an import-anchored regex sees none of them.
+    Scanning every `modules.<name>` occurrence also catches the string form.
+    """
     import re
     hits = []
     for n, line in enumerate(text.splitlines(), 1):
-        m = re.match(r"\s*(?:import|from)\s+modules\.([A-Za-z_]\w*)", line)
-        if m and m.group(1) not in _LOADER_API:
+        bad = [m.group(1) for m in re.finditer(_MODULES_ATTR, line)
+               if m.group(1) not in _LOADER_API]
+        m = re.match(_FROM_MODULES, line)
+        if m:
+            # `from modules import a, b as c` names no dotted path at all.
+            for name in m.group(1).split("#", 1)[0].split(","):
+                name = name.strip().split(" as ", 1)[0].strip()
+                if (name and name.isidentifier()
+                        and name not in _LOADER_API):
+                    bad.append(name)
+        if bad:
             hits.append((n, line.strip()))
     return hits
 
@@ -366,25 +382,31 @@ def test_platform_files_do_not_import_a_specific_module(results):
                 continue
             path = os.path.join(root, name)
             with open(path) as fh:
-                for n, line in _specific_module_imports(fh.read()):
+                for n, line in _specific_module_uses(fh.read()):
                     bad.append("%s:%d %s" % (path, n, line))
     # THE DETECTOR IS GRADED TOO. A scan with a broken pattern reports a clean
     # tree forever, which is the exact shape of every gate this repo has had to
     # repair (item 45): the check must be shown able to fail, and shown not to
-    # fail on the loader.
-    planted = _specific_module_imports(
+    # fail on the loader. The first three lines are the allowed forms; the rest
+    # are the bypasses an import-anchored regex misses.
+    planted = _specific_module_uses(
         "import modules\n"
         "from modules import discover\n"
         "import modules.discover\n"
+        "x = modules.fleet\n"
+        "from modules import fleet\n"
+        "import os, modules.fleet\n"
+        "importlib.import_module(\"modules.fleet\")\n"
         "from modules.fleet.settings import FleetConfig\n")
     results.check(
-        "no platform file imports modules.<id>, and the detector can see one",
-        [n for n, _ in planted] == [4] and bad == [],
+        "no platform file uses modules.<id>, and the detector can see every "
+        "bypass",
+        [n for n, _ in planted] == [4, 5, 6, 7, 8] and bad == [],
         "detector returned %r (it must allow `import modules`, "
-        "`from modules import discover` and `modules.discover`, and flag a real "
-        "module import); specific-module imports in platform code: %s -- the "
-        "boundary is what makes a module removable; break it and the loader is "
-        "theatre" % (planted, bad))
+        "`from modules import discover` and `modules.discover`, and flag "
+        "attribute use, from-import and dynamic-string forms); specific-module "
+        "uses in platform code: %s -- the boundary is what makes a module "
+        "removable; break it and the loader is theatre" % (planted, bad))
 
 
 def test_module_selection_reads_the_env(results):

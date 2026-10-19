@@ -698,28 +698,51 @@ def _deploy_code(text):
 
 
 def _deploy_branch(code, flag):
-    """The `flag)` arm, up to its terminating `;;` -- or nothing."""
+    """The `flag)` arm, up to ITS terminating `;;` -- or nothing.
+
+    A NESTED arm ends with `;;` too (`--run`'s guard uses a `case`), so the
+    terminator is matched by indentation: the arm's own ends at arm indent + 4,
+    a nested one sits deeper. Stopping at the first `;;` truncated `--run` and
+    `--arg` before their `MODE=ctl`, which would make the routing check pass on
+    an arm it never saw.
+    """
     lines = code.split("\n")
     for i, ln in enumerate(lines):
-        if ln.strip().startswith(flag + ")"):
+        stripped = ln.strip()
+        if stripped.startswith(flag + ")"):
+            indent = len(ln) - len(ln.lstrip())
+            if stripped.endswith(";;"):
+                return ln
             out = [ln]
             for nxt in lines[i + 1:]:
                 out.append(nxt)
-                if nxt.rstrip().endswith(";;"):
+                if (nxt.strip().endswith(";;")
+                        and len(nxt) - len(nxt.lstrip()) <= indent + 4):
                     break
             return "\n".join(out)
     return ""
+
+
+def _if_bodies(block, cond):
+    """(then-body, else-body) of the `if cond ... else ... fi` in `block`."""
+    i = block.index(cond)
+    then_i = block.index("then", i + len(cond))
+    else_i = block.index("else", then_i)
+    fi_i = block.index("fi", else_i)
+    return block[then_i + 4:else_i], block[else_i + 4:fi_i]
+
+
+_CTL_VERBS = ("--list-commands", "--run", "--arg", "--list-runs")
 
 
 def test_deploy_exposes_the_command_surface(results):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     path = os.path.join(root, "deploy.sh")
     code = _deploy_code(_deploy_text())
-    missing = [flag for flag in ("--list-commands", "--run", "--arg",
-                                 "--list-runs", "dc_ctl", "ctl.py")
+    missing = [flag for flag in _CTL_VERBS + ("dc_ctl", "ctl.py")
                if flag not in code]
     results.check(
-        "deploy.sh routes the module command surface through ctl.py",
+        "deploy.sh exposes the module command surface through ctl.py",
         not missing,
         "missing=%r -- a verb the parser does not route is a command the "
         "operator cannot reach from the documented entry point" % (missing,))
@@ -729,38 +752,101 @@ def test_deploy_exposes_the_command_surface(results):
         run.returncode == 0, run.stderr.strip())
 
 
+def test_every_command_verb_routes_to_ctl(results):
+    """PRESENCE IS NOT ROUTING, and routing is what makes a verb safe.
+
+    `--run` can be in the parser and still leave MODE=deploy, at which point
+    `./deploy.sh --run fleet.serial_break` RSYNCS, REBUILDS AND RESTARTS the
+    container instead of running the command. The case arm is the other half: a
+    MODE nothing dispatches falls through to the deploy in the same way.
+    """
+    code = _deploy_code(_deploy_text())
+    bad = []
+    for flag in _CTL_VERBS:
+        arm = _deploy_branch(code, flag)
+        if "MODE=ctl" not in arm or "PASSTHRU+=(%s" % flag not in arm:
+            bad.append((flag, arm))
+    results.check(
+        "every command verb sets MODE=ctl and passes its own flag",
+        not bad, "wrong arms: %r" % (bad,))
+    case_arm = _deploy_branch(code, "ctl")
+    results.check(
+        "the ctl case arm dispatches to ctl.py, so MODE=ctl cannot fall through "
+        "to the deploy",
+        "dc_ctl" in case_arm and "exit" in case_arm,
+        "ctl) arm=%r -- without a dispatching arm, MODE=ctl reaches the deploy "
+        "section and rsyncs/rebuilds/restarts the container" % (case_arm,))
+
+
 def test_deploy_dry_run_means_two_things_by_position(results):
-    """`--dry-run` before --run is --once's; after --run it is the command's.
+    """`--dry-run` alone is --once's; alongside a ctl verb it is the command's.
 
     Mutation this exists for: collapsing the two back to the original single
     meaning `MODE=once`. Then `--run fleet.serial_break --dry-run` runs an epoch
     that never invokes the command -- and `--once --dry-run` is unchanged, so a
-    test of that invocation alone stays green. The other way to break it is an
-    arm that changes MODE without passing the flag, which turns a dry run into a
-    WRITE; that is why every arm is checked to append it.
+    test of that invocation alone stays green. INVERTING the two branches is the
+    other mutant: a check that only asserts "SAW_CTL and MODE=once appear
+    somewhere in the arm" is placement-blind and passes it, while
+    `--list-commands --dry-run` becomes a collection. Every arm is also checked
+    to append the flag, because an arm that changes MODE without passing it
+    turns a dry run into a WRITE.
     """
     code = _deploy_code(_deploy_text())
     dry = _deploy_branch(code, "--dry-run")
-    run = _deploy_branch(code, "--run")
+    arms = [(flag, _deploy_branch(code, flag)) for flag in _CTL_VERBS]
     results.check(
-        "a --run is recorded, so a later --dry-run can be told apart",
-        "SAW_RUN=1" in run,
-        "--run) does not set SAW_RUN: %r" % (run,))
+        "a ctl verb makes the dry-run meaning sticky, whichever order it is typed",
+        all("SAW_CTL=1" in arm for _, arm in arms),
+        "arms without SAW_CTL=1: %r -- stickiness is what makes "
+        "`--dry-run --run X` the same invocation as `--run X --dry-run`"
+        % ([(f, a) for f, a in arms if "SAW_CTL=1" not in a],))
+    cond = 'if [ "$SAW_CTL" -eq 1 ]'
+    ok = cond in dry
+    try:
+        then_body, else_body = _if_bodies(dry, cond) if ok else ("", "")
+    except ValueError:
+        then_body = else_body = ""
+        ok = False
     results.check(
-        "a --dry-run after --run goes to ctl.py without changing MODE, and "
-        "both arms still pass the flag through",
-        'if [ "$SAW_RUN" -eq 1 ]' in dry
-        and dry.count("PASSTHRU+=(--dry-run)") == 2,
-        "branch=%r -- one arm means 'pass the command's flag', the other means "
-        "--once; a single unconditional MODE=once makes the first impossible, "
-        "and an arm that does not append the flag writes when it promised not to"
+        "alongside a ctl verb --dry-run goes to ctl.py and does NOT change MODE",
+        ok and "PASSTHRU+=(--dry-run)" in then_body and "MODE=" not in then_body,
+        "branch=%r -- this is the arm that must not touch MODE; inverting the "
+        "two branches leaves `--list-commands --dry-run` as a collection"
         % (dry,))
     results.check(
-        "a --dry-run before --run still means one collection that writes nothing",
-        "MODE=once" in dry and "else" in dry,
-        "branch=%r -- dropping MODE=once leaves --dry-run as only a command "
-        "flag, and `./deploy.sh --dry-run` would fall through to a full deploy"
-        % (dry,))
+        "with no ctl verb --dry-run is still one collection that writes nothing",
+        ok and "MODE=once" in else_body
+        and "PASSTHRU+=(--dry-run)" in else_body,
+        "branch=%r -- dropping MODE=once from the other arm leaves --dry-run as "
+        "only a command flag, and `./deploy.sh --dry-run` would fall through to "
+        "a full deploy" % (dry,))
+
+
+def test_deploy_refuses_a_flag_as_a_value(results):
+    """`--run --dry-run` must not consume the flag as the command name.
+
+    These invocations all stop in the parser, so this stays offline. If the
+    guard is removed they continue to the key checks and reach for the NAS,
+    which the timeout turns into a recorded failure rather than a hung suite.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "deploy.sh")
+    outcomes = {}
+    for argv in (["--run", "--dry-run"], ["--run"], ["--arg", "--dry-run"],
+                 ["--arg"]):
+        try:
+            run = subprocess.run([path] + argv, capture_output=True, text=True,
+                                 timeout=20)
+            outcomes[tuple(argv)] = (run.returncode,
+                                     "Usage:" in (run.stdout + run.stderr))
+        except subprocess.TimeoutExpired:
+            outcomes[tuple(argv)] = ("TIMEOUT", False)
+    results.check(
+        "a flag-shaped or missing --run/--arg value prints usage and exits "
+        "non-zero",
+        all(rc != 0 and shown for rc, shown in outcomes.values()),
+        "outcomes=%r -- without the guard `--run --dry-run` consumes the flag as "
+        "the command name (and the next step may then be a deploy)" % (outcomes,))
 
 
 def test_the_serial_commands_are_registered_and_dispatch_through_ctl(results):
@@ -815,7 +901,9 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_arm_rejects_a_window_outside_the_cap,
          test_arm_writes_an_arm_file_that_status_reports,
          test_deploy_exposes_the_command_surface,
+         test_every_command_verb_routes_to_ctl,
          test_deploy_dry_run_means_two_things_by_position,
+         test_deploy_refuses_a_flag_as_a_value,
          test_the_serial_commands_are_registered_and_dispatch_through_ctl,
          # LAST TWO: a missing release leaks the process-global _HELD set,
          # which would make every later test refuse for the wrong reason.

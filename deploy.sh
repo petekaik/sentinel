@@ -22,10 +22,10 @@
 #   ./deploy.sh --run MODULE.COMMAND [--arg k=v ...] [--dry-run]
 #                                                     # run one module command.
 #                                                     #   --arg repeats. A
-#                                                     #   --dry-run AFTER --run
-#                                                     #   belongs to the COMMAND;
-#                                                     #   before it, it is
-#                                                     #   --once's dry run.
+#                                                     #   --dry-run anywhere
+#                                                     #   alongside a command
+#                                                     #   verb is the COMMAND's
+#                                                     #   dry run.
 #   ./deploy.sh --list-runs        # the command audit
 #
 # Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER
@@ -71,9 +71,11 @@ BACKUP_USER="${BACKUP_USER:-admin}"
 
 MODE=deploy
 PASSTHRU=()
-# Whether a --run has been seen, which is the ONLY thing that decides what a
-# later --dry-run means. See the --dry-run branch below.
-SAW_RUN=0
+# Whether any ctl verb has been seen. STICKY: once it is set, --dry-run always
+# belongs to ctl.py and never changes MODE. That is what makes
+# `--dry-run --run X` and `--run X --dry-run` the same invocation, and what
+# stops `--list-commands --dry-run` from silently becoming a collection.
+SAW_CTL=0
 TRUST_NEW_HOST_KEYS=0
 
 # One home for the usage block: --help and the missing-value guards print it.
@@ -87,13 +89,14 @@ while [ $# -gt 0 ]; do
         --once)             MODE=once; PASSTHRU+=(--once) ;;
         --dry-run)
             # CONTEXT-SENSITIVE, and the two meanings are DIFFERENT FACTS.
-            # Before a --run this is deploy.sh's own dry run: --once plus the
-            # flag, i.e. one collection that writes NOTHING. After a --run it
-            # belongs to ctl.py, and changing MODE here would turn a command's
-            # dry run into an epoch that never invokes the command at all.
+            # Before any ctl verb this is deploy.sh's own dry run: --once plus
+            # the flag, i.e. one collection that writes NOTHING. After one it
+            # belongs to ctl.py: changing MODE here would turn a command's dry
+            # run into an epoch that never invokes the command at all, and
+            # `--list-commands --dry-run` into an argparse error.
             # Neither branch may swallow the flag: --once WITHOUT --dry-run is
             # a WRITE.
-            if [ "$SAW_RUN" -eq 1 ]; then
+            if [ "$SAW_CTL" -eq 1 ]; then
                 PASSTHRU+=(--dry-run)
             else
                 MODE=once
@@ -103,16 +106,27 @@ while [ $# -gt 0 ]; do
         # The module command surface. Each VALUE is consumed here and passed as
         # its own argv element, so the remote shell never re-splits it (item 81's
         # family -- argv is joined and re-split, so re-joining is already wrong).
-        --list-commands)    MODE=ctl; PASSTHRU+=(--list-commands) ;;
+        --list-commands)    MODE=ctl; SAW_CTL=1; PASSTHRU+=(--list-commands) ;;
         --run)
             [ $# -ge 2 ] || { echo "unknown argument: --run needs MODULE.COMMAND" >&2
                               usage >&2; exit 2; }
-            MODE=ctl; SAW_RUN=1; PASSTHRU+=(--run "$2"); shift ;;
+            # A FLAG-SHAPED VALUE IS A MISTAKE, NOT A COMMAND. Without this,
+            # `--run --dry-run` consumes --dry-run as the command name and the
+            # run is no longer dry.
+            case "$2" in
+                -*) echo "unknown argument: --run needs MODULE.COMMAND, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--run "$2"); shift ;;
         --arg)
             [ $# -ge 2 ] || { echo "unknown argument: --arg needs k=v" >&2
                               usage >&2; exit 2; }
-            MODE=ctl; PASSTHRU+=(--arg "$2"); shift ;;
-        --list-runs)        MODE=ctl; PASSTHRU+=(--list-runs) ;;
+            case "$2" in
+                -*) echo "unknown argument: --arg needs k=v, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--arg "$2"); shift ;;
+        --list-runs)        MODE=ctl; SAW_CTL=1; PASSTHRU+=(--list-runs) ;;
         --dismiss)          MODE=dismiss
                             # Everything after --dismiss belongs to dismiss.py,
                             # including a --reason whose text contains anything

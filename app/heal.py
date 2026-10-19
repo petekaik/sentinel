@@ -147,7 +147,9 @@ def attempt(action, incident, ctx, policy, conn, seq,
                               lock_dir=lock_dir):
             return _execute(action, incident, ctx, conn, seq,
                             dry_run_fn, run_fn, action.limits.timeout_s)
-    except commands.CommandError as exc:
+    except commands._LockRefused as exc:
+        # `reserve`'s own marker, so a handler that raised a CommandError of its
+        # own inside `_execute` cannot be misreported as a held resource.
         return {"executed": False, "why": "resource held: %s" % exc}
 
 

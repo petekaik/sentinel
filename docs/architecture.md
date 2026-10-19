@@ -167,13 +167,15 @@ library only** — `sqlite3`, `http.server`, `subprocess`, `urllib`. There is no
 
 The epoch order is the contract:
 
-1. discover the enabled modules and load each module's effective thresholds;
+1. discover the enabled modules and load the effective thresholds — the platform's
+   `checks.conf` merged with each module's `thresholds.conf` (duplicate ids are a
+   startup error);
 2. `preload()` every module (all remote/local I/O, once), then evaluate the union of
    checks;
 3. write the evidence (`record`), then run each module's `after_epoch` hook;
-4. run the healer for confirmed incidents — **after** evidence is durable, so a
-   post-check of `unknown` can still be explained, and **before** the epoch row, because
-   that row is not a licence to act;
+4. run the healer for confirmed incidents — **after** evidence is durable, so the
+   next epoch's observation that decides success is explainable, and **before** the
+   epoch row, because that row is not a licence to act;
 5. write `collector_run` (the dashboard's liveness proof), then run the selected
    advisors. An advisor that hangs or overruns cannot take the epoch record away.
 
@@ -260,7 +262,7 @@ block the collector.
 | `collection_attempt` | per-host transport outcome — **separate from check outcomes on purpose**, because it is what makes "no data" distinguishable from "no problem" after the fact |
 | `incident` | dedup state, first evidence, remedy counters |
 | `journal` | per-host journald cursor + rows: **the fleet's only durable log** |
-| `remedy` | every action, with its trigger evidence and post-check |
+| `remedy` | every action, with its trigger evidence and exit status (the verdict is the incident's next OK observation, not a stored post-check) |
 | `collector_run` | the monitor's own heartbeat, carrying a monotonic `epoch_seq` |
 | `command_run` | every operator invocation — including dry runs and failures — with argv, actor, exit status, bounded output head and the full output's digest |
 | `advisor_run` | one row per advisor per epoch, always: status, duration, requested/available window, error detail |
@@ -1092,14 +1094,21 @@ destructive switch and the confirmed-incident rule cannot be lifted by approving
 
 `actions.allowed()` is pure and decides first: incident `state == "open"`, trigger match,
 engine master switch, known level, level above `off`/`advisory`/`propose`, scoped
-allow-list, destructive switch. `heal.attempt()` then adds: not latched, attempt budget,
-cooldown, per-hour cap, a **dry run that must succeed**, and only then `run()`.
+allow-list (case-insensitive), destructive switch. `heal.attempt()` then adds: not latched,
+attempt budget, cooldown, per-hour cap, the **resource locks**, a **dry run that must
+succeed**, and only then `run()`.
 
-Every gate is a refusal, and a refusal is not retried because a gate said no. A timeout or
-an exception is a *failed attempt*: it advances the incident's counter and cooldown, so a
-handler that crashes or hangs latches instead of being retried every epoch forever. The
-handler runs on a daemon thread so the epoch is bounded even when Python cannot kill the
-thread.
+The locks are flock files under `MONITOR_LOCK_DIR`, held across the dry run and the run:
+`heal:incident:<key>`, `heal:module:<module>` (a module cap of one) and whatever the
+action declares through `resources_for(incident)` (the fleet actions declare
+`fleet:state:<box>` and `fleet:transcode:<box>`). That is what makes the collector and a
+one-shot `ctl --approve` process serialize instead of double-executing one condition.
+
+Every gate is a refusal, and a refusal is not retried because a gate said no. A timeout, an
+exception, a refused dry run and a completed run are all **attempts**: each advances the
+incident's counter and cooldown, so a handler that crashes or hangs -- or one that exits 0
+and changes nothing -- latches instead of being retried every epoch forever. The handler
+runs on a daemon thread so the epoch is bounded even when Python cannot kill the thread.
 
 **Success is not the engine's to claim.** `attempt()` reports that an action *executed*.
 Whether it *worked* is decided by the incident machine's next positive observation — a
@@ -1190,16 +1199,21 @@ process start, so a remount alone leaves it holding the old export's handles. It
 after the mount succeeds. A failed `mount` also aborts without restarting.
 
 **The automated path has no lazy fallback.** `umount -l` detaches rather than unmounts, so
-existing fds keep writing to deleted inodes and the post-check on the new mount reads green.
+existing fds keep writing to deleted inodes while a later check of the new mount
+reads green.
 A failed plain `umount` is therefore a refusal: its stderr (normally EBUSY) and the current
 `findmnt` row are captured as the refusal detail — which is what `heal.attempt` stores on
 the remedy row — and the command does not mount or restart. `fuser` is not used: psmisc is
 absent from the fleet image. The fleet's documented operator repair may use `-l` when a
 human is present to judge the consequence; the automated action does not.
 
-**`transcode_restart`** restarts the worker, triggered by `deadlock_kills` and
-`stall_watch`. It is not the `NRestarts` restart described above: it is bounded by the same
-engine gates and refuses a non-CuBox target. Before restarting it reads both the per-boot
+**`transcode_restart`** restarts the worker, triggered by the CURRENT-STATE checks
+`heartbeat_age_min` (the age of the job in flight) and `pass_cadence_min` (an idle box
+whose pass cadence has stalled). It deliberately does **not** trigger on
+`deadlock_kills` (a 360-minute historical window) or `stall_watch` (a static capability
+check): a restart cannot clear a historical fact, so either would restart a healthy worker
+for hours after a fault that may already be over. It is not the `NRestarts` restart
+described above: it is bounded by the same engine gates and refuses a non-CuBox target. Before restarting it reads both the per-boot
 marker `/run/cubox-transcode.started` and the unit's active state over ssh. The fleet's
 contract is **present = "already started this boot"**, so **present + inactive** is a
 deliberate stop and the action refuses; **absent** (never started this boot — the state-save
@@ -1210,13 +1224,19 @@ evidence of a stop.
 ### A remedy that does not work must become visible, not retried
 
 One attempt per key per cooldown (30 min mount, 60 min worker) regardless of how
-many polls confirm. `post_check` runs after a settle window **longer than the
-thing's own timeout**. **Attempt 2 fails → LATCH**: severity rises, the tile
-renders "RED — remedy attempted N times, ineffective", and no further automatic
-action until a human clears it. Without the latch, remedy 1 is an unmount flap
-every poll. A `post_check` of `unknown` is **neither** success nor failure:
-freeze, count the attempt, do not advance toward LATCH, and surface "remedy
-outcome unknown" as its own flag.
+many polls confirm. **Every executed attempt counts**, whether the command exited
+0 or not: the engine does not claim success from an exit status, so the only
+success signal is the incident machine's **next OK observation**. A run that
+exits 0 and leaves the condition open is an attempted-but-ineffective remedy, and
+it cools down and advances toward the latch exactly like a failed one. There is no
+settle window and no post-check written by the engine — those columns exist on the
+`remedy` table for historical rows, and nothing populates them.
+
+**Attempt budget exhausted → LATCH**: severity rises, the tile renders "RED —
+remedy attempted N times, ineffective", and no further automatic action until a
+human clears it. Without the latch, remedy 1 is an unmount flap every poll. A
+later OK observation still resolves the incident even while the engine is
+latched — resolution is the check's fact, not the remedy's verdict.
 
 ### Deliberately alert-only
 

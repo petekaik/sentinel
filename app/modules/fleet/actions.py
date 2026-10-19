@@ -72,8 +72,10 @@ def _state_mount_cycle(ctx, incident, dry_run):
            "mount -t nfs -o nolock,nfsvers=3 %s:/cubpxe/state/%s /mnt/state "  # secretscan:ignore (fleet design paths)
            "&& systemctl restart cubox-transcode" % (backup.address, box))
     if dry_run:
-        return actions.Result(True, "would cycle the state mount on %s" % box,
-                              cmd)
+        return actions.Result(
+            True,
+            "would cycle the state mount and restart the worker on %s" % box,
+            cmd)
     return _remote(host, cmd)
 
 

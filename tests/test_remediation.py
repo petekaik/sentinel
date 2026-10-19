@@ -960,19 +960,27 @@ def test_fleet_action_commands_are_the_documented_repairs(results):
                 "mount -t nfs -o nolock,nfsvers=3 "
                 "%s:/cubpxe/state/cubox-1 /mnt/state "
                 "&& systemctl restart cubox-transcode" % backup)
-    res = action.dry_run(ctx, _incident(action))
+    orig = probes_mod.ssh
+
+    def refuse(host, cmd, *a, **k):
+        raise AssertionError("a dry run tried to ssh to %s" % host.address)
+
+    probes_mod.ssh = refuse
+    try:
+        res = action.dry_run(ctx, _incident(action))
+    finally:
+        probes_mod.ssh = orig
     results.check(
         "the state mount cycle returns the fleet's documented repair verbatim",
         res.ok and res.output == expected, "output=%r" % (res.output,))
     results.check(
         "a dry run shows BOTH steps -- the remount and the worker restart -- "
-        "without executing either (the harness's ssh raises if called here)",
+        "without executing either (the local ssh stub raises if called)",
         "umount /mnt/state" in res.output
         and "systemctl restart cubox-transcode" in res.output,
         "output=%r" % (res.output,))
 
     calls = []
-    orig = probes_mod.ssh
     probes_mod.ssh = lambda host, cmd, *a, **k: (calls.append(cmd)
                                                  or probes_mod.RemoteResult(
                                                      probes_mod.Transport.RAN,
@@ -997,37 +1005,51 @@ def test_fleet_action_commands_are_the_documented_repairs(results):
 
 
 def test_fleet_actions_refuse_a_target_that_is_not_a_box(results):
+    import probes as probes_mod
     from modules.fleet import actions as fleet_actions
     ctx = _fleet_ctx()
-    for a in fleet_actions.actions_list():
-        for target in ("backup", "storage", "fleet", "cubox-9", None):
-            res = a.dry_run(ctx, _incident(a, target))
-            results.check(
-                "%s refuses target %r instead of guessing a host"
-                % (a.id, target),
-                not res.ok and "CuBox" in res.detail, "detail=%r" % (res.detail,))
+    orig = probes_mod.ssh
 
-    # The RUN path refuses at the same gate, before any ssh. The harness's
-    # probes.ssh raises if called, so a dry/run divergence aborts the suite.
-    for a in fleet_actions.actions_list():
-        for target in ("backup", "cubox-9", None):
-            res = a.run(ctx, _incident(a, target))
-            results.check(
-                "%s's RUN refuses target %r too, before any ssh"
-                % (a.id, target),
-                not res.ok and "CuBox" in res.detail,
-                "detail=%r" % (res.detail,))
+    # PATCHED LOCALLY, not inherited from the harness. The run path below must
+    # be proven never to reach the transport: if the box guard regressed, this
+    # would otherwise ssh a remount and a worker restart to the NAS before the
+    # assertion went red.
+    def refuse(host, cmd, *a, **k):
+        raise AssertionError("a refused target still tried to ssh to %s"
+                             % host.address)
 
-    # In cubox_ids but with no host entry: refusing beats a KeyError.
-    ctx = _fleet_ctx(env={"CUBOX_IDS": "cubox-1,cubox-2,cubox-9"})
-    for a in fleet_actions.actions_list():
-        for path in (a.dry_run, a.run):
-            res = path(ctx, _incident(a, "cubox-9"))
-            results.check(
-                "%s refuses a configured box that has no host entry (%s)"
-                % (a.id, "run" if path is a.run else "dry run"),
-                not res.ok and "no host" in res.detail,
-                "detail=%r" % (res.detail,))
+    probes_mod.ssh = refuse
+    try:
+        for a in fleet_actions.actions_list():
+            for target in ("backup", "storage", "fleet", "cubox-9", None):
+                res = a.dry_run(ctx, _incident(a, target))
+                results.check(
+                    "%s refuses target %r instead of guessing a host"
+                    % (a.id, target),
+                    not res.ok and "CuBox" in res.detail,
+                    "detail=%r" % (res.detail,))
+
+        for a in fleet_actions.actions_list():
+            for target in ("backup", "cubox-9", None):
+                res = a.run(ctx, _incident(a, target))
+                results.check(
+                    "%s's RUN refuses target %r too, before any ssh"
+                    % (a.id, target),
+                    not res.ok and "CuBox" in res.detail,
+                    "detail=%r" % (res.detail,))
+
+        # In cubox_ids but with no host entry: refusing beats a KeyError.
+        ctx = _fleet_ctx(env={"CUBOX_IDS": "cubox-1,cubox-2,cubox-9"})
+        for a in fleet_actions.actions_list():
+            for path in (a.dry_run, a.run):
+                res = path(ctx, _incident(a, "cubox-9"))
+                results.check(
+                    "%s refuses a configured box that has no host entry (%s)"
+                    % (a.id, "run" if path is a.run else "dry run"),
+                    not res.ok and "no host" in res.detail,
+                    "detail=%r" % (res.detail,))
+    finally:
+        probes_mod.ssh = orig
 
 
 TESTS = (test_off_by_default,

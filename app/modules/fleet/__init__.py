@@ -3,6 +3,7 @@
 from module import Module, Setting
 
 from modules.fleet import checks as fleet_checks
+from modules.fleet import commands as fleet_commands
 from modules.fleet.preload import after_epoch, context, preload
 
 MODULE = Module(
@@ -25,6 +26,7 @@ MODULE = Module(
     preload=preload,
     checks=(fleet_checks.cubox, fleet_checks.fleet, fleet_checks.storage,
             fleet_checks.backup, fleet_checks.serial),
+    commands=fleet_commands.commands,
     after_epoch=after_epoch,
     # The incidents collect.py emits for the fleet, and no Check class owns.
     # `monitor_local_access` is deliberately absent: it is the platform refusing

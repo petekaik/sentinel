@@ -167,6 +167,12 @@ class FleetConfig:
         # UNKNOWN across it rather than FAIL, because the path is not known to be
         # broken -- it is not yet known to be up.
         self.serial_watchdog_grace_s = int(_env("SERIAL_WATCHDOG_GRACE_S", "360", e))
+        # Where an arm file and the last capture live. A tmpfs path by default:
+        # both are runtime state, and the monitor container has no /data/serial.
+        self.capture_dir = _env("SERIAL_CAPTURE_DIR", "/tmp/sentinel-serial", e)
+        # Ceiling on an arm window. A stale arm holds the port and blocks a
+        # BREAK, so the window must expire even if the operator forgets it.
+        self.serial_arm_max_min = int(_env("SERIAL_ARM_MAX_MIN", "60", e))
         # Optional. Without a username TVH's own API stays UNKNOWN, which is
         # stated on the dashboard rather than hidden -- a wrong password returns
         # the same 401 as no password, so credentials need their own probe to be

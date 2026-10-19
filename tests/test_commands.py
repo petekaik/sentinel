@@ -384,6 +384,209 @@ def test_the_command_run_table_is_in_the_store_summary(results):
     conn.close()
 
 
+# ---------------------------------------------------------------------------
+# The fleet's serial commands. The identity rule is the contract here too: an
+# action refuses when the box's adapter cannot be RESOLVED, and never falls
+# back to a /dev/ttyUSB number. The sysfs tree is synthetic, so nothing here
+# reads the host's real USB bus.
+# ---------------------------------------------------------------------------
+
+
+def _fleet_cmd():
+    sys.path.insert(0, APP)
+    import modules.fleet.commands as fcmd
+    return fcmd
+
+
+def _fleet_sysfs(entries):
+    """A synthetic /sys/class/tty tree: [(tty, usb_port, chip_serial), ...]."""
+    root = tempfile.mkdtemp(prefix="sentinel-fs-")
+    for tty, port, chip in entries:
+        dev = os.path.join(root, "devices", "usb1", port)
+        iface = os.path.join(dev, "%s:1.0" % port)
+        os.makedirs(os.path.join(iface, tty))
+        with open(os.path.join(dev, "idVendor"), "w") as fh:
+            fh.write("0403\n")
+        if chip is not None:
+            with open(os.path.join(dev, "serial"), "w") as fh:
+                fh.write(chip + "\n")
+        cls = os.path.join(root, "class", "tty", tty)
+        os.makedirs(cls)
+        os.symlink(os.path.join(iface, tty), os.path.join(cls, "device"))
+    os.makedirs(os.path.join(root, "class", "tty"), exist_ok=True)
+    return root
+
+
+def _fleet_ctx(sysfs, serials=None, capture=None):
+    """The two attributes the serial handlers read: ctx.fleet and cfg.lock_dir."""
+    fleet = types.SimpleNamespace(
+        cubox_ids=("cubox-1", "cubox-2"),
+        serial_sysfs=sysfs,
+        serial_serials=serials or {},
+        capture_dir=capture or tempfile.mkdtemp(prefix="sentinel-cap-"),
+        serial_arm_max_min=60,
+    )
+    return types.SimpleNamespace(fleet=fleet,
+                                 cfg=types.SimpleNamespace(
+                                     lock_dir=tempfile.mkdtemp(prefix="sentinel-locks-")))
+
+
+def test_serial_break_is_destructive_and_refuses_without_a_resolved_adapter(results):
+    fcmd = _fleet_cmd()
+    b = {c.id: c for c in fcmd.commands()}["serial_break"]
+    results.check(
+        "serial_break is destructive and names the port as a resource",
+        b.danger == "destructive" and any("serial" in r for r in b.resources),
+        "danger=%r resources=%r" % (b.danger, b.resources))
+    # A resolver that cannot identify the box must refuse, never guess.
+    try:
+        b.handler(None, {"box": "cubox-1", "force": "0"}, dry_run=False,
+                  resolver=lambda box: (None, "absent", "no adapter"))
+    except commands.CommandError as exc:
+        ok = "adapter" in str(exc).lower() or "resolved" in str(exc).lower()
+    else:
+        ok = False
+    results.check(
+        "a BREAK without a resolved adapter refuses rather than guessing",
+        ok, "handler did not refuse")
+
+
+def test_serial_commands_declare_their_danger_and_the_serial_resource(results):
+    cmds = {c.id: c for c in _fleet_cmd().commands()}
+    want = {"serial_status": "read_only", "serial_arm": "state_changing",
+            "serial_disarm": "state_changing", "serial_read": "read_only",
+            "serial_break": "destructive"}
+    bad = [(cid, cmds[cid].danger if cid in cmds else None,
+            cmds[cid].resources if cid in cmds else None)
+           for cid, danger in sorted(want.items())
+           if cid not in cmds or cmds[cid].danger != danger
+           or "serial" not in cmds[cid].resources]
+    results.check(
+        "all five serial commands declare their danger and hold the serial "
+        "resource, so two cannot touch one port at once",
+        not bad, "wrong or missing: %r" % (bad,))
+
+
+def test_actions_refuse_an_unresolvable_adapter(results):
+    """NEVER GUESS: an unidentifiable box is a refusal, not a fallback device."""
+    fcmd = _fleet_cmd()
+    sysfs = _fleet_sysfs([("ttyUSB0", "1-2", "OTHER")])
+    try:
+        ctx = _fleet_ctx(sysfs, {"cubox-1": "SYNTH001"})
+        outcomes = {}
+        for name in ("arm", "disarm", "read"):
+            try:
+                getattr(fcmd, name)(ctx, {"box": "cubox-1", "min": "5"},
+                                    dry_run=False)
+            except commands.CommandError as exc:
+                outcomes[name] = "adapter" in str(exc).lower()
+            else:
+                outcomes[name] = False
+        results.check(
+            "arm, disarm and read refuse when the box's adapter is not identified",
+            all(outcomes.values()),
+            "outcomes=%r -- falling back to SERIAL_DEVICE here is exactly how a "
+            "command lands on the wrong box" % (outcomes,))
+        results.check(
+            "the refused arm wrote no arm file",
+            not os.path.exists(os.path.join(ctx.fleet.capture_dir, "arm-cubox-1")),
+            "capture dir: %r" % (os.listdir(ctx.fleet.capture_dir),))
+    finally:
+        import shutil
+        shutil.rmtree(sysfs)
+
+
+def test_dry_run_arm_writes_nothing(results):
+    fcmd = _fleet_cmd()
+    sysfs = _fleet_sysfs([("ttyUSB0", "1-1.2", "SYNTH001")])
+    try:
+        ctx = _fleet_ctx(sysfs, {"cubox-1": "SYNTH001"})
+        res = fcmd.arm(ctx, {"box": "cubox-1", "min": "5"}, dry_run=True)
+        results.check(
+            "a dry-run arm reports what it would do and writes no arm file",
+            res.ok and "would arm" in res.detail
+            and os.listdir(ctx.fleet.capture_dir) == [],
+            "detail=%r left=%r" % (res.detail, os.listdir(ctx.fleet.capture_dir)))
+    finally:
+        import shutil
+        shutil.rmtree(sysfs)
+
+
+def test_arm_rejects_a_window_outside_the_cap(results):
+    fcmd = _fleet_cmd()
+    sysfs = _fleet_sysfs([("ttyUSB0", "1-1.2", "SYNTH001")])
+    try:
+        ctx = _fleet_ctx(sysfs, {"cubox-1": "SYNTH001"})
+        outcomes = {}
+        for value in ("0", "-1", "61", "soon"):
+            try:
+                fcmd.arm(ctx, {"box": "cubox-1", "min": value}, dry_run=False)
+            except commands.CommandError:
+                outcomes[value] = True
+            else:
+                outcomes[value] = False
+        results.check(
+            "an arm window outside 1..SERIAL_ARM_MAX_MIN is refused before "
+            "anything is written",
+            all(outcomes.values()) and os.listdir(ctx.fleet.capture_dir) == [],
+            "outcomes=%r left=%r" % (outcomes, os.listdir(ctx.fleet.capture_dir)))
+    finally:
+        import shutil
+        shutil.rmtree(sysfs)
+
+
+def test_arm_writes_an_arm_file_that_status_reports(results):
+    import time as time_mod
+    fcmd = _fleet_cmd()
+    sysfs = _fleet_sysfs([("ttyUSB0", "1-1.2", "SYNTH001")])
+    try:
+        ctx = _fleet_ctx(sysfs, {"cubox-1": "SYNTH001"})
+        res = fcmd.arm(ctx, {"box": "cubox-1", "min": "5"}, dry_run=False)
+        path = os.path.join(ctx.fleet.capture_dir, "arm-cubox-1")
+        with open(path) as fh:
+            until, device = fh.read().split()
+        st = fcmd.status(ctx, {}, dry_run=True)
+        results.check(
+            "arming writes the resolved device and an expiry, and status reports it",
+            res.ok and device == "/dev/ttyUSB0"
+            and int(until) > time_mod.time()
+            and "serial=SYNTH001" in st.output
+            and "arm-cubox-1" in st.output,
+            "detail=%r file=%r status=%r" % (res.detail, (until, device), st.output))
+    finally:
+        import shutil
+        shutil.rmtree(sysfs)
+
+
+def test_the_serial_commands_are_registered_and_dispatch_through_ctl(results):
+    """ctl's path: discover, install the module's context, then dispatch."""
+    import ctl
+    import config as config_mod
+    from harness import CHECKS_CONF
+
+    sysfs = _fleet_sysfs([("ttyUSB0", "1-1.2", "SYNTH001")])
+    try:
+        env = {"MONITOR_CHECKS": CHECKS_CONF,
+               "MONITOR_LOCK_DIR": tempfile.mkdtemp(prefix="sentinel-locks-"),
+               "SERIAL_SYSFS": sysfs,
+               "SERIAL_CUBOX_1_SERIAL": "SYNTH001",
+               "SERIAL_CAPTURE_DIR": tempfile.mkdtemp(prefix="sentinel-cap-")}
+        cfg = config_mod.Config(env=env)
+        mods = ctl._modules(cfg)
+        ctx = ctl._context(cfg, mods)
+        ids = {c.id for c in mods["fleet"].commands()}
+        res = commands.run(mods["fleet"], "serial_status", {}, ctx=ctx)
+        results.check(
+            "ctl discovers the fleet's serial commands and dispatch runs one",
+            {"serial_status", "serial_arm", "serial_disarm", "serial_read",
+             "serial_break"} <= ids and res.ok
+            and "/dev/ttyUSB0" in res.output,
+            "ids=%r ok=%r output=%r" % (sorted(ids), res.ok, res.output))
+    finally:
+        import shutil
+        shutil.rmtree(sysfs)
+
+
 TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_disabled_module_refuses,
          test_a_held_resource_refuses_the_second_command,
@@ -397,6 +600,13 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_audit_row_is_written,
          test_the_audit_keeps_a_head_and_the_full_sha,
          test_the_command_run_table_is_in_the_store_summary,
+         test_serial_break_is_destructive_and_refuses_without_a_resolved_adapter,
+         test_serial_commands_declare_their_danger_and_the_serial_resource,
+         test_actions_refuse_an_unresolvable_adapter,
+         test_dry_run_arm_writes_nothing,
+         test_arm_rejects_a_window_outside_the_cap,
+         test_arm_writes_an_arm_file_that_status_reports,
+         test_the_serial_commands_are_registered_and_dispatch_through_ctl,
          # LAST TWO: a missing release leaks the process-global _HELD set,
          # which would make every later test refuse for the wrong reason.
          # Running them at the end keeps the failure attributed to the guard

@@ -39,20 +39,20 @@ class SerialAdapters(Check):
     def run(self, ctx):
         import modules.fleet.serial as serial_mod
 
-        cfg = ctx.fleet
-        adapters, why = serial_mod.list_adapters(cfg.serial_sysfs)
+        fleet = ctx.fleet
+        adapters, why = serial_mod.list_adapters(fleet.serial_sysfs)
         if adapters is None:
             return unknown(
                 self.id, self.target,
                 "cannot read %s (%s), so no console adapter can be identified here. "
                 "This is NOT 'no adapter attached' -- it means this container cannot "
-                "see the USB bus at all." % (cfg.serial_sysfs, why),
+                "see the USB bus at all." % (fleet.serial_sysfs, why),
                 subject="serial")
 
         resolved, missing, ambiguous, unconfigured = {}, [], [], []
-        for box in cfg.cubox_ids:
-            want = cfg.serial_serials.get(box)
-            ad, outcome, rwhy = serial_mod.resolve(want, cfg.serial_sysfs)
+        for box in fleet.cubox_ids:
+            want = fleet.serial_serials.get(box)
+            ad, outcome, rwhy = serial_mod.resolve(want, fleet.serial_sysfs)
             if outcome == serial_mod.OK:
                 resolved[box] = ad
             elif outcome == serial_mod.AMBIGUOUS:
@@ -82,20 +82,20 @@ class SerialAdapters(Check):
                         subject="serial", evidence=evidence)
 
         n = len(resolved)
-        if n < len(cfg.cubox_ids):
+        if n < len(fleet.cubox_ids):
             # ORDER MATTERS. The grace is checked before the "not required" case so
             # that a NAS booting through its watchdog window is reported as not-yet-
             # known rather than as an absent tool.
-            up = _uptime_seconds(cfg.serial_proc)
-            if up is not None and up < cfg.serial_watchdog_grace_s:
+            up = _uptime_seconds(fleet.serial_proc)
+            if up is not None and up < fleet.serial_watchdog_grace_s:
                 return unknown(
                     self.id, self.target,
                     "%d of %d console adapters identified; this NAS has been up %.0fs, "
                     "inside the %ds window in which the watchdog has not yet re-applied "
                     "the serial modules -- so this is 'not yet', not 'broken'."
-                    % (n, len(cfg.cubox_ids), up, cfg.serial_watchdog_grace_s),
+                    % (n, len(fleet.cubox_ids), up, fleet.serial_watchdog_grace_s),
                     subject="serial", evidence=evidence)
-            if not adapters and not cfg.serial_required:
+            if not adapters and not fleet.serial_required:
                 return unknown(
                     self.id, self.target,
                     "no USB-serial adapter is attached to this NAS. That is the expected "
@@ -111,7 +111,7 @@ class SerialAdapters(Check):
                     subject="serial", evidence=evidence)
 
         res = self.result_from_spec(ctx, float(n), subject="serial", evidence=evidence)
-        if n == len(cfg.cubox_ids):
+        if n == len(fleet.cubox_ids):
             res.detail = ("%s; %s" % (
                 res.detail,
                 ", ".join("%s at %s" % (b, a.device)

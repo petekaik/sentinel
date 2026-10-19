@@ -16,7 +16,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MONITOR = os.path.dirname(HERE)
 APP = os.path.join(MONITOR, "app")
 FIXTURES = os.path.join(HERE, "fixtures")
-CHECKS_CONF = os.path.join(MONITOR, "checks.conf")
+# The fleet module's threshold file. The platform's root checks.conf is
+# comment-only since Task 3; a suite that pointed there would load {} and every
+# spec-graded check would report UNKNOWN for a missing spec.
+CHECKS_CONF = os.path.join(APP, "modules", "fleet", "thresholds.conf")
 
 if APP not in sys.path:
     sys.path.insert(0, APP)
@@ -78,3 +81,30 @@ class Results:
 def read_fixture(name):
     with open(os.path.join(FIXTURES, name)) as fh:
         return fh.read()
+
+
+def fleet_module():
+    """The discovered fleet module -- the ONE home for its check list."""
+    import modules as loader
+    for mod in loader.discover():
+        if mod.id == "fleet":
+            return mod
+    raise AssertionError("the fleet module was not discovered; its checks are "
+                         "not registered anywhere and the dashboard shows no row")
+
+
+def check_classes():
+    """Every check class the discovered modules provide, through the registry."""
+    import checks
+    return checks.registry(*fleet_module().check_classes())
+
+
+def fleet_config(cfg):
+    """The fleet's settings view over the SAME env the Config was built from.
+
+    Passing `cfg.env` is what keeps a suite hermetic: `FleetConfig(cfg)` alone
+    reads os.environ, so a test's overrides would be silently ignored and the
+    real deployment's .env could leak in.
+    """
+    from modules.fleet.settings import FleetConfig
+    return FleetConfig(cfg, cfg.env)

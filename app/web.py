@@ -39,10 +39,12 @@ a slow query cannot block the collector's writer.
 
 import html
 import json
+import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import checks
+import modules as module_loader
 import shell
 import store
 import thresholds
@@ -116,8 +118,11 @@ def build_state(cfg, conn, now=None):
     else:
         staleness = "fresh"
 
-    specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
+    enabled = module_loader.discover_enabled(cfg)
+    specs = thresholds.load_many(
+        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
+    classes = checks.registry(
+        *[c for m in enabled for c in m.check_classes()])
     claimed, deferred, unclaimed = thresholds.audit(specs, classes)
 
     current, n_current = _rows(conn, NEWEST_EPOCH_SQL)
@@ -131,7 +136,7 @@ def build_state(cfg, conn, now=None):
               "ORDER BY severity = 'red' DESC, first_seen ASC" % store.LIVE_SQL)
 
     tiles, informational, others, missing = [], [], [], []
-    for chk in checks.expand(classes, cfg.cubox_ids):
+    for chk in checks.expand(classes, checks.expansion_targets(enabled)):
         row = by_key.pop((chk.target, chk.id), None)
         spec = specs.get(chk.spec) if chk.spec else None
         item = {

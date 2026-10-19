@@ -94,9 +94,12 @@ def _module_classes():
 
 
 def _classes(module_checks):
-    if module_checks:
-        return checks.registry(*module_checks)
-    return checks.registry(*checks.all_modules())
+    # The post-move path is the only one that can produce rows: the fleet
+    # module declares its checks and the old platform list is gone.
+    if not module_checks:
+        raise SystemExit("the fleet module declares no checks -- discovery is "
+                         "broken, so there is nothing to baseline")
+    return checks.registry(*module_checks)
 
 
 def _copy_fleet_view(cfg, fleet):

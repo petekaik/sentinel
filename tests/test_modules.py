@@ -7,6 +7,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                       # noqa: E402
 
+import checks                                     # noqa: E402
 import module as module_mod                       # noqa: E402
 import modules as loader                          # noqa: E402
 import shutil                                     # noqa: E402
@@ -199,13 +200,84 @@ def test_threshold_merge_refuses_duplicate_spec_ids(results):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_discover_enabled_carries_the_module_directory(results):
+    """The threshold file lives beside the module, so discovery must carry it."""
+    import config as config_mod
+    cfg = config_mod.Config(env={})
+    mods = loader.discover_enabled(cfg)
+    fleet = [m for m in mods if m.id == "fleet"]
+    path = os.path.join(fleet[0]._path, fleet[0].threshold_file) if fleet else ""
+    results.check(
+        "discover_enabled returns the fleet module with a real threshold file",
+        len(fleet) == 1 and os.path.isfile(path),
+        "module(s)=%r path=%r -- a module whose threshold file cannot be found "
+        "would make every spec-graded check UNKNOWN for a missing spec"
+        % ([m.id for m in mods], path))
+
+
+def test_expansion_targets_are_the_per_box_ids(results):
+    """Per-box checks expand against the module's concrete box ids, not its
+    whole target vocabulary (which also has backup/storage/fleet)."""
+    import config as config_mod
+    cfg = config_mod.Config(env={})
+    mods = loader.discover_enabled(cfg)
+    got = checks.expansion_targets(mods)
+    results.check(
+        "per-box expansion uses cubox-1/cubox-2 and not backup/storage/fleet",
+        got == ("cubox-1", "cubox-2"),
+        "got %r. A per-box check bound to 'backup' produces a row on a host that "
+        "check never describes, and the dashboard shows it as missing." % (got,))
+
+
+def test_context_settings_resolve_env_over_default(results):
+    """A module's Setting declares its key; the platform resolves the value."""
+    import config as config_mod
+    cfg = config_mod.Config(env={"CUBOX_IDS": "box-a,box-b"})
+    mods = loader.discover_enabled(cfg)
+    ctx = checks.Context(cfg, {}, {}, modules=mods)
+    got = ctx.settings("fleet")
+    results.check(
+        "Context.settings reads the module's declarations with the process env",
+        got.get("CUBOX_IDS") == "box-a,box-b"
+        and got.get("MONITOR_LOCAL_HOST") == "storage",
+        "got %r -- a setting that does not resolve would silently fall back to "
+        "a deployment-time default nobody chose" % (got,))
+
+
+def test_platform_files_do_not_import_a_specific_module(results):
+    """The direction of dependency: platform -> loader, never platform -> module."""
+    import re
+    bad = []
+    for root, _dirs, files in os.walk(os.path.join(os.path.dirname(
+            os.path.abspath(__file__)), "..", "app")):
+        if os.sep + "modules" + os.sep in root + os.sep:
+            continue                     # a module may import its own pieces
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(root, name)
+            with open(path) as fh:
+                for n, line in enumerate(fh, 1):
+                    if re.match(r"\s*(import|from)\s+modules\.[a-z_]", line):
+                        bad.append("%s:%d %s" % (path, n, line.strip()))
+    results.check(
+        "no platform file imports modules.<id>",
+        bad == [],
+        "specific-module imports in platform code: %s -- the boundary is what "
+        "makes a module removable; break it and the loader is theatre" % bad)
+
+
 TESTS = (test_discovery_finds_and_orders_modules,
          test_a_package_without_module_fails_loudly,
          test_a_package_that_raises_on_import_fails_loudly,
          test_a_non_module_MODULE_fails_loudly,
          test_duplicate_and_mismatched_ids_fail_loudly,
          test_fleet_settings_keep_the_deployed_env_names,
-         test_threshold_merge_refuses_duplicate_spec_ids)
+         test_threshold_merge_refuses_duplicate_spec_ids,
+         test_discover_enabled_carries_the_module_directory,
+         test_expansion_targets_are_the_per_box_ids,
+         test_context_settings_resolve_env_over_default,
+         test_platform_files_do_not_import_a_specific_module)
 
 
 def main():

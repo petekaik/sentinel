@@ -42,7 +42,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import CHECKS_CONF, Results  # noqa: E402
+from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
+                    fleet_config)
 
 import checks                 # noqa: E402
 import config as config_mod   # noqa: E402
@@ -118,7 +119,7 @@ class Dash:
 
 
 def registry_instances(cfg):
-    return checks.expand(checks.registry(*checks.all_modules()), cfg.cubox_ids)
+    return checks.expand(check_classes(), fleet_config(cfg).cubox_ids)
 
 
 class _Server(ThreadingHTTPServer):

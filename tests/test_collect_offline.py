@@ -49,13 +49,13 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import CHECKS_CONF, FIXTURES, Results, read_fixture  # noqa: E402
 
-import backupfacts                   # noqa: E402
-import boxfacts                      # noqa: E402
-import export as export_mod          # noqa: E402
 import collect                       # noqa: E402
 import config as config_mod          # noqa: E402
-import journal as journal_mod        # noqa: E402
-import parsers                       # noqa: E402
+import modules.fleet.backupfacts as backupfacts    # noqa: E402
+import modules.fleet.boxfacts as boxfacts          # noqa: E402
+import modules.fleet.export as export_mod          # noqa: E402
+import modules.fleet.journal as journal_mod        # noqa: E402
+import modules.fleet.parsers as parsers            # noqa: E402
 import probes                        # noqa: E402
 import store                         # noqa: E402
 
@@ -167,9 +167,8 @@ class Fleet:
             return jp
 
         # EVERY NAME THAT CAN REACH A HOST, in one list, so a new stub cannot be
-        # added without a matching restore. `collect.boxfacts` IS the `boxfacts`
-        # module and `export_mod` IS `export`, so these are the same objects the
-        # checks import.
+        # added without a matching restore. These are the SAME module objects the
+        # fleet's preload imports, so patching here is what the epoch sees.
         self._patched = (
             (probes, "run", probes.run, _fake_run),
             (probes, "ssh", probes.ssh, _fake_ssh),

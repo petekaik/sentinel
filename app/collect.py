@@ -44,13 +44,9 @@ import sys
 import time
 import traceback
 
-import backupfacts
-import boxfacts
 import checks
 import config as config_mod
-import journal as journal_mod
-import parsers
-import probes
+import modules as module_loader
 import store
 import thresholds
 
@@ -89,11 +85,6 @@ UNREACHABLE_ID = "host_unreachable"     # it does not answer
 AUTH_ID = "host_auth_failed"            # it answered and refused us
 LOCAL_ID = "monitor_local_access"       # the monitor cannot read its own runtime
 CONFIG_ID = "monitor_config"            # the host is not in the monitor's config
-
-# The one host the monitor RUNS ON. Its access path is entirely local (the docker
-# socket), so "unreachable" is not a thing that can happen to it and its failures
-# are classified as LOCAL_ID.
-LOCAL_HOST = "storage"
 
 # Prune samples every N epochs (about a week at 60 s).
 PRUNE_EVERY = 10080
@@ -151,135 +142,29 @@ def _attempt(attempts, host):
 # ---------------------------------------------------------------------------
 
 
-def preload(cfg, ctx, conn, attempts):
-    """Fetch every remote fact ONCE, under its own timeout, before any check runs.
+def preload_modules(cfg, ctx, attempts):
+    """Let each enabled module fetch its own facts, under its own guard.
 
-    Nothing in this function raises for an expected condition: a failed pull
-    installs a transport-failed fact block, which the check layer already knows
-    how to render as UNKNOWN with the reason in words. That is the whole point of
-    the fact-block types carrying `transport_ok`/`why` instead of being plain
-    dicts.
+    THE PLATFORM DOES NOT KNOW WHAT A CUBOX IS. Each module's `preload(ctx)`
+    performs every remote read it owns -- once, with its own timeout -- and
+    installs the results through the platform's `preload_*` methods. The check
+    layer then reads finished data and cannot open a socket of its own.
+
+    A module that raises is ISOLATED: its checks report UNKNOWN, the failure is
+    recorded against the module (with the traceback), and the rest of the epoch
+    proceeds. One broken module must not cost every other module's checks.
     """
-    # The Docker client is local (a unix socket) and cheap. Its absence is a
-    # configuration fact, not a transport failure, so it is noted rather than
-    # escalated -- and the checks that need it say so themselves.
-    ctx.docker = _docker_client(cfg, ctx)
-
-    # -- the CuBoxes -------------------------------------------------------
-    for cid in cfg.cubox_ids:
-        a = _attempt(attempts, cid)
-        host = cfg.cubox_host(cid)
-        if host is None:
-            ctx.preload_facts(cid, parsers.parse_facts(
-                "", transport_ok=False,
-                why="no host entry for %r in the monitor config" % cid))
-            a.note(False, "no host entry in config")
-            continue
-        f = boxfacts.pull(host, cfg.boxfacts_script, timeout=cfg.ssh_timeout)
-        ctx.preload_facts(cid, f)
-        a.note(f.ok, f.why)
-
-    # -- the worker.sh drift follow-up ------------------------------------
-    # Only pulled when the box's digest differs from the reference, because it is
-    # a 78 KB transfer per box per minute for a question that changes only when
-    # someone deploys. It is pulled HERE, not lazily inside the check, so the
-    # check phase stays socket-free.
-    _preload_worker_text(cfg, ctx)
-
-    # -- Backup-NAS --------------------------------------------------------
-    bhost = cfg.hosts.get("backup")
-    if bhost is None:
-        ctx.note("no backup host configured -- its checks will be UNKNOWN")
-    else:
-        a = _attempt(attempts, "backup")
-        bf = backupfacts.pull(bhost, cfg.backupfacts_script, cfg,
-                             timeout=cfg.ssh_timeout)
-        ctx.preload_backup_facts(bf)
-        # BackupFacts exposes `transport_ok`; BoxFacts exposes `ok`. The two
-        # probes were written at different times and the asymmetry is real, so it
-        # is named here rather than glossed with a getattr chain that would hide
-        # the day one of them is renamed.
-        a.note(bf.transport_ok, bf.why)
-
-        # The state exports ride the same host. Fetched here so the fleet checks
-        # that read the worker logs find them already installed.
-        for cid in cfg.cubox_ids:
-            se = ctx.export(cid)          # cached; the ssh happens on first use
-            a.note(_export_ok(se), getattr(se, "why", ""))
-
-    # -- the local host: TVH's container log -------------------------------
-    # No ssh: the monitor runs ON Storage-NAS, so this is the docker socket. A
-    # failed read stays a transport UNKNOWN via Context.tvh_log's (None, why).
-    #
-    # The attempt is created even when there is no docker client at all, so a
-    # monitor that is structurally blind to its own container runtime escalates
-    # to a visible FAIL rather than only to a note. "All 16 containers are
-    # unmonitored" must not be quiet.
-    la = _attempt(attempts, LOCAL_HOST)
-    text, why = ctx.tvh_log()
-    la.note(text is not None, why)
-
-    return attempts
-
-
-def _docker_client(cfg, ctx):
-    if not os.path.exists(cfg.docker_socket):
-        ctx.note("no docker socket at %s -- container checks will be UNKNOWN"
-                 % cfg.docker_socket)
-        return None
-    try:
-        return probes.DockerAPI(cfg.docker_socket)
-    except Exception as exc:                       # noqa: BLE001 - reported
-        ctx.note("cannot open the docker socket: %s" % exc)
-        return None
-
-
-def _export_ok(se):
-    """A state export counts as read only if its transport ran.
-
-    StateExport.ran exists for this and compares `transport` against the
-    probes.Transport VALUE -- the field is a string, not the enum member, so a
-    caller comparing against `probes.Transport.RAN` directly would be silently
-    False forever. That is the shape of every bug this project keeps finding, so
-    it is done in one place and this is a call to it rather than a second copy.
-    """
-    return bool(se is not None and se.ran)
-
-
-def _preload_worker_text(cfg, ctx):
-    """Pull worker.sh for boxes whose digest differs from their generation's.
-
-    BOTH texts the drift check compares live on the box (item 90): the live /etc
-    copy, pulled here, and the applied generation's copy, pulled through
-    ctx.gen_worker_text. Neither is pulled unconditionally -- the two are 78 KB
-    apiece and the question they answer changes only when a generation is applied,
-    so the MANIFEST digest is the cheap detector and these are the follow-up.
-    """
-    for cid in cfg.cubox_ids:
-        f = ctx.box.get(cid)
-        host = cfg.cubox_host(cid)
-        if f is None or host is None or not getattr(f, "ok", False):
-            continue
-        gen = f.get("shared_applied_gen").strip()
-        ref_md5 = f.get("worker_manifest_md5").strip()
-        box_md5 = f.get("worker_etc").strip()
-        # Having nothing to detect against is not a reason to pull: the check
-        # renders UNKNOWN from the same empty facts, and a pull would not change
-        # that -- it would only cost a transfer per box per epoch.
-        if not ref_md5 or not box_md5 or box_md5 == ref_md5:
-            continue
-        r = probes.ssh(host, "cat /etc/cubox-transcode/worker.sh",
-                       timeout=cfg.ssh_timeout)
-        # A pull that did not run leaves the entry absent, so the check's own
-        # ctx.worker_text falls back to its lazy path -- which returns None for a
-        # failed read and is rendered UNKNOWN. Deliberately not cached as "" here:
-        # an empty string means "the box has a worker.sh and it is empty", which
-        # is a DIFFERENT and much louder finding than "I could not read it".
-        if r.ran and r.out:
-            ctx.preload_worker(cid, r.out)
-        # Caches its own failure as None; the check renders that UNKNOWN and names
-        # the generation, rather than calling it drift.
-        ctx.gen_worker_text(cid, gen)
+    ctx.attempt_factory = Attempt
+    ctx.attempts = attempts
+    for mod in ctx.modules:
+        try:
+            mod.preload(ctx)
+        except Exception:                          # noqa: BLE001 - isolated
+            ctx.module_errors[mod.id] = traceback.format_exc()
+            ctx.note("module %s failed to preload; its checks are UNKNOWN"
+                     % mod.id)
+            for target in mod.targets:
+                _attempt(attempts, target).note(False, "module preload failed")
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +233,7 @@ def record_attempts(conn, seq, attempts):
 # ---------------------------------------------------------------------------
 
 
-def class_ids(host):
+def class_ids(host, local_host=None):
     """Every incident class `host` can open, PRIMARY FIRST.
 
     The first element is the host's reachability row -- the one the dashboard
@@ -356,12 +241,12 @@ def class_ids(host):
     The rest are listed so that a stranded incident in another class can still be
     resolved by the same positive observation; see escalate().
     """
-    if host == LOCAL_HOST:
+    if local_host is not None and host == local_host:
         return (LOCAL_ID,)
     return (UNREACHABLE_ID, AUTH_ID, CONFIG_ID)
 
 
-def classify_failure(host, why):
+def classify_failure(host, why, local_host=None):
     """Which KIND of failure is this? The answer must not be "it is down" by
     default, because three of the four classes are not that.
 
@@ -381,7 +266,7 @@ def classify_failure(host, why):
         answer. Everything left over lands here, which is correct: it is the only
         class that means what its name says without further evidence.
     """
-    if host == LOCAL_HOST:
+    if local_host is not None and host == local_host:
         return LOCAL_ID
     low = (why or "").lower()
     if "no host entry" in low:
@@ -445,7 +330,7 @@ def _class_message(cid, host, why, cfg, pulls, n=1):
            why or "unknown"))
 
 
-def escalate(conn, seq, attempts, cfg):
+def escalate(conn, seq, attempts, cfg, local_host=None):
     """Turn a host's sustained silence into a visible verdict -- and back again.
 
     THE HALF THAT IS EASY TO FORGET: a recovered host must be reported OK, or the
@@ -464,7 +349,7 @@ def escalate(conn, seq, attempts, cfg):
     results = []
     for host in attempts:
         a = attempts[host]
-        ids = class_ids(host)
+        ids = class_ids(host, local_host)
 
         if a.ok:
             detail = ("collection from this host succeeded (%d pull(s) in %d ms)"
@@ -479,7 +364,7 @@ def escalate(conn, seq, attempts, cfg):
                                              evidence={"pulls": a.pulls}))
             continue
 
-        cid = classify_failure(host, a.why)
+        cid = classify_failure(host, a.why, local_host)
         n = _recent_fail_count(conn, host) or 1
         results.append(checks.fail(
             cid, host, _class_message(cid, host, a.why, cfg, a.pulls, n),
@@ -505,99 +390,39 @@ def _recent_fail_count(conn, host):
 
 
 # ---------------------------------------------------------------------------
-# Journal capture
-# ---------------------------------------------------------------------------
-
-
-def capture_journals(cfg, conn, seq):
-    """Pull every CuBox's journal and store it. Returns [(host, summary, gap)].
-
-    Only the CuBoxes: their journald is volatile RAM, so this table is the only
-    copy that will ever exist. The NAS boxes keep no journald, and QTS logs to its
-    own volume -- pulling there would collect a different thing under the same
-    name, which is worse than not collecting it.
-
-    A GAP IS ITS OWN FINDING and is surfaced separately from a failed pull,
-    because the two call for different responses: a failed pull means we are
-    blind NOW (and the escalation above already handles the host), while a gap
-    means the history we already hold has a hole in it and no amount of future
-    reachability fills it.
-    """
-    out = []
-    for cid in cfg.cubox_ids:
-        host = cfg.cubox_host(cid)
-        if host is None:
-            continue
-        jp = journal_mod.pull(host, conn, cfg.interval,
-                              timeout=cfg.ssh_timeout)
-        for cursor, ts, unit, prio, msg in jp.lines:
-            store.record_journal(conn, cid, cursor, ts, unit, prio, msg)
-        if jp.new_cursor:
-            journal_mod.set_cursor(conn, cid, jp.new_cursor)
-
-        if jp.gap:
-            res = checks.unknown(
-                "journal_gap", cid,
-                "THE JOURNAL RECORD FOR THIS BOX HAS A HOLE IN IT. %s"
-                % jp.gap,
-                subject="journal-gap",
-                evidence={"prev_last_ts": jp.prev_last_ts,
-                          "first_ts": jp.first_ts, "captured": len(jp.lines)})
-        elif not jp.ok:
-            res = checks.unknown(
-                "journal_capture", cid,
-                "the journal could not be captured: %s" % (jp.why or jp.transport),
-                subject="journal", evidence={"transport": jp.transport})
-        elif jp.gap_unassessable:
-            res = checks.unknown(
-                "journal_capture", cid,
-                "journal captured (%d line(s)) but contiguity could not be "
-                "assessed: %s" % (len(jp.lines), jp.gap_unassessable),
-                subject="journal")
-        else:
-            res = checks.ok(
-                "journal_capture", cid,
-                "captured %d line(s), contiguous with the stored history%s"
-                % (len(jp.lines),
-                   "" if not jp.bad_lines
-                   else " (%d unparseable line(s) skipped)" % jp.bad_lines),
-                subject="journal")
-            res.metric("journal_lines", len(jp.lines), "lines")
-        out.append((cid, jp.summary(), bool(jp.gap)))
-        store.record_check(conn, seq, cid, res.check_id, res.status, res.detail,
-                           jp.duration_ms)
-        store.sync_incident(conn, seq, cid, res.check_id, res.subject,
-                            res.status, res.detail, res.evidence)
-    return out
-
-
-# ---------------------------------------------------------------------------
 # The epoch
 # ---------------------------------------------------------------------------
+
+
+def _fleet_view(ctx):
+    """The fleet module's installed view, if it is loaded (else None).
+
+    The collector keeps the fleet's reachability escalation -- that is platform
+    behaviour -- and it needs the fleet's host list and the name of the host the
+    monitor runs on. Both are DATA the module installed; this function is the one
+    place the platform reads them.
+    """
+    return ctx.module_cfg.get("fleet")
 
 
 def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     """One epoch. Returns a summary dict for the CLI/self-test."""
     t0 = _now()
     seq = store.next_epoch_seq(conn)
-    specs = thresholds.load(cfg.checks_conf)
 
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
-                         check_classes=classes)
+    enabled = module_loader.discover_enabled(cfg)
+    specs = thresholds.load_many(
+        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
+    classes = checks.registry(
+        *[c for m in enabled for c in m.check_classes()])
+    ctx = checks.Context(cfg, specs, {}, docker=None, check_classes=classes,
+                         modules=enabled)
+    ctx.hosts_only = hosts_only
 
     attempts = {}
-    if hosts_only:
-        saved = cfg.cubox_ids
-        cfg.cubox_ids = tuple(x for x in saved if x in hosts_only)
-        try:
-            preload(cfg, ctx, conn, attempts)
-        finally:
-            cfg.cubox_ids = saved
-    else:
-        preload(cfg, ctx, conn, attempts)
+    preload_modules(cfg, ctx, attempts)
 
-    results = evaluate(classes, ctx, cfg.cubox_ids)
+    results = evaluate(classes, ctx, checks.expansion_targets(enabled))
 
     # THIS ORDER MATTERS. The attempt rows are written BEFORE the escalation
     # reads them, so "3 consecutive failed attempts" counts the attempt that just
@@ -608,16 +433,31 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     if not (dry_run or cfg.dry_run):
         record_attempts(conn, seq, attempts)
 
-    results += escalate(conn, seq, attempts, cfg)
+    fleet = _fleet_view(ctx)
+    results += escalate(conn, seq, attempts, cfg,
+                        getattr(fleet, "local_host", None))
 
     if not (dry_run or cfg.dry_run):
         errors = record(conn, seq, results)
     else:
         errors = 0
 
+    # The modules' post-record hooks run AFTER the evidence is durable. Each
+    # returns its own summary rows (fleet's is the journal capture), which the
+    # caller prints; a hook that raises is isolated like a preload failure.
     journals = []
     if not (dry_run or cfg.dry_run):
-        journals = capture_journals(cfg, conn, seq)
+        for mod in enabled:
+            try:
+                out = mod.after_epoch(ctx, conn, seq, dry_run)
+            except Exception:                      # noqa: BLE001 - isolated
+                ctx.module_errors[mod.id + ":after_epoch"] = \
+                    traceback.format_exc()
+                ctx.note("module %s failed after the epoch; its post-record "
+                         "work did not complete" % mod.id)
+                continue
+            if out:
+                journals.extend(out)
 
     # REMEDIES LAST, AND ONLY EVER AFTER THE EVIDENCE IS DURABLE. Both halves of
     # that are deliberate. The trigger evidence must be in the store before
@@ -722,7 +562,7 @@ def run_forever(cfg, conn, hosts_only=None, should_stop=None):
 
     Two loops is two places for the "a failing epoch must not kill the collector"
     rule to be forgotten, and this repo has already paid for that shape twice
-    (item 7: one home for the provisioning definition; `checks.all_modules`: one
+    (item 7: one home for the provisioning definition; module discovery: one
     home for the check list). So the loop lives here and the container entry
     point calls it rather than re-implementing it.
 
@@ -778,8 +618,11 @@ def main(argv=None):
 
     if args.showconf:
         print(cfg.describe())
-        specs = thresholds.load(cfg.checks_conf)
-        classes = checks.registry(*checks.all_modules())
+        enabled = module_loader.discover_enabled(cfg)
+        specs = thresholds.load_many(
+            {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
+        classes = checks.registry(
+            *[c for m in enabled for c in m.check_classes()])
         claimed, deferred, unclaimed = thresholds.audit(specs, classes)
         print("\nthresholds: %d declared, %d claimed, %d deferred, %d UNCLAIMED"
               % (len(specs), len(claimed), len(deferred), len(unclaimed)))

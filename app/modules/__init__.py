@@ -7,6 +7,7 @@ module one directory.
 """
 
 import importlib
+import os
 import pkgutil
 
 
@@ -57,3 +58,30 @@ def discover(package=__name__, path=None):
     if problems:
         raise ModuleError("; ".join(problems))
     return [found[k] for k in sorted(found, key=lambda x: (found[x].order, x))]
+
+
+def _package_path(module_id):
+    """The directory a module package lives in (for its threshold file)."""
+    return os.path.dirname(
+        importlib.import_module("%s.%s" % (__name__, module_id)).__file__)
+
+
+def discover_enabled(cfg):
+    """The enabled modules, in order, each carrying `_path`.
+
+    Selection is platform configuration: `SENTINEL_MODULES` (a comma-separated
+    id list) narrows the set, and `<ID>_ENABLED=0` disables one without editing
+    the selector. Both default to "all discovered" -- read via getattr so this
+    works while the Config fields are being introduced.
+    """
+    selected = tuple(x for x in getattr(cfg, "module_ids", ()) if x)
+    enabled_fn = getattr(cfg, "module_enabled", None)
+    out = []
+    for mod in discover():
+        mod._path = _package_path(mod.id)
+        if selected and mod.id not in selected:
+            continue
+        if enabled_fn is not None and not enabled_fn(mod.id):
+            continue
+        out.append(mod)
+    return out

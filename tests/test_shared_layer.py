@@ -38,11 +38,12 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import CHECKS_CONF, Results, read_fixture   # noqa: E402
+from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
+                    fleet_config, read_fixture)
 
 import checks                # noqa: E402
 import config as config_mod  # noqa: E402
-import parsers               # noqa: E402
+import modules.fleet.parsers as parsers            # noqa: E402
 import store                 # noqa: E402
 import thresholds            # noqa: E402
 
@@ -157,9 +158,11 @@ def _run(cfg, box, facts_text, backup_text, check_id, other=None, backup_ok=True
     opens a real ssh, and this suite promises no fleet access.
     """
     specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
+    classes = check_classes()
+    fleet = fleet_config(cfg)
+    ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,
                          check_classes=classes)
+    ctx.fleet = fleet
     if facts_text is not None:
         ctx.preload_facts(box, parsers.parse_facts(facts_text, transport_ok=True))
     if other is not None:
@@ -174,18 +177,18 @@ def _run(cfg, box, facts_text, backup_text, check_id, other=None, backup_ok=True
             backup_text,
             transport_ok=backup_ok,
             why="" if backup_ok else "simulated: no route to Backup-NAS"))
-    for chk in checks.expand(classes, cfg.cubox_ids):
+    for chk in checks.expand(classes, fleet.cubox_ids):
         # A `per_box` check expands once per box and is selected by its bound
         # target; a fleet check has one instance whose target is the literal
         # "fleet". Both are looked up through `expand` rather than instantiated
         # here, so a check that exists but is not in the registry fails rather
         # than passing -- a class nothing registers never runs, and the dashboard
-        # shows no row (checks.all_modules).
+        # shows no row (the fleet module's check list).
         if chk.id == check_id and chk.target in (box, "fleet"):
             return chk.timed(ctx)
     raise AssertionError("check %r is not registered for %r -- a check that "
                          "exists but is not in the registry never runs, and the "
-                         "dashboard shows no row (checks.all_modules)" % (check_id, box))
+                         "dashboard shows no row (the fleet module's check list)" % (check_id, box))
 
 
 def _box(box="cubox-1", **over):

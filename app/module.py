@@ -72,5 +72,7 @@ class Module:
         return list(self._advisors())
 
     def after_epoch(self, ctx, conn, seq, dry_run=False):
+        """Run the module's post-record hook and return its summary, if any."""
         if self._after_epoch is not None:
-            self._after_epoch(ctx, conn, seq, dry_run)
+            return self._after_epoch(ctx, conn, seq, dry_run)
+        return None

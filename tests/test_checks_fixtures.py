@@ -33,15 +33,16 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import CHECKS_CONF, Results, read_fixture   # noqa: E402
+from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
+                    fleet_config, read_fixture)
 
-import backupfacts           # noqa: E402
-import boxfacts              # noqa: E402
 import checks                # noqa: E402
 import config as config_mod  # noqa: E402
-import export as export_mod  # noqa: E402
-import journal as journal_mod  # noqa: E402
-import parsers               # noqa: E402
+import modules.fleet.backupfacts as backupfacts    # noqa: E402
+import modules.fleet.boxfacts as boxfacts          # noqa: E402
+import modules.fleet.export as export_mod          # noqa: E402
+import modules.fleet.journal as journal_mod        # noqa: E402
+import modules.fleet.parsers as parsers            # noqa: E402
 import probes                # noqa: E402
 import store                 # noqa: E402
 import thresholds            # noqa: E402
@@ -101,17 +102,6 @@ class _Res:
         return ""
 
 
-class Ctx:
-    """The minimum a pull()/Check needs, so the REAL parse path runs."""
-
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.hosts = cfg.hosts
-
-    def host(self, name):
-        return self.hosts.get(name)
-
-
 def _cfg(tmpdir):
     return config_mod.Config(env={
         "CUBOX_IDS": "cubox-1,cubox-2",
@@ -143,16 +133,18 @@ def _export(cfg, box, transform=None):
     saved = export_mod._run_script
     export_mod._run_script = lambda host, script, payload: _Res(text)
     try:
-        return export_mod.pull(Ctx(cfg), box)
+        return export_mod.pull(fleet_config(cfg), box)
     finally:
         export_mod._run_script = saved
 
 
 def _context(cfg, box, se, with_facts=True):
     specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
+    classes = check_classes()
+    fleet = fleet_config(cfg)
+    ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,
                          check_classes=classes)
+    ctx.fleet = fleet
     if with_facts:
         ctx.preload_facts(box, parsers.parse_facts(
             read_fixture("boxfacts-%s-%s.txt" % (box, CAPTURE)),
@@ -181,8 +173,8 @@ def _context(cfg, box, se, with_facts=True):
 def _run_box_checks(cfg, box, ctx):
     """Every registered check for one box. Returns [(check_id, result)]."""
     out = []
-    for chk in checks.expand(checks.registry(*checks.all_modules()),
-                             cfg.cubox_ids):
+    for chk in checks.expand(check_classes(),
+                             fleet_config(cfg).cubox_ids):
         if chk.target != box:
             continue
         out.append((chk.id, chk.timed(ctx)))
@@ -218,7 +210,8 @@ def test_no_suite_leaked_a_transport_stub(results):
         "silently PASS while doing so" % leaked)
     results.check(
         "the import-time capture is of the real functions",
-        _REAL_PULL.__module__ == "export" and _REAL_PULL.__name__ == "pull",
+        _REAL_PULL.__module__ == "modules.fleet.export"
+        and _REAL_PULL.__name__ == "pull",
         "captured %r from %r -- capture must happen before any suite's patch"
         % (_REAL_PULL.__name__, _REAL_PULL.__module__))
 
@@ -380,7 +373,7 @@ def test_idle_gate_has_both_halves(results):
     try:
         cfg = _cfg(tmpdir)
         box = "cubox-1"
-        cls = [c for c in checks.registry(*checks.all_modules())
+        cls = [c for c in check_classes()
                if c.__name__ == "PassCadence"][0]
 
         def verdict(transform, facts_from=None):
@@ -443,7 +436,7 @@ def test_a_deliberate_stop_is_not_a_stall(results):
     try:
         cfg = _cfg(tmpdir)
         box = "cubox-1"
-        cls = [c for c in checks.registry(*checks.all_modules())
+        cls = [c for c in check_classes()
                if c.__name__ == "PassCadence"][0]
 
         raw = read_fixture("boxfacts-%s-%s.txt" % (box, CAPTURE))
@@ -585,7 +578,7 @@ def test_registry_and_thresholds_agree(results):
     try:
         cfg = _cfg(tmpdir)
         specs = thresholds.load(cfg.checks_conf)
-        classes = checks.registry(*checks.all_modules())
+        classes = check_classes()
         claimed, deferred, unclaimed = thresholds.audit(specs, classes)
         results.check(
             "every threshold is either claimed by a check or declared deferred",
@@ -960,11 +953,13 @@ def _save_result(cfg, box, facts_text):
     stopped being registered for this box fails here rather than passing.
     """
     specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
+    classes = check_classes()
+    fleet = fleet_config(cfg)
+    ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,
                          check_classes=classes)
+    ctx.fleet = fleet
     ctx.preload_facts(box, parsers.parse_facts(facts_text, transport_ok=True))
-    for chk in checks.expand(classes, cfg.cubox_ids):
+    for chk in checks.expand(classes, fleet_config(cfg).cubox_ids):
         if chk.id == "state_save_age_min" and chk.target == box:
             return chk.timed(ctx)
     raise AssertionError("StateSaveRunning is not registered for %r -- the "
@@ -1181,7 +1176,7 @@ def _facts_from(raw, **over):
 
 
 def _verdict_of(cls_name, cfg, box, raw):
-    cls = [c for c in checks.registry(*checks.all_modules())
+    cls = [c for c in check_classes()
            if c.__name__ == cls_name][0]
     ctx = _context(cfg, box, _export(cfg, box))
     ctx.preload_facts(box, parsers.parse_facts(raw, transport_ok=True))

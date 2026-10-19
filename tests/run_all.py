@@ -2,7 +2,7 @@
 
 `test.sh` calls this and nothing else, so there is exactly one
 list of suites -- the same rule this repo applies to the provisioning definition
-(item 7) and to the check registry (`checks.all_modules`): a second list is a
+(item 7) and to the check registry (module discovery): a second list is a
 second thing to forget to update, and forgetting is not an error, so it fails
 silently.
 

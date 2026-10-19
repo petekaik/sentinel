@@ -46,6 +46,10 @@ class Config:
 
         # Store + server.
         self.db_path = _env("MONITOR_DB", "/data/monitor.sqlite", e)
+        # Where command resource locks live. A one-shot `--run` is a new
+        # process, so the locks are files (flock), not in-memory state; this
+        # directory must be writable by every process that dispatches.
+        self.lock_dir = _env("MONITOR_LOCK_DIR", "/tmp/sentinel-locks", e)
         self.checks_conf = _env("MONITOR_CHECKS", "/app/checks.conf", e)
         self.port = int(_env("MONITOR_PORT", "8787", e))
         self.interval = int(_env("MONITOR_INTERVAL", "60", e))

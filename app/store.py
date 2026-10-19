@@ -22,6 +22,7 @@ Python 3 stdlib only, deliberately: no pip dependencies to rot in an appliance
 that is expected to run unattended for months.
 """
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -276,6 +277,26 @@ CREATE TABLE IF NOT EXISTS collector_run (
     errors      INTEGER,
     note        TEXT
 );
+
+-- OPERATOR-COMMAND AUDIT. Commands are the only part of the platform that can
+-- change the fleet, so every invocation -- including a dry run and a handler
+-- that failed -- leaves a row saying who ran what, with which arguments, and
+-- what came back. `output_head` is bounded (2048 chars) because a command can
+-- print a lot; `output_sha` covers the FULL output, so two runs whose heads
+-- agree are still distinguishable.
+CREATE TABLE IF NOT EXISTS command_run (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,
+    module      TEXT NOT NULL,
+    command     TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    argv_json   TEXT NOT NULL,
+    dry_run     INTEGER NOT NULL,
+    exit_status INTEGER NOT NULL,
+    output_head TEXT,
+    output_sha  TEXT,
+    duration_ms INTEGER NOT NULL
+);
 """
 
 
@@ -422,6 +443,35 @@ def record_collector_run(conn, seq, duration_ms, checks_run, errors, note=None):
         "VALUES (?, ?, ?, ?, ?, ?)",
         (time.time(), seq, duration_ms, checks_run, errors, note),
     )
+
+
+# The head kept in the row. Long enough to see what a command said, short
+# enough that an operator command cannot make the store the biggest thing on
+# the NAS; the SHA-256 covers what was cut, so truncation is lossy on the text
+# and not on the identity of the output.
+COMMAND_OUTPUT_HEAD = 2048
+
+
+def record_command_run(conn, module, command, actor, argv, dry_run,
+                       exit_status, output="", duration_ms=0):
+    """One audit row per dispatch. `output` is the FULL text; the head is cut."""
+    output = output or ""
+    conn.execute(
+        "INSERT INTO command_run (ts, module, command, actor, argv_json, "
+        "dry_run, exit_status, output_head, output_sha, duration_ms) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (time.time(), module, command, actor,
+         json.dumps(argv, sort_keys=True, default=str),
+         1 if dry_run else 0, int(exit_status), output[:COMMAND_OUTPUT_HEAD],
+         hashlib.sha256(output.encode("utf-8", "replace")).hexdigest(),
+         duration_ms),
+    )
+
+
+def list_command_runs(conn, limit=50):
+    rows = conn.execute(
+        "SELECT * FROM command_run ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def record_remedy(conn, key, remedy, evidence, dry_run, exit_status,
@@ -797,7 +847,7 @@ def db_summary(conn):
     """
     out = {}
     for table in ("sample", "check_run", "collection_attempt", "incident",
-                  "journal", "remedy", "collector_run"):
+                  "journal", "remedy", "collector_run", "command_run"):
         try:
             out[table] = conn.execute(
                 "SELECT COUNT(*) AS n FROM %s" % table

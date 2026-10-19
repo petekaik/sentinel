@@ -22,6 +22,7 @@ from harness import Results                     # noqa: E402
 
 import test_checks_fixtures as fixture_tests    # noqa: E402
 import test_collect_offline as collect_tests    # noqa: E402
+import test_commands as command_tests           # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
 import test_incident_lifecycle as incident_tests  # noqa: E402
 import test_modules as module_tests                # noqa: E402
@@ -32,6 +33,9 @@ import test_shared_layer as shared_tests        # noqa: E402
 SUITES = (
     ("serial -- the CuBox console identity: chip serial, not a /dev/ttyUSB number",
      serial_tests.TESTS),
+    ("commands -- validation, refusal, cross-process resource locks and the "
+     "command audit",
+     command_tests.TESTS),
     ("modules -- discovery, validation, and the module contract",
      module_tests.TESTS),
     ("collect.py -- the collection loop, the escalation state machine, and "

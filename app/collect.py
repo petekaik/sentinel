@@ -44,6 +44,7 @@ import sys
 import time
 import traceback
 
+import advisors
 import checks
 import config as config_mod
 from module import owned_check_ids
@@ -440,6 +441,57 @@ def freeze_disabled_modules(conn, seq, enabled, all_modules=None):
                                   "module %r is disabled" % mod.id)
 
 
+def _advisor_selected(ids, module_id, advisor_id):
+    """A selector entry names an advisor bare (`reference`) or qualified."""
+    return advisor_id in ids or ("%s.%s" % (module_id, advisor_id)) in ids
+
+
+def run_advisors_for_epoch(cfg, conn, ctx):
+    """Run the selected advisors of the enabled modules. NEVER raises.
+
+    CALLED AFTER `record()`, BEFORE `record_collector_run()`. Evidence is
+    durable before an advisor reads it -- an advisor only ever adds rows -- and
+    running before the epoch row lets its wall clock count in the epoch's
+    `duration_ms` and its failure notes land in the epoch's note column. The
+    per-advisor overrun is also recorded on its own `advisor_run` row.
+
+    AN EMPTY SELECTOR RUNS NOTHING. Unlike `SENTINEL_MODULES`, an advisor costs
+    time every epoch, so it must be named to run.
+
+    Selection is isolated per module (`advisors()` is module code), and the
+    whole call is contained as well: the epoch must survive a module that
+    cannot even list its advisors.
+    """
+    ids = tuple(getattr(cfg, "advisor_ids", ()))
+    if not ids:
+        return []
+    try:
+        picked = []
+        for mod in ctx.modules:
+            try:
+                declared = mod.advisors()
+            except Exception:                      # noqa: BLE001 - isolated
+                ctx.module_errors[mod.id + ":advisors"] = \
+                    traceback.format_exc()
+                ctx.note("module %s failed to list advisors; none from it ran"
+                         % mod.id)
+                continue
+            for adv in declared:
+                if not _advisor_selected(ids, mod.id, adv.id):
+                    continue
+                if not getattr(adv, "module", ""):
+                    adv.module = mod.id
+                picked.append(adv)
+        return advisors.run_advisors(
+            picked, conn, ctx,
+            history_cap_days=getattr(cfg, "advisor_max_history_days", 30))
+    except Exception as exc:                       # noqa: BLE001 - isolated
+        lines = str(exc).splitlines()
+        ctx.note("advisors could not run: %s"
+                 % (lines[0] if lines else type(exc).__name__))
+        return []
+
+
 def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     """One epoch. Returns a summary dict for the CLI/self-test."""
     t0 = _now()
@@ -523,6 +575,17 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
             lines = str(exc).splitlines()
             ctx.note("healing failed: %s"
                      % (lines[0] if lines else type(exc).__name__))
+
+    # ADVISORS AFTER THE EVIDENCE, BEFORE THE EPOCH ROW. `record()` above has
+    # already made every sample, verdict and incident durable -- an advisor only
+    # ever reads evidence that is stored. Running before `record_collector_run`
+    # rather than after it buys two things: the advisor's wall clock counts in
+    # the epoch duration the staleness banner reads, and a selection failure's
+    # note lands in the epoch's note column. It cannot cost the epoch record
+    # (the runner never raises and selection is contained), and it never runs
+    # on a dry run, whose contract is "claims nothing".
+    if not (dry_run or cfg.dry_run):
+        run_advisors_for_epoch(cfg, conn, ctx)
 
     duration_ms = int((_now() - t0) * 1000)
     if not (dry_run or cfg.dry_run):

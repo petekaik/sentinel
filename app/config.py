@@ -89,6 +89,17 @@ class Config:
             x.strip() for x in _env("SENTINEL_MODULES", "", e).split(",")
             if x.strip())
 
+        # Advisor selection. `SENTINEL_ADVISORS` is a comma-separated list of
+        # `module.advisor` or bare `advisor` ids, and -- unlike the module
+        # selector -- EMPTY MEANS NONE: an advisor costs time in every epoch,
+        # so it runs only when it has been named. The history cap bounds what
+        # an advisor can ask the snapshot for.
+        self.advisor_ids = tuple(
+            x.strip() for x in _env("SENTINEL_ADVISORS", "", e).split(",")
+            if x.strip())
+        self.advisor_max_history_days = int(
+            _env("SENTINEL_ADVISOR_MAX_HISTORY_DAYS", "30", e))
+
     def module_enabled(self, module_id):
         return _bool("%s_ENABLED" % module_id.upper(), True, self.env)
 
@@ -138,4 +149,8 @@ class Config:
                      "one)" % self.ssh_timeout)
         lines.append("remedies           : %s"
                      % ("ENABLED" if self.remedies_enabled else "disabled"))
+        advisors = (", ".join(self.advisor_ids)
+                    + " (max %d days history)" % self.advisor_max_history_days
+                    if self.advisor_ids else "none")
+        lines.append("advisors           : %s" % advisors)
         return "\n".join(lines)

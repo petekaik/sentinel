@@ -56,8 +56,8 @@ SUITES = (
     ("checks/* -- the shared dynamic layer (T2): converging vs stuck, the "
      "subjects incidents resolve by, and worker_drift's box-side authority",
      shared_tests.TESTS),
-    ("advisors -- the read-only snapshot: honest history windows, bounded "
-     "reads, and no write path",
+    ("advisors -- the read-only snapshot (honest history windows, bounded "
+     "reads, no write path) and the bounded, isolated runner",
      advisor_tests.TESTS),
     ("proxy/ -- the publishing stack's access rules (offline, text-level)",
      proxy_tests.TESTS),

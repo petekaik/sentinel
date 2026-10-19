@@ -8,7 +8,10 @@ otherwise is the "measured nothing" failure this platform exists to prevent.
 """
 
 import time
+import traceback
 from dataclasses import dataclass, field
+
+import store
 
 DAY = 86400
 
@@ -52,6 +55,12 @@ class Snapshot:
         `check_run` holds nothing, never the number that was asked for.
         """
         self.requested_days = int(days)
+        if self._conn is None:
+            # The runner's no-store path (the isolation tests, and any caller
+            # that runs an advisor without a database). No store means no
+            # history to report -- 0.0, never the days requested.
+            self.available_days = 0.0
+            return self.now, 0.0
         row = self._conn.execute("SELECT MIN(ts) FROM check_run").fetchone()
         oldest = row[0] if row and row[0] is not None else self.now
         history = max(0.0, (self.now - oldest) / DAY)
@@ -134,3 +143,100 @@ class Snapshot:
 
     def settings(self, values):
         return dict(values)
+
+
+class Advisor:
+    """One advisor. Plain object, no constructor required.
+
+    `history_days` is the advisor's own request; the runner caps it with the
+    platform's `SENTINEL_ADVISOR_MAX_HISTORY_DAYS`. `module` is filled by the
+    collector when it selects the advisor from a module, so the run row can name
+    its owner; a platform or test advisor leaves it empty.
+    """
+
+    id = ""
+    title = ""
+    history_days = 7
+    module = ""
+
+    def advise(self, ctx, snapshot):
+        raise NotImplementedError
+
+
+def _record(conn, advisor_id, insight, snap):
+    """Store one insight with the window that actually produced it."""
+    evidence = insight.evidence if isinstance(insight.evidence, dict) else {}
+    # `setdefault`: an advisor that states its own window (Task 17's reference
+    # advisor does) keeps it. If it does not, the runner supplies the honest
+    # numbers rather than leaving the claim unattributable.
+    evidence.setdefault("window", {
+        "requested_days": snap.requested_days,
+        "available_days": snap.available_days})
+    if snap.truncated:
+        evidence.setdefault("truncated", dict(snap.truncated))
+    insight.evidence = evidence
+    if conn is not None:
+        store.record_insight(conn, advisor=advisor_id, **insight.__dict__)
+
+
+def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30):
+    """Run each advisor once, in order, bounded and isolated. NEVER raises.
+
+    ONE FRESH SNAPSHOT PER ADVISOR, so no advisor can see what another read,
+    and `history_days` is capped before the window is requested -- the cap is
+    the platform's, not the advisor's.
+
+    THE BUDGET IS MEASURED, NOT ENFORCED. The call is synchronous and there is
+    no preemption, so a run that exceeds `budget_ms` is recorded as over budget
+    AFTER it returns. That is deliberate: killing an advisor mid-read would
+    leave a half-written insight, and the epoch does not wait on it anyway.
+
+    AN EXCEPTION, A MALFORMED INSIGHT, OR AN OVERRUN IS RECORDED, NEVER
+    PROPAGATED. The epoch has already stored its evidence before this runs, and
+    an advisor must not be able to take that record down with it.
+    """
+    out = []
+    for adv in advisors:
+        t0 = time.time()
+        snap = Snapshot(conn)
+        status, detail = "ok", ""
+        try:
+            days = min(int(getattr(adv, "history_days", 7)),
+                       int(history_cap_days))
+            snap.window(days)
+            insights = adv.advise(ctx, snap) or []
+            detail = "%d insight(s), window %s/%s days" % (
+                len(insights), snap.available_days, snap.requested_days)
+            for insight in insights:
+                _record(conn, adv.id, insight, snap)
+        except Exception:                          # noqa: BLE001 - isolated
+            status, detail = "error", traceback.format_exc()
+
+        duration_ms = int((time.time() - t0) * 1000)
+        if status == "ok" and duration_ms > budget_ms:
+            status = "budget"
+            detail += " (budget exceeded: %dms > %dms)" % (duration_ms,
+                                                           budget_ms)
+        entry = {"advisor": getattr(adv, "id", ""),
+                 "module": getattr(adv, "module", ""),
+                 "ok": status != "error",
+                 "status": status,
+                 "detail": detail,
+                 "duration_ms": duration_ms,
+                 "requested_days": snap.requested_days,
+                 "available_days": snap.available_days}
+        out.append(entry)
+
+        if conn is not None:
+            try:
+                store.record_advisor_run(
+                    conn, advisor=entry["advisor"],
+                    module=entry["module"], status=status,
+                    duration_ms=duration_ms,
+                    window_requested_days=snap.requested_days,
+                    window_available_days=snap.available_days,
+                    detail=detail)
+            except Exception:                      # noqa: BLE001 - isolated
+                entry["detail"] += " (advisor_run record failed: %s)" % (
+                    traceback.format_exc().strip().replace("\n", " | ")[-300:])
+    return out

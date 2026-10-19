@@ -298,6 +298,22 @@ CREATE TABLE IF NOT EXISTS command_run (
     duration_ms INTEGER NOT NULL
 );
 
+-- ONE ROW PER ADVISOR PER EPOCH, ALWAYS -- the run that raised and the run
+-- that overran its budget included. A run with no row reads exactly like an
+-- advisor that was never configured, so the failures are the rows that matter.
+CREATE TABLE IF NOT EXISTS advisor_run (
+    id                    INTEGER PRIMARY KEY,
+    ts                    REAL    NOT NULL,
+    advisor               TEXT    NOT NULL,
+    module                TEXT    NOT NULL DEFAULT '',
+    status                TEXT    NOT NULL,
+    duration_ms           INTEGER NOT NULL,
+    window_requested_days INTEGER NOT NULL DEFAULT 0,
+    window_available_days REAL    NOT NULL DEFAULT 0.0,
+    detail                TEXT
+);
+CREATE INDEX IF NOT EXISTS advisor_run_advisor ON advisor_run (advisor, ts);
+
 -- ADVISOR OUTPUT IS ADDITIVE. An insight is a claim an advisor makes about the
 -- fleet; a proposal asks for a change. Neither is an incident (an insight has no
 -- state machine and no check can resolve it) and neither is a command (a
@@ -542,6 +558,31 @@ def list_remedies(conn, limit=20):
     rows = conn.execute(
         "SELECT * FROM remedy ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+ADVISOR_RUN_STATUSES = ("ok", "error", "budget")
+
+
+def record_advisor_run(conn, advisor, module, status, duration_ms,
+                       window_requested_days, window_available_days,
+                       detail=""):
+    """Store one advisor run, whatever its outcome.
+
+    An unknown status is REFUSED: a typo would otherwise be a row nobody can
+    query, and the dashboard would count the run under a status that does not
+    exist. `detail` carries the traceback on error and the overrun on budget.
+    """
+    if status not in ADVISOR_RUN_STATUSES:
+        raise ValueError("invalid advisor run status %r; expected one of %s"
+                         % (status, ", ".join(ADVISOR_RUN_STATUSES)))
+    cur = conn.execute(
+        "INSERT INTO advisor_run (ts, advisor, module, status, duration_ms, "
+        "window_requested_days, window_available_days, detail) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (time.time(), advisor, module, status, int(duration_ms),
+         int(window_requested_days), float(window_available_days), detail),
+    )
+    return cur.lastrowid
 
 
 # The insight columns this store can persist, named ONCE. `advisors.Insight`'s
@@ -1010,7 +1051,7 @@ def db_summary(conn):
     out = {}
     for table in ("sample", "check_run", "collection_attempt", "incident",
                   "journal", "remedy", "collector_run", "command_run",
-                  "insight", "proposal"):
+                  "advisor_run", "insight", "proposal"):
         try:
             out[table] = conn.execute(
                 "SELECT COUNT(*) AS n FROM %s" % table

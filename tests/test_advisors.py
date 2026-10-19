@@ -11,11 +11,14 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                       # noqa: E402
 
 import advisors                                   # noqa: E402
+import collect                                    # noqa: E402
+import config as config_mod                       # noqa: E402
 import store                                      # noqa: E402
 
 DAY = 86400
@@ -414,12 +417,213 @@ def test_the_schema_is_additive_and_idempotent(results):
             "still reads the store." % (summary,))
         results.check(
             "db_summary reports the new tables",
-            summary.get("insight") == 1 and summary.get("proposal") == 0,
+            summary.get("insight") == 1 and summary.get("proposal") == 0
+            and summary.get("advisor_run") == 0,
             "summary=%r. A table missing from the summary reads as empty on "
             "the dashboard, which is the false-green this function exists to "
             "prevent." % (summary,))
     finally:
         _close(tmp, conn)
+
+
+class _Boom(advisors.Advisor):
+    """Every call raises. The runner must contain it."""
+
+    id = "boom"
+    title = "Boom"
+    history_days = 1
+
+    def advise(self, ctx, snapshot):
+        raise RuntimeError("simulated")
+
+
+class _Good(advisors.Advisor):
+    """One insight, and it exercises the truncation signal."""
+
+    id = "good"
+    title = "Good"
+    history_days = 9
+
+    def advise(self, ctx, snapshot):
+        since, _available = snapshot.window(self.history_days)
+        snapshot.check_runs(since, 0)      # asks for zero rows -> truncated
+        return [advisors.Insight(module="fleet", kind="report",
+                                 title="seen", body="b")]
+
+
+def test_a_failing_advisor_is_isolated_and_recorded(results):
+    out = advisors.run_advisors([_Boom()], conn=None, ctx=None,
+                                budget_ms=50, history_cap_days=30)
+    results.check(
+        "an advisor exception is recorded and swallowed",
+        len(out) == 1 and not out[0]["ok"]
+        and out[0]["status"] == "error"
+        and "simulated" in out[0]["detail"],
+        "out=%r. An advisor that raises must not be able to reach the epoch; "
+        "the traceback belongs in its own run row." % (out,))
+
+    tmp, conn = _store()
+    try:
+        advisors.run_advisors([_Boom()], conn=conn, ctx=None,
+                              budget_ms=50, history_cap_days=30)
+        row = conn.execute("SELECT * FROM advisor_run").fetchone()
+        results.check(
+            "a raising advisor still leaves an error run row",
+            row is not None and row["status"] == "error"
+            and row["advisor"] == "boom" and "simulated" in (row["detail"] or ""),
+            "row=%r. A run that vanishes reads like a run that never happened."
+            % (row and dict(row),))
+    finally:
+        _close(tmp, conn)
+
+
+def test_insights_carry_the_window_and_each_run_is_recorded(results):
+    tmp, conn = _store()
+    try:
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)",
+            (time.time() - 2 * DAY, 1, "cubox-1", "c", "ok"))
+        out = advisors.run_advisors([_Good(), _Boom()], conn=conn, ctx=None,
+                                    budget_ms=50, history_cap_days=30)
+        rows = store.list_insights(conn)
+        evidence = json.loads(rows[0]["evidence_json"])
+        runs = {r["advisor"]: r for r in
+                conn.execute("SELECT * FROM advisor_run").fetchall()}
+        results.check(
+            "the insight records its advisor and the honest window",
+            len(rows) == 1 and rows[0]["advisor"] == "good"
+            and evidence["window"]["requested_days"] == 9
+            and 0 < evidence["window"]["available_days"] <= 2.0,
+            "rows=%r evidence=%r. The insight must say what window produced it, "
+            "and available must be the history that exists, never the request."
+            % (rows, evidence))
+        results.check(
+            "a truncated snapshot is recorded in the insight evidence",
+            evidence.get("truncated") == {"check_runs": True},
+            "evidence=%r. A capped read is indistinguishable from a short "
+            "window unless the truncation travels with the insight."
+            % (evidence,))
+        results.check(
+            "an ok run and an error run are both rows",
+            (runs["good"]["status"] == "ok"
+             and runs["good"]["window_requested_days"] == 9
+             and runs["boom"]["status"] == "error"),
+            "runs=%r out=%r" % ({k: dict(v) for k, v in runs.items()}, out))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_history_cap_is_applied_to_every_advisor(results):
+    tmp, conn = _store()
+    try:
+        class Long(advisors.Advisor):
+            id = "long"
+            history_days = 90
+
+            def advise(self, ctx, snapshot):
+                return []
+
+        advisors.run_advisors([Long(), _Good()], conn=conn, ctx=None,
+                              budget_ms=500, history_cap_days=30)
+        runs = {r["advisor"]: r for r in
+                conn.execute("SELECT * FROM advisor_run").fetchall()}
+        results.check(
+            "a 90-day advisor is capped to 30, and a 9-day one is not raised",
+            (runs["long"]["window_requested_days"] == 30
+             and runs["good"]["window_requested_days"] == 9),
+            "runs=%r. The cap bounds context; an advisor asking for more "
+            "history than the cap gets the cap, not the asking."
+            % ({k: dict(v) for k, v in runs.items()},))
+    finally:
+        _close(tmp, conn)
+
+
+class _FakeCtx:
+    def __init__(self, modules):
+        self.modules = modules
+        self.module_errors = {}
+        self.notes = []
+
+    def note(self, text):
+        self.notes.append(text)
+        return text
+
+
+class _FakeModule:
+    def __init__(self, module_id, advs):
+        self.id = module_id
+        self._advs = advs
+
+    def advisors(self):
+        return list(self._advs)
+
+
+def test_the_selector_gates_advisors_and_accepts_both_forms(results):
+    tmp, conn = _store()
+    try:
+        class Adv(_Good):
+            id = "adv"
+            history_days = 1
+
+            def advise(self, ctx, snapshot):
+                return []
+
+        ctx = _FakeCtx([_FakeModule("fleet", [Adv()])])
+        cfg = config_mod.Config(env={"SENTINEL_ADVISORS": ""})
+        results.check(
+            "an empty selector parses to no advisors and runs none",
+            cfg.advisor_ids == ()
+            and collect.run_advisors_for_epoch(cfg, conn, ctx) == []
+            and conn.execute("SELECT COUNT(*) AS n FROM advisor_run")
+            .fetchone()["n"] == 0,
+            "ids=%r notes=%r. Empty means none; an advisor running unasked is "
+            "work nobody configured." % (cfg.advisor_ids, ctx.notes))
+
+        for selector in ("adv", "fleet.adv"):
+            cfg.advisor_ids = (selector,)
+            out = collect.run_advisors_for_epoch(cfg, conn, ctx)
+            results.check(
+                "the selector %r names the advisor" % selector,
+                len(out) == 1 and out[0]["advisor"] == "adv"
+                and out[0]["module"] == "fleet",
+                "out=%r. A selector must accept a bare id and module.advisor, "
+                "and the run row needs the owning module." % (out,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_raising_advisor_cannot_lose_the_epoch_record(results):
+    import shutil
+    import tempfile
+    import modules as loader
+    import test_collect_offline as collect_tests
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with collect_tests.Fleet(tmpdir) as f:
+            fleet_mod = [m for m in loader.discover() if m.id == "fleet"][0]
+            saved = fleet_mod._advisors
+            fleet_mod._advisors = lambda: [_Boom()]
+            old_ids = f.cfg.advisor_ids
+            f.cfg.advisor_ids = ("boom",)
+            try:
+                out = collect.collect_once(f.cfg, f.conn)
+            finally:
+                fleet_mod._advisors = saved
+                f.cfg.advisor_ids = old_ids
+            row = store.last_collection(f.conn)
+            runs = f.conn.execute("SELECT * FROM advisor_run").fetchall()
+            results.check(
+                "an advisor failure is contained and the epoch record survives",
+                row is not None and row["epoch_seq"] == out["seq"]
+                and len(runs) == 1 and runs[0]["status"] == "error"
+                and "simulated" in (runs[0]["detail"] or ""),
+                "epoch=%r runs=%r. The epoch is the dashboard's proof the "
+                "monitor is alive; an advisor must never be able to erase it."
+                % (row and dict(row), [dict(r) for r in runs]))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 TESTS = (test_requested_window_is_reported_against_what_exists,
@@ -434,7 +638,12 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_insight_defaults_match_the_spec,
          test_insights_and_proposals_are_stored_and_listed,
          test_insight_and_proposal_lists_filter_and_order,
-         test_the_schema_is_additive_and_idempotent)
+         test_the_schema_is_additive_and_idempotent,
+         test_a_failing_advisor_is_isolated_and_recorded,
+         test_insights_carry_the_window_and_each_run_is_recorded,
+         test_the_history_cap_is_applied_to_every_advisor,
+         test_the_selector_gates_advisors_and_accepts_both_forms,
+         test_a_raising_advisor_cannot_lose_the_epoch_record)
 
 
 def main():

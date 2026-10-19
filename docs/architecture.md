@@ -453,10 +453,76 @@ curl -s http://198.51.100.11:8787/api/status.json | python3 -c \
 
 ---
 
+## Modules — the contract, and where the CuBoxes went
+
+Every target family is a **module**: one package under `app/modules/`, discovered
+at startup, declaring `MODULE = Module(...)`. There is no hand-maintained list to
+forget and no way to fail quietly. A package that raises on import, has no
+`MODULE`, whose `id` disagrees with its directory name, or whose `id` duplicates
+another is a **startup error** (`modules.ModuleError`) — a module that does not
+load is a set of checks that never run, and the dashboard would show no row
+about it.
+
+`Module` members are declarations, not implementations:
+
+| Member | Meaning |
+|---|---|
+| `id` | the package name; discovery refuses a mismatch |
+| `title`, `order` | dashboard label and load order |
+| `targets` | the full reporting vocabulary (box ids, host names, `fleet`) |
+| `settings` | `Setting(key, default, kind)` tuples; the platform resolves env > default, typed, via `Context.settings(id)` |
+| `threshold_file` | the module's own threshold file, found beside the package |
+| `checks` | the module's check modules; a `per_box = True` check expands once per box |
+| `context` | config-only hook, **no I/O**, installed before every preload |
+| `preload` | **all** remote/local I/O, once per epoch, under the module's own timeout |
+| `after_epoch` | post-record hook, run after the evidence is durable |
+| `extra_check_ids` | incident ids the collector emits for this module and no `Check` class owns |
+| `commands`, `actions`, `advisors` | declared surfaces; all three default to empty, so a module that offers none says nothing |
+
+**Settings and thresholds belong to the module.** `app/config.py` holds only what
+every deployment shares; addresses, paths and box ids live in
+`modules/<id>/settings.py`, and every number lives in `modules/<id>/thresholds.conf`
+as data. A spec id claimed by two modules is a startup error. Ownership of
+collector-emitted rows is by **check id**, declared through `extra_check_ids`,
+never by target: two modules can share a reporting target, so a target set
+cannot say whose incident a row is.
+
+**Selection is platform configuration.** `SENTINEL_MODULES=id[,id]` narrows the
+set and `<ID>_ENABLED=0` disables one; both default to every discovered module.
+A selector naming an unknown id is a startup error — silently ignoring it would
+disable everything and read as a healthy fleet. A disabled module's incidents
+are **frozen every epoch**, never resolved, and its checks simply do not run.
+`checks.platform_modules()` returns the platform's own checks
+(`spec_coverage`, `modules_enabled`); no module may declare them, and they keep
+running when every module is disabled, so an empty fleet cannot read green.
+
+**The platform never imports a specific module.** `import modules` (the loader),
+`from modules import discover`, and `modules.discover` / `modules.discover_enabled`
+are the only allowed forms; anything under `app/` outside `app/modules/` that
+imports `modules.<id>` is a boundary break. That direction is what makes a
+module removable, and
+`tests/test_modules.py::test_platform_files_do_not_import_a_specific_module`
+enforces it (the test also grades its own detector). The other direction — the
+checks a module declares actually running, unchanged — is pinned by
+`python3 tools/parity.py --check tests/fixtures/parity-baseline.json`.
+
+**The three CuBox-shaped holes that used to live in `collect.py` are closed.**
+`preload()` no longer hardcodes host kinds and their pull order, because each
+module declares its own `preload`; there is no `LOCAL_HOST = "storage"` literal
+in the platform, because the module installs `local_host` in its context view and
+`escalate()` reads it from there; and the worker-text pull and journal capture
+are fleet code in `modules/fleet/preload.py`, not special cases inside the
+generic epoch. The collector now knows `Attempt`, the epoch phases and the
+`preload_*` installers, and nothing about a CuBox. The fleet itself is
+`app/modules/fleet/`: checks, its own parsers, settings, export, journal capture,
+the two shell probes and its `thresholds.conf`.
+
+---
+
 ## The checks
 
-67 check instances: 23 per CuBox, 10 on Backup-NAS, 8 on Storage-NAS/TVH/DVB,
-3 fleet-level — plus the rows the collector emits itself (`host_unreachable`,
+75 check instances: 26 per CuBox, 10 on Backup-NAS, 9 on Storage-NAS/TVH/DVB,
+4 fleet-level — plus the rows the collector emits itself (`host_unreachable`,
 `host_auth_failed`, `journal_capture`, `monitor_local_access`), which **no `Check`
 class owns** and which the renderer must therefore never derive from the registry
 alone. *"We cannot see cubox-1"* is exactly the row an operator must never lose
@@ -468,9 +534,12 @@ a doc is a count that is wrong:
 
 ```bash
 cd app && python3 -c \
-  "import checks,collections; print(collections.Counter(
-     x.target for x in checks.expand(checks.registry(*checks.all_modules()),
-     ['cubox-1','cubox-2'])))"
+  "import config, checks, collections, modules
+   m = modules.discover_enabled(config.Config())
+   classes = checks.registry(*([c for mod in m for c in mod.check_classes()]
+                               + list(checks.platform_modules())))
+   print(collections.Counter(x.target for x in checks.expand(
+       classes, checks.expansion_targets(m))))"
 ```
 
 ### CuBoxes
@@ -975,15 +1044,16 @@ that dies with `exec format error`. And a plain deploy never touches Backup-NAS 
 host's credentials is how a surprise gets introduced.
 
 Configuration is environment variables in the **monitor directory on
-Storage-NAS** — `/share/CACHEDEV1_DATA/Programs/sentinel/.env`, mode 600 —
+Storage-NAS** — `/share/CACHEDEV1_DATA/Programs/sentinel/.env`, mode 600 —  <!-- secretscan:ignore (deployment path, documented; no credential) -->
 not in the repo. It is created once from `.env.example` and is
 then **excluded from every deploy** (`deploy.sh` skips `.env` in the
 rsync and only writes it when it is ABSENT on the NAS). So editing the repo's
 copy, or the `.env.example` template, changes nothing on a running monitor and
 says nothing about it — the NAS file wins. That is items 79/83's shape: the live
 copy is authoritative and the checked-in file is a template. Thresholds are **data** in
-`checks.conf` — editing it and restarting the container changes the RAG
-boundaries, with no rebuild. That is the same contract the transcode worker has
+the module's own `thresholds.conf` (and, for platform/meta specs, `checks.conf`) —
+editing them and restarting the container changes the RAG boundaries, with no
+rebuild. That is the same contract the transcode worker has
 with `/mnt/state/transcode/config`, and it is deliberate.
 
 The two knobs that matter most:

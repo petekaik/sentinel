@@ -334,27 +334,57 @@ def test_unpreloaded_facts_are_unavailable_never_empty(results):
         "differently by the checks" % (ctx.backup_facts(),))
 
 
+# THE LOADER'S OWN API, and the only names a platform file may reach through
+# `modules.`. `discover`/`discover_enabled` are functions on the loader package,
+# not module directories; `from modules import discover` has no `modules.` prefix
+# at all, which is why it never needed an entry here.
+_LOADER_API = frozenset(("discover", "discover_enabled", "ModuleError"))
+
+
+def _specific_module_imports(text):
+    """(line number, line) for every import that reaches a module by name."""
+    import re
+    hits = []
+    for n, line in enumerate(text.splitlines(), 1):
+        m = re.match(r"\s*(?:import|from)\s+modules\.([A-Za-z_]\w*)", line)
+        if m and m.group(1) not in _LOADER_API:
+            hits.append((n, line.strip()))
+    return hits
+
+
 def test_platform_files_do_not_import_a_specific_module(results):
     """The direction of dependency: platform -> loader, never platform -> module."""
-    import re
+    app = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app")
     bad = []
-    for root, _dirs, files in os.walk(os.path.join(os.path.dirname(
-            os.path.abspath(__file__)), "..", "app")):
-        if os.sep + "modules" + os.sep in root + os.sep:
-            continue                     # a module may import its own pieces
+    for root, dirs, files in os.walk(app):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        rel = os.path.relpath(root, app)
+        if rel == "modules" or rel.startswith("modules" + os.sep):
+            continue                     # the loader and a module's own pieces
         for name in files:
             if not name.endswith(".py"):
                 continue
             path = os.path.join(root, name)
             with open(path) as fh:
-                for n, line in enumerate(fh, 1):
-                    if re.match(r"\s*(import|from)\s+modules\.[a-z_]", line):
-                        bad.append("%s:%d %s" % (path, n, line.strip()))
+                for n, line in _specific_module_imports(fh.read()):
+                    bad.append("%s:%d %s" % (path, n, line))
+    # THE DETECTOR IS GRADED TOO. A scan with a broken pattern reports a clean
+    # tree forever, which is the exact shape of every gate this repo has had to
+    # repair (item 45): the check must be shown able to fail, and shown not to
+    # fail on the loader.
+    planted = _specific_module_imports(
+        "import modules\n"
+        "from modules import discover\n"
+        "import modules.discover\n"
+        "from modules.fleet.settings import FleetConfig\n")
     results.check(
-        "no platform file imports modules.<id>",
-        bad == [],
-        "specific-module imports in platform code: %s -- the boundary is what "
-        "makes a module removable; break it and the loader is theatre" % bad)
+        "no platform file imports modules.<id>, and the detector can see one",
+        [n for n, _ in planted] == [4] and bad == [],
+        "detector returned %r (it must allow `import modules`, "
+        "`from modules import discover` and `modules.discover`, and flag a real "
+        "module import); specific-module imports in platform code: %s -- the "
+        "boundary is what makes a module removable; break it and the loader is "
+        "theatre" % (planted, bad))
 
 
 def test_module_selection_reads_the_env(results):

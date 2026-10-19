@@ -60,6 +60,17 @@ def test_requested_window_is_reported_against_what_exists(results):
         s.requested_days == 30, "requested=%r" % s.requested_days)
 
 
+def test_a_request_shorter_than_history_is_the_request(results):
+    now = 1_800_000_000
+    s = advisors.Snapshot(_Conn(now - 30 * DAY), now)
+    since, available = s.window(7)
+    results.check(
+        "a 7-day request over 30 days of history reports 7",
+        available == 7.0 and since == now - 7 * DAY,
+        "available=%r since=%r. Without this case `min` is a no-op and "
+        "nothing proves the requested cap is applied." % (available, since))
+
+
 def test_an_empty_store_reports_no_history(results):
     tmp, conn = _store()
     try:
@@ -116,6 +127,18 @@ def test_logs_are_bounded_by_bytes_and_rows(results):
         results.check(
             "an explicit limit narrows below the row cap, newest kept",
             got == ["b" * 6, "c" * 6], "got %r" % (got,))
+
+        for i in range(3):
+            conn.execute("INSERT INTO journal (host, ts, message) VALUES (?,?,?)",
+                         ("cubox-1", now + i, "é" * 10))
+        s = advisors.Snapshot(conn, now, caps={"rows": 5000, "log_bytes": 40})
+        got = s.logs("cubox-1", now - 1000)
+        results.check(
+            "the byte budget counts UTF-8 bytes, not characters",
+            len(got) == 2 and all(len(x) == 10 for x in got)
+            and s.truncated.get("logs") is True,
+            "got %r. Each message is 10 chars / 20 bytes; a 40-byte budget "
+            "admits two, while a character count would admit four." % (got,))
     finally:
         _close(tmp, conn)
 
@@ -145,10 +168,59 @@ def test_every_read_is_bounded_by_the_row_cap(results):
             "got %r/%r/%r" % (len(s.check_runs(since)), len(s.samples(since)),
                               len(s.incidents(since))))
         results.check(
+            "the cap keeps the NEWEST rows, returned chronologically",
+            ([r["check_id"] for r in s.check_runs(since)] == ["c3", "c4"]
+             and [r["metric"] for r in s.samples(since)] == ["m", "m"]
+             and [r["key"] for r in s.incidents(since)] == ["k3", "k4"]),
+            "check_runs=%r incidents=%r. Ordering oldest-first hands an "
+            "advisor the first hours of a 30-day window and calls it the window."
+            % ([r["check_id"] for r in s.check_runs(since)],
+               [r["key"] for r in s.incidents(since)]))
+        results.check(
+            "a capped read reports its truncation",
+            (s.truncated.get("check_runs") is True
+             and s.truncated.get("samples") is True
+             and s.truncated.get("incidents") is True),
+            "truncated=%r. A capped slice that cannot be told from a short "
+            "window is measured nothing." % (s.truncated,))
+        fresh = advisors.Snapshot(conn, now, caps={"rows": 100,
+                                                   "log_bytes": 200000})
+        fresh.check_runs(since)
+        fresh.samples(since)
+        fresh.incidents(since)
+        results.check(
+            "an uncapped read reports no truncation",
+            fresh.truncated == {}, "truncated=%r" % (fresh.truncated,))
+        results.check(
             "the default row cap is 5000",
             advisors.Snapshot(conn, now).caps == {"rows": 5000,
                                                   "log_bytes": 200000},
             "caps=%r" % (advisors.Snapshot(conn, now).caps,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_second_positional_is_a_limit_not_a_target(results):
+    tmp, conn = _store()
+    try:
+        now = 1_800_000_000
+        for i, target in enumerate(("cubox-1", "cubox-2")):
+            conn.execute(
+                "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+                "VALUES (?,?,?,?,?)", (now - 10 + i, i, target, "c%d" % i, "ok"))
+            conn.execute(
+                "INSERT INTO sample (ts, epoch_seq, target, metric, value) "
+                "VALUES (?,?,?,?,?)", (now - 10 + i, i, target, "m", 1.0))
+        s = advisors.Snapshot(conn, now)
+        runs = s.check_runs(now - 1000, 100)
+        samples = s.samples(now - 1000, 100)
+        results.check(
+            "check_runs(since, 100) and samples(since, 100) read 100 as a limit",
+            (sorted(r["target"] for r in runs) == ["cubox-1", "cubox-2"]
+             and sorted(r["target"] for r in samples)
+             == ["cubox-1", "cubox-2"]),
+            "runs=%r samples=%r. A positional limit read as a target silently "
+            "filters on 100 and returns empty." % (runs, samples))
     finally:
         _close(tmp, conn)
 
@@ -158,7 +230,7 @@ def test_the_snapshot_offers_no_write_path(results):
     public = {n for n in dir(s) if not n.startswith("_")}
     allowed = {"check_runs", "samples", "incidents", "logs", "thresholds",
                "settings", "window", "requested_days", "available_days",
-               "now", "caps"}
+               "now", "caps", "truncated"}
     results.check(
         "only the read API is public on a snapshot",
         public <= allowed, "unexpected public names: %r" % sorted(public - allowed))
@@ -195,10 +267,12 @@ def test_insight_defaults_match_the_spec(results):
 
 
 TESTS = (test_requested_window_is_reported_against_what_exists,
+         test_a_request_shorter_than_history_is_the_request,
          test_an_empty_store_reports_no_history,
          test_logs_use_the_real_journal_columns,
          test_logs_are_bounded_by_bytes_and_rows,
          test_every_read_is_bounded_by_the_row_cap,
+         test_the_second_positional_is_a_limit_not_a_target,
          test_the_snapshot_offers_no_write_path,
          test_thresholds_and_settings_are_copies,
          test_insight_defaults_match_the_spec)

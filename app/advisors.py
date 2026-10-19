@@ -39,6 +39,11 @@ class Snapshot:
         self.caps = {"rows": 5000, "log_bytes": 200000}
         if caps:
             self.caps.update(caps)
+        # Read name -> True when that read hit a cap and returned LESS than the
+        # store holds. Without it a capped read is indistinguishable from a
+        # short window: `available_days` would claim the whole span while the
+        # advisor reasons over one truncated slice.
+        self.truncated = {}
 
     def window(self, days):
         """(since_ts, available_days) for a `days` request.
@@ -54,32 +59,53 @@ class Snapshot:
         since = max(oldest, self.now - days * DAY)
         return since, self.available_days
 
-    def _rows(self, sql, params=(), limit=None):
-        n = self.caps["rows"] if limit is None else min(int(limit),
-                                                        self.caps["rows"])
-        return self._conn.execute(sql + " LIMIT ?",
-                                  tuple(params) + (n,)).fetchall()
+    def _rows(self, name, sql, params=(), limit=None):
+        """Fetch at most `limit` (capped) rows, recording a truncation.
 
-    def check_runs(self, since, target=None, limit=None):
+        One extra row is requested so hitting the cap can be TOLD apart from a
+        result that happened to be exactly cap-sized.
+        """
+        cap = self.caps["rows"]
+        n = cap if limit is None else min(int(limit), cap)
+        rows = self._conn.execute(sql + " LIMIT ?",
+                                  tuple(params) + (n + 1,)).fetchall()
+        if len(rows) > n:
+            self.truncated[name] = True
+            rows = rows[:n]
+        return rows
+
+    def check_runs(self, since, limit=None, target=None):
+        """Newest-first selection, returned chronological.
+
+        `limit` stays the SECOND positional: a caller written to spec §7
+        (`check_runs(since, 100)`) must not silently turn 100 into a target and
+        get an empty result -- the silent-empty failure class.
+        """
         sql = "SELECT * FROM check_run WHERE ts >= ?"
         p = [since]
         if target:
             sql += " AND target = ?"
             p.append(target)
-        return [dict(r) for r in self._rows(sql + " ORDER BY ts", p, limit)]
+        rows = self._rows("check_runs", sql + " ORDER BY ts DESC, id DESC",
+                          p, limit)
+        return [dict(r) for r in reversed(rows)]
 
-    def samples(self, since, target=None, limit=None):
+    def samples(self, since, limit=None, target=None):
         sql = "SELECT * FROM sample WHERE ts >= ?"
         p = [since]
         if target:
             sql += " AND target = ?"
             p.append(target)
-        return [dict(r) for r in self._rows(sql + " ORDER BY ts", p, limit)]
+        rows = self._rows("samples", sql + " ORDER BY ts DESC, id DESC",
+                          p, limit)
+        return [dict(r) for r in reversed(rows)]
 
     def incidents(self, since, limit=None):
-        return [dict(r) for r in self._rows(
-            "SELECT * FROM incident WHERE first_seen >= ? ORDER BY first_seen",
-            (since,), limit)]
+        rows = self._rows(
+            "incidents",
+            "SELECT * FROM incident WHERE first_seen >= ? "
+            "ORDER BY first_seen DESC, id DESC", (since,), limit)
+        return [dict(r) for r in reversed(rows)]
 
     def logs(self, target, since, limit=None):
         """Journal lines for one host, oldest first, bounded by `log_bytes`.
@@ -90,15 +116,17 @@ class Snapshot:
         context, then the result is returned in chronological order.
         """
         rows = self._rows(
-            "SELECT message FROM journal WHERE host = ? AND ts >= ? "
+            "logs", "SELECT message FROM journal WHERE host = ? AND ts >= ? "
             "ORDER BY id DESC", (target, since), limit)
         out, used = [], 0
         for r in rows:
             line = r[0] or ""
-            if used + len(line) > self.caps["log_bytes"]:
+            size = len(line.encode("utf-8"))      # the cap is BYTES, not chars
+            if used + size > self.caps["log_bytes"]:
+                self.truncated["logs"] = True
                 break
             out.append(line)
-            used += len(line)
+            used += size
         return list(reversed(out))
 
     def thresholds(self, specs):

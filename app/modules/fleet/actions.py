@@ -54,6 +54,13 @@ def _state_mount_cycle(ctx, incident, dry_run):
     `cubox-state` unit silently stops (a false ConditionPathIsMountPoint is not
     a failure). The umount is best-effort because the mount may be wedged; a
     lazy umount still frees the mount point for the fresh one.
+
+    THE RESTART IS PART OF THE REPAIR, not a separate action. The worker fixes
+    STATE_DIR from the mount at process start, so a remount alone leaves it
+    holding the old export's handles -- the incident stays open and this
+    action burns its attempt budget. `&&` makes the restart conditional on the
+    mount succeeding, and the whole sequence is one ssh command, whose exit
+    status is the last step's.
     """
     host, box, why = _target(ctx, incident)
     if host is None:
@@ -62,8 +69,8 @@ def _state_mount_cycle(ctx, incident, dry_run):
     if backup is None:
         return actions.Result(False, "no backup host configured")
     cmd = ("umount /mnt/state || umount -l /mnt/state; "  # secretscan:ignore (fleet mount point)
-           "mount -t nfs -o nolock,nfsvers=3 %s:/cubpxe/state/%s /mnt/state"  # secretscan:ignore (fleet design paths)
-           % (backup.address, box))
+           "mount -t nfs -o nolock,nfsvers=3 %s:/cubpxe/state/%s /mnt/state "  # secretscan:ignore (fleet design paths)
+           "&& systemctl restart cubox-transcode" % (backup.address, box))
     if dry_run:
         return actions.Result(True, "would cycle the state mount on %s" % box,
                               cmd)

@@ -950,18 +950,45 @@ def test_fleet_action_dry_runs_do_not_ssh(results):
 
 
 def test_fleet_action_commands_are_the_documented_repairs(results):
+    import probes as probes_mod
     from modules.fleet import actions as fleet_actions
     ctx = _fleet_ctx()
     declared = {a.id: a for a in fleet_actions.actions_list()}
     backup = ctx.fleet.hosts["backup"].address
-    res = declared["state_mount_cycle"].dry_run(
-        ctx, _incident(declared["state_mount_cycle"]))
+    action = declared["state_mount_cycle"]
     expected = ("umount /mnt/state || umount -l /mnt/state; "
                 "mount -t nfs -o nolock,nfsvers=3 "
-                "%s:/cubpxe/state/cubox-1 /mnt/state" % backup)
+                "%s:/cubpxe/state/cubox-1 /mnt/state "
+                "&& systemctl restart cubox-transcode" % backup)
+    res = action.dry_run(ctx, _incident(action))
     results.check(
         "the state mount cycle returns the fleet's documented repair verbatim",
         res.ok and res.output == expected, "output=%r" % (res.output,))
+    results.check(
+        "a dry run shows BOTH steps -- the remount and the worker restart -- "
+        "without executing either (the harness's ssh raises if called here)",
+        "umount /mnt/state" in res.output
+        and "systemctl restart cubox-transcode" in res.output,
+        "output=%r" % (res.output,))
+
+    calls = []
+    orig = probes_mod.ssh
+    probes_mod.ssh = lambda host, cmd, *a, **k: (calls.append(cmd)
+                                                 or probes_mod.RemoteResult(
+                                                     probes_mod.Transport.RAN,
+                                                     rc=0))
+    try:
+        action.run(ctx, _incident(action))
+    finally:
+        probes_mod.ssh = orig
+    results.check(
+        "the EXECUTED state mount cycle does both steps in one command -- a "
+        "remount alone leaves the worker holding the old export's handles, so "
+        "its incident could never clear",
+        len(calls) == 1 and "mount -t nfs" in calls[0]
+        and "systemctl restart cubox-transcode" in calls[0],
+        "calls=%r" % (calls,))
+
     res = declared["transcode_restart"].dry_run(
         ctx, _incident(declared["transcode_restart"]))
     results.check("the transcode restart returns the systemctl command",
@@ -980,13 +1007,27 @@ def test_fleet_actions_refuse_a_target_that_is_not_a_box(results):
                 % (a.id, target),
                 not res.ok and "CuBox" in res.detail, "detail=%r" % (res.detail,))
 
+    # The RUN path refuses at the same gate, before any ssh. The harness's
+    # probes.ssh raises if called, so a dry/run divergence aborts the suite.
+    for a in fleet_actions.actions_list():
+        for target in ("backup", "cubox-9", None):
+            res = a.run(ctx, _incident(a, target))
+            results.check(
+                "%s's RUN refuses target %r too, before any ssh"
+                % (a.id, target),
+                not res.ok and "CuBox" in res.detail,
+                "detail=%r" % (res.detail,))
+
     # In cubox_ids but with no host entry: refusing beats a KeyError.
     ctx = _fleet_ctx(env={"CUBOX_IDS": "cubox-1,cubox-2,cubox-9"})
     for a in fleet_actions.actions_list():
-        res = a.dry_run(ctx, _incident(a, "cubox-9"))
-        results.check(
-            "%s refuses a configured box that has no host entry" % a.id,
-            not res.ok and "no host" in res.detail, "detail=%r" % (res.detail,))
+        for path in (a.dry_run, a.run):
+            res = path(ctx, _incident(a, "cubox-9"))
+            results.check(
+                "%s refuses a configured box that has no host entry (%s)"
+                % (a.id, "run" if path is a.run else "dry run"),
+                not res.ok and "no host" in res.detail,
+                "detail=%r" % (res.detail,))
 
 
 TESTS = (test_off_by_default,

@@ -6,6 +6,7 @@ that EXISTS (never the number requested), every read is bounded by row and byte
 caps, and no write path -- or raw connection -- is reachable from a snapshot.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -270,9 +271,10 @@ def test_insight_defaults_match_the_spec(results):
 def test_insights_and_proposals_are_stored_and_listed(results):
     tmp, conn = _store()
     try:
-        iid = store.record_insight(conn, module="fleet", kind="anomaly",
-                                   title="drift", body="x", severity="notable",
-                                   confidence=0.7, evidence={}, expires_at=0)
+        iid = store.record_insight(
+            conn, advisor="fleet-anomaly", module="fleet", kind="anomaly",
+            title="drift", body="x", severity="notable", confidence=0.7,
+            evidence={"available_days": 4}, expires_at=0)
         pid = store.record_proposal(conn, module="fleet", kind="action",
                                     payload={"action": "transcode_restart"},
                                     rationale="stall", expires_at=0)
@@ -281,6 +283,41 @@ def test_insights_and_proposals_are_stored_and_listed(results):
             iid and pid and len(store.list_insights(conn)) == 1
             and len(store.list_proposals(conn, state="pending")) == 1,
             "iid=%r pid=%r" % (iid, pid))
+        irow = store.list_insights(conn)[0]
+        prow = store.list_proposals(conn)[0]
+        results.check(
+            "evidence and payload are JSON, and the advisor is stored",
+            json.loads(irow["evidence_json"]) == {"available_days": 4}
+            and json.loads(prow["payload_json"])
+            == {"action": "transcode_restart"}
+            and irow["advisor"] == "fleet-anomaly",
+            "insight=%r proposal=%r. Storing str(dict) instead of JSON makes the "
+            "row unreadable to every later consumer, and Task 16 writes the "
+            "advisor id for ownership." % (irow, prow))
+
+        try:
+            store.record_insight(conn, module="fleet", kind="anomaly",
+                                 title="t", body="b", confidance=0.5)
+            unknown_refused = False
+        except TypeError:
+            unknown_refused = True
+        results.check(
+            "an unknown insight field is refused, not silently dropped",
+            unknown_refused,
+            "a renamed or added Insight field would otherwise be stored as the "
+            "column default while the caller believed it was recorded")
+
+        try:
+            store.record_insight(conn, module="fleet", kind="anomaly",
+                                 title="t")
+            missing_msg = ""
+        except TypeError as exc:
+            missing_msg = str(exc)
+        results.check(
+            "a missing required insight field is named in the error",
+            "body" in missing_msg,
+            "message was %r; a bare KeyError does not say what to add"
+            % (missing_msg,))
     finally:
         _close(tmp, conn)
 
@@ -306,7 +343,7 @@ def test_insight_and_proposal_lists_filter_and_order(results):
                                    payload={"action": "a"}, rationale="r")
         p2 = store.record_proposal(conn, module="fleet", kind="threshold_change",
                                    payload={"spec": "t"}, rationale="r")
-        store.decide_proposal(conn, p2, "approved", "operator")
+        decided = store.decide_proposal(conn, p2, "approved", "operator")
         results.check(
             "list_proposals(state='pending') hides decided proposals",
             [r["id"] for r in store.list_proposals(conn, state="pending")]
@@ -318,10 +355,42 @@ def test_insight_and_proposal_lists_filter_and_order(results):
             [r["id"] for r in store.list_proposals(conn)] == [p2, p1]
             and store.list_proposals(conn)[0]["state"] == "approved"
             and store.list_proposals(conn)[0]["actor"] == "operator"
-            and store.list_proposals(conn)[0]["decided_at"] > 0,
-            "rows=%r. decide_proposal must record who decided and when, or a "
-            "later reader cannot tell a human approval from a default."
-            % (store.list_proposals(conn),))
+            and store.list_proposals(conn)[0]["decided_at"] > 0
+            and decided == 1,
+            "rows=%r decided=%r. decide_proposal must record who decided and "
+            "when, or a later reader cannot tell a human approval from a "
+            "default." % (store.list_proposals(conn), decided))
+
+        again = store.decide_proposal(conn, p2, "rejected", "intruder")
+        row = [r for r in store.list_proposals(conn) if r["id"] == p2][0]
+        results.check(
+            "a second decision is a no-op and returns 0",
+            again == 0 and row["state"] == "approved"
+            and row["actor"] == "operator",
+            "rowcount=%r row=%r. An unconditional UPDATE would let a second "
+            "call rewrite the history of a decided row." % (again, row))
+
+        try:
+            store.decide_proposal(conn, p1, "pending", "operator")
+            invalid_refused = False
+        except ValueError:
+            invalid_refused = True
+        results.check(
+            "decide_proposal refuses a state outside the decision set",
+            invalid_refused,
+            "only approved/rejected/expired end a proposal; 'pending' would "
+            "turn a decision into a state the machine never left")
+
+        decided_at = row["decided_at"]
+        executed = store.mark_proposal_executed(conn, p2)
+        row = [r for r in store.list_proposals(conn) if r["id"] == p2][0]
+        results.check(
+            "marking executed preserves the decision metadata",
+            executed == 1 and row["state"] == "executed"
+            and row["executed_at"] > 0 and row["decided_at"] == decided_at
+            and row["actor"] == "operator",
+            "row=%r. Execution happens after approval; resetting decided_at "
+            "or actor would erase who approved it." % (row,))
     finally:
         _close(tmp, conn)
 

@@ -544,6 +544,18 @@ def list_remedies(conn, limit=20):
     return [dict(r) for r in rows]
 
 
+# The insight columns this store can persist, named ONCE. `advisors.Insight`'s
+# fields plus `advisor`. An unknown keyword is REFUSED rather than dropped: a
+# renamed or newly added Insight field would otherwise be stored as the column
+# default while the caller believed it was recorded -- silent data loss in the
+# one table that is meant to be durable history.
+INSIGHT_FIELDS = (
+    "advisor", "module", "target", "check_id", "subject", "kind",
+    "severity", "confidence", "title", "body", "evidence", "expires_at",
+)
+INSIGHT_REQUIRED = ("module", "kind", "title", "body")
+
+
 def record_insight(conn, **fields):
     """Store one advisor insight.
 
@@ -552,6 +564,13 @@ def record_insight(conn, **fields):
     needs no translation layer. `evidence` is JSON-encoded here, once, rather
     than at every call site.
     """
+    unknown = sorted(set(fields) - set(INSIGHT_FIELDS))
+    if unknown:
+        raise TypeError("unexpected insight field(s): %s" % ", ".join(unknown))
+    missing = [name for name in INSIGHT_REQUIRED if name not in fields]
+    if missing:
+        raise TypeError("missing required insight field(s): %s"
+                        % ", ".join(missing))
     cur = conn.execute(
         "INSERT INTO insight (ts, advisor, module, target, check_id, subject, "
         "kind, severity, confidence, title, body, evidence_json, expires_at) "
@@ -599,13 +618,41 @@ def list_proposals(conn, state=None, limit=100):
     return [dict(r) for r in rows]
 
 
+DECISION_STATES = ("approved", "rejected", "expired")
+
+
 def decide_proposal(conn, proposal_id, state, actor):
     """Record the human decision. `actor` and `decided_at` are the evidence that
-    this was decided rather than defaulted."""
-    conn.execute(
-        "UPDATE proposal SET state = ?, decided_at = ?, actor = ? WHERE id = ?",
+    this was decided rather than defaulted.
+
+    Only a PENDING row can be decided, and the rowcount says whether anything
+    happened -- 0 means the id was unknown or already decided. An unconditional
+    UPDATE would let a second decision rewrite `actor`/`decided_at` on a row
+    whose history is meant to be final.
+    """
+    if state not in DECISION_STATES:
+        raise ValueError("invalid proposal state %r; expected one of %s"
+                         % (state, ", ".join(DECISION_STATES)))
+    cur = conn.execute(
+        "UPDATE proposal SET state = ?, decided_at = ?, actor = ? "
+        "WHERE id = ? AND state = 'pending'",
         (state, time.time(), actor, proposal_id),
     )
+    return cur.rowcount
+
+
+def mark_proposal_executed(conn, proposal_id):
+    """Record that an approved proposal ran. The decision metadata is preserved.
+
+    Deliberately not routed through `decide_proposal`: execution is a later
+    fact about the same row, and rewriting `decided_at`/`actor` would destroy
+    the evidence of who approved it. Returns the rowcount.
+    """
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'executed', executed_at = ? WHERE id = ?",
+        (time.time(), proposal_id),
+    )
+    return cur.rowcount
 
 
 def record_journal(conn, host, cursor, ts, unit, priority, message):

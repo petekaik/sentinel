@@ -10,6 +10,8 @@ off" would pass with the whole ladder deleted.
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -943,7 +945,12 @@ def test_fleet_action_dry_runs_do_not_ssh(results):
 
     def fake(host, cmd, *a, **k):
         calls.append((host.name, cmd))
-        return probes_mod.RemoteResult(probes_mod.Transport.RAN, rc=0)
+        # The restart action reads two facts in one call. This answer is the
+        # RESTARTABLE case: no marker this boot, unit inactive because it has
+        # never run. (`marker=present` + inactive would be a deliberate stop.)
+        out = ("marker=absent\ninactive"
+               if "cubox-transcode.started" in cmd else "")
+        return probes_mod.RemoteResult(probes_mod.Transport.RAN, rc=0, out=out)
 
     probes_mod.ssh = fake
     try:
@@ -968,8 +975,9 @@ def test_fleet_action_commands_are_the_documented_repairs(results):
     declared = {a.id: a for a in fleet_actions.actions_list()}
     backup = ctx.fleet.hosts["backup"].address
     action = declared["state_mount_cycle"]
-    expected = ("umount /mnt/state 2>&1 || { echo '--- holders ---'; "
-                "fuser -m /mnt/state 2>&1; exit 1; }; "
+    expected = ("if mountpoint -q /mnt/state; then "
+                "umount /mnt/state || { echo 'umount failed; mount table:' "
+                ">&2; findmnt -rn -M /mnt/state >&2; exit 1; }; fi; "
                 "mount -t nfs -o nolock,nfsvers=3 "
                 "%s:/cubpxe/state/cubox-1 /mnt/state "
                 "|| exit 1; systemctl restart cubox-transcode" % backup)
@@ -1013,20 +1021,130 @@ def test_fleet_action_commands_are_the_documented_repairs(results):
     res = declared["transcode_restart"].dry_run(
         ctx, _incident(declared["transcode_restart"]))
     results.check(
-        "the transcode restart shows the start-marker gate and the restart",
+        "the transcode restart shows the marker+unit-state probe and the "
+        "restart",
         res.ok and res.output ==
-        "test -e /run/cubox-transcode.started && "
+        "test -e /run/cubox-transcode.started && echo marker=present || "
+        "echo marker=absent; systemctl is-active cubox-transcode; "
         "systemctl restart cubox-transcode",
         "output=%r" % (res.output,))
 
 
-def test_transcode_restart_refuses_a_deliberately_stopped_worker(results):
-    """The /run marker is the difference between "restart it" and "do not".
+def _local_cycle(cmd, mounted, umount_busy=False):
+    """Run the mount-cycle command against stub binaries, locally.
 
-    `cubox-transcode.service` sets `/run/cubox-transcode.started` in its own
-    ExecStartPost, and the state-save drop-in reads it before starting a worker
-    an operator stopped (item 54). An automatic restart that ignored it would
-    undo that stop every epoch.
+    Returns `(CompletedProcess, calls)`. `calls` is the log the successful
+    `umount`/`mount`/`systemctl` stubs append to, so the test can prove which
+    steps ran -- not merely what the command string says.
+    """
+    bindir = tempfile.mkdtemp()
+    log = os.path.join(bindir, "calls")
+
+    def script(name, body):
+        path = os.path.join(bindir, name)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n%s\n" % body)
+        os.chmod(path, 0o755)
+
+    script("mountpoint", "exit %d" % (0 if mounted else 1))
+    if umount_busy:
+        script("umount", "echo 'umount: /mnt/state: target is busy' >&2; "
+                         "exit 1")
+    else:
+        script("umount", 'echo umount >> "%s"; exit 0' % log)
+    script("mount", 'echo mount >> "%s"' % log)
+    script("systemctl", 'echo systemctl >> "%s"' % log)
+    script("findmnt", "echo 'findmnt: /mnt/state not found' >&2; exit 1")
+    env = dict(os.environ)
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
+                          env=env)
+    calls = open(log).read().split() if os.path.exists(log) else []
+    shutil.rmtree(bindir)
+    return proc, calls
+
+
+def test_state_mount_cycle_reaches_mount_when_nothing_is_mounted(results):
+    """`state_dir_tmpfs` fires when STATE_DIR resolved on an UNMOUNTED path.
+
+    A bare `umount` there exits non-zero, so an unguarded umount aborts before
+    the mount that is the whole repair. The guard must let the mount happen.
+    """
+    import probes as probes_mod
+    from modules.fleet import actions as fleet_actions
+    ctx = _fleet_ctx()
+    action = {a.id: a for a in fleet_actions.actions_list()}["state_mount_cycle"]
+    orig = probes_mod.ssh
+    seen = []
+
+    def fake(host, cmd, *a, **k):
+        seen.append(cmd)
+        proc, calls = _local_cycle(cmd, mounted=False)
+        return probes_mod.RemoteResult(
+            probes_mod.Transport.RAN, rc=proc.returncode,
+            out=proc.stdout, err=proc.stderr)
+
+    probes_mod.ssh = fake
+    try:
+        res = action.run(ctx, _incident(action))
+        _, calls = _local_cycle(seen[0], mounted=False)
+    finally:
+        probes_mod.ssh = orig
+    results.check(
+        "an unmounted /mnt/state skips umount and proceeds to the mount",
+        res.ok and calls == ["mount", "systemctl"],
+        "calls=%r res=%r -- refusing here would make the action useless for "
+        "the very condition it is triggered by" % (calls, res.__dict__))
+
+
+def test_state_mount_cycle_reports_why_an_umount_failed(results):
+    """A failed umount's stderr must reach the remedy row.
+
+    `heal.attempt` stores `Result.detail`, and `_remote` carries the remote
+    stderr there. `fuser` is NOT used: psmisc is not in the fleet image.
+    """
+    import probes as probes_mod
+    from modules.fleet import actions as fleet_actions
+    ctx = _fleet_ctx()
+    action = {a.id: a for a in fleet_actions.actions_list()}["state_mount_cycle"]
+    orig = probes_mod.ssh
+    seen = []
+
+    def fake(host, cmd, *a, **k):
+        seen.append(cmd)
+        proc, calls = _local_cycle(cmd, mounted=True, umount_busy=True)
+        return probes_mod.RemoteResult(
+            probes_mod.Transport.RAN, rc=proc.returncode,
+            out=proc.stdout, err=proc.stderr)
+
+    probes_mod.ssh = fake
+    try:
+        res = action.run(ctx, _incident(action))
+        _, calls = _local_cycle(seen[0], mounted=True, umount_busy=True)
+    finally:
+        probes_mod.ssh = orig
+    results.check(
+        "a busy unmount refuses, carries its stderr, and never mounts or "
+        "restarts",
+        not res.ok and "target is busy" in res.detail
+        and "mount" not in calls and "systemctl" not in calls,
+        "detail=%r calls=%r -- without the reason, the remedy row says only "
+        "rc=1 and nobody can tell why" % (res.detail, calls))
+    results.check(
+        "the automated repair does not depend on fuser/psmisc",
+        "fuser" not in res.detail and seen and "fuser" not in seen[0],
+        "detail=%r cmd=%r" % (res.detail, seen[0] if seen else ""))
+
+
+def test_transcode_restart_gate_reads_marker_and_unit_state(results):
+    """PRESENT means "already started this boot", so PRESENT + INACTIVE is a
+    deliberate stop.
+
+    That is the fleet's own contract (`cubox-transcode.service` sets the marker;
+    `cubox-state-save.service.d/transcode-start.conf` and `cubox-shared-apply`
+    read it before starting). An automatic restart that ignored the pairing would
+    undo the operator's stop every epoch, reachable for up to 360 minutes via
+    `deadlock_kills`.
     """
     import probes as probes_mod
     from modules.fleet import actions as fleet_actions
@@ -1035,21 +1153,39 @@ def test_transcode_restart_refuses_a_deliberately_stopped_worker(results):
     orig = probes_mod.ssh
     calls = []
 
-    def absent(host, cmd, *a, **k):
-        calls.append(cmd)
-        return probes_mod.RemoteResult(probes_mod.Transport.RAN, rc=1)
+    cases = (
+        # marker,   unit state,   restart?, why
+        ("present", "inactive", False, "deliberately stopped"),
+        ("present", "active",   True,  None),
+        ("present", "failed",   True,  None),
+        ("absent",  "inactive", True,  None),
+    )
+    for marker, state, should_run, why in cases:
+        calls[:] = []
 
-    probes_mod.ssh = absent
-    try:
-        res = action.run(ctx, _incident(action))
-    finally:
-        probes_mod.ssh = orig
-    results.check(
-        "an absent start marker refuses, and the worker is never restarted",
-        not res.ok and "deliberately stopped" in res.detail
-        and calls == ["test -e /run/cubox-transcode.started"],
-        "calls=%r res=%r -- restarting a deliberately stopped worker undoes "
-        "the operator's stop" % (calls, res.__dict__))
+        def fake(host, cmd, *a, **k):
+            calls.append(cmd)
+            return probes_mod.RemoteResult(
+                probes_mod.Transport.RAN, rc=0,
+                out="marker=%s\n%s\n" % (marker, state))
+
+        probes_mod.ssh = fake
+        try:
+            res = action.run(ctx, _incident(action))
+        finally:
+            probes_mod.ssh = orig
+        if should_run:
+            ok = (res.ok and len(calls) == 2
+                  and calls[1] == "systemctl restart cubox-transcode")
+        else:
+            ok = (not res.ok and len(calls) == 1
+                  and why in res.detail)
+        results.check(
+            "marker=%s + unit=%s -> %s" % (
+                marker, state, "restart" if should_run else "refuse"),
+            ok, "calls=%r res=%r -- marker PRESENT + INACTIVE is the fleet's "
+                "deliberate-stop evidence; ABSENT or a wedged unit is "
+                "restartable" % (calls, res.__dict__))
 
     calls[:] = []
 
@@ -1064,9 +1200,8 @@ def test_transcode_restart_refuses_a_deliberately_stopped_worker(results):
     finally:
         probes_mod.ssh = orig
     results.check(
-        "an unreadable marker is a refusal, not a restart",
-        not res.ok and "connection refused" in res.detail
-        and calls == ["test -e /run/cubox-transcode.started"],
+        "an unreadable marker/unit state is a refusal, not a restart",
+        not res.ok and "connection refused" in res.detail and len(calls) == 1,
         "calls=%r res=%r -- 'I could not ask' must never become 'restart it'"
         % (calls, res.__dict__))
 
@@ -1159,7 +1294,9 @@ TESTS = (test_off_by_default,
          test_fleet_actions_are_off_by_default,
          test_fleet_action_dry_runs_do_not_ssh,
          test_fleet_action_commands_are_the_documented_repairs,
-         test_transcode_restart_refuses_a_deliberately_stopped_worker,
+         test_state_mount_cycle_reaches_mount_when_nothing_is_mounted,
+         test_state_mount_cycle_reports_why_an_umount_failed,
+         test_transcode_restart_gate_reads_marker_and_unit_state,
          test_fleet_actions_refuse_a_target_that_is_not_a_box)
 
 

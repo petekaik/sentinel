@@ -363,12 +363,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = config_mod.Config()
-    mods = _modules(cfg)
 
     if args.modules:
+        # Discovery only -- no module contexts, no store, no connection.
         for line in module_loader.format_summary(module_loader.summary(cfg)):
             print(line)
         return 0
+
+    mods = _modules(cfg)
 
     if args.list_commands:
         for mid, mod in sorted(mods.items()):

@@ -178,6 +178,9 @@ Deploying is separate, because it is not "docker compose up":
 
 # Modules — what was discovered, and what state each is in
 ./deploy.sh --modules          # id, enabled/disabled, order, targets, check count
+#                              #   checks= counts the module's own expanded checks;
+#                              #   the platform's spec_coverage/module-audit checks
+#                              #   are not included.
 
 # Commands — explicit operator operations, never automatic
 ./deploy.sh --list-commands    # module commands, their arguments and danger level

@@ -591,8 +591,10 @@ them through `ctl.py`, and the audit lives in `command_run`.
 ```
 
 `--modules` lists every **discovered** module, enabled or disabled: id, title,
-order, state, reporting targets and the expanded check count. `--showconf` carries the
-same summary beside the configuration and threshold coverage. A disabled module is
+order, state, reporting targets and the expanded check count. `checks=` counts the module's
+OWN checks only; the platform's `spec_coverage` and `modules_enabled` checks are not
+included, so a module total of 73 against the fleet's 75 is not drift. `--showconf` carries
+the same summary beside the configuration and threshold coverage. A disabled module is
 named as disabled, never omitted — a module that vanishes from the list reads as one that
 does not exist.
 
@@ -1171,29 +1173,39 @@ export while a box is up invalidates the live mount, every `cubox-state` unit is
 and shutdown save both stop running and report nothing. The shipped command is
 
 ```sh
-umount /mnt/state 2>&1 || { echo '--- holders ---'; fuser -m /mnt/state 2>&1; exit 1; };
-mount -t nfs -o nolock,nfsvers=3 <backup>:/cubpxe/state/<box> /mnt/state || exit 1;
+if mountpoint -q /mnt/state; then
+  umount /mnt/state || { echo 'umount failed; mount table:' >&2;
+                         findmnt -rn -M /mnt/state >&2; exit 1; }
+fi
+mount -t nfs -o nolock,nfsvers=3 <backup>:/cubpxe/state/<box> /mnt/state || exit 1
 systemctl restart cubox-transcode
 ```
 
+The umount is **guarded by `mountpoint`**: `state_dir_tmpfs` fires exactly when `STATE_DIR`
+resolved while `/mnt/state` was *not* mounted, and a bare `umount` there exits non-zero
+("not mounted"), which would abort before the mount that is the whole repair.
+
 The restart is part of the repair, not a second action: the worker fixes `STATE_DIR` at
 process start, so a remount alone leaves it holding the old export's handles. It runs only
-after the mount succeeds.
+after the mount succeeds. A failed `mount` also aborts without restarting.
 
-**The automated path has no lazy fallback.** `umount -l` detaches rather than unmounts, so existing fds
-keep writing to deleted inodes and the post-check on the new mount reads green. A failed
-plain `umount` is therefore a refusal: the command captures the holders with `fuser -m` as
-evidence, does not mount, and does not restart the worker. The fleet's documented operator
-repair may use `-l` when a human is present to judge the consequence; the automated action
-does not.
+**The automated path has no lazy fallback.** `umount -l` detaches rather than unmounts, so
+existing fds keep writing to deleted inodes and the post-check on the new mount reads green.
+A failed plain `umount` is therefore a refusal: its stderr (normally EBUSY) and the current
+`findmnt` row are captured as the refusal detail — which is what `heal.attempt` stores on
+the remedy row — and the command does not mount or restart. `fuser` is not used: psmisc is
+absent from the fleet image. The fleet's documented operator repair may use `-l` when a
+human is present to judge the consequence; the automated action does not.
 
 **`transcode_restart`** restarts the worker, triggered by `deadlock_kills` and
 `stall_watch`. It is not the `NRestarts` restart described above: it is bounded by the same
-engine gates and refuses a non-CuBox target. Before restarting it reads the per-boot marker
-`/run/cubox-transcode.started` over ssh (`test -e`): absent means the worker was stopped on
-purpose this boot, so the action refuses and does **not** undo the stop. An unreadable
-marker is also a refusal — "I could not ask" and "it is stopped" are different facts, and
-neither is permission to restart.
+engine gates and refuses a non-CuBox target. Before restarting it reads both the per-boot
+marker `/run/cubox-transcode.started` and the unit's active state over ssh. The fleet's
+contract is **present = "already started this boot"**, so **present + inactive** is a
+deliberate stop and the action refuses; **absent** (never started this boot — the state-save
+drop-in would start it too) and **present + active/failed** (wedged) are restartable. An
+unreadable marker or unit state is a refusal: "I could not ask" is neither permission nor
+evidence of a stop.
 
 ### A remedy that does not work must become visible, not retried
 

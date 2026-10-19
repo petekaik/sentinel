@@ -17,6 +17,7 @@ import contextlib
 import fcntl
 import os
 import re
+import threading
 import time
 
 import store
@@ -87,6 +88,43 @@ class Command:
         self.danger = danger
         self.resources = tuple(resources)
         self.timeout_s = timeout_s
+
+
+def call_bounded(fn, timeout_s):
+    """Run `fn()` bounded by `timeout_s`, returning `(state, value)`.
+
+    `("ok", value)`, `("error", exception)` or `("timeout", None)`. The same
+    helper the remedy engine uses, so a command cannot outlive its declared
+    `timeout_s` any more than an action can.
+
+    A DAEMON THREAD, NOT A KILL. Python cannot stop a running thread, so a call
+    that does not return is ABANDONED: it keeps running and may still finish its
+    side effect, possibly after `dispatch` has already released the resource
+    lock. The point is to bound the CALLER (an operator CLI, an epoch), not the
+    thread -- this fleet's history is hard NFS mounts and D-state, where no
+    signal reaches the hanging call. `timeout_s` of None or 0 means no bound.
+    """
+    if not timeout_s or timeout_s <= 0:
+        try:
+            return "ok", fn()
+        except BaseException as exc:                # noqa: BLE001 - carried back
+            return "error", exc
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:                # noqa: BLE001 - carried back
+            box["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    if worker.is_alive():
+        return "timeout", None
+    if "error" in box:
+        return "error", box["error"]
+    return "ok", box.get("value")
 
 
 _HELD = set()
@@ -174,8 +212,28 @@ def dispatch(module, cmd, argv, actor="operator", dry_run=False, conn=None,
     # `_LockRefused` leaves here as a refusal: no handler call, no audit row.
     try:
         with reserve(cmd.resources, lock_dir=_lock_dir_for(ctx)):
-            res = cmd.handler(ctx, args, dry_run=dry_run)
-            status = 0 if res.ok else 1
+            # BOUNDED BY THE COMMAND'S OWN DECLARED TIMEOUT. A handler that
+            # hangs on a hard mount must not hang the operator's CLI (or the
+            # epoch that invoked it); a timeout is a FAILED command, so it gets
+            # an audit row with rc=1 like any other handler failure.
+            state, value = call_bounded(
+                lambda: cmd.handler(ctx, args, dry_run=dry_run), cmd.timeout_s)
+            if state == "timeout":
+                res = Result(ok=False, output="",
+                             detail="command %r timed out after %ss"
+                                    % (cmd.id, cmd.timeout_s))
+                status = 1
+            elif state == "error":
+                if not isinstance(value, Exception):
+                    # A BaseException (Ctrl-C) propagates through reserve so its
+                    # `finally` releases the resource -- the interrupted-handler
+                    # contract the lock tests pin.
+                    raise value
+                res = Result(ok=False, detail=str(value))
+                status = 1
+            else:
+                res = value
+                status = 0 if res.ok else 1
     except _LockRefused:
         raise
     except Exception as exc:                           # noqa: BLE001 - audited

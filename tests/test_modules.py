@@ -150,11 +150,35 @@ def test_duplicate_and_mismatched_ids_fail_loudly(results):
         _drop(root)
 
 
+def test_fleet_settings_keep_the_deployed_env_names(results):
+    import config as config_mod
+    from modules.fleet.settings import FleetConfig
+    env = {
+        "MONITOR_HOST_CUBOX_1_ADDR": "203.0.113.9",
+        "MONITOR_HOST_CUBOX_1_USER": "root",
+        "RECORDINGS_PATH": "/tmp/rec",
+        "SERIAL_CUBOX_1_SERIAL": "ABC123",
+        "TVH_USER": "u",
+    }
+    cfg = config_mod.Config(env=env)
+    fc = FleetConfig(cfg, env)
+    results.check(
+        "fleet settings read the same env keys the deployment already sets",
+        fc.hosts["cubox-1"].address == "203.0.113.9"
+        and fc.recordings_root == "/tmp/rec"
+        and fc.serial_serials.get("cubox-1") == "ABC123"
+        and fc.tvh_user == "u",
+        "hosts=%r recordings=%r serials=%r tvh_user=%r"
+        % (fc.hosts["cubox-1"].address, fc.recordings_root,
+           fc.serial_serials, fc.tvh_user))
+
+
 TESTS = (test_discovery_finds_and_orders_modules,
          test_a_package_without_module_fails_loudly,
          test_a_package_that_raises_on_import_fails_loudly,
          test_a_non_module_MODULE_fails_loudly,
-         test_duplicate_and_mismatched_ids_fail_loudly)
+         test_duplicate_and_mismatched_ids_fail_loudly,
+         test_fleet_settings_keep_the_deployed_env_names)
 
 
 def main():

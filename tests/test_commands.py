@@ -680,6 +680,89 @@ def test_arm_writes_an_arm_file_that_status_reports(results):
         shutil.rmtree(sysfs)
 
 
+def _deploy_text():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "deploy.sh")) as fh:
+        return fh.read()
+
+
+def _deploy_code(text):
+    """The script without its comment lines -- the parser, not the prose.
+
+    Load-bearing, not tidiness: deploy.sh's header documents every verb, so a
+    raw-text form of the checks below would pass on a file whose parser had
+    lost the flag entirely.
+    """
+    return "\n".join(ln for ln in text.split("\n")
+                     if not ln.lstrip().startswith("#"))
+
+
+def _deploy_branch(code, flag):
+    """The `flag)` arm, up to its terminating `;;` -- or nothing."""
+    lines = code.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith(flag + ")"):
+            out = [ln]
+            for nxt in lines[i + 1:]:
+                out.append(nxt)
+                if nxt.rstrip().endswith(";;"):
+                    break
+            return "\n".join(out)
+    return ""
+
+
+def test_deploy_exposes_the_command_surface(results):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "deploy.sh")
+    code = _deploy_code(_deploy_text())
+    missing = [flag for flag in ("--list-commands", "--run", "--arg",
+                                 "--list-runs", "dc_ctl", "ctl.py")
+               if flag not in code]
+    results.check(
+        "deploy.sh routes the module command surface through ctl.py",
+        not missing,
+        "missing=%r -- a verb the parser does not route is a command the "
+        "operator cannot reach from the documented entry point" % (missing,))
+    run = subprocess.run(["bash", "-n", path], capture_output=True, text=True)
+    results.check(
+        "deploy.sh parses (bash -n), so an unreachable mode cannot ship",
+        run.returncode == 0, run.stderr.strip())
+
+
+def test_deploy_dry_run_means_two_things_by_position(results):
+    """`--dry-run` before --run is --once's; after --run it is the command's.
+
+    Mutation this exists for: collapsing the two back to the original single
+    meaning `MODE=once`. Then `--run fleet.serial_break --dry-run` runs an epoch
+    that never invokes the command -- and `--once --dry-run` is unchanged, so a
+    test of that invocation alone stays green. The other way to break it is an
+    arm that changes MODE without passing the flag, which turns a dry run into a
+    WRITE; that is why every arm is checked to append it.
+    """
+    code = _deploy_code(_deploy_text())
+    dry = _deploy_branch(code, "--dry-run")
+    run = _deploy_branch(code, "--run")
+    results.check(
+        "a --run is recorded, so a later --dry-run can be told apart",
+        "SAW_RUN=1" in run,
+        "--run) does not set SAW_RUN: %r" % (run,))
+    results.check(
+        "a --dry-run after --run goes to ctl.py without changing MODE, and "
+        "both arms still pass the flag through",
+        'if [ "$SAW_RUN" -eq 1 ]' in dry
+        and dry.count("PASSTHRU+=(--dry-run)") == 2,
+        "branch=%r -- one arm means 'pass the command's flag', the other means "
+        "--once; a single unconditional MODE=once makes the first impossible, "
+        "and an arm that does not append the flag writes when it promised not to"
+        % (dry,))
+    results.check(
+        "a --dry-run before --run still means one collection that writes nothing",
+        "MODE=once" in dry and "else" in dry,
+        "branch=%r -- dropping MODE=once leaves --dry-run as only a command "
+        "flag, and `./deploy.sh --dry-run` would fall through to a full deploy"
+        % (dry,))
+
+
 def test_the_serial_commands_are_registered_and_dispatch_through_ctl(results):
     """ctl's path: discover, install the module's context, then dispatch."""
     import ctl
@@ -731,6 +814,8 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_dry_run_arm_writes_nothing,
          test_arm_rejects_a_window_outside_the_cap,
          test_arm_writes_an_arm_file_that_status_reports,
+         test_deploy_exposes_the_command_surface,
+         test_deploy_dry_run_means_two_things_by_position,
          test_the_serial_commands_are_registered_and_dispatch_through_ctl,
          # LAST TWO: a missing release leaks the process-global _HELD set,
          # which would make every later test refuse for the wrong reason.

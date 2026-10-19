@@ -18,6 +18,15 @@
 #                                                     #   no check can ever
 #                                                     #   close, and it is not
 #                                                     #   a way to hide a fault.
+#   ./deploy.sh --list-commands    # the module commands this build offers
+#   ./deploy.sh --run MODULE.COMMAND [--arg k=v ...] [--dry-run]
+#                                                     # run one module command.
+#                                                     #   --arg repeats. A
+#                                                     #   --dry-run AFTER --run
+#                                                     #   belongs to the COMMAND;
+#                                                     #   before it, it is
+#                                                     #   --once's dry run.
+#   ./deploy.sh --list-runs        # the command audit
 #
 # Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER
 #
@@ -62,15 +71,48 @@ BACKUP_USER="${BACKUP_USER:-admin}"
 
 MODE=deploy
 PASSTHRU=()
+# Whether a --run has been seen, which is the ONLY thing that decides what a
+# later --dry-run means. See the --dry-run branch below.
+SAW_RUN=0
 TRUST_NEW_HOST_KEYS=0
+
+# One home for the usage block: --help and the missing-value guards print it.
+# Anchored range, never a line count (docs/08 item 57's family).
+usage() { sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --status)           MODE=status ;;
         --logs)             MODE=logs ;;
         --once)             MODE=once; PASSTHRU+=(--once) ;;
-        --dry-run)          MODE=once; PASSTHRU+=(--dry-run) ;;
+        --dry-run)
+            # CONTEXT-SENSITIVE, and the two meanings are DIFFERENT FACTS.
+            # Before a --run this is deploy.sh's own dry run: --once plus the
+            # flag, i.e. one collection that writes NOTHING. After a --run it
+            # belongs to ctl.py, and changing MODE here would turn a command's
+            # dry run into an epoch that never invokes the command at all.
+            # Neither branch may swallow the flag: --once WITHOUT --dry-run is
+            # a WRITE.
+            if [ "$SAW_RUN" -eq 1 ]; then
+                PASSTHRU+=(--dry-run)
+            else
+                MODE=once
+                PASSTHRU+=(--dry-run)
+            fi ;;
         --showconf)         MODE=showconf ;;
+        # The module command surface. Each VALUE is consumed here and passed as
+        # its own argv element, so the remote shell never re-splits it (item 81's
+        # family -- argv is joined and re-split, so re-joining is already wrong).
+        --list-commands)    MODE=ctl; PASSTHRU+=(--list-commands) ;;
+        --run)
+            [ $# -ge 2 ] || { echo "unknown argument: --run needs MODULE.COMMAND" >&2
+                              usage >&2; exit 2; }
+            MODE=ctl; SAW_RUN=1; PASSTHRU+=(--run "$2"); shift ;;
+        --arg)
+            [ $# -ge 2 ] || { echo "unknown argument: --arg needs k=v" >&2
+                              usage >&2; exit 2; }
+            MODE=ctl; PASSTHRU+=(--arg "$2"); shift ;;
+        --list-runs)        MODE=ctl; PASSTHRU+=(--list-runs) ;;
         --dismiss)          MODE=dismiss
                             # Everything after --dismiss belongs to dismiss.py,
                             # including a --reason whose text contains anything
@@ -90,8 +132,7 @@ while [ $# -gt 0 ]; do
         # The terminator is a BARE `#`, not an empty line: every line of this
         # header starts with `#`, so /^$/ never matches until the comment block
         # ends -- and the first attempt at this printed the entire header.
-        -h|--help)          sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
-                            exit 0 ;;
+        -h|--help)          usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -207,6 +248,7 @@ _oneoff() {
 
 dc_oneoff()  { _oneoff /app/collect.py "$@"; }
 dc_dismiss() { _oneoff /app/dismiss.py "$@"; }
+dc_ctl()     { _oneoff /app/ctl.py "$@"; }
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -356,6 +398,17 @@ case "$MODE" in
         # The sync above is idempotent and cheap, so agreement is guaranteed
         # rather than assumed.
         dc_dismiss ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+        exit $? ;;
+    ctl)
+        # COMMANDS ACT ON WHAT IS DEPLOYED, exactly like --dismiss: the enabled
+        # modules and their handlers are read from the running container's own
+        # app/, so invoking one against a stale copy would apply this revision's
+        # arguments to the previous revision's code (or fail with an ImportError
+        # for a handler the old tree never had).
+        #
+        # The array is passed, never a joined string -- see the note below. An
+        # --arg value containing a space must arrive as ONE argv element.
+        dc_ctl ${PASSTHRU[@]+"${PASSTHRU[@]}"}
         exit $? ;;
     # PASS THE ARRAY, NEVER A JOINED STRING. This branch used to build
     # `ARGS="$ARGS $a"` from an empty ARGS and then call `dc_oneoff "$ARGS"`,

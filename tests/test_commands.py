@@ -774,7 +774,9 @@ def _if_bodies(block, cond):
     return block[then_i + 4:else_i], block[else_i + 4:fi_i]
 
 
-_CTL_VERBS = ("--list-commands", "--run", "--arg", "--list-runs")
+_CTL_VERBS = ("--list-commands", "--run", "--arg", "--list-runs",
+              "--proposals", "--approve", "--reject", "--insights",
+              "--advisors", "--thresholds", "--revert-threshold")
 
 
 def test_deploy_exposes_the_command_surface(results):
@@ -875,7 +877,10 @@ def test_deploy_refuses_a_flag_as_a_value(results):
     path = os.path.join(root, "deploy.sh")
     outcomes = {}
     for argv in (["--run", "--dry-run"], ["--run"], ["--arg", "--dry-run"],
-                 ["--arg"]):
+                 ["--arg"], ["--approve", "--dry-run"], ["--approve"],
+                 ["--reject", "--dry-run"], ["--reject"],
+                 ["--revert-threshold", "--dry-run"],
+                 ["--revert-threshold"]):
         try:
             run = subprocess.run([path] + argv, capture_output=True, text=True,
                                  timeout=20)
@@ -920,6 +925,31 @@ def test_the_serial_commands_are_registered_and_dispatch_through_ctl(results):
         shutil.rmtree(sysfs)
 
 
+def test_ctl_exposes_proposal_and_insight_verbs(results):
+    """The surface the operator reaches is the parser's, and it is pinned.
+
+    Reading the source is a RETYPING check, so it names every verb the brief
+    requires rather than the subset a previous revision happened to ship --
+    the failure it guards is a verb documented in deploy.sh but absent from
+    argparse, which reads as "the queue is empty" rather than an error.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "app", "ctl.py")).read()
+    wanted = ("--proposals", "--approve", "--reject", "--insights",
+              "--remedies", "--advisors", "--thresholds",
+              "--revert-threshold")
+    missing = [v for v in wanted if v not in text]
+    results.check("ctl.py exposes the proposal and insight verbs", not missing,
+                  "missing=%r" % (missing,))
+    deploy = _deploy_code(_deploy_text())
+    missing = [v for v in wanted if v not in deploy]
+    results.check(
+        "deploy.sh routes every proposal and insight verb to ctl.py",
+        not missing,
+        "missing=%r -- a verb the parser does not route is a surface the "
+        "operator cannot reach from the documented entry point" % (missing,))
+
+
 TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_disabled_module_refuses,
          test_a_held_resource_refuses_the_second_command,
@@ -948,6 +978,7 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_deploy_dry_run_means_two_things_by_position,
          test_deploy_refuses_a_flag_as_a_value,
          test_the_serial_commands_are_registered_and_dispatch_through_ctl,
+         test_ctl_exposes_proposal_and_insight_verbs,
          # LAST TWO: a missing release leaks the process-global _HELD set,
          # which would make every later test refuse for the wrong reason.
          # Running them at the end keeps the failure attributed to the guard

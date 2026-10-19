@@ -100,6 +100,18 @@ def check_classes():
                              + tuple(checks.platform_modules())))
 
 
+def load_specs(cfg, conn=None):
+    """Threshold specs through the loader the RUNTIME uses.
+
+    The suites must grade against the same band the monitor does, overrides
+    included, or a check that passes here could fail on the deployment at the
+    next epoch. `conn` is optional: most suites build no store, so they get the
+    file's band; a test that applies an override passes its connection.
+    """
+    import thresholds
+    return thresholds.load_effective({"config": cfg.checks_conf}, conn)
+
+
 def fleet_config(cfg):
     """The fleet's settings view over the SAME env the Config was built from.
 

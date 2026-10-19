@@ -39,7 +39,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
-                    fleet_config, read_fixture)
+                    fleet_config, load_specs, read_fixture)
 
 import checks                # noqa: E402
 import config as config_mod  # noqa: E402
@@ -157,7 +157,7 @@ def _run(cfg, box, facts_text, backup_text, check_id, other=None, backup_ok=True
     preloaded for any case that reaches the comparison: the check's lazy path
     opens a real ssh, and this suite promises no fleet access.
     """
-    specs = thresholds.load(cfg.checks_conf)
+    specs = load_specs(cfg)
     classes = check_classes()
     fleet = fleet_config(cfg)
     ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,

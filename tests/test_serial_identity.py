@@ -24,7 +24,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
-                    fleet_config)
+                    fleet_config, load_specs)
 
 import checks                                    # noqa: E402
 import config as config_mod                      # noqa: E402
@@ -267,7 +267,7 @@ def test_config_defaults_are_the_measured_ones(results):
 def _run_check(cfg, check_id="serial_adapter"):
     """The check, looked up through expand() -- so one that is not registered fails
     here rather than passing (the fleet module's check list is the one home)."""
-    specs = thresholds.load(cfg.checks_conf)
+    specs = load_specs(cfg)
     classes = check_classes()
     fleet = fleet_config(cfg)
     ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,

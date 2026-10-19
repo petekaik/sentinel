@@ -2187,6 +2187,79 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_insights_and_proposals_are_rendered_and_empty_safe(results):
+    """Recommendations and Approvals are additive, and empty is still a section.
+
+    An absent section reads as a healthy one, so the EMPTY case must render
+    its own sentence and its id; the populated case must name the insight, the
+    rationale and the expiry. And an expired proposal is shown EXPIRED even
+    though the collector has not swept the row -- the page opens the store
+    read-only and cannot.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        state, html = d.state(), d.html()
+        results.check(
+            "build_state exposes additive insight and proposal keys",
+            state.get("insights") == [] and state.get("proposals") == []
+            and "tiles" in state and "incidents" in state,
+            "keys=%r -- additive means existing consumers are unaffected"
+            % (sorted(state),))
+        results.check(
+            "empty Recommendations and Approvals still render, with ids",
+            "Recommendations (0)" in html and "Approvals (0)" in html
+            and "id='sec-recommendations'" in html
+            and "id='sec-approvals'" in html
+            and "No pending proposal" in html,
+            "a section that vanishes when empty cannot be told from one whose "
+            "query broke")
+
+        store.record_insight(
+            d.conn, advisor="reference", module="platform",
+            kind="threshold_suggestion", severity="notable",
+            title="cubox-1 mem: p95 outside the band",
+            body="Proposed band moved by at most 10.")
+        store.record_proposal(
+            d.conn, module="fleet", kind="action",
+            payload={"action_id": "transcode_restart",
+                     "incident_key": "cubox-1|c|s"},
+            rationale="worker stalled for six hours",
+            expires_at=time.time() + 3600)
+        store.record_proposal(
+            d.conn, module="fleet", kind="action",
+            payload={"action_id": "transcode_restart",
+                     "incident_key": "cubox-2|c|s"},
+            rationale="this one lapsed",
+            expires_at=time.time() - 5)
+
+        state, html = d.state(), d.html()
+        results.check(
+            "insights and pending proposals appear in the model",
+            len(state["insights"]) == 1 and len(state["proposals"]) == 2,
+            "insights=%r proposals=%r"
+            % (state["insights"], state["proposals"]))
+        results.check(
+            "the Recommendations section names the insight",
+            "Recommendations (1)" in html
+            and "cubox-1 mem: p95 outside the band" in html,
+            "the advisor's claim is not on the page")
+        results.check(
+            "the Approvals section names the rationale and the expiry",
+            "Approvals (2)" in html
+            and "worker stalled for six hours" in html
+            and "remaining" in html,
+            "a proposal without its rationale is an id nobody can decide")
+        results.check(
+            "an expired proposal is shown as EXPIRED, not pending",
+            "EXPIRED" in html and "this one lapsed" in html,
+            "the row is still pending in the store, and the page must not "
+            "present a lapsed authority as actionable")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_each_enabled_module_renders_its_own_section,
          test_a_disabled_module_is_loud_and_has_no_tiles,
@@ -2209,7 +2282,8 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_app_shell_may_cache_and_nothing_else_may,
          test_the_refresh_script_has_the_hooks_it_looks_for,
          test_the_newest_epoch_read_uses_an_index,
-         test_the_page_fits_a_phone_without_being_asked)
+         test_the_page_fits_a_phone_without_being_asked,
+         test_insights_and_proposals_are_rendered_and_empty_safe)
 
 
 def main():

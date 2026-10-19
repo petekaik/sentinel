@@ -82,10 +82,17 @@ def _fleet(cfg):
 
 
 def _specs(cfg):
+    """The SAME loader the runtime uses, with no store: parity pins a baseline.
+
+    `conn=None` means "threshold files only". Routing through `load_effective`
+    anyway is deliberate -- if the runtime's loader changes (an override layer,
+    a merge rule), this tool must move with it rather than keep grading a
+    baseline through a second implementation.
+    """
     if os.path.exists(FLEET_CONF):
-        return thresholds.load_many({"fleet": FLEET_CONF})
+        return thresholds.load_effective({"fleet": FLEET_CONF})
     # Pre-Task-3 tree: one flat checks.conf.
-    return thresholds.load(cfg.checks_conf)
+    return thresholds.load_effective({"config": cfg.checks_conf})
 
 
 def _module_classes():

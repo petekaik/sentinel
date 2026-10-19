@@ -34,7 +34,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
-                    fleet_config, read_fixture)
+                    fleet_config, load_specs, read_fixture)
 
 import checks                # noqa: E402
 import config as config_mod  # noqa: E402
@@ -139,7 +139,7 @@ def _export(cfg, box, transform=None):
 
 
 def _context(cfg, box, se, with_facts=True):
-    specs = thresholds.load(cfg.checks_conf)
+    specs = load_specs(cfg)
     classes = check_classes()
     fleet = fleet_config(cfg)
     ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,
@@ -577,7 +577,7 @@ def test_registry_and_thresholds_agree(results):
     tmpdir = tempfile.mkdtemp()
     try:
         cfg = _cfg(tmpdir)
-        specs = thresholds.load(cfg.checks_conf)
+        specs = load_specs(cfg)
         classes = check_classes()
         claimed, deferred, unclaimed = thresholds.audit(specs, classes)
         results.check(
@@ -952,7 +952,7 @@ def _save_result(cfg, box, facts_text):
     The whole of checks/* is exercised, not the class directly, so a check that
     stopped being registered for this box fails here rather than passing.
     """
-    specs = thresholds.load(cfg.checks_conf)
+    specs = load_specs(cfg)
     classes = check_classes()
     fleet = fleet_config(cfg)
     ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,

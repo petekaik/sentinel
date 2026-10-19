@@ -16,10 +16,15 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                       # noqa: E402
 
+import actions                                    # noqa: E402
 import advisors                                   # noqa: E402
 import collect                                    # noqa: E402
 import config as config_mod                       # noqa: E402
+import ctl                                        # noqa: E402
+import heal                                       # noqa: E402
 import store                                      # noqa: E402
+import thresholds                                 # noqa: E402
+import web                                        # noqa: E402
 
 DAY = 86400
 
@@ -1654,6 +1659,489 @@ def test_the_llm_api_key_never_reaches_a_record_or_the_config_summary(results):
         _close(tmp, conn)
 
 
+# ---------------------------------------------------------------------------
+# The authority ladder's last rung: propose, approve, reject, and the live
+# threshold override an approval can write.
+# ---------------------------------------------------------------------------
+
+
+def _open_incident(conn, target="t", check_id="c", subject="s"):
+    """Drive the real state machine to a confirmed `open` row."""
+    for seq in range(1, store.CONFIRM_POLLS + 1):
+        store.sync_incident(conn, seq, target, check_id, subject,
+                            store.Status.FAIL, "bad", {"why": "fixture"})
+    return dict(conn.execute(
+        "SELECT * FROM incident WHERE key = ?",
+        (store.incident_key(target, check_id, subject),)).fetchone())
+
+
+def _action(action_id="a", danger="state_changing", ran=None):
+    ran = ran if ran is not None else []
+    return actions.Action(
+        id=action_id, title=action_id, triggers=[("c", "*")], danger=danger,
+        dry_run=lambda ctx, inc: actions.Result(True, "would run"),
+        run=lambda ctx, inc: (ran.append(1) or actions.Result(True, "done")),
+        verify=("c", "*"), limits=actions.Limits(max_attempts=5))
+
+
+class _ActMod:
+    """One module declaring actions; enough for the healer and for ctl."""
+
+    def __init__(self, declared, module_id="m", check_ids=("c",), path=None):
+        self.id = module_id
+        self._declared = list(declared)
+        self.extra_check_ids = tuple(check_ids)
+        self.targets = ("t",)
+        self._path = path or tempfile.mkdtemp()
+        self.threshold_file = "thresholds.conf"
+
+    def actions(self):
+        return list(self._declared)
+
+    def check_classes(self):
+        return ()
+
+    def context(self, ctx):
+        pass
+
+
+class _ProposalCfg:
+    def __init__(self, authority="propose", remedies=True, ttl_h=24,
+                 destructive=False, enabled=True):
+        self.remedies_enabled = remedies
+        self.dry_run = False
+        self.proposal_ttl_s = ttl_h * 3600
+        self._policy = actions.Authority(
+            authority=authority, allow=(), destructive=destructive,
+            enabled=enabled)
+
+    def authority(self, module_id):
+        return self._policy
+
+
+class _ProposalCtx:
+    def __init__(self, modules):
+        self.modules = tuple(modules)
+        self.cfg = _ProposalCfg()
+
+
+class _Ran:
+    def __init__(self, target="t", check_id="c", subject="s"):
+        self.target = target
+        self.check_id = check_id
+        self.subject = subject
+
+
+def _action_proposal(conn, inc, action_id="a", module="m", expires_at=0):
+    return store.record_proposal(
+        conn, module=module, kind="action",
+        payload={"action_id": action_id, "incident_key": inc["key"],
+                 "target": inc["target"], "check_id": inc["check_id"],
+                 "subject": inc["subject"]},
+        rationale="stalled source", expires_at=expires_at)
+
+
+def test_propose_writes_one_pending_proposal_and_never_runs(results):
+    tmp, conn = _store()
+    try:
+        ran = []
+        mod = _ActMod([_action(ran=ran)])
+        _open_incident(conn)
+        cfg = _ProposalCfg()
+        out = heal.consider(cfg, conn, 4, [_Ran()], _ProposalCtx([mod]))
+
+        pending = store.list_proposals(conn, state="pending")
+        payload = json.loads(pending[0]["payload_json"]) if pending else {}
+        results.check(
+            "a propose-level action writes exactly one pending proposal",
+            len(pending) == 1 and pending[0]["kind"] == "action"
+            and pending[0]["module"] == "m"
+            and payload == {"action_id": "a", "incident_key": "t|c|s",
+                            "target": "t", "check_id": "c", "subject": "s"}
+            and pending[0]["expires_at"] > time.time(),
+            "pending=%r payload=%r out=%r" % (pending, payload, out))
+        results.check(
+            "propose records the refusal without executing",
+            out and out[0][2] == {"executed": False,
+                                  "why": "propose: awaiting operator approval"}
+            and ran == [],
+            "out=%r ran=%r" % (out, ran))
+
+        first_id = pending[0]["id"] if pending else None
+        results.check(
+            "the proposal carries the configured TTL",
+            pending and pending[0]["expires_at"] <= time.time() + 24 * 3600 + 5,
+            "expires_at=%r -- the default TTL is 24h"
+            % ((pending[0]["expires_at"] if pending else None),))
+        for seq in (5, 6, 7):
+            heal.consider(cfg, conn, seq, [_Ran()], _ProposalCtx([mod]))
+        again = store.list_proposals(conn, state="pending")
+        results.check(
+            "repeated epochs do not duplicate the proposal",
+            len(again) == 1 and again[0]["id"] == first_id and ran == [],
+            "ids=%r first=%r -- a row per epoch is a queue nobody can read"
+            % ([r["id"] for r in again], first_id))
+
+        # ONE PER (INCIDENT, ACTION), not one in total: a second incident is a
+        # second decision, and the dedup key would otherwise swallow it.
+        _open_incident(conn, subject="s2")
+        heal.consider(cfg, conn, 8, [_Ran(), _Ran(subject="s2")],
+                      _ProposalCtx([mod]))
+        keys = sorted(json.loads(r["payload_json"])["incident_key"]
+                      for r in store.list_proposals(conn, state="pending"))
+        results.check(
+            "a second incident gets its own proposal",
+            keys == ["t|c|s", "t|c|s2"],
+            "keys=%r -- deduping on the action alone would merge two incidents "
+            "into one decision" % (keys,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_an_expired_proposal_is_not_reused(results):
+    tmp, conn = _store()
+    try:
+        mod = _ActMod([_action()])
+        _open_incident(conn)
+        cfg = _ProposalCfg(ttl_h=1)
+        heal.consider(cfg, conn, 4, [_Ran()], _ProposalCtx([mod]))
+        created = store.list_proposals(conn, state="pending")
+        if not results.check(
+                "the propose-level action wrote a proposal to expire",
+                len(created) == 1,
+                "pending=%r -- without a proposal there is nothing to expire, "
+                "so the rest of this test would be measuring nothing"
+                % (created,)):
+            return
+        old = created[0]
+        conn.execute("UPDATE proposal SET expires_at = ? WHERE id = ?",
+                     (time.time() - 1, old["id"]))
+
+        heal.consider(cfg, conn, 5, [_Ran()], _ProposalCtx([mod]))
+        rows = store.list_proposals(conn)
+        pending = [r for r in rows if r["state"] == "pending"]
+        expired = [r for r in rows if r["state"] == "expired"]
+        results.check(
+            "a lapsed proposal is marked expired and a new one is written",
+            old["id"] in [r["id"] for r in expired]
+            and len(pending) == 1 and pending[0]["id"] != old["id"],
+            "rows=%r -- an expired proposal must never be reused, or an old "
+            "authority would cover a condition nobody re-checked"
+            % [(r["id"], r["state"], r["expires_at"]) for r in rows])
+    finally:
+        _close(tmp, conn)
+
+
+def test_an_action_approval_executes_audits_and_marks_executed(results):
+    tmp, conn = _store()
+    try:
+        ran = []
+        mod = _ActMod([_action(ran=ran)])
+        inc = _open_incident(conn)
+        pid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        msg = ctl.approve_proposal(_ProposalCfg(), conn, {"m": mod}, pid,
+                                   "operator", ctx=object())
+        row = store.get_proposal(conn, pid)
+        runs = store.list_command_runs(conn)
+        results.check(
+            "an approved action executes through the healer",
+            ran == [1] and row["state"] == "executed"
+            and row["executed_at"] > 0 and "executed" in msg,
+            "ran=%r row=%r msg=%r" % (ran, row, msg))
+        results.check(
+            "the approval writes a command_run audit row",
+            len(runs) == 1 and runs[0]["command"] == "approve_proposal"
+            and runs[0]["actor"] == "operator"
+            and runs[0]["exit_status"] == 0,
+            "runs=%r -- a human decision that becomes an action must be "
+            "visible in the command audit" % (runs,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_an_approval_refuses_every_unsafe_state(results):
+    tmp, conn = _store()
+    try:
+        ran = []
+        mod = _ActMod([_action(ran=ran)])
+        inc = _open_incident(conn)
+        pid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        cfg = _ProposalCfg()
+
+        def refused(label, call, needle):
+            try:
+                call()
+                got = ""
+            except ctl.ProposalRefused as exc:
+                got = str(exc)
+            pending = store.get_proposal(conn, pid)["state"] == "pending"
+            results.check(label, needle in got and pending and ran == [],
+                          "refusal=%r pending=%r ran=%r" % (got, pending, ran))
+
+        # A resolved incident.
+        conn.execute("UPDATE incident SET state = 'resolved', resolved_at = ? "
+                     "WHERE key = ?", (time.time(), inc["key"]))
+        refused("an approval refuses when the incident has resolved",
+                lambda: ctl.approve_proposal(cfg, conn, {"m": mod}, pid,
+                                             "operator", ctx=object()),
+                "no longer live")
+        conn.execute("UPDATE incident SET state = 'open', resolved_at = NULL "
+                     "WHERE key = ?", (inc["key"],))
+
+        refused("an approval refuses when the module is disabled",
+                lambda: ctl.approve_proposal(cfg, conn, {}, pid, "operator",
+                                             ctx=object()),
+                "disabled")
+        refused("an approval refuses while MONITOR_REMEDIES is off",
+                lambda: ctl.approve_proposal(
+                    _ProposalCfg(remedies=False), conn, {"m": mod}, pid,
+                    "operator", ctx=object()),
+                "MONITOR_REMEDIES")
+        refused("an approval refuses while SENTINEL_REMEDIATION is off",
+                lambda: ctl.approve_proposal(
+                    _ProposalCfg(enabled=False), conn, {"m": mod}, pid,
+                    "operator", ctx=object()),
+                "SENTINEL_REMEDIATION")
+
+        conn.execute("UPDATE proposal SET expires_at = ? WHERE id = ?",
+                     (time.time() - 1, pid))
+        try:
+            ctl.approve_proposal(cfg, conn, {"m": mod}, pid, "operator",
+                                 ctx=object())
+            got = ""
+        except ctl.ProposalRefused as exc:
+            got = str(exc)
+        results.check(
+            "an expired proposal is refused AND moved out of pending",
+            "expired" in got and ran == []
+            and store.get_proposal(conn, pid)["state"] == "expired",
+            "refusal=%r row=%r ran=%r -- a lapsed authority must not read as "
+            "pending in either the refusal or the store"
+            % (got, store.get_proposal(conn, pid), ran))
+        conn.execute("UPDATE proposal SET state = 'pending', expires_at = ? "
+                     "WHERE id = ?", (time.time() + 3600, pid))
+
+        # A destructive action still needs its own switch.
+        dmod = _ActMod([_action(danger="destructive", ran=ran)])
+        refused("an approval cannot lift ALLOW_DESTRUCTIVE",
+                lambda: ctl.approve_proposal(
+                    _ProposalCfg(destructive=False), conn, {"m": dmod}, pid,
+                    "operator", ctx=object()),
+                "destructive")
+
+        # The action is re-resolved from the module loaded now.
+        empty = _ActMod([])
+        refused("an approval refuses an action no longer declared",
+                lambda: ctl.approve_proposal(cfg, conn, {"m": empty}, pid,
+                                             "operator", ctx=object()),
+                "no longer declared")
+    finally:
+        _close(tmp, conn)
+
+
+def test_reject_decides_and_never_executes(results):
+    tmp, conn = _store()
+    try:
+        ran = []
+        mod = _ActMod([_action(ran=ran)])
+        inc = _open_incident(conn)
+        pid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        msg = ctl.reject_proposal(conn, pid, "operator")
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "reject decides the proposal and never executes it",
+            ran == [] and row["state"] == "rejected"
+            and row["actor"] == "operator" and row["decided_at"] > 0
+            and "rejected" in msg,
+            "ran=%r row=%r msg=%r" % (ran, row, msg))
+        try:
+            ctl.reject_proposal(conn, pid, "intruder")
+            got = ""
+        except ctl.ProposalRefused as exc:
+            got = str(exc)
+        results.check(
+            "a decided proposal cannot be rejected again",
+            "not pending" in got
+            and store.get_proposal(conn, pid)["actor"] == "operator",
+            "refusal=%r row=%r -- a second decision must not rewrite the "
+            "history of the first" % (got, store.get_proposal(conn, pid)))
+    finally:
+        _close(tmp, conn)
+
+
+_THRESHOLD_CONF = """\
+[mem]
+direction = high_is_good
+green = 100
+amber = 60
+
+[latency]
+direction = low_is_good
+green = 10
+amber = 50
+"""
+
+
+def _threshold_module():
+    root = tempfile.mkdtemp()
+    with open(os.path.join(root, "thresholds.conf"), "w") as fh:
+        fh.write(_THRESHOLD_CONF)
+    return _ActMod([], path=root), root
+
+
+def _threshold_proposal(conn, spec_id, module, green, amber, expires_at=None):
+    return store.record_proposal(
+        conn, module=module, kind="threshold_change",
+        payload={"spec_id": spec_id, "module": module,
+                 "green": green, "amber": amber},
+        rationale="p95 outside the band",
+        expires_at=(time.time() + 3600 if expires_at is None else expires_at))
+
+
+def test_an_approved_threshold_changes_grading_without_a_rebuild(results):
+    tmp, conn = _store()
+    mod, root = _threshold_module()
+    try:
+        path = os.path.join(root, "thresholds.conf")
+        pid = _threshold_proposal(conn, "mem", "m", 100, 50)
+        msg = ctl.approve_proposal(_ProposalCfg(authority="off"), conn,
+                                   {"m": mod}, pid, "operator", ctx=object())
+        override = store.get_threshold_override(conn, "mem")
+        results.check(
+            "an approved threshold writes the override and previous band",
+            override is not None and override["green"] == 100
+            and override["amber"] == 50
+            and json.loads(override["previous_json"])
+            == {"green": 100, "amber": 60}
+            and override["proposal_id"] == pid
+            and store.get_proposal(conn, pid)["state"] == "executed",
+            "override=%r msg=%r" % (override, msg))
+        results.check(
+            "previous_json round-trips the band it replaced",
+            override is not None
+            and json.loads(override["previous_json"])
+            == {"green": 100, "amber": 60},
+            "previous_json=%r" % (override or {}).get("previous_json"))
+
+        effective = thresholds.load_effective({"m": path}, conn)
+        results.check(
+            "the next load_effective grades with the approved band",
+            effective["mem"].green == 100 and effective["mem"].amber == 50
+            and effective["latency"].amber == 50,
+            "mem=%r latency=%r -- an override that does not reach the loader is "
+            "a rebuild in disguise" % (effective["mem"], effective["latency"]))
+
+        ctl.revert_threshold(conn, "mem")
+        restored = thresholds.load_effective({"m": path}, conn)
+        results.check(
+            "revert-threshold restores the file's band",
+            store.get_threshold_override(conn, "mem") is None
+            and restored["mem"].green == 100 and restored["mem"].amber == 60,
+            "restored=%r override=%r"
+            % (restored["mem"], store.get_threshold_override(conn, "mem")))
+    finally:
+        _close(tmp, conn)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_threshold_approval_refuses_what_it_cannot_justify(results):
+    tmp, conn = _store()
+    mod, root = _threshold_module()
+    try:
+        cases = [
+            ("unknown spec", _threshold_proposal(conn, "nope", "m", 100, 50),
+             "unknown threshold spec"),
+            # high_is_good wants amber <= green.
+            ("unordered band",
+             _threshold_proposal(conn, "mem", "m", 100, 110),
+             "not ordered"),
+            # green is the operator's standard; only the failing edge moves.
+            ("moved green edge",
+             _threshold_proposal(conn, "mem", "m", 90, 50),
+             "only the failing edge"),
+            # width 40 -> at most 10; 60 -> 49 is 11.
+            ("over the 25% bound",
+             _threshold_proposal(conn, "mem", "m", 100, 49),
+             "exceeds"),
+            ("loosening the failing edge",
+             _threshold_proposal(conn, "mem", "m", 100, 61),
+             "only tighten"),
+            # low_is_good wants amber >= green, and tightens upward.
+            ("unordered low_is_good band",
+             _threshold_proposal(conn, "latency", "m", 10, 5),
+             "not ordered"),
+            ("over the bound on low_is_good",
+             _threshold_proposal(conn, "latency", "m", 10, 61),
+             "exceeds"),
+        ]
+        for label, pid, needle in cases:
+            try:
+                ctl.approve_proposal(_ProposalCfg(authority="off"), conn,
+                                     {"m": mod}, pid, "operator", ctx=object())
+                got = ""
+            except ctl.ProposalRefused as exc:
+                got = str(exc)
+            results.check(
+                "a threshold approval refuses %s" % label,
+                needle in got
+                and store.get_threshold_override(conn, "mem") is None
+                and store.get_threshold_override(conn, "latency") is None
+                and store.get_proposal(conn, pid)["state"] == "pending",
+                "refusal=%r -- an approval must not be able to apply an "
+                "arbitrary band or an unknown spec" % (got,))
+    finally:
+        _close(tmp, conn)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_runtime_loads_effective_thresholds(results):
+    """Every grading surface goes through ONE loader, overrides included.
+
+    Checked with `inspect.getsource` on the FUNCTION, not the file: collect.py
+    has a second `load_effective(` in `--showconf`, and a file-level grep stayed
+    green after `collect_once` was reverted to `load_many` -- the mutation run
+    caught that. The alternative costs a split brain: the collector grades the
+    file's band while an approval says otherwise, and nothing reports it.
+    """
+    import inspect
+    missing = []
+    for fn in (collect.collect_once, web.build_state):
+        if "load_effective(" not in inspect.getsource(fn):
+            missing.append("%s.%s" % (fn.__module__, fn.__name__))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for rel in ("tools/parity.py", "tests/harness.py"):
+        with open(os.path.join(root, rel)) as fh:
+            if "load_effective(" not in fh.read():
+                missing.append(rel)
+    results.check(
+        "collect_once, build_state, parity and the harness use load_effective",
+        not missing,
+        "missing=%r -- a surface that loads the file directly cannot see an "
+        "approved override" % (missing,))
+
+
+def test_the_proposal_ttl_defaults_validated_and_overridable(results):
+    default = config_mod.Config(env={})
+    results.check(
+        "the proposal TTL defaults to 24h",
+        default.proposal_ttl_h == 24 and default.proposal_ttl_s == 24 * 3600,
+        "ttl_h=%r" % (default.proposal_ttl_h,))
+    custom = config_mod.Config(env={"SENTINEL_PROPOSAL_TTL_H": "48"})
+    results.check(
+        "SENTINEL_PROPOSAL_TTL_H overrides the deadline",
+        custom.proposal_ttl_s == 48 * 3600, "ttl_s=%r" % (custom.proposal_ttl_s,))
+    try:
+        config_mod.Config(env={"SENTINEL_PROPOSAL_TTL_H": "0"})
+        msg = ""
+    except ValueError as exc:
+        msg = str(exc)
+    results.check(
+        "a non-positive TTL refuses to start rather than expiring everything",
+        "SENTINEL_PROPOSAL_TTL_H" in msg,
+        "error=%r -- a zero TTL would make every proposal born expired"
+        % (msg,))
+
+
 TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_request_shorter_than_history_is_the_request,
          test_an_empty_store_reports_no_history,
@@ -1699,7 +2187,16 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_the_llm_advisor_without_a_provider_is_inert,
          test_the_llm_advisor_is_registered_only_when_configured,
          test_selecting_the_llm_advisor_runs_it_and_errors_loudly,
-         test_the_llm_api_key_never_reaches_a_record_or_the_config_summary)
+         test_the_llm_api_key_never_reaches_a_record_or_the_config_summary,
+         test_propose_writes_one_pending_proposal_and_never_runs,
+         test_an_expired_proposal_is_not_reused,
+         test_an_action_approval_executes_audits_and_marks_executed,
+         test_an_approval_refuses_every_unsafe_state,
+         test_reject_decides_and_never_executes,
+         test_an_approved_threshold_changes_grading_without_a_rebuild,
+         test_a_threshold_approval_refuses_what_it_cannot_justify,
+         test_the_runtime_loads_effective_thresholds,
+         test_the_proposal_ttl_defaults_validated_and_overridable)
 
 
 def main():

@@ -159,6 +159,11 @@ CREATE TABLE IF NOT EXISTS check_run (
     epoch_seq   INTEGER NOT NULL,
     target      TEXT    NOT NULL,
     check_id    TEXT    NOT NULL,
+    -- The incident key is (target, check_id, subject), so an approval's
+    -- freshness test needs the subject too. It was absent from this table
+    -- (only check_run's in-memory results carried it), which made the store's
+    -- freshness question weaker than the one `heal.consider` asks.
+    subject     TEXT    NOT NULL DEFAULT '',
     status      TEXT    NOT NULL,
     detail      TEXT,
     duration_ms INTEGER
@@ -429,6 +434,14 @@ def _migrate(conn):
     for name, decl in _ADDED_COLUMNS:
         if name not in have:
             conn.execute("ALTER TABLE incident ADD COLUMN %s %s" % (name, decl))
+    # `check_run.subject` arrived with the approval freshness gate. An older
+    # row gets the empty default: it is evidence recorded before the subject
+    # was stored, and the approval gate then treats it as not fresh, which is
+    # the safe direction.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(check_run)")}
+    if "subject" not in have:
+        conn.execute("ALTER TABLE check_run ADD COLUMN subject TEXT NOT NULL "
+                     "DEFAULT ''")
 
 
 def _ensure_live_index(conn):
@@ -482,16 +495,18 @@ def record_sample(conn, seq, target, metric, value=None, unit=None, text=None):
     )
 
 
-def record_check(conn, seq, target, check_id, status, detail, duration_ms=None):
+def record_check(conn, seq, target, check_id, status, detail, duration_ms=None,
+                 subject=""):
     conn.execute(
         "INSERT INTO check_run "
-        "(ts, epoch_seq, target, check_id, status, detail, duration_ms) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(ts, epoch_seq, target, check_id, subject, status, detail, "
+        "duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             time.time(),
             seq,
             target,
             check_id,
+            subject or "",
             status.value if isinstance(status, Status) else str(status),
             detail,
             duration_ms,
@@ -668,6 +683,73 @@ def list_insights(conn, module=None, limit=100):
     return [dict(r) for r in rows]
 
 
+def newest_insight(conn, advisor, kind, target="", check_id="", subject="",
+                   since=None):
+    """The newest insight for one identity, optionally no older than `since`.
+
+    The identity is `(advisor, kind, target, check_id, subject)` -- the same
+    four-part selection the runner uses to decide whether an epoch's advice is
+    new or a repeat. `since` is what turns that into a dedupe window: an advisor
+    that runs every minute must not write a row every minute.
+    """
+    sql = ("SELECT * FROM insight WHERE advisor = ? AND kind = ? AND target = ? "
+           "AND check_id = ? AND subject = ?")
+    params = [advisor or "", kind or "", target or "", check_id or "",
+              subject or ""]
+    if since is not None:
+        sql += " AND ts >= ?"
+        params.append(since)
+    row = conn.execute(sql + " ORDER BY id DESC LIMIT 1",
+                       tuple(params)).fetchone()
+    return dict(row) if row else None
+
+
+def recent_insights(conn, kind, module=None, target=None, check_id=None,
+                    subject=None, since=None, limit=50):
+    """Newest insights of one kind, with whatever filters are given.
+
+    Used by the advisory engine to answer, from the store, whether it has
+    already written the recommendation this incident/action pair deserves.
+    """
+    sql = "SELECT * FROM insight WHERE kind = ?"
+    params = [kind]
+    for column, value in (("module", module), ("target", target),
+                          ("check_id", check_id), ("subject", subject)):
+        if value is not None:
+            sql += " AND %s = ?" % column
+            params.append(value)
+    if since is not None:
+        sql += " AND ts >= ?"
+        params.append(since)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+
+def update_insight(conn, insight_id, **fields):
+    """Replace an insight row's content in place, keeping its id and identity.
+
+    Same field whitelist as `record_insight` (with `evidence` JSON-encoded here,
+    once). `ts` moves to now, so a deduped row reads as current advice rather
+    than as a stale one that happens to still be the newest.
+    """
+    unknown = sorted(set(fields) - set(INSIGHT_FIELDS))
+    if unknown:
+        raise TypeError("unexpected insight field(s): %s" % ", ".join(unknown))
+    values = {}
+    for name, value in fields.items():
+        values["evidence_json" if name == "evidence" else name] = (
+            json.dumps(value) if name == "evidence" else value)
+    if not values:
+        return 0
+    values["ts"] = time.time()
+    cur = conn.execute(
+        "UPDATE insight SET %s WHERE id = ?"
+        % ", ".join("%s = ?" % name for name in values),
+        tuple(values.values()) + (insight_id,))
+    return cur.rowcount
+
+
 def record_proposal(conn, module, kind, payload, rationale, expires_at=0):
     """A proposal starts `pending`; only `decide_proposal` moves it."""
     cur = conn.execute(
@@ -791,15 +873,52 @@ def decide_proposal(conn, proposal_id, state, actor):
     return cur.rowcount
 
 
+def claim_proposal(conn, proposal_id, actor):
+    """Atomically take a PENDING proposal for execution.
+
+    Returns the rowcount: 1 when THIS caller won the claim, 0 when the row was
+    not pending. The conditional UPDATE is the whole mechanism -- two operator
+    processes that both read `pending` must not both execute the action, and a
+    check-then-execute sequence cannot promise that. The winner is recorded as
+    the decider here (the human said yes); `mark_proposal_executed` later adds
+    the execution stamp without rewriting this one.
+    """
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'approved', decided_at = ?, actor = ? "
+        "WHERE id = ? AND state = 'pending'",
+        (time.time(), actor, proposal_id),
+    )
+    return cur.rowcount
+
+
+def release_proposal(conn, proposal_id):
+    """Undo a claim whose execution was REFUSED, restoring `pending`.
+
+    Only ever touches a row still in `approved`, so a proposal that executed (or
+    was decided in the meantime) cannot be dragged back. A refusal is not a
+    decision about the proposal: the operator can retry the approval once the
+    refusal's cause is gone.
+    """
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'pending', decided_at = NULL, actor = NULL, "
+        "executed_at = NULL WHERE id = ? AND state = 'approved'",
+        (proposal_id,),
+    )
+    return cur.rowcount
+
+
 def mark_proposal_executed(conn, proposal_id):
     """Record that an approved proposal ran. The decision metadata is preserved.
 
     Deliberately not routed through `decide_proposal`: execution is a later
     fact about the same row, and rewriting `decided_at`/`actor` would destroy
-    the evidence of who approved it. Returns the rowcount.
+    the evidence of who approved it. STATE-GUARDED to `approved`: only a claimed
+    proposal can become `executed`, so an unclaimed pending row cannot skip the
+    claim. Returns the rowcount.
     """
     cur = conn.execute(
-        "UPDATE proposal SET state = 'executed', executed_at = ? WHERE id = ?",
+        "UPDATE proposal SET state = 'executed', executed_at = ? "
+        "WHERE id = ? AND state = 'approved'",
         (time.time(), proposal_id),
     )
     return cur.rowcount
@@ -907,6 +1026,26 @@ def get_live_incident(conn, key):
     """The one live row for a key, as a dict -- the healer's approval gate."""
     row = _live_incident(conn, key)
     return dict(row) if row else None
+
+
+def evidence_in_newest_epoch(conn, target, check_id, subject=""):
+    """True if the NEWEST epoch observed exactly this incident.
+
+    Approving a proposal acts on an incident, and an incident row can outlive
+    the observation that produced it (a frozen `unknown` row, or one selected
+    by a check id that did not run this epoch). An approval must therefore
+    confirm that the EVIDENCE it is acting on was produced by the latest
+    collection -- for the same `(target, check_id, subject)` triple the incident
+    key is built from, not merely the same check somewhere.
+    """
+    row = conn.execute("SELECT MAX(epoch_seq) AS s FROM check_run").fetchone()
+    seq = row["s"] if row else None
+    if seq is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM check_run WHERE epoch_seq = ? AND target = ? "
+        "AND check_id = ? AND subject = ? LIMIT 1",
+        (seq, target, check_id, subject or "")).fetchone() is not None
 
 
 def sync_incident(conn, seq, target, check_id, subject, status, detail,

@@ -109,6 +109,17 @@ class Config:
                 "SENTINEL_ADVISOR_MAX_HISTORY_DAYS must be >= 0, got %d" % cap)
         self.advisor_max_history_days = cap
 
+        # LLM advisor. ALL FOUR DEFAULT EMPTY, and the advisor is registered
+        # only when provider AND endpoint are both set. Configuring it is the
+        # operator's explicit opt-in to data leaving the container; it still
+        # runs only when named in `SENTINEL_ADVISORS` (e.g. `llm`), never on
+        # the default path. The key is a credential and is never printed by
+        # `describe()`.
+        self.llm_provider = _env("SENTINEL_LLM_PROVIDER", "", e)
+        self.llm_endpoint = _env("SENTINEL_LLM_ENDPOINT", "", e)
+        self.llm_key = _env("SENTINEL_LLM_KEY", "", e)
+        self.llm_model = _env("SENTINEL_LLM_MODEL", "", e)
+
     def module_enabled(self, module_id):
         return _bool("%s_ENABLED" % module_id.upper(), True, self.env)
 
@@ -162,4 +173,11 @@ class Config:
                     + " (max %d days history)" % self.advisor_max_history_days
                     if self.advisor_ids else "none")
         lines.append("advisors           : %s" % advisors)
+        # Provider/endpoint/model are configuration; the KEY is a credential
+        # and is deliberately never part of this summary.
+        llm = ("%s at %s (model %s; selected explicitly only)"
+               % (self.llm_provider, self.llm_endpoint,
+                  self.llm_model or "default")
+               if self.llm_provider and self.llm_endpoint else "not configured")
+        lines.append("llm advisor        : %s" % llm)
         return "\n".join(lines)

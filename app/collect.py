@@ -494,7 +494,7 @@ def run_advisors_for_epoch(cfg, conn, ctx):
         # `ctx.modules`; and it is the DEFAULT selection, so if the selector
         # could not see it every default epoch would record "selector names no
         # advisor". A malformed platform object is isolated like any other.
-        for adv in intelligence.platform_advisors():
+        for adv in intelligence.platform_advisors(cfg):
             try:
                 adv_id = str(adv.id)
             except Exception:                  # noqa: BLE001 - isolated

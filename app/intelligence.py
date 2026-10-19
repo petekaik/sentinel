@@ -37,6 +37,7 @@ and reusing a real module id would put its advice in that module's report.
 import math
 
 import advisors
+import llm_advisor
 from module import owned_check_ids
 import store
 
@@ -270,11 +271,25 @@ class ReferenceAdvisor(advisors.Advisor):
         return out
 
 
-def platform_advisors():
+def platform_advisors(cfg=None):
     """Fresh instances of every advisor the platform itself owns.
 
     They are not reachable through `ctx.modules` (they belong to no module), so
     the selector in `collect.run_advisors_for_epoch` needs this list. A fresh
     instance per epoch keeps one run's reads out of the next run's state.
+
+    THE LLM ADVISOR IS REGISTERED ONLY WHEN CONFIGURED (both provider and
+    endpoint set). Registration makes it SELECTABLE -- `SENTINEL_ADVISORS=llm`
+    or `platform.llm` -- and is deliberately not the same thing as selecting
+    it: the default selector names only `reference`, so configuring a provider
+    never puts an advisor that sends data off the box on the default path.
     """
-    return [ReferenceAdvisor()]
+    out = [ReferenceAdvisor()]
+    configured = llm_advisor.LlmAdvisor(
+        provider=getattr(cfg, "llm_provider", ""),
+        endpoint=getattr(cfg, "llm_endpoint", ""),
+        api_key=getattr(cfg, "llm_key", ""),
+        model=getattr(cfg, "llm_model", ""))
+    if configured.configured:
+        out.append(configured)
+    return out

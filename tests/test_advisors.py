@@ -1489,6 +1489,171 @@ def test_the_runner_hands_threshold_specs_to_every_snapshot(results):
         _close(tmp, conn)
 
 
+def test_the_llm_advisor_without_a_provider_is_inert(results):
+    import llm_advisor
+
+    a = llm_advisor.LlmAdvisor(provider="", endpoint="", api_key="", model="")
+    results.check(
+        "an unconfigured LLM advisor is inert, not silently green",
+        getattr(a, "configured", False) is False,
+        "configured=%r" % (getattr(a, "configured", None),))
+    results.check(
+        "its id, title and window are the documented ones",
+        a.id == "llm" and a.title == "LLM diagnosis and summaries"
+        and a.history_days == 7 and a.module == "platform",
+        "id=%r title=%r history_days=%r module=%r. The id is the selector "
+        "name (SENTINEL_ADVISORS=llm); the platform module is what attributes "
+        "the run row to nobody else." % (a.id, a.title, a.history_days,
+                                         a.module))
+    results.check(
+        "an unconfigured advise returns no insight and does not raise",
+        a.advise(None, None) == [],
+        "An unconfigured advisor must be inert -- an epoch that runs it "
+        "unasked must not turn its absence of config into a red row.")
+    for kwargs in ({"provider": "openai"}, {"endpoint": "https://x.invalid"}):
+        results.check(
+            "configuration requires both provider and endpoint (%s only)"
+            % next(iter(kwargs)),
+            llm_advisor.LlmAdvisor(**kwargs).configured is False,
+            "configured=%r. A provider with no endpoint cannot be called, and "
+            "an endpoint with no provider names no protocol."
+            % (llm_advisor.LlmAdvisor(**kwargs).configured,))
+    results.check(
+        "the four LLM keys default to empty",
+        (config_mod.Config(env={}).llm_provider,
+         config_mod.Config(env={}).llm_endpoint,
+         config_mod.Config(env={}).llm_key,
+         config_mod.Config(env={}).llm_model) == ("", "", "", ""),
+        "LLM configuration must be off unless an operator writes it.")
+
+
+def test_the_llm_advisor_is_registered_only_when_configured(results):
+    import intelligence
+
+    unconfigured = intelligence.platform_advisors(config_mod.Config(env={}))
+    env = {"SENTINEL_LLM_PROVIDER": "openai",
+           "SENTINEL_LLM_ENDPOINT": "https://llm.invalid/v1"}
+    cfg = config_mod.Config(env=env)
+    configured = intelligence.platform_advisors(cfg)
+
+    results.check(
+        "an unconfigured platform registers only the reference advisor",
+        [a.id for a in unconfigured] == ["reference"],
+        "ids=%r. Registering an unconfigured LLM advisor would let a selector "
+        "name it and read the resulting inert run as a healthy one."
+        % ([a.id for a in unconfigured],))
+    results.check(
+        "a configured provider registers the LLM advisor beside the reference",
+        [a.id for a in configured] == ["reference", "llm"],
+        "ids=%r. Configuring it is what makes SENTINEL_ADVISORS=llm "
+        "resolvable." % ([a.id for a in configured],))
+    results.check(
+        "configuring a provider does NOT put the LLM advisor on the default path",
+        cfg.advisor_ids == ("reference",),
+        "ids=%r. The default selector stays `reference`; the LLM advisor runs "
+        "only when named. Configuration is not consent to egress."
+        % (cfg.advisor_ids,))
+
+    tmp, conn = _store()
+    try:
+        out = collect.run_advisors_for_epoch(cfg, conn, _FakeCtx([]))
+        results.check(
+            "a configured but unselected LLM advisor does not run",
+            [e["advisor"] for e in out] == ["reference"],
+            "out=%r. Registration makes it selectable, not selected."
+            % ([e["advisor"] for e in out],))
+    finally:
+        _close(tmp, conn)
+
+
+def test_selecting_the_llm_advisor_runs_it_and_errors_loudly(results):
+    import socket
+
+    env = {"SENTINEL_LLM_PROVIDER": "openai",
+           "SENTINEL_LLM_ENDPOINT": "https://llm.invalid/v1",
+           "SENTINEL_LLM_MODEL": "test-model"}
+    tmp, conn = _store()
+    try:
+        for selector in ("llm", "platform.llm"):
+            conn.execute("DELETE FROM advisor_run")
+            cfg = config_mod.Config(env=dict(env, SENTINEL_ADVISORS=selector))
+            ctx = _FakeCtx([])
+            # NO NETWORK: transport is unimplemented, so any attempt is a
+            # defect. This makes one fail loudly instead of reaching out.
+            real_socket = socket.socket
+            socket.socket = lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("the LLM advisor tried to open a socket"))
+            try:
+                out = collect.run_advisors_for_epoch(cfg, conn, ctx)
+            finally:
+                socket.socket = real_socket
+            row = conn.execute(
+                "SELECT * FROM advisor_run WHERE advisor = 'llm'").fetchone()
+            results.check(
+                "%r runs the LLM advisor and records an explicit error"
+                % selector,
+                len(out) == 1 and out[0]["advisor"] == "llm"
+                and out[0]["module"] == "platform"
+                and out[0]["status"] == "error" and out[0]["ok"] is False
+                and "not implemented" in out[0]["detail"]
+                and row is not None and row["status"] == "error"
+                and "not implemented" in (row["detail"] or ""),
+                "out=%r row=%r notes=%r. An unimplemented transport must not "
+                "read as a green run that found nothing; the error is the "
+                "honest answer until the provider client exists."
+                % (out, dict(row) if row else None, ctx.notes))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_llm_api_key_never_reaches_a_record_or_the_config_summary(results):
+    key = "sentinel-test-key-must-never-be-stored-7f3a9c"
+    env = {"SENTINEL_ADVISORS": "llm",
+           "SENTINEL_LLM_PROVIDER": "openai",
+           "SENTINEL_LLM_ENDPOINT": "https://llm.invalid/v1",
+           "SENTINEL_LLM_KEY": key,
+           "SENTINEL_LLM_MODEL": "test-model"}
+    tmp, conn = _store()
+    try:
+        cfg = config_mod.Config(env=env)
+        ctx = _FakeCtx([])
+        out = collect.run_advisors_for_epoch(cfg, conn, ctx)
+        rows = [dict(r) for r in conn.execute("SELECT * FROM advisor_run")]
+        insights = [dict(r) for r in conn.execute("SELECT * FROM insight")]
+        blobs = [cfg.describe(), json.dumps(out, default=str),
+                 json.dumps(ctx.notes, default=str),
+                 json.dumps(rows, default=str),
+                 json.dumps(insights, default=str)]
+        where = ["describe()", "runner output", "notes", "advisor_run",
+                 "insight"]
+
+        results.check(
+            "the key is absent from --showconf, run detail and every stored row",
+            all(key not in blob for blob in blobs),
+            "found in %s. The key is a credential: a diagnostic dump, a "
+            "traceback or --showconf must never carry it."
+            % ([w for w, blob in zip(where, blobs) if key in blob],))
+        with open(os.path.join(tmp, "snapshot.sqlite"), "rb") as fh:
+            raw = fh.read()
+        results.check(
+            "the key is absent from the store file itself",
+            key.encode() not in raw,
+            "found in the sqlite file. Nothing may persist the credential, "
+            "not even in a WAL page or a detail string.")
+
+        # The checks above are only worth something if the configuration that
+        # holds the key was actually in force for the run.
+        results.check(
+            "the configured advisor really was selected and reported configured",
+            len(out) == 1 and out[0]["advisor"] == "llm"
+            and cfg.llm_key == key
+            and "llm" in cfg.describe(),
+            "out=%r describe=%r. A key-absence check over a run that never "
+            "read the key proves nothing." % (out, cfg.describe()))
+    finally:
+        _close(tmp, conn)
+
+
 TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_request_shorter_than_history_is_the_request,
          test_an_empty_store_reports_no_history,
@@ -1530,7 +1695,11 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_short_sample_span_alone_blocks_the_suggestion,
          test_a_series_beyond_the_old_global_cap_still_yields_a_suggestion,
          test_the_snapshot_deep_copies_the_threshold_specs,
-         test_the_runner_hands_threshold_specs_to_every_snapshot)
+         test_the_runner_hands_threshold_specs_to_every_snapshot,
+         test_the_llm_advisor_without_a_provider_is_inert,
+         test_the_llm_advisor_is_registered_only_when_configured,
+         test_selecting_the_llm_advisor_runs_it_and_errors_loudly,
+         test_the_llm_api_key_never_reaches_a_record_or_the_config_summary)
 
 
 def main():

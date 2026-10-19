@@ -16,6 +16,12 @@ import store
 
 DAY = 86400
 
+# How long one advisor's insight stays "current" before a repeat is a new row.
+# An advisor runs every epoch; without this window the reference advisor writes
+# an identical incident report once a minute forever, and the operator surface
+# becomes a list of the same sentence.
+INSIGHT_DEDUPE_S = 3600
+
 
 def series_key(target, metric):
     """The truncation-record key for one (target, metric) sample series."""
@@ -258,7 +264,24 @@ def _record(conn, advisor_id, insight, snap):
         evidence.setdefault("truncated", dict(snap.truncated))
     insight.evidence = evidence
     if conn is not None:
-        store.record_insight(conn, advisor=advisor_id, **insight.__dict__)
+        # DEDUPE WITHIN A SHORT WINDOW. The reference advisor runs every epoch,
+        # so an unchanged report/suggestion is one current row, updated in
+        # place, rather than a new row every minute. The identity is the same
+        # one an operator would use to ask "what does this advisor say about
+        # this subject"; after the window a still-true claim is new evidence
+        # and gets its own row.
+        existing = store.newest_insight(
+            conn, advisor=advisor_id, kind=insight.kind,
+            target=insight.target, check_id=insight.check_id,
+            subject=insight.subject, since=time.time() - INSIGHT_DEDUPE_S)
+        if existing is not None:
+            store.update_insight(
+                conn, existing["id"], module=insight.module,
+                severity=insight.severity, confidence=insight.confidence,
+                title=insight.title, body=insight.body,
+                evidence=evidence, expires_at=insight.expires_at)
+        else:
+            store.record_insight(conn, advisor=advisor_id, **insight.__dict__)
 
 
 def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
@@ -303,6 +326,21 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
                 if cfg is not None
                 and hasattr(cfg, "advisor_history_days") else default_days)
             days = min(requested, int(history_cap_days))
+            # THE ADVISOR MUST ASK FOR THE SAME WINDOW THE RUNNER RESOLVED.
+            # `advise()` calls `snapshot.window(self.history_days)` itself, so
+            # without this assignment a per-advisor override was a no-op for
+            # the reference advisor: the runner resolved 14 days, then the
+            # advisor asked for its class default 7 and the second call won
+            # both `requested_days` and `since`. Setting the effective request
+            # on the instance keeps the override authoritative while the
+            # snapshot's own `max_days` still enforces the platform cap.
+            try:
+                adv.history_days = days
+            except Exception:                      # noqa: BLE001 - frozen obj
+                # A frozen advisor keeps its own ask; Snapshot.max_days still
+                # caps the span it can read, so this degrades to the cap rather
+                # than to unchecked history.
+                pass
             snap.window(days)
             insights = adv.advise(ctx, snap) or []
             detail = "%d insight(s), window %s/%s days" % (

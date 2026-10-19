@@ -1,8 +1,9 @@
 """RAG evaluation. Thresholds are DATA, deliberately.
 
 The operator's stated preference is that a routine tuning change is an edit and a
-restart, never a rebuild. So every boundary lives in `checks.conf`
-and nothing numeric is hard-coded in a check.
+restart, never a rebuild. So every boundary lives in a threshold file -- the
+platform's `checks.conf`, or a module's own `thresholds.conf` merged by
+`load_many()` -- and nothing numeric is hard-coded in a check.
 
 FORMAT: INI, parsed by the stdlib `configparser`, NOT YAML. The design said YAML
 and this substitutes INI for one reason: the whole application is stdlib-only by
@@ -81,7 +82,7 @@ class Spec:
     """One threshold definition."""
 
     __slots__ = ("id", "metric", "unit", "direction", "green", "amber", "target",
-                 "note", "unavailable_reason", "window_min", "claim")
+                 "note", "unavailable_reason", "window_min", "claim", "owner")
 
     def __init__(self, check_id, metric=None, unit=None, direction="high_is_good",
                  green=None, amber=None, target=None, note=None,
@@ -102,6 +103,9 @@ class Spec:
         # None means "a check MUST claim this". A string means "deliberately not
         # implemented yet, and here is why" -- see ALLOWED_KEYS above.
         self.claim = claim
+        # Which module's file declared this spec. Set by load_many(); None for a
+        # spec read straight out of the platform file with load().
+        self.owner = None
 
     def __repr__(self):
         return "<Spec %s %s green=%s amber=%s>" % (
@@ -177,6 +181,28 @@ def load(path):
                 "%s: [%s] low_is_good wants amber >= green; got green=%s amber=%s"
                 % (path, name, spec.green, spec.amber))
         specs[name] = spec
+    return specs
+
+
+def load_many(mapping):
+    """Merge module threshold files. Duplicate ids and bad files are fatal.
+
+    The duplicate check is the one thing a per-module split can break that a
+    single file could not: two modules declaring `disk_free_gb` would silently
+    grade one check against the other module's band.
+    """
+    specs = {}
+    for module_id, path in mapping.items():
+        if not path or not os.path.exists(path):
+            raise ConfigError("module %r: threshold file missing: %s"
+                              % (module_id, path))
+        for key, spec in load(path).items():
+            if key in specs:
+                raise ConfigError(
+                    "duplicate threshold spec %r (claimed by %r and %r)"
+                    % (key, specs[key].owner, module_id))
+            spec.owner = module_id
+            specs[key] = spec
     return specs
 
 

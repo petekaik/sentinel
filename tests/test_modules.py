@@ -173,12 +173,39 @@ def test_fleet_settings_keep_the_deployed_env_names(results):
            fc.serial_serials, fc.tvh_user))
 
 
+def test_threshold_merge_refuses_duplicate_spec_ids(results):
+    import thresholds
+    root = tempfile.mkdtemp()
+    try:
+        a = os.path.join(root, "a.conf")
+        b = os.path.join(root, "b.conf")
+        # `amber` is present because load() rejects a section without both
+        # boundaries -- without it the FIRST file would fail validation and the
+        # duplicate check would never be reached, so the test would grade a
+        # different error than the one it names.
+        open(a, "w").write("[x]\nmetric = x\ngreen = 1\namber = 0\n")
+        open(b, "w").write("[x]\nmetric = x\ngreen = 2\namber = 0\n")
+        try:
+            thresholds.load_many({"alpha": a, "beta": b})
+        except thresholds.ConfigError as exc:
+            ok = "duplicate" in str(exc) and "x" in str(exc)
+            detail = str(exc)
+        else:
+            ok, detail = False, "two modules claimed spec x and the merge accepted it"
+        results.check(
+            "a spec id claimed by two modules is a startup error",
+            ok, detail)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 TESTS = (test_discovery_finds_and_orders_modules,
          test_a_package_without_module_fails_loudly,
          test_a_package_that_raises_on_import_fails_loudly,
          test_a_non_module_MODULE_fails_loudly,
          test_duplicate_and_mismatched_ids_fail_loudly,
-         test_fleet_settings_keep_the_deployed_env_names)
+         test_fleet_settings_keep_the_deployed_env_names,
+         test_threshold_merge_refuses_duplicate_spec_ids)
 
 
 def main():

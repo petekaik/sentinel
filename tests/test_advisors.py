@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                       # noqa: E402
 
 import advisors                                   # noqa: E402
+import store                                      # noqa: E402
 
 DAY = 86400
 
@@ -266,6 +267,92 @@ def test_insight_defaults_match_the_spec(results):
         "shared default evidence would leak one insight's window into another")
 
 
+def test_insights_and_proposals_are_stored_and_listed(results):
+    tmp, conn = _store()
+    try:
+        iid = store.record_insight(conn, module="fleet", kind="anomaly",
+                                   title="drift", body="x", severity="notable",
+                                   confidence=0.7, evidence={}, expires_at=0)
+        pid = store.record_proposal(conn, module="fleet", kind="action",
+                                    payload={"action": "transcode_restart"},
+                                    rationale="stall", expires_at=0)
+        results.check(
+            "insight and proposal rows are written and readable",
+            iid and pid and len(store.list_insights(conn)) == 1
+            and len(store.list_proposals(conn, state="pending")) == 1,
+            "iid=%r pid=%r" % (iid, pid))
+    finally:
+        _close(tmp, conn)
+
+
+def test_insight_and_proposal_lists_filter_and_order(results):
+    tmp, conn = _store()
+    try:
+        i1 = store.record_insight(conn, module="fleet", kind="anomaly",
+                                  title="one", body="b")
+        store.record_insight(conn, module="serial", kind="report",
+                             title="other", body="b")
+        i3 = store.record_insight(conn, module="fleet", kind="diagnosis",
+                                  title="three", body="b")
+        fleet = store.list_insights(conn, module="fleet")
+        results.check(
+            "list_insights filters on module and returns newest first",
+            [r["id"] for r in fleet] == [i3, i1],
+            "got ids %r, wanted %r. Newest-first is what the operator surface "
+            "shows; module is the only ownership key an advisor has."
+            % ([r["id"] for r in fleet], [i3, i1]))
+
+        p1 = store.record_proposal(conn, module="fleet", kind="action",
+                                   payload={"action": "a"}, rationale="r")
+        p2 = store.record_proposal(conn, module="fleet", kind="threshold_change",
+                                   payload={"spec": "t"}, rationale="r")
+        store.decide_proposal(conn, p2, "approved", "operator")
+        results.check(
+            "list_proposals(state='pending') hides decided proposals",
+            [r["id"] for r in store.list_proposals(conn, state="pending")]
+            == [p1],
+            "got %r" % [r["id"] for r in store.list_proposals(
+                conn, state="pending")])
+        results.check(
+            "list_proposals is newest first and keeps the decision",
+            [r["id"] for r in store.list_proposals(conn)] == [p2, p1]
+            and store.list_proposals(conn)[0]["state"] == "approved"
+            and store.list_proposals(conn)[0]["actor"] == "operator"
+            and store.list_proposals(conn)[0]["decided_at"] > 0,
+            "rows=%r. decide_proposal must record who decided and when, or a "
+            "later reader cannot tell a human approval from a default."
+            % (store.list_proposals(conn),))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_schema_is_additive_and_idempotent(results):
+    tmp, conn = _store()
+    try:
+        iid = store.record_insight(conn, module="fleet", kind="anomaly",
+                                   title="survives", body="b")
+        conn.execute(
+            "INSERT INTO incident (key, target, check_id, state, first_seen, "
+            "last_seen, first_epoch_seq) VALUES (?,?,?,?,?,?,?)",
+            ("k", "cubox-1", "c", "open", 1.0, 1.0, 1))
+        store.init(conn)          # idempotent: a re-run must change nothing
+        summary = store.db_summary(conn)
+        results.check(
+            "init() twice leaves the store and its new rows intact",
+            [r["id"] for r in store.list_insights(conn)] == [iid]
+            and summary["incident"] == 1,
+            "summary=%r. Migrations must be idempotent so an image rollback "
+            "still reads the store." % (summary,))
+        results.check(
+            "db_summary reports the new tables",
+            summary.get("insight") == 1 and summary.get("proposal") == 0,
+            "summary=%r. A table missing from the summary reads as empty on "
+            "the dashboard, which is the false-green this function exists to "
+            "prevent." % (summary,))
+    finally:
+        _close(tmp, conn)
+
+
 TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_request_shorter_than_history_is_the_request,
          test_an_empty_store_reports_no_history,
@@ -275,7 +362,10 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_the_second_positional_is_a_limit_not_a_target,
          test_the_snapshot_offers_no_write_path,
          test_thresholds_and_settings_are_copies,
-         test_insight_defaults_match_the_spec)
+         test_insight_defaults_match_the_spec,
+         test_insights_and_proposals_are_stored_and_listed,
+         test_insight_and_proposal_lists_filter_and_order,
+         test_the_schema_is_additive_and_idempotent)
 
 
 def main():

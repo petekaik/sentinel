@@ -297,6 +297,45 @@ CREATE TABLE IF NOT EXISTS command_run (
     output_sha  TEXT,
     duration_ms INTEGER NOT NULL
 );
+
+-- ADVISOR OUTPUT IS ADDITIVE. An insight is a claim an advisor makes about the
+-- fleet; a proposal asks for a change. Neither is an incident (an insight has no
+-- state machine and no check can resolve it) and neither is a command (a
+-- proposal cannot act until a human decides it). Keeping them out of those
+-- tables is what keeps their semantics untouched.
+CREATE TABLE IF NOT EXISTS insight (
+    id            INTEGER PRIMARY KEY,
+    ts            REAL    NOT NULL,
+    advisor       TEXT    NOT NULL DEFAULT '',
+    module        TEXT    NOT NULL,
+    target        TEXT    NOT NULL DEFAULT '',
+    check_id      TEXT    NOT NULL DEFAULT '',
+    subject       TEXT    NOT NULL DEFAULT '',
+    kind          TEXT    NOT NULL,
+    severity      TEXT    NOT NULL DEFAULT 'info',
+    confidence    REAL    NOT NULL DEFAULT 0.0,
+    title         TEXT    NOT NULL,
+    body          TEXT    NOT NULL,
+    evidence_json TEXT,
+    expires_at    REAL    NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS insight_module ON insight (module, ts);
+
+CREATE TABLE IF NOT EXISTS proposal (
+    id           INTEGER PRIMARY KEY,
+    ts           REAL    NOT NULL,
+    module       TEXT    NOT NULL,
+    kind         TEXT    NOT NULL,
+    payload_json TEXT    NOT NULL,
+    rationale    TEXT    NOT NULL,
+    state        TEXT    NOT NULL DEFAULT 'pending',
+    expires_at   REAL    NOT NULL DEFAULT 0,
+    decided_at   REAL,
+    actor        TEXT,
+    executed_at  REAL
+);
+CREATE INDEX IF NOT EXISTS proposal_module ON proposal (module, ts);
+CREATE INDEX IF NOT EXISTS proposal_state ON proposal (state, expires_at);
 """
 
 
@@ -503,6 +542,70 @@ def list_remedies(conn, limit=20):
     rows = conn.execute(
         "SELECT * FROM remedy ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+def record_insight(conn, **fields):
+    """Store one advisor insight.
+
+    `fields` are `advisors.Insight`'s own fields plus `advisor` (the advisor's
+    id); everything optional defaults so a caller that uses the dataclass as-is
+    needs no translation layer. `evidence` is JSON-encoded here, once, rather
+    than at every call site.
+    """
+    cur = conn.execute(
+        "INSERT INTO insight (ts, advisor, module, target, check_id, subject, "
+        "kind, severity, confidence, title, body, evidence_json, expires_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (time.time(), fields.get("advisor", ""), fields["module"],
+         fields.get("target", ""), fields.get("check_id", ""),
+         fields.get("subject", ""), fields["kind"],
+         fields.get("severity", "info"), fields.get("confidence", 0.0),
+         fields["title"], fields["body"],
+         json.dumps(fields.get("evidence", {})), fields.get("expires_at", 0)),
+    )
+    return cur.lastrowid
+
+
+def list_insights(conn, module=None, limit=100):
+    """Newest first, for the operator surface."""
+    sql = "SELECT * FROM insight"
+    params = []
+    if module:
+        sql += " WHERE module = ?"
+        params.append(module)
+    rows = conn.execute(sql + " ORDER BY id DESC LIMIT ?",
+                        tuple(params) + (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_proposal(conn, module, kind, payload, rationale, expires_at=0):
+    """A proposal starts `pending`; only `decide_proposal` moves it."""
+    cur = conn.execute(
+        "INSERT INTO proposal (ts, module, kind, payload_json, rationale, state, "
+        "expires_at) VALUES (?,?,?,?,?,'pending',?)",
+        (time.time(), module, kind, json.dumps(payload), rationale, expires_at),
+    )
+    return cur.lastrowid
+
+
+def list_proposals(conn, state=None, limit=100):
+    sql = "SELECT * FROM proposal"
+    params = []
+    if state:
+        sql += " WHERE state = ?"
+        params.append(state)
+    rows = conn.execute(sql + " ORDER BY id DESC LIMIT ?",
+                        tuple(params) + (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def decide_proposal(conn, proposal_id, state, actor):
+    """Record the human decision. `actor` and `decided_at` are the evidence that
+    this was decided rather than defaulted."""
+    conn.execute(
+        "UPDATE proposal SET state = ?, decided_at = ?, actor = ? WHERE id = ?",
+        (state, time.time(), actor, proposal_id),
+    )
 
 
 def record_journal(conn, host, cursor, ts, unit, priority, message):
@@ -859,7 +962,8 @@ def db_summary(conn):
     """
     out = {}
     for table in ("sample", "check_run", "collection_attempt", "incident",
-                  "journal", "remedy", "collector_run", "command_run"):
+                  "journal", "remedy", "collector_run", "command_run",
+                  "insight", "proposal"):
         try:
             out[table] = conn.execute(
                 "SELECT COUNT(*) AS n FROM %s" % table

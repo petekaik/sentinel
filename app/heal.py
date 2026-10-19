@@ -196,6 +196,28 @@ def attempt(action, incident, ctx, policy, conn, seq,
             "why": "executed; success is the next OK observation"}
 
 
+def _propose(cfg, conn, module_id, action, inc, key):
+    """Record the operator decision a `propose`-level action is waiting on.
+
+    ONE PENDING PROPOSAL PER (INCIDENT, ACTION). The engine sees the same
+    incident every epoch, so a row per epoch would be a queue nobody can read
+    -- and after the deadline the old row is EXPIRED (never reused), which is
+    what makes a fresh proposal after the TTL a new decision rather than a
+    resurrection of a stale one.
+    """
+    if store.pending_action_proposal(conn, key, action.id) is not None:
+        return None
+    ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
+    payload = {"action_id": action.id, "incident_key": key,
+               "target": inc.get("target"), "check_id": inc.get("check_id"),
+               "subject": inc.get("subject", "")}
+    rationale = (inc.get("last_detail")
+                 or "incident %s matches action %s" % (key, action.id))
+    return store.record_proposal(
+        conn, module=module_id, kind="action", payload=payload,
+        rationale=rationale, expires_at=time.time() + ttl_s)
+
+
 def consider(cfg, conn, seq, results, ctx):
     """The collector seam: consider confirmed incidents for enabled modules.
 
@@ -217,6 +239,13 @@ def consider(cfg, conn, seq, results, ctx):
     if (getattr(cfg, "dry_run", False)
             or getattr(getattr(ctx, "cfg", None), "dry_run", False)):
         return []
+
+    # The expiry deadline passes without an epoch having to notice at the tick
+    # it lapses, so the sweep runs here -- once per epoch, before anything is
+    # proposed -- and the row the store holds is `expired`, not a pending row
+    # nothing will ever decide.
+    if conn is not None:
+        store.expire_proposals(conn)
 
     # THE FRESHNESS GATE. An incident row can outlive its observation -- it is
     # selected by check id and may still say `open` from an earlier epoch
@@ -268,11 +297,28 @@ def consider(cfg, conn, seq, results, ctx):
             # latch it: a latch is a decision about an action this module was
             # allowed to take, and there is none.
             action = None
+            proposal_for = None
             for cand in declared.values():
                 if actions.allowed(cand, inc, policy)[0]:
                     action = cand
                     break
+                # A `propose`-level action passes every OTHER gate. Asking the
+                # ladder with the level forced to `full` is the same question
+                # an approval will ask, so the destructive switch and the
+                # engine switch still refuse here -- a proposal nobody could
+                # approve must not be written.
+                if (proposal_for is None
+                        and actions.effective_level(cand, policy) == "propose"
+                        and actions.allowed(
+                            cand, inc, actions.approval_policy(policy,
+                                                               cand.id))[0]):
+                    proposal_for = cand
             if action is None:
+                if proposal_for is not None:
+                    _propose(cfg, conn, mod.id, proposal_for, inc, key)
+                    out.append((key, proposal_for.id,
+                                {"executed": False,
+                                 "why": "propose: awaiting operator approval"}))
                 continue
 
             if inc.get("remedy_attempts", 0) >= cap:

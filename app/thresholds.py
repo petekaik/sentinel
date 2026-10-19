@@ -24,6 +24,7 @@ which is item 72's shape exactly.
 """
 
 import configparser
+import copy
 import os
 
 from store import Status
@@ -204,6 +205,50 @@ def load_many(mapping):
             spec.owner = module_id
             specs[key] = spec
     return specs
+
+
+def apply_overrides(specs, overrides):
+    """Return a COPY of `specs` with each approved override's band applied.
+
+    `overrides` maps `spec_id` to `{"green": g, "amber": a}`. Only the two edges
+    are replaced; every other field (metric, direction, note, owner) still comes
+    from the module's file, because an approval is a band change and not a
+    rewrite of the spec.
+
+    An override naming a spec this mapping does not carry is IGNORED. A module
+    can be disabled, or a spec removed from its file, and a stale row in the
+    store must not stop the collector starting -- the file is still the
+    baseline, and `--thresholds` is where an orphaned override is visible.
+    """
+    out = dict(specs)
+    for spec_id, band in (overrides or {}).items():
+        spec = out.get(spec_id)
+        if spec is None:
+            continue
+        clone = copy.copy(spec)
+        clone.green = band["green"]
+        clone.amber = band["amber"]
+        out[spec_id] = clone
+    return out
+
+
+def load_effective(mapping, conn=None):
+    """Load module threshold files, then apply the store's live overrides.
+
+    ONE LOADER FOR EVERY READER. `collect_once`, `web.build_state`, the parity
+    tool and the offline tests all come through here, so an approved override
+    changes grading at the next epoch on every surface -- including the test
+    harness, which must grade against the same band the monitor does.
+
+    `conn=None` means "files only": parity pins a baseline and has no store.
+    """
+    specs = load_many(mapping)
+    if conn is None:
+        return specs
+    rows = conn.execute(
+        "SELECT spec_id, green, amber FROM threshold_override").fetchall()
+    return apply_overrides(
+        specs, {r[0]: {"green": r[1], "amber": r[2]} for r in rows})
 
 
 def audit(specs, check_classes):

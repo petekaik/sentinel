@@ -86,6 +86,31 @@ def _level(action, policy):
     return policy.get("authority", "off")
 
 
+def effective_level(action, policy):
+    """The level that applies to one action in one module's policy."""
+    return _level(action, policy or {})
+
+
+def approval_policy(policy, action_id):
+    """A policy whose effective level for ONE action is `full`.
+
+    This is how an approved proposal becomes authority: the human decision is
+    the grant. It is not a bypass -- `enabled` and `destructive` are carried
+    over untouched, so an approval still cannot run while the engine is off or
+    a destructive action has lost ALLOW_DESTRUCTIVE.
+    """
+    policy = policy or {}
+    overrides = dict(getattr(policy, "overrides", None)
+                     or policy.get("overrides") or {})
+    overrides[action_id] = "full"
+    return Authority(
+        authority=policy.get("authority", "off"),
+        allow=policy.get("allow", ()),
+        destructive=policy.get("destructive", False),
+        enabled=policy.get("enabled", True),
+        overrides=overrides)
+
+
 def allowed(action, incident, policy=None, module_id=None):
     """The pure permission decision; every gate below is recorded by heal.py.
 

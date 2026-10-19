@@ -109,6 +109,19 @@ class Config:
                 "SENTINEL_ADVISOR_MAX_HISTORY_DAYS must be >= 0, got %d" % cap)
         self.advisor_max_history_days = cap
 
+        # How long an operator has to decide a proposal. EXPIRY IS A REAL
+        # DEADLINE, not a display nicety: an approval is a statement about the
+        # incident as it stands, and a proposal acted on three days later is an
+        # authority granted for a fleet nobody re-checked. Zero or negative is
+        # refused rather than clamped -- it would mean "every proposal is born
+        # expired", which no operator wrote.
+        ttl_h = int(_env("SENTINEL_PROPOSAL_TTL_H", "24", e))
+        if ttl_h <= 0:
+            raise ValueError(
+                "SENTINEL_PROPOSAL_TTL_H must be > 0, got %d" % ttl_h)
+        self.proposal_ttl_h = ttl_h
+        self.proposal_ttl_s = ttl_h * 3600
+
         # LLM advisor. ALL FOUR DEFAULT EMPTY, and the advisor is registered
         # only when provider AND endpoint are both set. Configuring it is the
         # operator's explicit opt-in to data leaving the container; it still
@@ -173,6 +186,7 @@ class Config:
                     + " (max %d days history)" % self.advisor_max_history_days
                     if self.advisor_ids else "none")
         lines.append("advisors           : %s" % advisors)
+        lines.append("proposal TTL       : %dh" % self.proposal_ttl_h)
         # Provider/endpoint/model are configuration; the KEY is a credential
         # and is deliberately never part of this summary.
         llm = ("%s at %s (model %s; selected explicitly only)"

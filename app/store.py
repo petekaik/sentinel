@@ -352,6 +352,23 @@ CREATE TABLE IF NOT EXISTS proposal (
 );
 CREATE INDEX IF NOT EXISTS proposal_module ON proposal (module, ts);
 CREATE INDEX IF NOT EXISTS proposal_state ON proposal (state, expires_at);
+
+-- A LIVE THRESHOLD BAND, WITHOUT A REBUILD. The threshold files are still the
+-- baseline -- an override is an operator-approved adjustment layered on top --
+-- so the store holds only the specs that differ from their file. `previous_json`
+-- is the band the file declared when the override was applied, which is what
+-- `--revert-threshold` restores and what makes the change auditable after the
+-- file is edited again. `proposal_id` is the approval that wrote the row.
+CREATE TABLE IF NOT EXISTS threshold_override (
+    spec_id       TEXT PRIMARY KEY,
+    module        TEXT NOT NULL,
+    green         REAL NOT NULL,
+    amber         REAL NOT NULL,
+    actor         TEXT NOT NULL,
+    applied_at    REAL NOT NULL,
+    previous_json TEXT NOT NULL,
+    proposal_id   INTEGER
+);
 """
 
 
@@ -585,6 +602,19 @@ def record_advisor_run(conn, advisor, module, status, duration_ms,
     return cur.lastrowid
 
 
+def last_advisor_run(conn, advisor):
+    """The newest run row for one advisor id, or None if it never ran.
+
+    "Never ran" is a different fact from "ran and failed", and the operator
+    surface must be able to say which -- an advisor with no row is one the
+    selector did not reach, and that is a configuration question.
+    """
+    row = conn.execute(
+        "SELECT * FROM advisor_run WHERE advisor = ? ORDER BY id DESC LIMIT 1",
+        (advisor,)).fetchone()
+    return dict(row) if row else None
+
+
 # The insight columns this store can persist, named ONCE. `advisors.Insight`'s
 # fields plus `advisor`. An unknown keyword is REFUSED rather than dropped: a
 # renamed or newly added Insight field would otherwise be stored as the column
@@ -648,6 +678,62 @@ def record_proposal(conn, module, kind, payload, rationale, expires_at=0):
     return cur.lastrowid
 
 
+def get_proposal(conn, proposal_id):
+    row = conn.execute("SELECT * FROM proposal WHERE id = ?",
+                       (proposal_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def proposal_expired(row, now=None):
+    """A pending row past its expiry is EXPIRED, whatever the state column says.
+
+    The collector rewrites expired rows with `expire_proposals()`, but the
+    dashboard reads a store that may not have been collected since the deadline
+    (that is exactly the stale-collector case), so the display cannot depend on
+    that rewrite having happened.
+    """
+    expires_at = row.get("expires_at") if hasattr(row, "get") else row["expires_at"]
+    if not expires_at:
+        return False
+    return float(expires_at) <= (time.time() if now is None else now)
+
+
+def expire_proposals(conn, now=None):
+    """Move every pending proposal past its deadline to `expired`.
+
+    Called by the healer once per epoch and by the ctl verbs that decide one, so
+    the stored state converges without a second timer. `decided_at` records when
+    the deadline lapsed, not a human decision; `actor` stays NULL for that reason.
+    """
+    now = time.time() if now is None else now
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'expired', decided_at = ? "
+        "WHERE state = 'pending' AND expires_at > 0 AND expires_at <= ?",
+        (now, now))
+    return cur.rowcount
+
+
+def pending_action_proposal(conn, incident_key, action_id):
+    """The pending proposal for one `(incident, action)`, if any.
+
+    Payload is JSON, so the filter is applied here rather than in SQL: SQLite's
+    JSON1 is not something this otherwise stdlib-only appliance should depend on.
+    The pending set is small by construction (one per live incident/action).
+    """
+    rows = conn.execute(
+        "SELECT * FROM proposal WHERE state = 'pending' AND kind = 'action' "
+        "ORDER BY id").fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        if (payload.get("incident_key") == incident_key
+                and payload.get("action_id") == action_id):
+            return dict(row)
+    return None
+
+
 def list_proposals(conn, state=None, limit=100):
     sql = "SELECT * FROM proposal"
     params = []
@@ -694,6 +780,50 @@ def mark_proposal_executed(conn, proposal_id):
         (time.time(), proposal_id),
     )
     return cur.rowcount
+
+
+THRESHOLD_OVERRIDE_COLUMNS = (
+    "spec_id", "module", "green", "amber", "actor", "applied_at",
+    "previous_json", "proposal_id",
+)
+
+
+def set_threshold_override(conn, spec_id, module, green, amber, actor,
+                           previous, proposal_id=None):
+    """Apply one live band. `previous` is the band it is replacing, as a dict.
+
+    INSERT OR REPLACE because `spec_id` is the key: a second approved change to
+    the same spec supersedes the first, and the first's `previous_json` is the
+    band this one is measured against -- not the file's, which is why the bound
+    check runs against the EFFECTIVE band.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO threshold_override "
+        "(spec_id, module, green, amber, actor, applied_at, previous_json, "
+        "proposal_id) VALUES (?,?,?,?,?,?,?,?)",
+        (spec_id, module, green, amber, actor, time.time(),
+         json.dumps(previous), proposal_id))
+
+
+def get_threshold_override(conn, spec_id):
+    row = conn.execute("SELECT * FROM threshold_override WHERE spec_id = ?",
+                       (spec_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_threshold_overrides(conn):
+    rows = conn.execute(
+        "SELECT * FROM threshold_override ORDER BY spec_id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_threshold_override(conn, spec_id):
+    """Delete one override, returning the row it removed (None if absent)."""
+    row = get_threshold_override(conn, spec_id)
+    if row is None:
+        return None
+    conn.execute("DELETE FROM threshold_override WHERE spec_id = ?", (spec_id,))
+    return row
 
 
 def record_journal(conn, host, cursor, ts, unit, priority, message):
@@ -748,6 +878,12 @@ def _live_incident(conn, key):
         "SELECT * FROM incident WHERE key = ? AND state IN (%s)" % LIVE_SQL,
         (key,),
     ).fetchone()
+
+
+def get_live_incident(conn, key):
+    """The one live row for a key, as a dict -- the healer's approval gate."""
+    row = _live_incident(conn, key)
+    return dict(row) if row else None
 
 
 def sync_incident(conn, seq, target, check_id, subject, status, detail,
@@ -1051,7 +1187,8 @@ def db_summary(conn):
     out = {}
     for table in ("sample", "check_run", "collection_attempt", "incident",
                   "journal", "remedy", "collector_run", "command_run",
-                  "advisor_run", "insight", "proposal"):
+                  "advisor_run", "insight", "proposal",
+                  "threshold_override"):
         try:
             out[table] = conn.execute(
                 "SELECT COUNT(*) AS n FROM %s" % table

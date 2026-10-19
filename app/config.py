@@ -92,6 +92,43 @@ class Config:
     def module_enabled(self, module_id):
         return _bool("%s_ENABLED" % module_id.upper(), True, self.env)
 
+    def authority(self, module_id):
+        """The remedy policy for one module. Off unless an operator says otherwise.
+
+        THREE SWITCHES, ALL REQUIRED. `SENTINEL_REMEDIATION` is the engine's
+        master switch (default on), `<MODULE>_AUTHORITY` is the per-module level
+        (default off), and `MONITOR_REMEDIES` is the process-level kill switch
+        (default off, read by the collector before the engine starts at all).
+        The defaults are deliberately not symmetric: a container that upgrades
+        must not start acting on an incident because a new build shipped the
+        engine, so every module still has to be named.
+
+        `<MODULE>_ACTION_<ID>_AUTHORITY` overrides one action's level in either
+        direction. That is not a second switch -- it is how an operator grants
+        `full` to one action, or withdraws it, without widening the module.
+        """
+        import actions
+        prefix = module_id.upper()
+        action_prefix = prefix + "_ACTION_"
+        suffix = "_AUTHORITY"
+        overrides = {}
+        for key, value in self.env.items():
+            if (key.startswith(action_prefix) and key.endswith(suffix)
+                    and len(key) > len(action_prefix) + len(suffix)):
+                overrides[key[len(action_prefix):-len(suffix)].lower()] = (
+                    value.strip().lower())
+        return actions.Authority(
+            authority=_env("%s_AUTHORITY" % prefix, "off",
+                           self.env).strip().lower(),
+            allow=tuple(
+                x.strip()
+                for x in _env("%s_ALLOW" % prefix, "", self.env).split(",")
+                if x.strip()),
+            destructive=_bool("%s_ALLOW_DESTRUCTIVE" % prefix, False,
+                              self.env),
+            enabled=_bool("SENTINEL_REMEDIATION", True, self.env),
+            overrides=overrides)
+
     def describe(self):
         """A one-screen summary, for --showconf and for the collector log."""
         lines = ["db / port          : %s / %d" % (self.db_path, self.port)]

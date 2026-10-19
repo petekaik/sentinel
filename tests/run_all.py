@@ -27,6 +27,7 @@ import test_dashboard as dash_tests             # noqa: E402
 import test_incident_lifecycle as incident_tests  # noqa: E402
 import test_modules as module_tests                # noqa: E402
 import test_proxy_config as proxy_tests         # noqa: E402
+import test_remediation as remediation_tests    # noqa: E402
 import test_serial_identity as serial_tests     # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
 
@@ -38,6 +39,9 @@ SUITES = (
      command_tests.TESTS),
     ("modules -- discovery, validation, and the module contract",
      module_tests.TESTS),
+    ("remediation -- action declarations and the authority ladder: no action "
+     "without an explicit, scoped and unexpired grant",
+     remediation_tests.TESTS),
     ("collect.py -- the collection loop, the escalation state machine, and "
      "the journal cursors",
      collect_tests.TESTS),

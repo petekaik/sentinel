@@ -1,19 +1,40 @@
-"""Operator CLI: module commands and the command audit.
+"""Operator CLI: module commands, the proposal surface and the command audit.
 
 The platform never imports a module. The enabled modules are discovered through
 `modules.discover_enabled`, and each installs its own config view via its
 `context` hook -- the same hook the collector calls, and config-only by
 contract, so building a Context here performs no I/O against the fleet.
+
+AN APPROVAL IS AUTHORITY, NOT A BYPASS. `--approve` asks the ladder with the
+one action's level set to `full`, which is exactly what a human saying yes
+means -- and it still goes through every engine gate in `heal.attempt()` plus
+the module, engine and incident checks below. A refusal leaves the proposal
+PENDING, because a failed approval is not a decision about it.
 """
 
 import argparse
+import json
+import os
 import sys
+import time
 
+import actions
 import checks
 import commands
 import config as config_mod
+import heal
 import modules as module_loader
 import store
+import thresholds
+
+# The largest band change one approval may apply, as a fraction of the band's
+# own width. The reference advisor proposes at most this step; requiring it
+# again here means an approval cannot be used to type in an arbitrary band.
+MAX_THRESHOLD_STEP = 0.25
+
+
+class ProposalRefused(RuntimeError):
+    """The approval or rejection was refused; nothing was decided."""
 
 
 def _modules(cfg):
@@ -27,6 +48,229 @@ def _context(cfg, mods):
     return ctx
 
 
+def _threshold_mapping(mods):
+    return {mid: os.path.join(m._path, m.threshold_file)
+            for mid, m in mods.items()}
+
+
+def _payload(row):
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        raise ProposalRefused(
+            "proposal %s has an unreadable payload" % row["id"])
+    if not isinstance(payload, dict):
+        raise ProposalRefused(
+            "proposal %s payload is not an object" % row["id"])
+    return payload
+
+
+def _audit_approval(conn, row, proposal_id, actor, ok, detail, t0):
+    """One command_run row per approval attempt -- refusals included.
+
+    Approval is the only place a human decision can become an action, so the
+    audit must show the refusals too: a pending proposal with no audit row
+    cannot be told apart from one nobody tried to approve.
+    """
+    store.record_command_run(
+        conn, module=(row or {}).get("module", ""),
+        command="approve_proposal", actor=actor,
+        argv={"proposal": proposal_id}, dry_run=False,
+        exit_status=0 if ok else 1, output=detail,
+        duration_ms=int((time.time() - t0) * 1000))
+
+
+def _approve_action(cfg, conn, mod, payload, row, actor, ctx):
+    action_id = payload.get("action_id")
+    action = next((a for a in mod.actions() if a.id == action_id), None)
+    if action is None:
+        raise ProposalRefused(
+            "action %r is no longer declared by module %r"
+            % (action_id, mod.id))
+
+    key = payload.get("incident_key")
+    incident = store.get_live_incident(conn, key) if key else None
+    if incident is None:
+        raise ProposalRefused(
+            "incident %r is no longer live; nothing was executed" % (key,))
+
+    # SENTINEL_REMEDIATION is enforced by the ladder itself: `approval_policy`
+    # carries `enabled` through, and `allowed()` refuses on it. Not repeating
+    # that check here is deliberate -- one gate, one home.
+    policy = cfg.authority(mod.id)
+    approval = actions.approval_policy(policy, action.id)
+    ok, why = actions.allowed(action, incident, approval)
+    if not ok:
+        # The destructive switch and the confirmed-incident rule live here, and
+        # an approval deliberately cannot lift either of them.
+        raise ProposalRefused("the ladder refuses this action: %s" % why)
+
+    res = heal.attempt(action, incident, ctx, approval, conn, seq=0)
+    if not res["executed"]:
+        raise ProposalRefused(
+            "not executed: %s; the proposal is left pending" % res["why"])
+    store.mark_proposal_executed(conn, row["id"])
+    return "proposal %d: %s %s" % (row["id"], action.id, res["why"])
+
+
+def _approve_threshold(conn, mods, row, payload, actor):
+    spec_id = payload.get("spec_id")
+    green = payload.get("green")
+    amber = payload.get("amber")
+    if not spec_id or green is None or amber is None:
+        raise ProposalRefused(
+            "a threshold_change proposal needs spec_id, green and amber")
+
+    module = payload.get("module") or row["module"]
+    if module not in mods:
+        raise ProposalRefused(
+            "module %r is disabled or unknown" % (module,))
+
+    specs = thresholds.load_effective(_threshold_mapping(mods), conn)
+    spec = specs.get(spec_id)
+    if spec is None:
+        raise ProposalRefused("unknown threshold spec %r" % (spec_id,))
+    if spec.owner != module:
+        raise ProposalRefused(
+            "threshold spec %r belongs to module %r, not %r"
+            % (spec_id, spec.owner, module))
+
+    try:
+        green = float(green)
+        amber = float(amber)
+    except (TypeError, ValueError):
+        raise ProposalRefused("green and amber must be numbers")
+
+    if spec.direction == "high_is_good" and amber > green:
+        raise ProposalRefused(
+            "band is not ordered for high_is_good: amber %s > green %s"
+            % (amber, green))
+    if spec.direction == "low_is_good" and amber < green:
+        raise ProposalRefused(
+            "band is not ordered for low_is_good: amber %s < green %s"
+            % (amber, green))
+
+    # FAILING EDGE ONLY, AND BOUNDED. The green edge is the operator's stated
+    # standard; an approval may tighten the amber edge toward the observation,
+    # by at most 25% of the band's current width. Anything else is an arbitrary
+    # band typed into an approval, which is not what the proposal was for.
+    previous = {"green": spec.green, "amber": spec.amber}
+    if green != spec.green:
+        raise ProposalRefused(
+            "an approval may move only the failing edge; green is %s and the "
+            "proposal asked for %s" % (spec.green, green))
+    max_step = MAX_THRESHOLD_STEP * abs(float(spec.amber) - float(spec.green))
+    if spec.direction == "high_is_good":
+        if amber > float(spec.amber):
+            raise ProposalRefused(
+                "the failing edge may only tighten: amber %s > current %s"
+                % (amber, spec.amber))
+        step = float(spec.amber) - amber
+    else:
+        if amber < float(spec.amber):
+            raise ProposalRefused(
+                "the failing edge may only tighten: amber %s < current %s"
+                % (amber, spec.amber))
+        step = amber - float(spec.amber)
+    if step > max_step + 1e-9:
+        raise ProposalRefused(
+            "change of %s exceeds the %s bound (25%% of the band width %s)"
+            % (step, max_step, abs(float(spec.amber) - float(spec.green))))
+
+    store.set_threshold_override(
+        conn, spec_id=spec_id, module=module, green=green, amber=amber,
+        actor=actor, previous=previous, proposal_id=row["id"])
+    store.mark_proposal_executed(conn, row["id"])
+    return ("proposal %d: %s now grades green=%s amber=%s (was green=%s "
+            "amber=%s)" % (row["id"], spec_id, green, amber,
+                           previous["green"], previous["amber"]))
+
+
+def approve_proposal(cfg, conn, mods, proposal_id, actor, ctx=None):
+    """Approve one proposal. Raises ProposalRefused; returns a message.
+
+    THE PROPOSAL IS THE APPROVAL. Its kind decides what is being approved, and
+    nothing else about it is trusted: the action is re-resolved from the module
+    actually loaded now, the incident is re-read from the store now, and the
+    band is measured against the EFFECTIVE band now.
+    """
+    t0 = time.time()
+    row = store.get_proposal(conn, proposal_id)
+    try:
+        if row is None:
+            raise ProposalRefused("no proposal %s" % (proposal_id,))
+        # Expiry is a deadline, not a hint. Sweep first so a lapsed row reads
+        # `expired` everywhere rather than as a pending row nobody decides.
+        store.expire_proposals(conn)
+        row = store.get_proposal(conn, proposal_id)
+        if row["state"] != "pending":
+            raise ProposalRefused(
+                "proposal %s is %s, not pending"
+                % (proposal_id, row["state"]))
+        if store.proposal_expired(row):
+            raise ProposalRefused(
+                "proposal %s has expired; it is shown as expired, not pending"
+                % (proposal_id,))
+
+        mod = mods.get(row["module"])
+        if mod is None:
+            raise ProposalRefused(
+                "module %r is disabled or unknown" % (row["module"],))
+
+        payload = _payload(row)
+        if row["kind"] == "action":
+            if not getattr(cfg, "remedies_enabled", False):
+                raise ProposalRefused(
+                    "MONITOR_REMEDIES is off; an approval cannot execute")
+            detail = _approve_action(
+                cfg, conn, mod, payload, row, actor,
+                ctx if ctx is not None else _context(cfg, mods))
+        elif row["kind"] == "threshold_change":
+            detail = _approve_threshold(conn, mods, row, payload, actor)
+        else:
+            raise ProposalRefused(
+                "proposal kind %r cannot be approved" % (row["kind"],))
+    except ProposalRefused as exc:
+        _audit_approval(conn, row, proposal_id, actor, False, str(exc), t0)
+        raise
+    _audit_approval(conn, row, proposal_id, actor, True, detail, t0)
+    return detail
+
+
+def reject_proposal(conn, proposal_id, actor):
+    """Decide a pending proposal `rejected`. It can never execute afterwards."""
+    store.expire_proposals(conn)
+    row = store.get_proposal(conn, proposal_id)
+    if row is None:
+        raise ProposalRefused("no proposal %s" % (proposal_id,))
+    if row["state"] != "pending":
+        raise ProposalRefused(
+            "proposal %s is %s, not pending" % (proposal_id, row["state"]))
+    if store.decide_proposal(conn, proposal_id, "rejected", actor) != 1:
+        raise ProposalRefused("proposal %s was not pending" % (proposal_id,))
+    return "proposal %d rejected by %s" % (proposal_id, actor)
+
+
+def revert_threshold(conn, spec_id):
+    """Remove one live override and report the band it restores."""
+    row = store.remove_threshold_override(conn, spec_id)
+    if row is None:
+        raise ProposalRefused("no threshold override for %r" % (spec_id,))
+    try:
+        previous = json.loads(row["previous_json"])
+    except (TypeError, ValueError):
+        previous = {}
+    return "reverted %s: restored green=%s amber=%s" % (
+        spec_id, previous.get("green"), previous.get("amber"))
+
+
+def _display_state(row, now):
+    """A pending row past its deadline is shown EXPIRED, not pending."""
+    if row["state"] == "pending" and store.proposal_expired(row, now):
+        return "expired"
+    return row["state"]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ctl.py")
     ap.add_argument("--list-commands", action="store_true")
@@ -37,6 +281,13 @@ def main(argv=None):
     ap.add_argument("--actor", default="operator")
     ap.add_argument("--list-runs", action="store_true")
     ap.add_argument("--remedies", action="store_true")
+    ap.add_argument("--proposals", action="store_true")
+    ap.add_argument("--approve", metavar="ID")
+    ap.add_argument("--reject", metavar="ID")
+    ap.add_argument("--insights", action="store_true")
+    ap.add_argument("--advisors", action="store_true")
+    ap.add_argument("--thresholds", action="store_true")
+    ap.add_argument("--revert-threshold", metavar="SPEC_ID")
     args = ap.parse_args(argv)
 
     cfg = config_mod.Config()
@@ -67,6 +318,104 @@ def main(argv=None):
                      row["exit_status"], row["post_check_result"]))
         conn.close()
         return 0
+
+    if args.proposals:
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        now = time.time()
+        for row in store.list_proposals(conn):
+            payload = {}
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                pass
+            expires = ("never" if not row["expires_at"]
+                       else time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                          time.gmtime(row["expires_at"])))
+            print("%d %s %s %s expires=%s %s"
+                  % (row["id"], _display_state(row, now), row["kind"],
+                     row["module"], expires,
+                     payload.get("action_id") or payload.get("spec_id") or ""))
+        conn.close()
+        return 0
+
+    if args.insights:
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        for row in store.list_insights(conn, limit=50):
+            print("%s %s %s/%s %s %s"
+                  % (time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(row["ts"])),
+                     row["module"], row["advisor"] or "-", row["kind"],
+                     row["severity"], row["title"]))
+        conn.close()
+        return 0
+
+    if args.advisors:
+        if not cfg.advisor_ids:
+            print("no advisor configured (SENTINEL_ADVISORS=none)")
+            return 0
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        for advisor in cfg.advisor_ids:
+            # A selector may be `fleet.some_advisor`, while `advisor_run` stores
+            # the advisor's own id. Try the qualified form, then the bare tail.
+            run = store.last_advisor_run(conn, advisor)
+            if run is None and "." in advisor:
+                run = store.last_advisor_run(conn, advisor.rsplit(".", 1)[1])
+            if run is None:
+                print("%-20s never ran (no advisor_run row)" % advisor)
+                continue
+            print("%-20s last %s at %s (%dms)%s"
+                  % (advisor, run["status"],
+                     time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(run["ts"])),
+                     run["duration_ms"],
+                     (" " + run["detail"]) if run["detail"] else ""))
+        conn.close()
+        return 0
+
+    if args.thresholds:
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        rows = store.list_threshold_overrides(conn)
+        if not rows:
+            print("no active threshold override; every spec grades from its file")
+        for row in rows:
+            try:
+                previous = json.loads(row["previous_json"])
+            except (TypeError, ValueError):
+                previous = {}
+            print("%s %s green=%s amber=%s (file had green=%s amber=%s) "
+                  "actor=%s proposal=%s"
+                  % (row["spec_id"], row["module"], row["green"], row["amber"],
+                     previous.get("green"), previous.get("amber"),
+                     row["actor"], row["proposal_id"]))
+        conn.close()
+        return 0
+
+    if args.approve or args.reject or args.revert_threshold:
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        try:
+            if args.approve:
+                if not args.approve.isdigit():
+                    ap.error("--approve expects a proposal id")
+                print(approve_proposal(cfg, conn, mods, int(args.approve),
+                                       args.actor))
+                return 0
+            if args.reject:
+                if not args.reject.isdigit():
+                    ap.error("--reject expects a proposal id")
+                print(reject_proposal(conn, int(args.reject), args.actor))
+                return 0
+            print(revert_threshold(conn, args.revert_threshold))
+            return 0
+        except ProposalRefused as exc:
+            print("REFUSED: %s" % exc, file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
 
     if not args.run or "." not in args.run:
         ap.error("--run MODULE.COMMAND is required")

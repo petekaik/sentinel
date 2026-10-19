@@ -581,8 +581,12 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     if not (dry_run or cfg.dry_run):
         freeze_disabled_modules(conn, seq, enabled)
 
-    specs = thresholds.load_many(
-        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
+    # THRESHOLDS ARE DATA, INCLUDING A LIVE OVERRIDE. An approved band change
+    # lives in the store, so the epoch must load the effective band rather than
+    # the file's -- otherwise an approval would not change grading until the
+    # next rebuild, which is the thing this mechanism exists to avoid.
+    specs = thresholds.load_effective(
+        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled}, conn)
     classes = checks.registry(
         *([c for m in enabled for c in m.check_classes()]
           + list(checks.platform_modules())))
@@ -808,8 +812,15 @@ def main(argv=None):
     if args.showconf:
         print(cfg.describe())
         enabled = module_loader.discover_enabled(cfg)
-        specs = thresholds.load_many(
-            {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
+        # The effective band, overrides included, so the coverage report
+        # describes what the NEXT epoch will grade with rather than what the
+        # files alone say.
+        show_conn = store.connect(cfg.db_path)
+        store.init(show_conn)
+        specs = thresholds.load_effective(
+            {m.id: os.path.join(m._path, m.threshold_file) for m in enabled},
+            show_conn)
+        show_conn.close()
         classes = checks.registry(
             *([c for m in enabled for c in m.check_classes()]
               + list(checks.platform_modules())))

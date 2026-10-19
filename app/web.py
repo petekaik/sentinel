@@ -135,8 +135,10 @@ def build_state(cfg, conn, now=None):
         # enumerates their classes, which are what carry an id.
         for cls in checks.registry(*m.check_classes()):
             module_of[cls.id] = m
-    specs = thresholds.load_many(
-        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
+    # THE BAND THE COLLECTOR GRADES WITH, not the file's band: an approved
+    # override is live, and the page must not describe the old one.
+    specs = thresholds.load_effective(
+        {m.id: os.path.join(m._path, m.threshold_file) for m in enabled}, conn)
     classes = checks.registry(
         *([c for m in enabled for c in m.check_classes()]
           + list(checks.platform_modules())))
@@ -217,6 +219,16 @@ def build_state(cfg, conn, now=None):
 
     summary = store.db_summary(conn)
 
+    # ADVISOR OUTPUT AND THE OPERATOR'S QUEUE. Additive keys: a consumer that
+    # ignores them is unaffected. A pending proposal past its deadline is
+    # annotated `expired` here because the dashboard opens the store READ-ONLY
+    # and cannot run `expire_proposals()` -- the display must not depend on a
+    # collector epoch having happened since the deadline lapsed.
+    insights = store.list_insights(conn, limit=50)
+    proposals = store.list_proposals(conn, state="pending")
+    for proposal in proposals:
+        proposal["expired"] = store.proposal_expired(proposal, now)
+
     return {
         "now": now,
         "last": last,
@@ -238,6 +250,11 @@ def build_state(cfg, conn, now=None):
         # their audit belongs on the operator's page and not only behind ssh.
         # Additive: a consumer of this model that ignores the key is unaffected.
         "command_runs": store.list_command_runs(conn, limit=COMMAND_RUNS_LIMIT),
+        # The advisor surface: platform-level insights are included because
+        # `list_insights` is unfiltered, which is the point -- a threshold
+        # suggestion belongs to no module and must not vanish for that reason.
+        "insights": insights,
+        "proposals": proposals,
         "deferred": [{"id": k, "reason": v.claim} for k, v in sorted(deferred.items())],
         "unclaimed": sorted(unclaimed),
         "counts": {
@@ -1219,6 +1236,67 @@ def render_html(state, cfg):
         _cm("</table></div>")
     commands_html = "\n".join(cacc)
 
+    # ---- recommendations: what the advisors claim --------------------------
+    #
+    # ADDITIVE OUTPUT, NOT AN INCIDENT. An insight has no state machine and no
+    # check can resolve it, so it is presented as advice and never as a
+    # verdict. Platform-level insights (the reference advisor's incident report
+    # and threshold suggestions) are included: filtering by module would hide
+    # the only advisor the default deployment runs.
+    racc = []
+    _rec = racc.append
+    insights = state.get("insights", [])
+    _rec("<h2>Recommendations (%d)</h2>" % len(insights))
+    if not insights:
+        _rec("<div class=note>No advisor insight is stored. That means no "
+             "advisor produced one, not that the fleet has nothing worth "
+             "recommending &mdash; the <code>insight</code> row count is in the "
+             "evidence section.</div>")
+    else:
+        _rec("<div class=scroll><table><tr><th>When</th><th>Kind</th>"
+             "<th>Source</th><th>Title</th></tr>")
+        for row in insights:
+            source = row["module"]
+            if row.get("target"):
+                source += " &middot; " + row["target"]
+            _rec("<tr><td>%s</td><td>%s</td><td>%s</td><td class=detail>%s"
+                 "</td></tr>"
+                 % (_esc(_age(state["now"] - row["ts"])), _esc(row["kind"]),
+                    _esc(source), _esc(row["title"])))
+        _rec("</table></div>")
+    recommendations_html = "\n".join(racc)
+
+    # ---- approvals: the pending proposal queue -----------------------------
+    #
+    # AN EXPIRED PROPOSAL IS SHOWN AS EXPIRED, not as pending. The row is still
+    # `pending` in a store the collector has not swept since the deadline, and
+    # presenting it as actionable is exactly the kind of stale-but-data-shaped
+    # claim this page exists not to make.
+    pacc = []
+    _app = pacc.append
+    proposals = state.get("proposals", [])
+    _app("<h2>Approvals (%d)</h2>" % len(proposals))
+    if not proposals:
+        _app("<div class=note>No pending proposal. A <code>propose</code>-level "
+             "remedy writes one here rather than acting; an empty queue means "
+             "the engine has nothing waiting for a human.</div>")
+    else:
+        _app("<div class=scroll><table><tr><th>Key</th><th>Kind</th>"
+             "<th>Module</th><th>Rationale</th><th>Expiry</th></tr>")
+        for row in proposals:
+            if not row["expires_at"]:
+                expiry = "never"
+            elif row.get("expired"):
+                expiry = "EXPIRED %s ago" % _span(state["now"] - row["expires_at"])
+            else:
+                expiry = "%s remaining" % _span(row["expires_at"] - state["now"])
+            _app("<tr><td>%s</td><td>%s</td><td>%s</td><td class=detail>%s"
+                 "</td><td>%s</td></tr>"
+                 % (_esc(row["id"]), _esc(row["kind"]), _esc(row["module"]),
+                    _esc(row["rationale"]), _esc(expiry)))
+        _app("</table></div>")
+    approvals_html = "\n".join(pacc)
+
     # ---- the RAG tiles, then every check the registry does not own ----------
     tacc = []
     _tc = tacc.append
@@ -1369,6 +1447,15 @@ def render_html(state, cfg):
                ("Operator commands (last %d)" % COMMAND_RUNS_LIMIT)
                if state["command_runs"] else "No operator command recorded",
                commands_html))
+
+    # Both are always rendered, empty-safe: a section that vanishes when the
+    # queue empties is indistinguishable from one whose query broke.
+    a(_details("recommendations",
+               "Recommendations (%d)" % len(state.get("insights", [])),
+               recommendations_html))
+    a(_details("approvals",
+               "Approvals (%d)" % len(state.get("proposals", [])),
+               approvals_html))
 
     if state["informational"]:
         a(_details("informational",

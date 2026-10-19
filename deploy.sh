@@ -27,6 +27,15 @@
 #                                                     #   verb is the COMMAND's
 #                                                     #   dry run.
 #   ./deploy.sh --list-runs        # the command audit
+#   ./deploy.sh --proposals        # the proposal queue (expired shown as expired)
+#   ./deploy.sh --approve ID       # approve one; it still passes every gate
+#   ./deploy.sh --reject ID        # reject one; it can never execute
+#   ./deploy.sh --insights         # advisor insights, newest first
+#   ./deploy.sh --advisors         # configured advisors and their last run
+#   ./deploy.sh --remedies         # the remedy audit (newest 20)
+#   ./deploy.sh --thresholds       # active threshold overrides
+#   ./deploy.sh --revert-threshold SPEC_ID
+#                                  # drop one override, restoring the file band
 #
 # Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER
 #
@@ -127,6 +136,38 @@ while [ $# -gt 0 ]; do
             esac
             MODE=ctl; SAW_CTL=1; PASSTHRU+=(--arg "$2"); shift ;;
         --list-runs)        MODE=ctl; SAW_CTL=1; PASSTHRU+=(--list-runs) ;;
+        # The proposal and advisor surface. Each VALUE is consumed here and
+        # passed as its own argv element, exactly like --run's: the remote shell
+        # joins and re-splits argv, so a value never travels as a string.
+        --proposals)        MODE=ctl; SAW_CTL=1; PASSTHRU+=(--proposals) ;;
+        --insights)         MODE=ctl; SAW_CTL=1; PASSTHRU+=(--insights) ;;
+        --advisors)         MODE=ctl; SAW_CTL=1; PASSTHRU+=(--advisors) ;;
+        --thresholds)       MODE=ctl; SAW_CTL=1; PASSTHRU+=(--thresholds) ;;
+        --remedies)         MODE=ctl; SAW_CTL=1; PASSTHRU+=(--remedies) ;;
+        --approve)
+            [ $# -ge 2 ] || { echo "unknown argument: --approve needs a proposal id" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --approve needs a proposal id, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--approve "$2"); shift ;;
+        --reject)
+            [ $# -ge 2 ] || { echo "unknown argument: --reject needs a proposal id" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --reject needs a proposal id, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--reject "$2"); shift ;;
+        --revert-threshold)
+            [ $# -ge 2 ] || { echo "unknown argument: --revert-threshold needs a spec id" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --revert-threshold needs a spec id, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--revert-threshold "$2"); shift ;;
         --dismiss)          MODE=dismiss
                             # Everything after --dismiss belongs to dismiss.py,
                             # including a --reason whose text contains anything

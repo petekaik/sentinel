@@ -15,6 +15,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import harness                                    # noqa: E402
 from harness import Results                       # noqa: E402
 
 import actions                                    # noqa: E402
@@ -817,6 +818,177 @@ def test_the_per_hour_cap_bounds_executions(results):
                       "out=%r ran=%r" % (out, ran))
 
 
+# ---------------------------------------------------------------------------
+# THE FIRST FLEET ACTIONS (modules/fleet/actions.py).
+#
+# Declaring an action is not granting one: the fleet module still ships at
+# authority `off`, and every test below proves its own half of that. The two
+# things that would make the declarations useless -- a trigger naming a check id
+# that does not exist, and a `run` callable that is really a dry run -- are
+# assertions rather than conventions, because both fail SILENTLY: a typo'd
+# trigger never fires, and a shared defaulted implementation reports a
+# successful dry run every time it was asked to repair something.
+# ---------------------------------------------------------------------------
+
+
+def _fleet_ctx(env=None):
+    """The object the engine passes: a real FleetConfig over a hermetic env."""
+    ctx = type("_FleetCtx", (), {})()
+    ctx.fleet = harness.fleet_config(config_mod.Config(env=env or {}))
+    return ctx
+
+
+def _incident(action, target="cubox-1"):
+    return {"state": "open", "target": target, "subject": target,
+            "check_id": action.triggers[0][0]}
+
+
+def test_fleet_actions_are_declared(results):
+    from modules.fleet import actions as fleet_actions
+    declared = {a.id: a for a in fleet_actions.actions_list()}
+    results.check(
+        "the first fleet actions exist, each with a dry-run and a verify target",
+        {"state_mount_cycle", "transcode_restart"} <= set(declared)
+        and all(a.dry_run and a.verify for a in declared.values()),
+        "declared=%r" % sorted(declared))
+    results.check(
+        "each action's dry run and run are DISTINCT callables -- the engine "
+        "passes no flag, so one shared callable with a defaulted dry_run would "
+        "make every real run a dry run",
+        all(a.dry_run is not a.run for a in declared.values()),
+        "declared=%r" % sorted(declared))
+    results.check(
+        "every action carries real Limits",
+        all(a.limits is not None and a.limits.max_attempts > 0
+            and a.limits.cooldown_s > 0 and a.limits.per_hour > 0
+            and a.limits.timeout_s > 0 for a in declared.values()),
+        "limits=%r" % {k: vars(a.limits) for k, a in declared.items()})
+    wired = {a.id for a in harness.fleet_module().actions()}
+    results.check("the fleet module exposes the actions to the engine",
+                  set(declared) <= wired, "wired=%r" % sorted(wired))
+
+
+def test_fleet_action_triggers_name_real_checks(results):
+    """A trigger whose check id does not exist can never fire, and nothing
+    reports it -- so the ids are compared with the fleet module's own classes."""
+    import checks as checks_mod
+    from modules.fleet import actions as fleet_actions
+    real = {c.id for c in checks_mod.registry(
+        *harness.fleet_module().check_classes())}
+    declared = fleet_actions.actions_list()
+    unknown = [(a.id, cid) for a in declared for cid, _ in a.triggers
+               if cid not in real]
+    results.check(
+        "every declared trigger names a check the fleet module really runs",
+        not unknown, "unknown=%r; fleet check ids=%r" % (unknown, sorted(real)))
+    results.check(
+        "every verify target names a real check too",
+        all(a.verify[0] in real for a in declared),
+        "verify=%r; fleet check ids=%r"
+        % ([a.verify for a in declared], sorted(real)))
+    triggers = {a.id: {cid for cid, _ in a.triggers} for a in declared}
+    results.check(
+        "the worker is restarted on a deadlock kill or a stall-watch report",
+        triggers.get("transcode_restart") == {"deadlock_kills", "stall_watch"},
+        "triggers=%r" % (triggers.get("transcode_restart"),))
+    results.check(
+        "the state mount is cycled on the checks that report it unusable",
+        triggers.get("state_mount_cycle")
+        == {"state_dir_tmpfs", "state_save_age_min"},
+        "triggers=%r" % (triggers.get("state_mount_cycle"),))
+
+
+def test_fleet_actions_are_off_by_default(results):
+    from modules.fleet import actions as fleet_actions
+    policy = config_mod.Config(env={}).authority("fleet")
+    results.check("the fleet module ships at authority off",
+                  policy["authority"] == "off", repr(policy))
+    refusals = [(a.id, actions.allowed(a, _incident(a), policy))
+                for a in fleet_actions.actions_list()]
+    results.check("no declared action is allowed until an operator grants it",
+                  all(not ok and "off" in why for _, (ok, why) in refusals),
+                  "refusals=%r" % (refusals,))
+
+
+def test_fleet_action_dry_runs_do_not_ssh(results):
+    import probes as probes_mod
+    from modules.fleet import actions as fleet_actions
+    ctx = _fleet_ctx()
+    declared = {a.id: a for a in fleet_actions.actions_list()}
+    orig = probes_mod.ssh
+
+    def refuse(host, cmd, *a, **k):
+        raise AssertionError("a dry run tried to ssh to %s" % host.address)
+
+    probes_mod.ssh = refuse
+    try:
+        for aid, a in declared.items():
+            res = a.dry_run(ctx, _incident(a))
+            results.check(
+                "%s's dry run says what it would do and never touches the box"
+                % aid, res.ok and res.output, "res=%r" % (res.__dict__,))
+    finally:
+        probes_mod.ssh = orig
+
+    calls = []
+
+    def fake(host, cmd, *a, **k):
+        calls.append((host.name, cmd))
+        return probes_mod.RemoteResult(probes_mod.Transport.RAN, rc=0)
+
+    probes_mod.ssh = fake
+    try:
+        for aid, a in declared.items():
+            calls[:] = []
+            res = a.run(ctx, _incident(a))
+            results.check(
+                "%s's run really executes exactly one command on the box" % aid,
+                res.ok and len(calls) == 1,
+                "calls=%r res=%r" % (calls, res.__dict__))
+    finally:
+        probes_mod.ssh = orig
+
+
+def test_fleet_action_commands_are_the_documented_repairs(results):
+    from modules.fleet import actions as fleet_actions
+    ctx = _fleet_ctx()
+    declared = {a.id: a for a in fleet_actions.actions_list()}
+    backup = ctx.fleet.hosts["backup"].address
+    res = declared["state_mount_cycle"].dry_run(
+        ctx, _incident(declared["state_mount_cycle"]))
+    expected = ("umount /mnt/state || umount -l /mnt/state; "
+                "mount -t nfs -o nolock,nfsvers=3 "
+                "%s:/cubpxe/state/cubox-1 /mnt/state" % backup)
+    results.check(
+        "the state mount cycle returns the fleet's documented repair verbatim",
+        res.ok and res.output == expected, "output=%r" % (res.output,))
+    res = declared["transcode_restart"].dry_run(
+        ctx, _incident(declared["transcode_restart"]))
+    results.check("the transcode restart returns the systemctl command",
+                  res.ok and res.output == "systemctl restart cubox-transcode",
+                  "output=%r" % (res.output,))
+
+
+def test_fleet_actions_refuse_a_target_that_is_not_a_box(results):
+    from modules.fleet import actions as fleet_actions
+    ctx = _fleet_ctx()
+    for a in fleet_actions.actions_list():
+        for target in ("backup", "storage", "fleet", "cubox-9", None):
+            res = a.dry_run(ctx, _incident(a, target))
+            results.check(
+                "%s refuses target %r instead of guessing a host"
+                % (a.id, target),
+                not res.ok and "CuBox" in res.detail, "detail=%r" % (res.detail,))
+
+    # In cubox_ids but with no host entry: refusing beats a KeyError.
+    ctx = _fleet_ctx(env={"CUBOX_IDS": "cubox-1,cubox-2,cubox-9"})
+    for a in fleet_actions.actions_list():
+        res = a.dry_run(ctx, _incident(a, "cubox-9"))
+        results.check(
+            "%s refuses a configured box that has no host entry" % a.id,
+            not res.ok and "no host" in res.detail, "detail=%r" % (res.detail,))
+
+
 TESTS = (test_off_by_default,
          test_scoped_requires_allowlist,
          test_advisory_and_propose_never_execute,
@@ -851,7 +1023,13 @@ TESTS = (test_off_by_default,
          test_an_executed_attempt_is_audited,
          test_a_failed_run_is_executed_and_noted,
          test_cooldown_blocks_a_recent_attempt,
-         test_the_per_hour_cap_bounds_executions)
+         test_the_per_hour_cap_bounds_executions,
+         test_fleet_actions_are_declared,
+         test_fleet_action_triggers_name_real_checks,
+         test_fleet_actions_are_off_by_default,
+         test_fleet_action_dry_runs_do_not_ssh,
+         test_fleet_action_commands_are_the_documented_repairs,
+         test_fleet_actions_refuse_a_target_that_is_not_a_box)
 
 
 def main():

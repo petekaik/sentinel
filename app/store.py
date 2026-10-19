@@ -740,11 +740,17 @@ def last_action_proposal(conn, incident_key, action_id):
     return None
 
 
-def pending_threshold_proposal(conn, spec_id):
-    """The pending `threshold_change` proposal for one spec, if any."""
+def last_threshold_proposal(conn, spec_id):
+    """The NEWEST `threshold_change` proposal for one spec, whatever its state.
+
+    The producer needs the decided history, not only the pending set: a
+    rejected or just-executed proposal must not regenerate on the next epoch
+    (60 s later), or `--reject` is inert. Expiry is handled by the caller --
+    a lapsed row is absent, not a decision.
+    """
     rows = conn.execute(
-        "SELECT * FROM proposal WHERE state = 'pending' "
-        "AND kind = 'threshold_change' ORDER BY id DESC").fetchall()
+        "SELECT * FROM proposal WHERE kind = 'threshold_change' "
+        "ORDER BY id DESC").fetchall()
     for row in rows:
         if _proposal_payload(row).get("spec_id") == spec_id:
             return dict(row)

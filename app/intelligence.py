@@ -9,8 +9,10 @@ Two jobs, both advisory:
     proposed band.
 
 ADVISORY MEANS ADVISORY. This module never records a proposal and never touches
-a threshold: a suggestion is one `insight` row, and a human decision is the only
-thing that can turn it into a change. `store.list_proposals` stays empty.
+a threshold: a suggestion is one `insight` row. The collector may translate a
+stored suggestion into a PENDING proposal, but the approval remains a human
+decision -- nothing here changes a band, and the approvals inbox (not this
+advisor) owns any change.
 
 WINDOW HONESTY. Every insight states `requested_days` (the ask) beside
 `available_days` (the history that exists), and carries the snapshot's
@@ -259,9 +261,10 @@ class ReferenceAdvisor(advisors.Advisor):
                       "days) is %s %s, outside the current band (green %s, "
                       "amber %s, direction %s). Proposed band, moved by at "
                       "most %s toward the observation: green %s, amber %s. "
-                      "ADVISORY ONLY: no threshold was changed and no proposal "
-                      "was written; the next epoch still grades with the "
-                      "current band."
+                      "RECOMMENDATION ONLY: no threshold was changed. This "
+                      "insight is advice; the approvals inbox "
+                      "(`--proposals`) owns any change, and the next epoch "
+                      "still grades with the current band."
                       % (self.percentile, _fmt(window["available_days"]),
                          len(values), span_days, _fmt(observed), unit,
                          _fmt(spec.green), _fmt(spec.amber), direction,

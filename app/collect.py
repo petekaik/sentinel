@@ -481,8 +481,25 @@ def _propose_thresholds(cfg, conn, ctx, runs):
         return []
     specs = getattr(ctx, "specs", None) or {}
     ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
+    now = time.time()
+
+    # A LAPSED PROPOSAL IS ABSENT, NOT A DECISION. The healer's sweep does not
+    # run when MONITOR_REMEDIES=0, so without this a dead pending row would
+    # block its spec's new proposals for as long as the collector runs.
+    try:
+        store.expire_proposals(conn, now)
+    except Exception as exc:                       # noqa: BLE001 - isolated
+        line = str(exc).splitlines()
+        ctx.note("could not expire lapsed proposals: %s"
+                 % (line[0] if line else type(exc).__name__))
+
     written = []
     for run in runs or ():
+        # AN ERROR/BUDGET RUN'S INSIGHT MAY NOT BE DURABLE. The runner carries
+        # the insight objects back on that path too, and proposing from one
+        # would cite evidence the store rejected.
+        if run.get("status") != "ok":
+            continue
         for insight in run.get("insights") or ():
             if getattr(insight, "kind", "") != "threshold_suggestion":
                 continue
@@ -499,8 +516,24 @@ def _propose_thresholds(cfg, conn, ctx, runs):
                     # A spec with no owning module cannot be approved: the
                     # approval path resolves it through that module's file.
                     continue
-                if store.pending_threshold_proposal(conn, spec.id) is not None:
-                    continue
+                # THE NEWEST PROPOSAL SPEAKS, NOT JUST THE PENDING ONE. A row
+                # rejected (or executed) seconds ago must not regenerate on the
+                # next epoch, or `--reject` is decoration and an approved band
+                # is re-proposed before anyone can see whether it helped. The
+                # suppression lasts one TTL; after that a still-outside band is
+                # new evidence and may be proposed again.
+                last = store.last_threshold_proposal(conn, spec.id)
+                if last is not None:
+                    if (last["state"] == "pending"
+                            and not store.proposal_expired(last, now)):
+                        continue
+                    if last["state"] in ("rejected", "executed"):
+                        stamp = (last.get("decided_at")
+                                 if last["state"] == "rejected"
+                                 else last.get("executed_at"))
+                        stamp = stamp or last["ts"]
+                        if float(stamp) + ttl_s > now:
+                            continue
                 pid = store.record_proposal(
                     conn, module=module, kind="threshold_change",
                     payload={"spec_id": spec.id, "module": module,

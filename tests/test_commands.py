@@ -451,46 +451,102 @@ def test_serial_break_is_destructive_and_refuses_without_a_resolved_adapter(resu
         ok, "handler did not refuse")
 
 
+def test_a_real_break_is_never_faked(results):
+    """F7: with an adapter RESOLVED, the handler still refuses to pretend.
+
+    Mutation this exists for: returning `Result(True, "BREAK sent")` on the real
+    path. That would report a reboot that never happened, and an operator would
+    wait for a box that is still hung.
+    """
+    from modules.fleet import serial as serial_mod
+    fcmd = _fleet_cmd()
+    ad = serial_mod.Adapter(serial="SYNTH001", port="1-1.2",
+                            tty="ttyUSB0", device="/dev/ttyUSB0")
+    try:
+        fcmd.serial_break(None, {"box": "cubox-1"}, dry_run=False,
+                          resolver=lambda box: ad)
+    except commands.CommandError as exc:
+        refused = ("not wired" in str(exc).lower()
+                   or "pretending" in str(exc).lower())
+        returned = False
+    else:
+        refused, returned = False, True
+    dry = fcmd.serial_break(None, {"box": "cubox-1"}, dry_run=True,
+                            resolver=lambda box: ad)
+    results.check(
+        "a real BREAK against a resolved adapter refuses; only a dry run "
+        "describes it, and neither claims a BREAK was sent",
+        refused and not returned and dry.ok
+        and dry.detail == "would send BREAK+b to /dev/ttyUSB0"
+        and "sent" not in dry.detail.lower(),
+        "refused=%r returned_result=%r dry=%r" % (refused, returned, dry.detail))
+
+
 def test_serial_commands_declare_their_danger_and_the_serial_resource(results):
+    """Only the commands that OPEN the port hold the resource.
+
+    A read-only status or a local log read opens nothing, and making it contend
+    with an in-flight arm would let a dashboard poll block the operator.
+    """
     cmds = {c.id: c for c in _fleet_cmd().commands()}
-    want = {"serial_status": "read_only", "serial_arm": "state_changing",
-            "serial_disarm": "state_changing", "serial_read": "read_only",
-            "serial_break": "destructive"}
+    want = {"serial_status": ("read_only", False),
+            "serial_arm": ("state_changing", True),
+            "serial_disarm": ("state_changing", True),
+            "serial_read": ("read_only", False),
+            "serial_break": ("destructive", True)}
     bad = [(cid, cmds[cid].danger if cid in cmds else None,
             cmds[cid].resources if cid in cmds else None)
-           for cid, danger in sorted(want.items())
+           for cid, (danger, holds) in sorted(want.items())
            if cid not in cmds or cmds[cid].danger != danger
-           or "serial" not in cmds[cid].resources]
+           or ("serial" in cmds[cid].resources) != holds]
     results.check(
-        "all five serial commands declare their danger and hold the serial "
-        "resource, so two cannot touch one port at once",
+        "all five serial commands declare their danger, and exactly the "
+        "port-opening ones hold the serial resource",
         not bad, "wrong or missing: %r" % (bad,))
 
 
-def test_actions_refuse_an_unresolvable_adapter(results):
-    """NEVER GUESS: an unidentifiable box is a refusal, not a fallback device."""
+def test_only_arm_requires_a_resolved_adapter(results):
+    """NEVER GUESS applies to the action that opens the port, not to files.
+
+    `arm` must refuse an unidentifiable box. `disarm` and `read` touch no port
+    and are keyed by box, so they must still work while the cable is unplugged:
+    that is exactly when a stale arm has to be cleared and a capture read.
+    """
     fcmd = _fleet_cmd()
     sysfs = _fleet_sysfs([("ttyUSB0", "1-2", "OTHER")])
     try:
         ctx = _fleet_ctx(sysfs, {"cubox-1": "SYNTH001"})
-        outcomes = {}
-        for name in ("arm", "disarm", "read"):
-            try:
-                getattr(fcmd, name)(ctx, {"box": "cubox-1", "min": "5"},
-                                    dry_run=False)
-            except commands.CommandError as exc:
-                outcomes[name] = "adapter" in str(exc).lower()
-            else:
-                outcomes[name] = False
+        try:
+            fcmd.arm(ctx, {"box": "cubox-1", "min": "5"}, dry_run=False)
+        except commands.CommandError as exc:
+            refused = "adapter" in str(exc).lower()
+        else:
+            refused = False
         results.check(
-            "arm, disarm and read refuse when the box's adapter is not identified",
-            all(outcomes.values()),
-            "outcomes=%r -- falling back to SERIAL_DEVICE here is exactly how a "
-            "command lands on the wrong box" % (outcomes,))
+            "arm refuses when the box's adapter is not identified",
+            refused,
+            "falling back to SERIAL_DEVICE here is exactly how an arm lands on "
+            "the wrong box")
         results.check(
-            "the refused arm wrote no arm file",
+            "and the refused arm wrote no arm file",
             not os.path.exists(os.path.join(ctx.fleet.capture_dir, "arm-cubox-1")),
             "capture dir: %r" % (os.listdir(ctx.fleet.capture_dir),))
+
+        with open(os.path.join(ctx.fleet.capture_dir, "arm-cubox-1"), "w") as fh:
+            fh.write("0 /dev/ttyUSB0\n")
+        log = os.path.join(ctx.fleet.capture_dir, "last-cubox-1.log")
+        with open(log, "w") as fh:
+            fh.write("boot log\n")
+        dis = fcmd.disarm(ctx, {"box": "cubox-1"}, dry_run=False)
+        red = fcmd.read(ctx, {"box": "cubox-1"}, dry_run=False)
+        results.check(
+            "disarm and read still work with no identifiable adapter attached",
+            dis.ok and red.ok and "boot log" in red.output
+            and not os.path.exists(os.path.join(ctx.fleet.capture_dir,
+                                                "arm-cubox-1")),
+            "disarm=%r read=%r left=%r -- refusing these prevents clearing a "
+            "stale arm (which blocks BREAK) while the cable is out"
+            % (dis.detail, red.output, os.listdir(ctx.fleet.capture_dir)))
     finally:
         import shutil
         shutil.rmtree(sysfs)
@@ -601,8 +657,9 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_the_audit_keeps_a_head_and_the_full_sha,
          test_the_command_run_table_is_in_the_store_summary,
          test_serial_break_is_destructive_and_refuses_without_a_resolved_adapter,
+         test_a_real_break_is_never_faked,
          test_serial_commands_declare_their_danger_and_the_serial_resource,
-         test_actions_refuse_an_unresolvable_adapter,
+         test_only_arm_requires_a_resolved_adapter,
          test_dry_run_arm_writes_nothing,
          test_arm_rejects_a_window_outside_the_cap,
          test_arm_writes_an_arm_file_that_status_reports,

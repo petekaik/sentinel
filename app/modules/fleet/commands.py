@@ -45,14 +45,17 @@ def status(ctx, args, dry_run=False):
     try:
         names = sorted(n for n in os.listdir(fleet.capture_dir)
                        if n.startswith("arm-"))
-    except OSError:
-        names = []
-    for name in names:
-        try:
-            with open(os.path.join(fleet.capture_dir, name)) as fh:
-                lines.append("%s: %s" % (name, fh.read().strip()))
-        except OSError as exc:
-            lines.append("%s: unreadable (%s)" % (name, exc))
+    except OSError as exc:
+        # "I could not read the arm state" must not read as "there is no arm
+        # state": the latter is a green-looking empty, the former is a fact.
+        lines.append("arm state unreadable: %s" % exc)
+    else:
+        for name in names:
+            try:
+                with open(os.path.join(fleet.capture_dir, name)) as fh:
+                    lines.append("%s: %s" % (name, fh.read().strip()))
+            except OSError as exc:
+                lines.append("%s: unreadable (%s)" % (name, exc))
     return cmdlib.Result(True, "%d adapter(s)" % len(adapters), "\n".join(lines))
 
 
@@ -77,7 +80,9 @@ def arm(ctx, args, dry_run=False):
 
 
 def disarm(ctx, args, dry_run=False):
-    _serial_for(ctx, args["box"])
+    # Removing an arm file touches no port and is keyed by box, so it needs no
+    # resolved adapter -- and refusing here would leave a stale arm (which
+    # blocks BREAK) uncleared exactly while the cable is unplugged.
     path = _arm_path(ctx, args["box"])
     if dry_run:
         return cmdlib.Result(True, "would clear %s" % path)
@@ -89,7 +94,8 @@ def disarm(ctx, args, dry_run=False):
 
 
 def read(ctx, args, dry_run=False):
-    _serial_for(ctx, args["box"])
+    # Reading a local capture log opens no port; it must work when the adapter
+    # is unplugged, which is when an operator most needs the evidence.
     path = os.path.join(ctx.fleet.capture_dir, "last-%s.log" % args["box"])
     try:
         with open(path) as fh:
@@ -124,8 +130,7 @@ def serial_break(ctx, args, dry_run=False, resolver=None):
 
 def commands():
     return [
-        cmdlib.Command("serial_status", "Serial adapters and arm state", status,
-                       resources=["serial"]),
+        cmdlib.Command("serial_status", "Serial adapters and arm state", status),
         cmdlib.Command("serial_arm", "Arm a capture window", arm,
                        args=[cmdlib.Arg("box"),
                              cmdlib.Arg("min", required=False)],
@@ -134,7 +139,7 @@ def commands():
                        args=[cmdlib.Arg("box")], danger="state_changing",
                        resources=["serial"]),
         cmdlib.Command("serial_read", "Read the last capture", read,
-                       args=[cmdlib.Arg("box")], resources=["serial"]),
+                       args=[cmdlib.Arg("box")]),
         cmdlib.Command("serial_break", "SysRq BREAK + reboot a box", serial_break,
                        args=[cmdlib.Arg("box")], danger="destructive",
                        resources=["serial"]),

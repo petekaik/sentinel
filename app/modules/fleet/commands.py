@@ -28,6 +28,21 @@ def _serial_for(ctx, box):
     return ad
 
 
+def _known_box(ctx, box):
+    """The box, or a refusal. `box` becomes a FILENAME, so it is a closed key set.
+
+    Without this, `box="../../../../etc/passwd"` is a path, and `disarm` would
+    unlink whatever it names. The adapter lookup used to refuse unknown boxes by
+    accident when these handlers resolved one; validating here is the actual
+    defence.
+    """
+    known = ctx.fleet.cubox_ids
+    if box not in known:
+        raise cmdlib.CommandError(
+            "unknown box %r; accepted boxes: %s" % (box, ", ".join(known)))
+    return box
+
+
 def _arm_path(ctx, box):
     return os.path.join(ctx.fleet.capture_dir, "arm-%s" % box)
 
@@ -60,6 +75,7 @@ def status(ctx, args, dry_run=False):
 
 
 def arm(ctx, args, dry_run=False):
+    box = _known_box(ctx, args["box"])
     try:
         minutes = int(args.get("min") or "5")
     except (TypeError, ValueError):
@@ -69,10 +85,10 @@ def arm(ctx, args, dry_run=False):
     if not 1 <= minutes <= limit:
         raise cmdlib.CommandError(
             "min must be between 1 and %d, got %d" % (limit, minutes))
-    ad = _serial_for(ctx, args["box"])
+    ad = _serial_for(ctx, box)
     if dry_run:
         return cmdlib.Result(True, "would arm %s for %d min" % (ad.device, minutes))
-    path = _arm_path(ctx, args["box"])
+    path = _arm_path(ctx, box)
     os.makedirs(ctx.fleet.capture_dir, exist_ok=True)
     with open(path, "w") as fh:
         fh.write("%d %s\n" % (int(time.time()) + minutes * 60, ad.device))
@@ -80,28 +96,32 @@ def arm(ctx, args, dry_run=False):
 
 
 def disarm(ctx, args, dry_run=False):
-    # Removing an arm file touches no port and is keyed by box, so it needs no
-    # resolved adapter -- and refusing here would leave a stale arm (which
-    # blocks BREAK) uncleared exactly while the cable is unplugged.
-    path = _arm_path(ctx, args["box"])
+    # Removing an arm file touches no port, so it needs no resolved adapter --
+    # and refusing on an absent adapter would leave a stale arm (which blocks
+    # BREAK) uncleared exactly while the cable is unplugged. It still holds the
+    # serial resource: this is the capture-stop path, and clearing the arm file
+    # while a capture is opening is a race.
+    box = _known_box(ctx, args["box"])
+    path = _arm_path(ctx, box)
     if dry_run:
         return cmdlib.Result(True, "would clear %s" % path)
     try:
         os.unlink(path)
     except FileNotFoundError:
-        pass
-    return cmdlib.Result(True, "disarmed")
+        return cmdlib.Result(True, "no arm file for %s" % box)
+    return cmdlib.Result(True, "disarmed %s" % box)
 
 
 def read(ctx, args, dry_run=False):
     # Reading a local capture log opens no port; it must work when the adapter
     # is unplugged, which is when an operator most needs the evidence.
-    path = os.path.join(ctx.fleet.capture_dir, "last-%s.log" % args["box"])
+    box = _known_box(ctx, args["box"])
+    path = os.path.join(ctx.fleet.capture_dir, "last-%s.log" % box)
     try:
         with open(path) as fh:
             text = fh.read()
     except OSError as exc:
-        raise cmdlib.CommandError("no capture for %s: %s" % (args["box"], exc))
+        raise cmdlib.CommandError("no capture for %s: %s" % (box, exc))
     return cmdlib.Result(True, "capture %s (%d bytes)" % (path, len(text)),
                          text[-4000:])
 

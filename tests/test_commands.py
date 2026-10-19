@@ -424,7 +424,7 @@ def _fleet_ctx(sysfs, serials=None, capture=None):
         serial_sysfs=sysfs,
         serial_serials=serials or {},
         capture_dir=capture or tempfile.mkdtemp(prefix="sentinel-cap-"),
-        serial_arm_max_min=60,
+        serial_arm_max_min=30,
     )
     return types.SimpleNamespace(fleet=fleet,
                                  cfg=types.SimpleNamespace(
@@ -483,10 +483,12 @@ def test_a_real_break_is_never_faked(results):
 
 
 def test_serial_commands_declare_their_danger_and_the_serial_resource(results):
-    """Only the commands that OPEN the port hold the resource.
+    """Danger per command, and a lock on everything that touches the port.
 
-    A read-only status or a local log read opens nothing, and making it contend
-    with an in-flight arm would let a dashboard poll block the operator.
+    `serial_disarm` holds the lock deliberately even though it opens no port: it
+    is the capture-stop path, and clearing the arm file while a capture is
+    opening is a race. `serial_status` and `serial_read` touch no port and must
+    not contend with an operator's arm.
     """
     cmds = {c.id: c for c in _fleet_cmd().commands()}
     want = {"serial_status": ("read_only", False),
@@ -539,6 +541,7 @@ def test_only_arm_requires_a_resolved_adapter(results):
             fh.write("boot log\n")
         dis = fcmd.disarm(ctx, {"box": "cubox-1"}, dry_run=False)
         red = fcmd.read(ctx, {"box": "cubox-1"}, dry_run=False)
+        again = fcmd.disarm(ctx, {"box": "cubox-1"}, dry_run=False)
         results.check(
             "disarm and read still work with no identifiable adapter attached",
             dis.ok and red.ok and "boot log" in red.output
@@ -547,9 +550,72 @@ def test_only_arm_requires_a_resolved_adapter(results):
             "disarm=%r read=%r left=%r -- refusing these prevents clearing a "
             "stale arm (which blocks BREAK) while the cable is out"
             % (dis.detail, red.output, os.listdir(ctx.fleet.capture_dir)))
+        results.check(
+            "a disarm with nothing to clear says so instead of 'disarmed'",
+            again.ok and "no arm file" in again.detail,
+            "detail=%r -- a mistyped box must not read as a successful disarm"
+            % (again.detail,))
     finally:
         import shutil
         shutil.rmtree(sysfs)
+
+
+def test_box_arguments_are_validated_against_the_fleet(results):
+    """A box is a KEY, not a path. Unvalidated, `box` escapes the capture dir.
+
+    Mutation this exists for: `disarm` with box="../../../../etc/passwd" unlinking
+    a file outside the capture directory, and `read` returning any `*.log` the
+    process can reach. The old incidental protection was the adapter lookup, and
+    removing it is what made this the handler's own job.
+    """
+    import shutil
+    fcmd = _fleet_cmd()
+    sysfs = _fleet_sysfs([])
+    tmp = tempfile.mkdtemp(prefix="sentinel-trav-")
+    cap = os.path.join(tmp, "cap")
+    os.makedirs(cap)
+    victim = os.path.join(tmp, "victim")
+    with open(victim, "w") as fh:
+        fh.write("x")
+    victim_log = os.path.join(tmp, "victim.log")
+    with open(victim_log, "w") as fh:
+        fh.write("secret")
+    try:
+        ctx = _fleet_ctx(sysfs, capture=cap)
+        outcomes = {}
+        for name in ("disarm", "read"):
+            for box in ("../victim", "cubox-9"):
+                try:
+                    getattr(fcmd, name)(ctx, {"box": box}, dry_run=False)
+                except commands.CommandError as exc:
+                    outcomes[(name, box)] = "cubox-1" in str(exc)
+                else:
+                    outcomes[(name, box)] = False
+        results.check(
+            "disarm and read refuse a traversal or unknown box, naming the "
+            "accepted boxes",
+            all(outcomes.values()), "outcomes=%r" % (outcomes,))
+        results.check(
+            "the traversal value touched nothing outside the capture dir",
+            os.path.exists(victim) and os.path.exists(victim_log),
+            "victim=%r victim.log=%r" % (os.path.exists(victim),
+                                         os.path.exists(victim_log)))
+    finally:
+        shutil.rmtree(sysfs)
+        shutil.rmtree(tmp)
+
+
+def test_serial_capture_defaults_match_the_spec(results):
+    """The fixture sets the cap explicitly, so this is the only pin on the default."""
+    import config as config_mod
+    from modules.fleet.settings import FleetConfig
+    fleet = FleetConfig(config_mod.Config(env={}), {})
+    results.check(
+        "SERIAL_CAPTURE_DIR defaults to /data/serial and SERIAL_ARM_MAX_MIN to 30",
+        fleet.capture_dir == "/data/serial" and fleet.serial_arm_max_min == 30,
+        "got capture_dir=%r serial_arm_max_min=%r -- the fixture hardcodes the "
+        "cap, so a reverted default would otherwise stay green"
+        % (fleet.capture_dir, fleet.serial_arm_max_min))
 
 
 def test_dry_run_arm_writes_nothing(results):
@@ -574,7 +640,7 @@ def test_arm_rejects_a_window_outside_the_cap(results):
     try:
         ctx = _fleet_ctx(sysfs, {"cubox-1": "SYNTH001"})
         outcomes = {}
-        for value in ("0", "-1", "61", "soon"):
+        for value in ("0", "-1", "31", "soon"):
             try:
                 fcmd.arm(ctx, {"box": "cubox-1", "min": value}, dry_run=False)
             except commands.CommandError:
@@ -660,6 +726,8 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_a_real_break_is_never_faked,
          test_serial_commands_declare_their_danger_and_the_serial_resource,
          test_only_arm_requires_a_resolved_adapter,
+         test_box_arguments_are_validated_against_the_fleet,
+         test_serial_capture_defaults_match_the_spec,
          test_dry_run_arm_writes_nothing,
          test_arm_rejects_a_window_outside_the_cap,
          test_arm_writes_an_arm_file_that_status_reports,

@@ -1175,6 +1175,13 @@ def test_a_p95_outside_the_band_yields_a_bounded_suggestion(results):
             "proposals=%r out=%r. Even a correctly bounded suggestion stops "
             "at the insight; only a human decision turns it into a change."
             % (store.list_proposals(conn), out))
+        results.check(
+            "the body no longer claims no proposal exists",
+            "approvals inbox" in rows[0]["body"]
+            and "no proposal was written" not in rows[0]["body"],
+            "body=%r -- the collector now writes a pending proposal from this "
+            "suggestion, so the insight must point at the inbox rather than "
+            "deny it exists" % (rows[0]["body"],))
     finally:
         _close(tmp, conn)
 
@@ -2366,6 +2373,163 @@ def test_a_threshold_suggestion_becomes_one_pending_proposal(results):
         _close(tmp, conn)
 
 
+def _suggestion_setup():
+    spec = thresholds.Spec("mem", metric="mem", direction="high_is_good",
+                           green=100, amber=60)
+    spec.owner = "m"
+    ctx = _AdvisorCtx(_AdvisorModule(_SuggestAdvisor()), {"mem": spec})
+    return ctx, _ProposalCfg(advisor_ids=("suggest",))
+
+
+def test_a_rejected_threshold_proposal_does_not_regenerate(results):
+    """`--reject` must last a TTL, not one epoch (60 seconds)."""
+    tmp, conn = _store()
+    try:
+        ctx, cfg = _suggestion_setup()
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        first = store.list_proposals(conn, state="pending")[0]
+        ctl.reject_proposal(conn, first["id"], "operator")
+
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        rows = store.list_proposals(conn)
+        results.check(
+            "a rejected threshold proposal is not regenerated next epoch",
+            [r["id"] for r in rows] == [first["id"]]
+            and rows[0]["state"] == "rejected",
+            "rows=%r -- regenerating seconds after a rejection makes --reject "
+            "inert and the queue a treadmill"
+            % ([(r["id"], r["state"]) for r in rows],))
+
+        # After the TTL a still-outside band is new evidence, not churn.
+        conn.execute("UPDATE proposal SET decided_at = ? WHERE id = ?",
+                     (time.time() - cfg.proposal_ttl_s - 1, first["id"]))
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        pending = store.list_proposals(conn, state="pending")
+        results.check(
+            "after the TTL a still-outside band may be proposed again",
+            len(pending) == 1 and pending[0]["id"] != first["id"],
+            "pending=%r -- a permanent veto would hide a band that never "
+            "became adequate" % ([r["id"] for r in pending],))
+    finally:
+        _close(tmp, conn)
+
+
+def test_an_executed_threshold_proposal_does_not_regenerate(results):
+    """Approval is not an invitation to re-propose the same band next epoch."""
+    tmp, conn = _store()
+    try:
+        ctx, cfg = _suggestion_setup()
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        first = store.list_proposals(conn, state="pending")[0]
+        store.decide_proposal(conn, first["id"], "approved", "operator")
+        store.mark_proposal_executed(conn, first["id"])
+
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        rows = store.list_proposals(conn)
+        results.check(
+            "an executed threshold proposal is not regenerated next epoch",
+            [r["id"] for r in rows] == [first["id"]]
+            and rows[0]["state"] == "executed",
+            "rows=%r -- re-proposing before the new band has been graded makes "
+            "the approval look ineffective and refills the queue"
+            % ([(r["id"], r["state"]) for r in rows],))
+
+        conn.execute("UPDATE proposal SET executed_at = ? WHERE id = ?",
+                     (time.time() - cfg.proposal_ttl_s - 1, first["id"]))
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        pending = store.list_proposals(conn, state="pending")
+        results.check(
+            "after the TTL an executed proposal may be followed by another",
+            len(pending) == 1 and pending[0]["id"] != first["id"],
+            "pending=%r -- suppression must end, or a still-bad metric can "
+            "never be tightened again" % ([r["id"] for r in pending],))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_lapsed_threshold_proposal_does_not_block_a_new_one(results):
+    """Expiry is absence, not a decision -- even with remedies disabled."""
+    tmp, conn = _store()
+    try:
+        ctx, cfg = _suggestion_setup()
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        first = store.list_proposals(conn, state="pending")[0]
+        conn.execute("UPDATE proposal SET expires_at = ? WHERE id = ?",
+                     (time.time() - 1, first["id"]))
+
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        rows = store.list_proposals(conn)
+        pending = [r for r in rows if r["state"] == "pending"]
+        old = [r for r in rows if r["id"] == first["id"]][0]
+        results.check(
+            "a lapsed pending proposal is expired and does not block a new one",
+            old["state"] == "expired" and len(pending) == 1
+            and pending[0]["id"] != first["id"],
+            "rows=%r -- the healer's sweep does not run with "
+            "MONITOR_REMEDIES=0, so the producer must not depend on it"
+            % ([(r["id"], r["state"], r["expires_at"]) for r in rows],))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_lapsed_proposal_is_absent_even_when_the_sweep_does_not_run(results):
+    """The expiry check is a second guard, not decoration.
+
+    The producer sweeps first; this exercises the case where that write does
+    not happen (a locked store, an older schema), so a lapsed pending row must
+    still not veto its spec's next proposal.
+    """
+    tmp, conn = _store()
+    try:
+        ctx, cfg = _suggestion_setup()
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        first = store.list_proposals(conn, state="pending")[0]
+        conn.execute("UPDATE proposal SET expires_at = ? WHERE id = ?",
+                     (time.time() - 1, first["id"]))
+        saved = store.expire_proposals
+        store.expire_proposals = lambda *a, **k: 0
+        try:
+            collect.run_advisors_for_epoch(cfg, conn, ctx)
+        finally:
+            store.expire_proposals = saved
+        pending = store.list_proposals(conn, state="pending")
+        ids = [r["id"] for r in pending]
+        results.check(
+            "a lapsed pending row is absent even without the sweep",
+            first["id"] in ids and len(ids) == 2 and max(ids) != first["id"],
+            "pending=%r -- an unswept lapsed row must not block a new "
+            "proposal" % (ids,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_an_advisor_error_run_never_proposes(results):
+    """An insight whose store write failed must not become a proposal."""
+    tmp, conn = _store()
+    try:
+        ctx, cfg = _suggestion_setup()
+        saved = store.record_insight
+
+        def refuse(*a, **k):
+            raise RuntimeError("insight write refused")
+
+        store.record_insight = refuse
+        try:
+            collect.run_advisors_for_epoch(cfg, conn, ctx)
+        finally:
+            store.record_insight = saved
+        runs = conn.execute("SELECT status FROM advisor_run").fetchall()
+        results.check(
+            "an advisor run that errored proposes nothing",
+            store.list_proposals(conn) == []
+            and [r[0] for r in runs] == ["error"],
+            "proposals=%r runs=%r -- proposing from an insight the store "
+            "rejected cites evidence nobody can read"
+            % (store.list_proposals(conn), [r[0] for r in runs]))
+    finally:
+        _close(tmp, conn)
+
+
 def test_display_state_marks_a_lapsed_pending_row_expired(results):
     now = time.time()
     results.check(
@@ -2482,6 +2646,11 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_an_approved_threshold_changes_grading_without_a_rebuild,
          test_a_threshold_approval_refuses_what_it_cannot_justify,
          test_a_threshold_suggestion_becomes_one_pending_proposal,
+         test_a_rejected_threshold_proposal_does_not_regenerate,
+         test_an_executed_threshold_proposal_does_not_regenerate,
+         test_a_lapsed_threshold_proposal_does_not_block_a_new_one,
+         test_a_lapsed_proposal_is_absent_even_when_the_sweep_does_not_run,
+         test_an_advisor_error_run_never_proposes,
          test_display_state_marks_a_lapsed_pending_row_expired,
          test_an_approval_refuses_a_withdrawn_propose_grant,
          test_a_store_fault_during_approval_is_a_clean_refusal,

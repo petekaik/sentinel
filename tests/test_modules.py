@@ -39,16 +39,60 @@ def _drop(root):
 def test_discovery_finds_and_orders_modules(results):
     root = tempfile.mkdtemp()
     try:
+        # Names and order values are deliberately opposite: pkgutil iterates in
+        # name order, so if the loader ever dropped the `order` term (or the
+        # whole sort) this fixture would still come back ["aaa", "zzz"] and the
+        # check would pass while testing nothing.
         _fixture_pkg(root, [
-            ("beta", "from module import Module\n"
-                     "MODULE = Module(id='beta', title='B', order=20)\n"),
-            ("alpha", "from module import Module\n"
-                      "MODULE = Module(id='alpha', title='A', order=10)\n")])
+            ("aaa", "from module import Module\n"
+                    "MODULE = Module(id='aaa', title='A', order=20)\n"),
+            ("zzz", "from module import Module\n"
+                    "MODULE = Module(id='zzz', title='Z', order=10)\n")])
         found = loader.discover(package="zz_fixtures")
         results.check(
             "discovery returns modules ordered by (order, id)",
-            [m.id for m in found] == ["alpha", "beta"],
+            [m.id for m in found] == ["zzz", "aaa"],
             "got %r" % [m.id for m in found])
+    finally:
+        _drop(root)
+
+
+def test_a_package_that_raises_on_import_fails_loudly(results):
+    root = tempfile.mkdtemp()
+    try:
+        _fixture_pkg(root, [("boom", "raise RuntimeError('kaboom at import')\n")])
+        try:
+            loader.discover(package="zz_fixtures")
+        except loader.ModuleError as exc:
+            detail = str(exc)
+            ok = "boom" in detail and "import" in detail
+        except Exception as exc:                       # noqa: BLE001 - graded
+            ok = False
+            detail = ("%s escaped instead of ModuleError: %s"
+                      % (type(exc).__name__, exc))
+        else:
+            ok, detail = False, "discovery accepted a module that raises on import"
+        results.check(
+            "a module that raises on import is a ModuleError naming the directory",
+            ok, detail)
+    finally:
+        _drop(root)
+
+
+def test_a_non_module_MODULE_fails_loudly(results):
+    root = tempfile.mkdtemp()
+    try:
+        _fixture_pkg(root, [("odd", "MODULE = object()\n")])
+        try:
+            loader.discover(package="zz_fixtures")
+        except loader.ModuleError as exc:
+            ok = "odd" in str(exc)
+        else:
+            ok = False
+        results.check(
+            "MODULE = object() is a ModuleError naming the directory, not "
+            "an AttributeError",
+            ok, "discovery did not raise ModuleError")
     finally:
         _drop(root)
 
@@ -108,6 +152,8 @@ def test_duplicate_and_mismatched_ids_fail_loudly(results):
 
 TESTS = (test_discovery_finds_and_orders_modules,
          test_a_package_without_module_fails_loudly,
+         test_a_package_that_raises_on_import_fails_loudly,
+         test_a_non_module_MODULE_fails_loudly,
          test_duplicate_and_mismatched_ids_fail_loudly)
 
 

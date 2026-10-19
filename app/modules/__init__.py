@@ -39,6 +39,14 @@ def discover(package=__name__, path=None):
                 "silently does not load is a set of checks that never run"
                 % info.name)
             continue
+        if not hasattr(declared, "id"):
+            # `MODULE = object()` would otherwise surface as AttributeError from
+            # the line below, which is a startup crash that does not name the
+            # module -- the opposite of what this loader is for.
+            problems.append(
+                "module %r has a MODULE that is not a Module (no id); the "
+                "contract is MODULE = Module(...)" % info.name)
+            continue
         if declared.id != info.name:
             problems.append(
                 "module %r declares id %r; the directory and the id must agree"

@@ -104,9 +104,9 @@ thing.
 | | |
 |---|---|
 | collector, dashboard, store, checks, `checks.conf`, offline suite | **built and running** |
-| 71 check instances across 4 hosts; ~75 checks per epoch | **built** |
+| 75 check instances across 4 hosts | **built** |
 | module contract and discovery; the fleet behind `app/modules/fleet/` | **built** |
-| operator commands, resource locks and the command audit (`app/commands.py`, `app/ctl.py`) | **built** |
+| operator commands, resource locks and the command audit (`app/commands.py`, `app/ctl.py`) | **built; `serial_break` is declared but its write path is not wired, and it refuses outside a dry run** |
 | remediation engine and the authority ladder (`app/heal.py`, `app/actions.py`) | **built; off by default** |
 | advisors (`app/advisors.py`, `app/intelligence.py`) | **built; the reference advisor runs by default** |
 | proposal queue and live threshold overrides (`app/ctl.py`, `store.py`) | **built** |
@@ -176,12 +176,16 @@ Deploying is separate, because it is not "docker compose up":
 ./deploy.sh --logs             # follow the container log
 ./deploy.sh --dismiss          # list the live incidents
 
+# Modules — what was discovered, and what state each is in
+./deploy.sh --modules          # id, enabled/disabled, order, targets, check count
+
 # Commands — explicit operator operations, never automatic
-./deploy.sh --list-commands    # module commands, their args and danger level
+./deploy.sh --list-commands    # module commands, their arguments and danger level
 ./deploy.sh --list-runs        # the command audit
 ./deploy.sh --run fleet.serial_status
 ./deploy.sh --run fleet.serial_arm --arg box=cubox-1 --arg min=5
 ./deploy.sh --run fleet.serial_break --arg box=cubox-1 --dry-run
+./deploy.sh --run fleet.serial_status --actor alice   # audit attribution
 
 # Proposals — the human decision a propose-level action waits on
 ./deploy.sh --proposals        # the queue; a lapsed row shows as expired
@@ -192,7 +196,7 @@ Deploying is separate, because it is not "docker compose up":
 ./deploy.sh --insights         # advisor insights, newest first
 ./deploy.sh --advisors         # configured advisors and their last run
 ./deploy.sh --remedies         # the remedy audit (newest 20)
-./deploy.sh --thresholds       # active overrides, with the file band beside them
+./deploy.sh --thresholds       # active overrides, with the band each replaced
 ./deploy.sh --revert-threshold <spec_id>   # restore the band the file declares
 ```
 

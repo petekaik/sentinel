@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results, check_classes, fleet_module  # noqa: E402
 
 import checks                                     # noqa: E402
+import config as config_mod                       # noqa: E402
 import module as module_mod                       # noqa: E402
 import modules as loader                          # noqa: E402
 import shutil                                     # noqa: E402
@@ -657,6 +658,36 @@ def test_a_fleet_with_no_modules_does_not_read_green(results):
         "pass on a check hardcoded to grey" % (some.status, some.detail))
 
 
+def test_summary_lists_discovered_modules_in_both_states(results):
+    """`summary()` answers a different question from `discover_enabled()`.
+
+    It must list DISCOVERED modules even when disabled -- a module that simply
+    vanishes reads as one that does not exist. The check count is the expanded
+    instance count, which is what the dashboard shows.
+    """
+    rows = {r["id"]: r for r in loader.summary(config_mod.Config(env={}))}
+    fleet = rows.get("fleet")
+    results.check(
+        "summary lists the fleet module with its order, targets and an "
+        "expanded check count",
+        fleet is not None and fleet["enabled"] and fleet["order"] == 10
+        and fleet["checks"] > 0 and "cubox-1" in fleet["targets"],
+        "fleet=%r" % (fleet,))
+    rows = {r["id"]: r
+            for r in loader.summary(
+                config_mod.Config(env={"FLEET_ENABLED": "0"}))}
+    results.check(
+        "a disabled module is still listed, as disabled",
+        rows.get("fleet") is not None and not rows["fleet"]["enabled"],
+        "fleet=%r" % (rows.get("fleet"),))
+    line = loader.format_summary([rows["fleet"]])[0]
+    results.check(
+        "the shared rendering names the state, so neither caller can print a "
+        "disabled module as enabled",
+        "disabled" in line and "fleet" in line and "checks=" in line,
+        "line=%r" % (line,))
+
+
 TESTS = (test_discovery_finds_and_orders_modules,
          test_a_package_without_module_fails_loudly,
          test_a_package_that_raises_on_import_fails_loudly,
@@ -669,6 +700,7 @@ TESTS = (test_discovery_finds_and_orders_modules,
          test_context_settings_resolve_env_over_default,
          test_preload_failure_opens_no_attempt_and_names_the_cause,
          test_module_selection_reads_the_env,
+         test_summary_lists_discovered_modules_in_both_states,
          test_a_disabled_module_freezes_its_incidents,
          test_a_disabled_module_freezes_only_its_own_checks,
          test_spec_coverage_never_reads_green_on_an_empty_audit,

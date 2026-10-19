@@ -886,6 +886,15 @@ def test_fleet_action_triggers_name_real_checks(results):
         all(a.verify[0] in real for a in declared),
         "verify=%r; fleet check ids=%r"
         % ([a.verify for a in declared], sorted(real)))
+    # `verify` is DECLARATIVE (heal.py decides success from the next OK
+    # observation), but a declaration that names a different check than the one
+    # triggering the action is a documentation defect: it says a different
+    # condition proves the repair, and no reader can tell which one is intended.
+    inconsistent = [(a.id, a.verify[0]) for a in declared
+                    if a.verify[0] not in {cid for cid, _ in a.triggers}]
+    results.check(
+        "each verify target is one of its action's own trigger check ids",
+        not inconsistent, "inconsistent=%r" % (inconsistent,))
     triggers = {a.id: {cid for cid, _ in a.triggers} for a in declared}
     results.check(
         "the worker is restarted on a deadlock kill or a stall-watch report",
@@ -941,9 +950,12 @@ def test_fleet_action_dry_runs_do_not_ssh(results):
         for aid, a in declared.items():
             calls[:] = []
             res = a.run(ctx, _incident(a))
+            # `transcode_restart` reads the /run start marker before restarting,
+            # so it costs two commands; the mount cycle is still one.
+            want = 2 if aid == "transcode_restart" else 1
             results.check(
-                "%s's run really executes exactly one command on the box" % aid,
-                res.ok and len(calls) == 1,
+                "%s's run executes its command(s) on the box" % aid,
+                res.ok and len(calls) == want,
                 "calls=%r res=%r" % (calls, res.__dict__))
     finally:
         probes_mod.ssh = orig
@@ -956,10 +968,11 @@ def test_fleet_action_commands_are_the_documented_repairs(results):
     declared = {a.id: a for a in fleet_actions.actions_list()}
     backup = ctx.fleet.hosts["backup"].address
     action = declared["state_mount_cycle"]
-    expected = ("umount /mnt/state || umount -l /mnt/state; "
+    expected = ("umount /mnt/state 2>&1 || { echo '--- holders ---'; "
+                "fuser -m /mnt/state 2>&1; exit 1; }; "
                 "mount -t nfs -o nolock,nfsvers=3 "
                 "%s:/cubpxe/state/cubox-1 /mnt/state "
-                "&& systemctl restart cubox-transcode" % backup)
+                "|| exit 1; systemctl restart cubox-transcode" % backup)
     orig = probes_mod.ssh
 
     def refuse(host, cmd, *a, **k):
@@ -999,9 +1012,63 @@ def test_fleet_action_commands_are_the_documented_repairs(results):
 
     res = declared["transcode_restart"].dry_run(
         ctx, _incident(declared["transcode_restart"]))
-    results.check("the transcode restart returns the systemctl command",
-                  res.ok and res.output == "systemctl restart cubox-transcode",
-                  "output=%r" % (res.output,))
+    results.check(
+        "the transcode restart shows the start-marker gate and the restart",
+        res.ok and res.output ==
+        "test -e /run/cubox-transcode.started && "
+        "systemctl restart cubox-transcode",
+        "output=%r" % (res.output,))
+
+
+def test_transcode_restart_refuses_a_deliberately_stopped_worker(results):
+    """The /run marker is the difference between "restart it" and "do not".
+
+    `cubox-transcode.service` sets `/run/cubox-transcode.started` in its own
+    ExecStartPost, and the state-save drop-in reads it before starting a worker
+    an operator stopped (item 54). An automatic restart that ignored it would
+    undo that stop every epoch.
+    """
+    import probes as probes_mod
+    from modules.fleet import actions as fleet_actions
+    ctx = _fleet_ctx()
+    action = {a.id: a for a in fleet_actions.actions_list()}["transcode_restart"]
+    orig = probes_mod.ssh
+    calls = []
+
+    def absent(host, cmd, *a, **k):
+        calls.append(cmd)
+        return probes_mod.RemoteResult(probes_mod.Transport.RAN, rc=1)
+
+    probes_mod.ssh = absent
+    try:
+        res = action.run(ctx, _incident(action))
+    finally:
+        probes_mod.ssh = orig
+    results.check(
+        "an absent start marker refuses, and the worker is never restarted",
+        not res.ok and "deliberately stopped" in res.detail
+        and calls == ["test -e /run/cubox-transcode.started"],
+        "calls=%r res=%r -- restarting a deliberately stopped worker undoes "
+        "the operator's stop" % (calls, res.__dict__))
+
+    calls[:] = []
+
+    def unreachable(host, cmd, *a, **k):
+        calls.append(cmd)
+        return probes_mod.RemoteResult(
+            probes_mod.Transport.UNREACHABLE, why="connection refused")
+
+    probes_mod.ssh = unreachable
+    try:
+        res = action.run(ctx, _incident(action))
+    finally:
+        probes_mod.ssh = orig
+    results.check(
+        "an unreadable marker is a refusal, not a restart",
+        not res.ok and "connection refused" in res.detail
+        and calls == ["test -e /run/cubox-transcode.started"],
+        "calls=%r res=%r -- 'I could not ask' must never become 'restart it'"
+        % (calls, res.__dict__))
 
 
 def test_fleet_actions_refuse_a_target_that_is_not_a_box(results):
@@ -1092,6 +1159,7 @@ TESTS = (test_off_by_default,
          test_fleet_actions_are_off_by_default,
          test_fleet_action_dry_runs_do_not_ssh,
          test_fleet_action_commands_are_the_documented_repairs,
+         test_transcode_restart_refuses_a_deliberately_stopped_worker,
          test_fleet_actions_refuse_a_target_that_is_not_a_box)
 
 

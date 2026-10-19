@@ -6,12 +6,15 @@ held resource must all refuse BEFORE the handler runs, and every invocation --
 successful or not -- must leave an audit row.
 """
 
+import contextlib
 import hashlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import types
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import APP, Results                    # noqa: E402
@@ -774,9 +777,9 @@ def _if_bodies(block, cond):
     return block[then_i + 4:else_i], block[else_i + 4:fi_i]
 
 
-_CTL_VERBS = ("--list-commands", "--run", "--arg", "--list-runs",
-              "--proposals", "--approve", "--reject", "--insights",
-              "--advisors", "--thresholds", "--revert-threshold")
+_CTL_VERBS = ("--modules", "--list-commands", "--run", "--arg", "--actor",
+              "--list-runs", "--proposals", "--approve", "--reject",
+              "--insights", "--advisors", "--thresholds", "--revert-threshold")
 
 
 def test_deploy_exposes_the_command_surface(results):
@@ -877,7 +880,8 @@ def test_deploy_refuses_a_flag_as_a_value(results):
     path = os.path.join(root, "deploy.sh")
     outcomes = {}
     for argv in (["--run", "--dry-run"], ["--run"], ["--arg", "--dry-run"],
-                 ["--arg"], ["--approve", "--dry-run"], ["--approve"],
+                 ["--arg"], ["--actor", "--dry-run"], ["--actor"],
+                 ["--approve", "--dry-run"], ["--approve"],
                  ["--reject", "--dry-run"], ["--reject"],
                  ["--revert-threshold", "--dry-run"],
                  ["--revert-threshold"]):
@@ -950,6 +954,48 @@ def test_ctl_exposes_proposal_and_insight_verbs(results):
         "operator cannot reach from the documented entry point" % (missing,))
 
 
+def _run_ctl(argv, env=None):
+    """Run ctl.main with a controlled environment and captured stdout."""
+    import ctl
+    buf = io.StringIO()
+    with mock.patch.dict(os.environ, env or {}, clear=True):
+        with contextlib.redirect_stdout(buf):
+            rc = ctl.main(argv)
+    return rc, buf.getvalue()
+
+
+def test_list_commands_shows_each_commands_arguments(results):
+    rc, out = _run_ctl(["--list-commands"])
+    arm = [ln for ln in out.splitlines() if "fleet.serial_arm" in ln]
+    status = [ln for ln in out.splitlines() if "fleet.serial_status" in ln]
+    results.check(
+        "--list-commands prints a command's accepted arguments, and says "
+        "(no args) when it takes none",
+        rc == 0 and arm and "box min" in arm[0]
+        and status and "(no args)" in status[0],
+        "rc=%r arm=%r status=%r -- an unlisted argument reads as a command "
+        "that takes none, and the next step is a key that silently fails "
+        "validation" % (rc, arm, status))
+
+
+def test_modules_lists_discovered_modules_and_their_state(results):
+    rc, out = _run_ctl(["--modules"], {"SENTINEL_MODULES": "fleet"})
+    fleet = [ln for ln in out.splitlines() if ln.startswith("fleet")]
+    results.check(
+        "--modules lists id, state, order, targets and an expanded check count",
+        rc == 0 and fleet and "enabled" in fleet[0]
+        and "order=10" in fleet[0] and "checks=" in fleet[0]
+        and "cubox-1" in fleet[0],
+        "rc=%r fleet=%r out=%r" % (rc, fleet, out))
+    rc, out = _run_ctl(["--modules"], {"FLEET_ENABLED": "0"})
+    fleet = [ln for ln in out.splitlines() if ln.startswith("fleet")]
+    results.check(
+        "a disabled module is listed as disabled, not omitted",
+        rc == 0 and fleet and "disabled" in fleet[0],
+        "rc=%r fleet=%r -- a module that vanishes from the list reads as one "
+        "that does not exist" % (rc, fleet))
+
+
 TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_disabled_module_refuses,
          test_a_held_resource_refuses_the_second_command,
@@ -979,6 +1025,8 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_deploy_refuses_a_flag_as_a_value,
          test_the_serial_commands_are_registered_and_dispatch_through_ctl,
          test_ctl_exposes_proposal_and_insight_verbs,
+         test_list_commands_shows_each_commands_arguments,
+         test_modules_lists_discovered_modules_and_their_state,
          # LAST TWO: a missing release leaks the process-global _HELD set,
          # which would make every later test refuse for the wrong reason.
          # Running them at the end keeps the failure attributed to the guard

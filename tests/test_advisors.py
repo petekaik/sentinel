@@ -548,6 +548,59 @@ def test_the_history_cap_is_applied_to_every_advisor(results):
         _close(tmp, conn)
 
 
+def test_a_per_advisor_history_override_is_read_and_still_capped(results):
+    """`SENTINEL_ADVISOR_<ID>_HISTORY_DAYS` is the advisor's own ask.
+
+    It changes the default `history_days`, NOT the platform cap: an override of
+    90 still gets the cap, and an override of 0 refuses rather than becoming a
+    window nobody asked for.
+    """
+    default = config_mod.Config(env={}).advisor_history_days("reference", 7)
+    override = config_mod.Config(
+        env={"SENTINEL_ADVISOR_REFERENCE_HISTORY_DAYS": "14"}
+    ).advisor_history_days("reference", 7)
+    dotted = config_mod.Config(
+        env={"SENTINEL_ADVISOR_FLEET_DRIFT_HISTORY_DAYS": "9"}
+    ).advisor_history_days("fleet.drift", 7)
+    try:
+        config_mod.Config(
+            env={"SENTINEL_ADVISOR_REFERENCE_HISTORY_DAYS": "0"}
+        ).advisor_history_days("reference", 7)
+        bad = "no exception"
+    except ValueError as exc:
+        bad = str(exc)
+    results.check(
+        "the per-advisor override defaults, applies, normalises the id and "
+        "refuses a non-positive value",
+        default == 7 and override == 14 and dotted == 9
+        and "SENTINEL_ADVISOR_REFERENCE_HISTORY_DAYS" in bad,
+        "default=%r override=%r dotted=%r bad=%r" % (default, override,
+                                                     dotted, bad))
+
+    tmp, conn = _store()
+    try:
+        class Reference(advisors.Advisor):
+            id = "reference"
+            history_days = 7
+
+            def advise(self, ctx, snapshot):
+                return []
+
+        ctx = _FakeCtx([])
+        ctx.cfg = config_mod.Config(
+            env={"SENTINEL_ADVISOR_REFERENCE_HISTORY_DAYS": "14"})
+        out = advisors.run_advisors([Reference()], conn=conn, ctx=ctx,
+                                    history_cap_days=10)
+        results.check(
+            "the runner uses min(override, cap), so an override cannot exceed "
+            "the platform's history cap",
+            out and out[0]["requested_days"] == 10,
+            "out=%r. An override is the advisor's request; the cap is the "
+            "platform's permission." % (out,))
+    finally:
+        _close(tmp, conn)
+
+
 class _FakeCtx:
     def __init__(self, modules):
         self.modules = modules
@@ -2608,6 +2661,7 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_failing_advisor_is_isolated_and_recorded,
          test_insights_carry_the_window_and_each_run_is_recorded,
          test_the_history_cap_is_applied_to_every_advisor,
+         test_a_per_advisor_history_override_is_read_and_still_capped,
          test_a_negative_history_cap_refuses_to_start,
          test_the_selector_gates_advisors_and_accepts_both_forms,
          test_a_selector_that_names_nothing_is_a_loud_error,

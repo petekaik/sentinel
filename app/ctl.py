@@ -344,6 +344,7 @@ def _display_state(row, now):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ctl.py")
+    ap.add_argument("--modules", action="store_true")
     ap.add_argument("--list-commands", action="store_true")
     ap.add_argument("--run", metavar="MODULE.COMMAND")
     ap.add_argument("--arg", action="append", default=[],
@@ -364,10 +365,22 @@ def main(argv=None):
     cfg = config_mod.Config()
     mods = _modules(cfg)
 
+    if args.modules:
+        for line in module_loader.format_summary(module_loader.summary(cfg)):
+            print(line)
+        return 0
+
     if args.list_commands:
         for mid, mod in sorted(mods.items()):
             for cmd in mod.commands():
-                print("%s.%s  %-14s %s" % (mid, cmd.id, cmd.danger, cmd.title))
+                # ARGUMENTS ARE PART OF THE SURFACE. A command whose accepted
+                # arguments are not listed reads as one that takes none, and the
+                # next step is an operator guessing a key that silently fails
+                # validation. `serial_arm` takes `box min`; `serial_status` takes
+                # nothing and says so.
+                names = " ".join(a.name for a in cmd.args) or "(no args)"
+                print("%s.%s  %-14s %-14s %s"
+                      % (mid, cmd.id, cmd.danger, names, cmd.title))
         return 0
 
     if args.list_runs:
@@ -457,7 +470,11 @@ def main(argv=None):
                 previous = json.loads(row["previous_json"])
             except (TypeError, ValueError):
                 previous = {}
-            print("%s %s green=%s amber=%s (file had green=%s amber=%s) "
+            # `previous_json` is the band THIS override replaced, which on a
+            # chained approval is another override -- not the file's band. The
+            # wording says what the row holds; `--revert-threshold` is what
+            # reports the file after the delete.
+            print("%s %s green=%s amber=%s (replaced green=%s amber=%s) "
                   "actor=%s proposal=%s"
                   % (row["spec_id"], row["module"], row["green"], row["amber"],
                      previous.get("green"), previous.get("amber"),

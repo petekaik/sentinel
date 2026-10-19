@@ -52,15 +52,21 @@ def _state_mount_cycle(ctx, incident, dry_run):
     Item 83: after `03-build-state.sh` recreates the export under a mounted
     client, every handle the box cached points at deleted inodes and every
     `cubox-state` unit silently stops (a false ConditionPathIsMountPoint is not
-    a failure). The umount is best-effort because the mount may be wedged; a
-    lazy umount still frees the mount point for the fresh one.
+    a failure).
+
+    NO LAZY UNMOUNT. `umount -l` detaches rather than unmounts: existing fds keep
+    writing onto deleted inodes, the save reports success, and the post-check on
+    the new mount reads green while the old handles are still live. So a failed
+    plain `umount` is a REFUSAL: capture the holders with `fuser -m` as evidence
+    and stop. The worker is not restarted, because the mount it would fix is not
+    fixed.
 
     THE RESTART IS PART OF THE REPAIR, not a separate action. The worker fixes
     STATE_DIR from the mount at process start, so a remount alone leaves it
-    holding the old export's handles -- the incident stays open and this
-    action burns its attempt budget. `&&` makes the restart conditional on the
-    mount succeeding, and the whole sequence is one ssh command, whose exit
-    status is the last step's.
+    holding the old export's handles -- the incident stays open and this action
+    burns its attempt budget. The `|| exit 1` between mount and restart makes the
+    restart conditional on the mount succeeding. It is one ssh command, so its
+    exit status names the failed step.
     """
     host, box, why = _target(ctx, incident)
     if host is None:
@@ -68,27 +74,71 @@ def _state_mount_cycle(ctx, incident, dry_run):
     backup = ctx.fleet.hosts.get("backup")
     if backup is None:
         return actions.Result(False, "no backup host configured")
-    cmd = ("umount /mnt/state || umount -l /mnt/state; "  # secretscan:ignore (fleet mount point)
+    cmd = ("umount /mnt/state 2>&1 || { echo '--- holders ---'; "  # secretscan:ignore (fleet mount point)
+           "fuser -m /mnt/state 2>&1; exit 1; }; "  # secretscan:ignore (fleet mount point)
            "mount -t nfs -o nolock,nfsvers=3 %s:/cubpxe/state/%s /mnt/state "  # secretscan:ignore (fleet design paths)
-           "&& systemctl restart cubox-transcode" % (backup.address, box))
+           "|| exit 1; systemctl restart cubox-transcode" % (backup.address, box))
     if dry_run:
         return actions.Result(
             True,
-            "would cycle the state mount and restart the worker on %s" % box,
+            "would unmount (no lazy fallback), remount and restart the worker "
+            "on %s; a failed umount captures its holders and stops" % box,
             cmd)
-    return _remote(host, cmd)
+    res = _remote(host, cmd)
+    if not res.ok:
+        # `_remote` carries stderr in its detail and stdout in its output; the
+        # holder list is on stdout because the remote shell merged `fuser` into
+        # it. Keep both -- this is the only evidence of who held the mount.
+        return actions.Result(
+            False,
+            "state mount repair did not complete, so the worker was NOT "
+            "restarted: %s" % res.detail,
+            res.output)
+    return res
+
+
+# The per-boot start marker. `cubox-transcode.service` sets it in its own
+# ExecStartPost, and the state-save drop-in reads it before starting a worker
+# the operator deliberately stopped (docs/08 item 54). An automatic restart that
+# ignored it would undo that stop every epoch -- the exact defect the marker was
+# added to fix.
+START_MARKER = "/run/cubox-transcode.started"
 
 
 def _transcode_restart(ctx, incident, dry_run):
-    """Restart the worker. The unit's Type/TimeoutStopSec make this bounded;
-    the next pass re-derives its queue position from the recordings tree."""
+    """Restart the worker, unless it was deliberately stopped this boot.
+
+    The unit's Type/TimeoutStopSec make the restart bounded; the next pass
+    re-derives its queue position from the recordings tree.
+
+    THE MARKER GATE IS READ BEFORE THE RESTART, over the same ssh transport. A
+    missing marker means no worker has been started since boot, i.e. someone
+    stopped it on purpose -- and an auto-restart that undoes a deliberate stop is
+    how a measurement gets contaminated (item 54). `test -e` is read-only; the
+    restart only follows a present marker.
+    """
     host, box, why = _target(ctx, incident)
     if host is None:
         return actions.Result(False, why)
-    cmd = "systemctl restart cubox-transcode"
+    gate = "test -e %s" % START_MARKER
+    restart = "systemctl restart cubox-transcode"
     if dry_run:
-        return actions.Result(True, "would restart the worker on %s" % box, cmd)
-    return _remote(host, cmd)
+        return actions.Result(
+            True,
+            "would verify %s on %s, then restart the worker"
+            % (START_MARKER, box),
+            "%s && %s" % (gate, restart))
+    check = probes.ssh(host, gate, timeout=60)
+    if not check.ran:
+        # "I could not ask" is not "it is stopped" and not "it is running". No
+        # action is taken, and the refusal names the transport.
+        return actions.Result(False, check.reason())
+    if check.rc != 0:
+        return actions.Result(
+            False,
+            "worker deliberately stopped; refusing to start it (%s absent on "
+            "%s)" % (START_MARKER, box))
+    return _remote(host, restart)
 
 
 def _wrappers(impl):

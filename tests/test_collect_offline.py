@@ -42,9 +42,12 @@ restated, so the healthy-fleet half of these tests exercises the real probe
 output.
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import CHECKS_CONF, FIXTURES, Results, read_fixture  # noqa: E402
@@ -437,9 +440,47 @@ def test_a_raising_healer_cannot_lose_the_epoch_record(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_showconf_lists_modules_including_disabled(results):
+    """`--showconf` must answer what was found, not only what runs.
+
+    A disabled module that vanishes from the report reads as a module that does
+    not exist, which is the opposite of what an operator checking their selector
+    needs to see.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        def showconf(extra):
+            env = {"MONITOR_DB": os.path.join(tmpdir, "none.sqlite")}
+            env.update(extra)
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True):
+                with contextlib.redirect_stdout(buf):
+                    collect.main(["--showconf"])
+            return buf.getvalue()
+
+        out = showconf({"SENTINEL_MODULES": "fleet"})
+        fleet = [ln for ln in out.splitlines() if "fleet" in ln
+                 and "order=10" in ln]
+        results.check(
+            "--showconf prints the module summary, enabled state included",
+            "modules:" in out and fleet and "enabled" in fleet[0],
+            "out=%r" % (out,))
+        out = showconf({"FLEET_ENABLED": "0"})
+        fleet = [ln for ln in out.splitlines() if "fleet" in ln
+                 and "order=10" in ln]
+        results.check(
+            "--showconf names a disabled module as disabled",
+            fleet and "disabled" in fleet[0],
+            "fleet=%r -- an omitted module reads as a missing one" % (fleet,))
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_outage_keeps_its_history, test_blip_leaves_no_trace,
          test_unknown_is_never_green, test_transport_argv_is_the_measured_one,
-         test_a_raising_healer_cannot_lose_the_epoch_record)
+         test_a_raising_healer_cannot_lose_the_epoch_record,
+         test_showconf_lists_modules_including_disabled)
 
 
 def main():

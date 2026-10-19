@@ -66,6 +66,45 @@ def _package_path(module_id):
         importlib.import_module("%s.%s" % (__name__, module_id)).__file__)
 
 
+def summary(cfg):
+    """One row per DISCOVERED module, enabled or not.
+
+    `discover_enabled` answers "what runs this epoch"; this answers "what was
+    found and what state is each in", which is a different question and the one
+    `--modules`/`--showconf` exist for. A disabled module that simply vanished
+    from the list would read as a module that does not exist.
+
+    The check count is the EXPANDED instance count (a `per_box` check counts
+    once per box), because that is what an operator compares with the dashboard
+    -- the class count is an implementation detail.
+    """
+    import checks
+
+    discovered = discover()
+    enabled = {m.id for m in discover_enabled(cfg)}
+    rows = []
+    for mod in discovered:
+        classes = checks.registry(*mod.check_classes())
+        rows.append({
+            "id": mod.id,
+            "title": mod.title,
+            "order": mod.order,
+            "enabled": mod.id in enabled,
+            "targets": tuple(mod.targets),
+            "checks": len(checks.expand(
+                classes, checks.expansion_targets([mod]))),
+        })
+    return rows
+
+
+def format_summary(rows):
+    """The one rendering of `summary()`, shared by `ctl` and `collect`."""
+    return ["%-10s %-8s order=%-3d checks=%-3d targets=%s  %s"
+            % (r["id"], "enabled" if r["enabled"] else "disabled", r["order"],
+               r["checks"], ",".join(r["targets"]) or "-", r["title"])
+            for r in rows]
+
+
 def discover_enabled(cfg):
     """The enabled modules, in order, each carrying `_path`.
 

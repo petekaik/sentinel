@@ -14,6 +14,7 @@ an explicit known_hosts file, and every one of those is a variable.
 """
 
 import os
+import re
 
 
 def _env(name, default, env):
@@ -135,6 +136,32 @@ class Config:
 
     def module_enabled(self, module_id):
         return _bool("%s_ENABLED" % module_id.upper(), True, self.env)
+
+    def advisor_history_days(self, advisor_id, default=7):
+        """One advisor's requested window, overridable per advisor.
+
+        `SENTINEL_ADVISOR_<ID>_HISTORY_DAYS`, where the id is uppercased and
+        every non-alphanumeric character becomes `_` (`fleet.drift` ->
+        `FLEET_DRIFT`). The platform still caps the result with
+        `SENTINEL_ADVISOR_MAX_HISTORY_DAYS`; this is the advisor's own request,
+        not permission to exceed the cap.
+
+        A non-positive or non-integer value REFUSES rather than clamping: it is a
+        configuration that cannot mean what it says, and a silent clamp would
+        report a window nobody asked for.
+        """
+        key = "SENTINEL_ADVISOR_%s_HISTORY_DAYS" % re.sub(
+            r"[^A-Za-z0-9]", "_", str(advisor_id)).upper()
+        raw = self.env.get(key)
+        if raw is None or raw == "":
+            return int(default)
+        try:
+            days = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError("%s must be an integer, got %r" % (key, raw))
+        if days <= 0:
+            raise ValueError("%s must be > 0, got %d" % (key, days))
+        return days
 
     def authority(self, module_id):
         """The remedy policy for one module. Off unless an operator says otherwise.

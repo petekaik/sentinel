@@ -901,6 +901,13 @@ def main(argv=None):
 
     if args.showconf:
         print(cfg.describe())
+        # DISCOVERY IS PART OF THE CONFIGURATION. A disabled module is named as
+        # disabled rather than vanishing: `--modules`/`--showconf` answer "what
+        # was found and what state is each in", which is not the same question
+        # as "what runs this epoch".
+        print("\nmodules:")
+        for line in module_loader.format_summary(module_loader.summary(cfg)):
+            print("  " + line)
         enabled = module_loader.discover_enabled(cfg)
         # The effective band, overrides included, so the coverage report
         # describes what the NEXT epoch will grade with rather than what the

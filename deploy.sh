@@ -7,7 +7,8 @@
 #   ./deploy.sh --status           # what is running, what it sees
 #   ./deploy.sh --once             # one collection, print it, exit
 #   ./deploy.sh --once --dry-run   # ... and write NOTHING to the store
-#   ./deploy.sh --showconf         # config + threshold coverage
+#   ./deploy.sh --showconf         # config + modules + threshold coverage
+#   ./deploy.sh --modules          # discovered modules: state, order, targets, checks
 #   ./deploy.sh --authorise-backup # let the monitor ssh to Backup-NAS
 #   ./deploy.sh --logs             # follow the container log
 #   ./deploy.sh --dismiss          # list the live incidents
@@ -18,7 +19,7 @@
 #                                                     #   no check can ever
 #                                                     #   close, and it is not
 #                                                     #   a way to hide a fault.
-#   ./deploy.sh --list-commands    # the module commands this build offers
+#   ./deploy.sh --list-commands    # module commands, their arguments and danger
 #   ./deploy.sh --run MODULE.COMMAND [--arg k=v ...] [--dry-run]
 #                                                     # run one module command.
 #                                                     #   --arg repeats. A
@@ -36,11 +37,8 @@
 #   ./deploy.sh --thresholds       # active threshold overrides
 #   ./deploy.sh --revert-threshold SPEC_ID
 #                                  # drop one override, restoring the file band
-#
-# There is no --modules verb (the design document proposed one): discovery and
-# enablement are reported by --showconf, the dashboard renders one section per
-# module (and a stated note for a disabled one), and --list-commands names each
-# command's module.
+#   --actor NAME                   # modifier for a ctl verb: attribute the run
+#                                  #   or approval to NAME (default: operator)
 #
 # Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER
 #
@@ -120,7 +118,16 @@ while [ $# -gt 0 ]; do
         # The module command surface. Each VALUE is consumed here and passed as
         # its own argv element, so the remote shell never re-splits it (item 81's
         # family -- argv is joined and re-split, so re-joining is already wrong).
+        --modules)          MODE=ctl; SAW_CTL=1; PASSTHRU+=(--modules) ;;
         --list-commands)    MODE=ctl; SAW_CTL=1; PASSTHRU+=(--list-commands) ;;
+        --actor)
+            [ $# -ge 2 ] || { echo "unknown argument: --actor needs a name" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --actor needs a name, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--actor "$2"); shift ;;
         --run)
             [ $# -ge 2 ] || { echo "unknown argument: --run needs MODULE.COMMAND" >&2
                               usage >&2; exit 2; }

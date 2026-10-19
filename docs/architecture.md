@@ -18,7 +18,7 @@ reader must be able to tell which half of it exists today.
 | `app/module.py`, `app/modules/` — the module contract, discovery and validation | **built** |
 | `app/probes.py`, `app/modules/fleet/{boxfacts,backupfacts}.*` — read-only host probing | **built** |
 | `app/parsers.py` (generic helpers) and `app/modules/fleet/parsers.py`, `export.py`, `journal.py` — log/state/cursor parsing | **built** |
-| checks — 71 instances across 4 hosts, behind `app/modules/fleet/` | **built** |
+| checks — 75 instances across 4 hosts, behind `app/modules/fleet/` | **built** |
 | `app/collect.py` — the epoch loop, preload-then-evaluate, remedies, advisors | **built** |
 | `app/commands.py`, `app/ctl.py` — operator commands, cross-process locks, audit | **built** |
 | `app/actions.py`, `app/heal.py` — action declarations, authority ladder and the remedy engine | **built; no live remedy has executed** |
@@ -583,11 +583,18 @@ A command is never automatic and is not a remedy. A module declares its commands
 them through `ctl.py`, and the audit lives in `command_run`.
 
 ```bash
+./deploy.sh --modules
 ./deploy.sh --list-commands
 ./deploy.sh --run fleet.serial_arm --arg box=cubox-1 --arg min=5
 ./deploy.sh --run fleet.serial_break --arg box=cubox-1 --dry-run
 ./deploy.sh --list-runs
 ```
+
+`--modules` lists every **discovered** module, enabled or disabled: id, title,
+order, state, reporting targets and the expanded check count. `--showconf` carries the
+same summary beside the configuration and threshold coverage. A disabled module is
+named as disabled, never omitted — a module that vanishes from the list reads as one that
+does not exist.
 
 **The gate order is the contract.** `commands.dispatch()` refuses — before the handler is
 called — if the module is disabled, an argument is unknown or outside its choices, or a
@@ -598,14 +605,21 @@ rather than `REFUSED`.
 
 **Resource locks cross processes.** `--run` is a new process per invocation, so the lock
 is an `flock` on one file per resource under `MONITOR_LOCK_DIR` (`/tmp/sentinel-locks` by
-default), with an in-process set on top only to give a reentrant call a clear message. The
-fleet's serial commands all declare `serial`; two operations cannot own one adapter.
+default), with an in-process set on top only to give a reentrant call a clear message.
+The commands that touch the port — `serial_arm`, `serial_disarm`, `serial_break` — declare
+the `serial` resource; `serial_status` and `serial_read` do not. Two operations cannot own
+one adapter.
 
 `box` arguments are a **closed key set**, not a hostname to try: the value becomes a
 filename (the arm file), so `../../etc/passwd` must be a refusal. The serial identity rule
 applies to every command that touches a port: it refuses when the box's adapter cannot be
 resolved from the chip's own serial and never falls back to `SERIAL_DEVICE`. A `BREAK` on
 the wrong box is not recoverable.
+
+**`serial_break` is declared but its write path is not wired.** It resolves identity and a
+dry run reports what it would send, but outside a dry run it refuses rather than pretend to
+reboot a box. So the command surface being "built" does not mean a real BREAK works yet;
+the arm/disarm/read/status commands do.
 
 ---
 
@@ -615,8 +629,9 @@ An advisor is an in-container plug-in with `id`, `title`, `history_days` and
 `advise(ctx, snapshot) -> list[Insight]`. The platform owns selection, the snapshot, the
 runner and every write.
 
-**The snapshot is read-only and honest about its window.** It has no database handle and
-no write path. `window(days)` reports `available_days = min(history that exists, min(asked,
+**The snapshot is read-only and honest about its window.** It exposes only bounded read
+methods — it holds a connection internally, but no caller can reach it, and there is no
+write path. `window(days)` reports `available_days = min(history that exists, min(asked,
 cap))` — never the number asked for — and `_rows`/`sample_series`/`logs` bound every read
 and record a truncation when a cap was hit. Each `(target, metric)` series is read under
 its own cap, so a busy metric cannot starve the window to hours. An insight carries the
@@ -1156,24 +1171,29 @@ export while a box is up invalidates the live mount, every `cubox-state` unit is
 and shutdown save both stop running and report nothing. The shipped command is
 
 ```sh
-umount /mnt/state || umount -l /mnt/state;
-mount -t nfs -o nolock,nfsvers=3 <backup>:/cubpxe/state/<box> /mnt/state \
-  && systemctl restart cubox-transcode
+umount /mnt/state 2>&1 || { echo '--- holders ---'; fuser -m /mnt/state 2>&1; exit 1; };
+mount -t nfs -o nolock,nfsvers=3 <backup>:/cubpxe/state/<box> /mnt/state || exit 1;
+systemctl restart cubox-transcode
 ```
 
 The restart is part of the repair, not a second action: the worker fixes `STATE_DIR` at
-process start, so a remount alone leaves it holding the old export's handles.
+process start, so a remount alone leaves it holding the old export's handles. It runs only
+after the mount succeeds.
 
-**This shipped form uses `-l` as an EBUSY fallback, which the earlier design text in this
-document rejected** (a lazy unmount detaches rather than unmounts, so old fds can keep
-writing to deleted inodes). The engine's gates — confirmed incident, attempt budget,
-cooldown, per-hour cap, dry run, latch — bound how often it can fire, but they do not make
-a lazy unmount safe. Treat this as an open defect for the review that owns remediation
-semantics, not as a settled design.
+**The automated path has no lazy fallback.** `umount -l` detaches rather than unmounts, so existing fds
+keep writing to deleted inodes and the post-check on the new mount reads green. A failed
+plain `umount` is therefore a refusal: the command captures the holders with `fuser -m` as
+evidence, does not mount, and does not restart the worker. The fleet's documented operator
+repair may use `-l` when a human is present to judge the consequence; the automated action
+does not.
 
 **`transcode_restart`** restarts the worker, triggered by `deadlock_kills` and
 `stall_watch`. It is not the `NRestarts` restart described above: it is bounded by the same
-engine gates and refuses a non-CuBox target.
+engine gates and refuses a non-CuBox target. Before restarting it reads the per-boot marker
+`/run/cubox-transcode.started` over ssh (`test -e`): absent means the worker was stopped on
+purpose this boot, so the action refuses and does **not** undo the stop. An unreadable
+marker is also a refusal — "I could not ask" and "it is stopped" are different facts, and
+neither is permission to restart.
 
 ### A remedy that does not work must become visible, not retried
 
@@ -1217,7 +1237,8 @@ the dashboard says so explicitly.
 | `./deploy.sh` | sync the tree, build **on the NAS**, `up -d`, health-check |
 | `--status` | container state, the collector's last epoch, and every endpoint's HTTP code |
 | `--once` / `--once --dry-run` | one epoch, printed; the dry run writes not a single row |
-| `--showconf` | configuration, module selection and threshold coverage, exit non-zero on any unclaimed spec |
+| `--showconf` | configuration, the module summary and threshold coverage, exit non-zero on any unclaimed spec |
+| `--modules` | every discovered module, enabled or disabled: id, title, order, state, targets, expanded check count |
 | `--authorise-backup` | install the monitor's key on Backup-NAS (**separate on purpose** — see below) |
 | `--logs` | follow the container log |
 | `--list-commands` | every module command, its arguments and its danger level |
@@ -1225,14 +1246,12 @@ the dashboard says so explicitly.
 | `--list-runs` | the command audit |
 | `--proposals` / `--approve ID` / `--reject ID` | the approvals inbox and the human decision |
 | `--insights` / `--advisors` | advisor output and advisor run health |
-| `--thresholds` / `--revert-threshold SPEC_ID` | live overrides beside their file bands, and the one-command revert |
+| `--thresholds` / `--revert-threshold SPEC_ID` | live overrides with the band each replaced, and the one-command revert |
 | `--remedies` | the remedy audit, newest 20 |
+| `--actor NAME` | modifier for any ctl verb: attribute the command or approval to NAME (default `operator`) |
 
-There is **no `--modules` verb**, although the design document proposed one. Module
-discovery and enablement are reported by `--showconf`, and the dashboard renders one
-section per enabled module plus an explicit disabled note; `--list-commands` names the
-module id of every command. A missing verb is recorded here rather than documented as if it
-existed.
+The dashboard renders one section per enabled module plus an explicit disabled note;
+`--modules` and `--list-commands` name the module id of every discovery and every command.
 
 Two things it deliberately does *not* do. It never builds locally: this Mac is
 Apple Silicon and the NAS is x86_64, so a local build produces an aarch64 image

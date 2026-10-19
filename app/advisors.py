@@ -38,7 +38,11 @@ class Insight:
 
 
 class Snapshot:
-    """Read-only, windowed views of the store. No writes, no database handle."""
+    """Read-only, windowed views of the store.
+
+    It holds the connection internally (`_conn`) so the bounded read methods can
+    use it, but no caller is given it and there is no write path.
+    """
 
     def __init__(self, conn, now=None, caps=None, max_days=None, specs=None):
         self._conn = conn
@@ -288,8 +292,17 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
         status, detail = "ok", ""
         insights = []
         try:
-            days = min(int(getattr(adv, "history_days", 7)),
-                       int(history_cap_days))
+            # THE ADVISOR'S OWN REQUEST, overridable per advisor, then CAPPED by
+            # the platform. The override is read through the Config when a ctx
+            # carries one (the production path); an offline caller that passes
+            # no cfg keeps the class attribute.
+            default_days = int(getattr(adv, "history_days", 7))
+            cfg = getattr(ctx, "cfg", None)
+            requested = (cfg.advisor_history_days(
+                getattr(adv, "id", ""), default_days)
+                if cfg is not None
+                and hasattr(cfg, "advisor_history_days") else default_days)
+            days = min(requested, int(history_cap_days))
             snap.window(days)
             insights = adv.advise(ctx, snap) or []
             detail = "%d insight(s), window %s/%s days" % (

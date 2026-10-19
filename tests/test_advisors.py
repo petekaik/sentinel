@@ -197,9 +197,10 @@ def test_every_read_is_bounded_by_the_row_cap(results):
             "an uncapped read reports no truncation",
             fresh.truncated == {}, "truncated=%r" % (fresh.truncated,))
         results.check(
-            "the default row cap is 5000",
+            "the default row cap is 5000 and the per-series cap is 20000",
             advisors.Snapshot(conn, now).caps == {"rows": 5000,
-                                                  "log_bytes": 200000},
+                                                  "log_bytes": 200000,
+                                                  "sample_rows": 20000},
             "caps=%r" % (advisors.Snapshot(conn, now).caps,))
     finally:
         _close(tmp, conn)
@@ -233,9 +234,10 @@ def test_the_second_positional_is_a_limit_not_a_target(results):
 def test_the_snapshot_offers_no_write_path(results):
     s = advisors.Snapshot(_Conn(0), 0)
     public = {n for n in dir(s) if not n.startswith("_")}
-    allowed = {"check_runs", "samples", "incidents", "logs", "thresholds",
-               "settings", "specs", "window", "requested_days",
-               "available_days", "now", "caps", "truncated", "max_days"}
+    allowed = {"check_runs", "samples", "sample_keys", "sample_series",
+               "incidents", "logs", "thresholds", "settings", "specs", "window",
+               "requested_days", "available_days", "now", "caps", "truncated",
+               "max_days"}
     results.check(
         "only the read API is public on a snapshot",
         public <= allowed, "unexpected public names: %r" % sorted(public - allowed))
@@ -1107,11 +1109,11 @@ def test_the_reference_advisor_is_on_by_default_and_none_switches_it_off(results
 def _add_series(conn, now, metric, values, span_days=7.0, target="cubox-1"):
     """Evenly spaced samples over `span_days`, newest at `now`."""
     n = len(values)
-    for i, value in enumerate(values):
-        ts = now - span_days * DAY + (span_days * DAY) * i / max(1, n - 1)
-        conn.execute(
-            "INSERT INTO sample (ts, epoch_seq, target, metric, value) "
-            "VALUES (?,?,?,?,?)", (ts, i, target, metric, value))
+    conn.executemany(
+        "INSERT INTO sample (ts, epoch_seq, target, metric, value) "
+        "VALUES (?,?,?,?,?)",
+        [(now - span_days * DAY + (span_days * DAY) * i / max(1, n - 1),
+          i, target, metric, value) for i, value in enumerate(values)])
 
 
 def _mem_spec():
@@ -1146,18 +1148,19 @@ def test_a_p95_outside_the_band_yields_a_bounded_suggestion(results):
             and rows[0]["check_id"] == "mem_available_mb"
             and ev.get("observed") == 100.0 and ev.get("percentile") == 95
             and ev.get("current") == {"green": 600, "amber": 300}
-            and ev.get("proposed") == {"green": 450.0, "amber": 150.0}
-            and ev.get("max_step") == 150.0
+            and ev.get("proposed") == {"green": 600, "amber": 225.0}
+            and ev.get("max_step") == 75.0
             and ev.get("window") == {"requested_days": 7,
                                      "available_days": 7.0},
-            "rows=%r evidence=%r. p95=100 sits below amber=300; the whole band "
-            "moves 150 (25%% of green, the bounded step) toward it, giving "
-            "green 450 / amber 150." % ([dict(r) for r in rows], ev))
+            "rows=%r evidence=%r. p95=100 sits below amber=300; only amber "
+            "moves, by 75 (25%% of the 300-wide band), giving green 600 / "
+            "amber 225. Green -- the healthy edge -- must not move."
+            % ([dict(r) for r in rows], ev))
         results.check(
             "the suggestion names the current band, the percentile and the "
             "proposed numbers",
             rows and all(k in rows[0]["title"] for k in ("600", "300", "100"))
-            and all(k in rows[0]["body"] for k in ("450", "150")),
+            and all(k in rows[0]["body"] for k in ("600", "225")),
             "title=%r body=%r" % (rows and rows[0]["title"],
                                   rows and rows[0]["body"]))
         results.check(
@@ -1280,6 +1283,184 @@ def test_every_insight_states_the_window_and_any_truncation(results):
         _close(tmp, conn)
 
 
+def test_a_truncated_series_never_supplies_a_percentile(results):
+    """The reviewed reproduction: truncation must suppress, not fabricate.
+
+    30 samples: 10 at 700 (older) and 20 at 100 (newest), under a 20-row
+    per-series cap and a band of green=800/amber=650 (high_is_good). The capped
+    slice is all 100 and would look RED; the full-window p95 is 700, inside the
+    band, so NO suggestion is correct.
+    """
+    import intelligence
+    import thresholds
+
+    tmp, conn = _store()
+    try:
+        now = time.time()
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        rows = []
+        for i in range(10):
+            rows.append((now - 7 * DAY + i * (7 * DAY / 30), i,
+                         "cubox-1", "mem_available_mb", 700.0))
+        for i in range(20):
+            rows.append((now - 3 * DAY + i * (3 * DAY / 19), 10 + i,
+                         "cubox-1", "mem_available_mb", 100.0))
+        conn.executemany(
+            "INSERT INTO sample (ts, epoch_seq, target, metric, value) "
+            "VALUES (?,?,?,?,?)", rows)
+        spec = thresholds.Spec("mem_available_mb", metric="mem_available_mb",
+                               direction="high_is_good", green=800, amber=650,
+                               unit="MB")
+        # BOTH caps at 20: `rows` is what the OLD global `samples()` read
+        # obeyed, `sample_rows` is the new per-series cap. The reproduction is
+        # red either way -- a pre-read truncation check misses the flag, and a
+        # global read returns the newest 20 (all 100).
+        snap = advisors.Snapshot(conn, now,
+                                 caps={"rows": 20, "sample_rows": 20},
+                                 specs={"mem_available_mb": spec})
+        out = intelligence.ReferenceAdvisor().advise(None, snap)
+        key = advisors.series_key("cubox-1", "mem_available_mb")
+        results.check(
+            "a capped series records its truncation and yields no suggestion",
+            out == []
+            and snap.truncated.get(key) is True
+            and intelligence._percentile([100.0] * 20 + [700.0] * 10, 95)
+            == 700.0,
+            "out=%r truncated=%r. The full-window p95 is 700 (inside "
+            "650..800); the capped newest slice says 100. Reporting 100 would "
+            "suggest a band change that the window does not support."
+            % (out, snap.truncated))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_low_is_good_suggestion_moves_only_the_amber_edge(results):
+    import intelligence
+    import thresholds
+
+    tmp, conn = _store()
+    try:
+        now = 1_800_000_000
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        _add_series(conn, now, "tmpfs_used_pct", [100.0] * 30)
+        spec = thresholds.Spec("tmpfs_used_pct", metric="tmpfs_used_pct",
+                               direction="low_is_good", green=60, amber=85,
+                               unit="percent")
+        out = intelligence.ReferenceAdvisor().advise(
+            None, advisors.Snapshot(
+                conn, now, specs={"tmpfs_used_pct": spec}))
+        ev = out[0].evidence if out else {}
+        proposed = ev.get("proposed", {})
+        graded = thresholds.evaluate(100.0, thresholds.Spec(
+            "tmpfs_used_pct", direction="low_is_good", green=60,
+            amber=proposed.get("amber", 85)))[0]
+        results.check(
+            "a low_is_good suggestion moves amber up by 25% of the band width",
+            len(out) == 1
+            and ev.get("observed") == 100.0
+            and proposed == {"green": 60, "amber": 91.25}
+            and ev.get("max_step") == 6.25,
+            "evidence=%r. green=60/amber=85 is 25 wide; a quarter is 6.25, so "
+            "amber moves 85 -> 91.25 and green stays 60." % (ev,))
+        results.check(
+            "the proposed band still grades a full tmpfs as FAIL, not WARN",
+            graded is store.Status.FAIL,
+            "graded=%r proposed=%r. Moving green to 75 and amber to 100 would "
+            "turn a 100%% full tmpfs into WARN, loosening the healthy edge "
+            "instead of the failing one." % (graded, proposed))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_percentile_is_nearest_rank(results):
+    import intelligence
+
+    values = [600.0] * 28 + [700.0] * 2 + [100.0]
+    results.check(
+        "p95 of 31 samples is the 30th smallest: 700, not an interpolated 660",
+        intelligence._percentile(values, 95) == 700.0
+        and intelligence._percentile([100.0] * 20 + [700.0] * 10, 95) == 700.0,
+        "31 samples: 28x600, 2x700, 1x100. ceil(0.95*31)-1 = 29 -> 700. "
+        "round(0.95*30) = 29 on the 30-sample case is the same rank; the old "
+        "`round(pct/100*(n-1))` under-ranks small samples.")
+
+
+def test_a_short_sample_span_alone_blocks_the_suggestion(results):
+    import intelligence
+
+    tmp, conn = _store()
+    try:
+        now = 1_800_000_000
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        # 30 samples, but only 6 days of span: every gate passes except the
+        # 90%-of-7-days span check (6.0 < 6.3).
+        _add_series(conn, now, "mem_available_mb", [100.0] * 30,
+                    span_days=6.0)
+        out = intelligence.ReferenceAdvisor().advise(
+            None, advisors.Snapshot(
+                conn, now, specs={"mem_available_mb": _mem_spec()}))
+        results.check(
+            "a 6-day sample span is not a 7-day window, so no suggestion",
+            out == [],
+            "out=%r. available_days is 7 and there are 30 samples, so the "
+            "sample-count and history gates pass; only the span gate stops "
+            "this. Deleting that line would emit the suggestion."
+            % (out,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_series_beyond_the_old_global_cap_still_yields_a_suggestion(results):
+    import intelligence
+
+    tmp, conn = _store()
+    try:
+        now = 1_800_000_000
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        # 6000 minute samples: a week at 60 s minus a few. A shared 5000-row
+        # read would keep the newest 5000, a 5.8-day span, and the span gate
+        # would suppress the suggestion for a metric that is genuinely bad.
+        _add_series(conn, now, "mem_available_mb", [100.0] * 6000)
+        out = intelligence.ReferenceAdvisor().advise(
+            None, advisors.Snapshot(
+                conn, now, specs={"mem_available_mb": _mem_spec()}))
+        ev = out[0].evidence if out else {}
+        results.check(
+            "a series longer than the old 5000-row cap still yields the "
+            "suggestion",
+            len(out) == 1 and ev.get("samples") == 6000
+            and ev.get("span_days", 0) >= 6.9,
+            "out=%r evidence=%r. The per-series cap is 20000, so all 6000 "
+            "samples are read and the span is a full week." % (out, ev))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_snapshot_deep_copies_the_threshold_specs(results):
+    import thresholds
+
+    spec = thresholds.Spec("x", metric="x", direction="high_is_good",
+                           green=10, amber=5)
+    source = {"x": spec}
+    snap = advisors.Snapshot(None, 0, specs=source)
+    snap.specs["x"].green = 99
+    snap.specs["added"] = "not in the source"
+    results.check(
+        "mutating snapshot.specs cannot mutate the caller's Spec objects",
+        spec.green == 10 and "added" not in source,
+        "green=%r source=%r. A shallow copy shares the mutable Spec with "
+        "ctx.specs, so an advisor could change the epoch's thresholds while "
+        "believing it was only reading them." % (spec.green, source))
+
+
 def test_the_runner_hands_threshold_specs_to_every_snapshot(results):
     class Specs(advisors.Advisor):
         id = "specs"
@@ -1343,6 +1524,12 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_p95_inside_the_band_yields_no_suggestion,
          test_a_short_or_thin_history_yields_no_suggestion,
          test_every_insight_states_the_window_and_any_truncation,
+         test_a_truncated_series_never_supplies_a_percentile,
+         test_a_low_is_good_suggestion_moves_only_the_amber_edge,
+         test_the_percentile_is_nearest_rank,
+         test_a_short_sample_span_alone_blocks_the_suggestion,
+         test_a_series_beyond_the_old_global_cap_still_yields_a_suggestion,
+         test_the_snapshot_deep_copies_the_threshold_specs,
          test_the_runner_hands_threshold_specs_to_every_snapshot)
 
 

@@ -7,6 +7,7 @@ age, so a request for 30 days over a 4-day store must report 4 -- implying
 otherwise is the "measured nothing" failure this platform exists to prevent.
 """
 
+import copy
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -14,6 +15,11 @@ from dataclasses import dataclass, field
 import store
 
 DAY = 86400
+
+
+def series_key(target, metric):
+    """The truncation-record key for one (target, metric) sample series."""
+    return "samples:%s/%s" % (target, metric)
 
 
 @dataclass
@@ -36,9 +42,11 @@ class Snapshot:
 
     def __init__(self, conn, now=None, caps=None, max_days=None, specs=None):
         self._conn = conn
-        # The epoch's loaded threshold specs, keyed by spec id. A copy, like
-        # every other read: an advisor may look up the band but cannot edit it.
-        self.specs = dict(specs or {})
+        # The epoch's loaded threshold specs, keyed by spec id. A DEEP copy:
+        # a shallow one would share the mutable `Spec` objects with `ctx.specs`,
+        # so an advisor that edited a band would change the epoch's thresholds
+        # while believing it was looking at them.
+        self.specs = copy.deepcopy(dict(specs or {}))
         self.now = now if now is not None else time.time()
         self.requested_days = 0
         self.available_days = 0.0
@@ -47,7 +55,11 @@ class Snapshot:
         # days itself must still get no more history than the platform allows.
         # None means uncapped (a direct snapshot in a test or a diagnostic).
         self.max_days = None if max_days is None else int(max_days)
-        self.caps = {"rows": 5000, "log_bytes": 200000}
+        # `rows` bounds the check_run/incident/list reads. `sample_rows` bounds
+        # ONE (target, metric) series: 20000 is two weeks of minute samples, so
+        # a full 7-day window fits and the percentile is computed over the
+        # window rather than the newest slice of a shared 5000-row budget.
+        self.caps = {"rows": 5000, "log_bytes": 200000, "sample_rows": 20000}
         if caps:
             self.caps.update(caps)
         # Read name -> True when that read hit a cap and returned LESS than the
@@ -121,6 +133,48 @@ class Snapshot:
             p.append(target)
         rows = self._rows("samples", sql + " ORDER BY ts DESC, id DESC",
                           p, limit)
+        return [dict(r) for r in reversed(rows)]
+
+    def sample_keys(self, since, limit=None):
+        """Distinct (target, metric) pairs with samples in the window.
+
+        Distinct keys are cheap and few; reading them first is what lets an
+        advisor then read each SERIES under its own cap instead of one global
+        slice that a busy metric would starve.
+        """
+        if self._conn is None:
+            return []
+        cap = self.caps["rows"] if limit is None \
+            else min(int(limit), self.caps["rows"])
+        rows = self._conn.execute(
+            "SELECT DISTINCT target, metric FROM sample WHERE ts >= ? "
+            "ORDER BY target, metric LIMIT ?", (since, cap + 1)).fetchall()
+        if len(rows) > cap:
+            self.truncated["sample_keys"] = True
+            rows = rows[:cap]
+        return [(r[0], r[1]) for r in rows]
+
+    def sample_series(self, since, target, metric, limit=None):
+        """One (target, metric) series, chronological, bounded by `sample_rows`.
+
+        A per-series cap is the point: the global `rows` cap would return the
+        newest few hours of whichever metric is busiest, and a percentile over
+        that slice would be reported as the window. A truncated series records
+        its truncation under `series_key()` and the advisor must not reason
+        from it.
+        """
+        if self._conn is None:
+            return []
+        cap = self.caps["sample_rows"] if limit is None \
+            else min(int(limit), self.caps["sample_rows"])
+        rows = self._conn.execute(
+            "SELECT * FROM sample WHERE ts >= ? AND target = ? AND metric = ? "
+            "ORDER BY ts DESC, id DESC LIMIT ?",
+            (since, target, metric, cap + 1)).fetchall()
+        key = series_key(target, metric)
+        if len(rows) > cap:
+            self.truncated[key] = True
+            rows = rows[:cap]
         return [dict(r) for r in reversed(rows)]
 
     def incidents(self, since, limit=None):

@@ -4,9 +4,9 @@ Two jobs, both advisory:
 
   * an INCIDENT REPORT for the window -- incidents grouped by module/check, so
     the dashboard's Recommendations section starts with what actually happened;
-  * a THRESHOLD SUGGESTION per (target, metric) whose p95 has sat outside the
-    spec's amber edge across the whole window. It names the current band, the
-    observation, the window, and a proposed band moved by a bounded step.
+  * a THRESHOLD SUGGESTION per (target, metric) whose WINDOW p95 is outside the
+    spec's band. It names the current band, the observation, the window, and a
+    proposed band.
 
 ADVISORY MEANS ADVISORY. This module never records a proposal and never touches
 a threshold: a suggestion is one `insight` row, and a human decision is the only
@@ -14,18 +14,27 @@ thing that can turn it into a change. `store.list_proposals` stays empty.
 
 WINDOW HONESTY. Every insight states `requested_days` (the ask) beside
 `available_days` (the history that exists), and carries the snapshot's
-truncation flag when a read hit the platform cap. A percentile over a capped
-slice describes the newest slice, not the window, so a truncated sample read
-produces no suggestion at all rather than a confident wrong one.
+truncation flag when a read hit the platform cap. Each sample series is read
+under its own cap (`Snapshot.sample_series`), so a busy metric cannot starve the
+window down to a few hours; a series that still hits its cap produces no
+suggestion at all rather than a confident wrong one.
 
 "Outside the band" means on the FAILING side of `amber`. A metric healthier
 than `green` needs no band change -- the band's job is to catch the bad end,
 and tightening a working bound on the strength of a good week is how a
 monitor teaches its operator to ignore it.
 
+THE BOUNDED STEP MOVES ONLY THE FAILING EDGE. A suggestion shifts `amber`
+toward the observation by at most 25% of the band's WIDTH (`|amber - green|`);
+`green` -- the healthy edge -- never moves. Moving green as well would loosen
+the boundary on the strength of one observation, which is a threshold change
+dressed as a suggestion.
+
 The advisor is platform-level (`module = "platform"`): it spans every module,
 and reusing a real module id would put its advice in that module's report.
 """
+
+import math
 
 import advisors
 from module import owned_check_ids
@@ -40,15 +49,16 @@ def _fmt(value):
 
 
 def _percentile(values, pct):
-    """Nearest-rank percentile. Linear interpolation buys nothing here.
+    """Nearest-rank percentile: the ceil(pct/100 * n)-th smallest value.
 
-    p95 over a week of minute samples is a shape, not a precise statistic, and
-    nearest-rank is the definition every operator already knows.
+    That is the textbook definition, and it is NOT
+    `round(pct/100 * (n-1))` -- the two disagree on small samples, and a p95
+    that reports a value no sample reached is worse than no percentile.
     """
     ordered = sorted(values)
     if not ordered:
         return None
-    idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+    idx = math.ceil(pct / 100.0 * len(ordered)) - 1
     return ordered[max(0, min(len(ordered) - 1, idx))]
 
 
@@ -69,9 +79,17 @@ def _owners(ctx):
     return owners
 
 
-def _evidence(snapshot, window):
+def _evidence(snapshot, window, only=None):
+    """Window honest numbers, plus truncations -- all of them, or just one.
+
+    `only` is a `series_key` for a suggestion: another series' truncation is
+    not evidence about THIS insight, and attaching it would read as if this
+    window had been cut short.
+    """
     evidence = {"window": dict(window)}
-    truncated = getattr(snapshot, "truncated", None)
+    truncated = getattr(snapshot, "truncated", None) or {}
+    if only is not None:
+        truncated = {only: True} if truncated.get(only) else {}
     if truncated:
         evidence["truncated"] = dict(truncated)
     return evidence
@@ -89,7 +107,7 @@ class ReferenceAdvisor(advisors.Advisor):
     # and enough observations for a p95 to exist at all.
     min_history_days = 7
     min_samples = 20
-    # The band may move by at most this fraction of its own scale per
+    # The failing edge may move by at most this fraction of the band WIDTH per
     # suggestion. Bounded so a single noisy week cannot leap a threshold across
     # the fleet; repeated suggestions can still converge over several epochs.
     max_step_fraction = 0.25
@@ -127,13 +145,10 @@ class ReferenceAdvisor(advisors.Advisor):
             evidence=_evidence(snapshot, window))
 
     def _suggestions(self, snapshot, since, window):
-        read_samples = getattr(snapshot, "samples", None)
+        read_keys = getattr(snapshot, "sample_keys", None)
+        read_series = getattr(snapshot, "sample_series", None)
         specs = getattr(snapshot, "specs", None) or {}
-        if not callable(read_samples) or not specs:
-            return []
-        if getattr(snapshot, "truncated", {}).get("samples"):
-            # The newest slice is not the window. Suggesting from it would state
-            # a percentile as if it described the ask.
+        if not (callable(read_keys) and callable(read_series)) or not specs:
             return []
 
         # One spec per metric name. Two specs sharing a metric are a
@@ -144,17 +159,17 @@ class ReferenceAdvisor(advisors.Advisor):
             spec = specs[spec_id]
             by_metric.setdefault(getattr(spec, "metric", None) or spec_id, spec)
 
-        groups = {}
-        for row in read_samples(since) or ():
-            try:
-                value = float(row.get("value"))
-            except (TypeError, ValueError):
-                continue
-            key = (row.get("target") or "", row.get("metric") or "")
-            groups.setdefault(key, []).append((float(row.get("ts") or 0), value))
+        if window["available_days"] < self.min_history_days:
+            return []
+
+        keys = list(read_keys(since))
+        if getattr(snapshot, "truncated", {}).get("sample_keys"):
+            # A truncated key list would silently advise on a subset of the
+            # fleet's metrics while the evidence claimed the window.
+            return []
 
         out = []
-        for (target, metric), points in sorted(groups.items()):
+        for target, metric in keys:
             spec = by_metric.get(metric)
             if spec is None:
                 continue
@@ -165,13 +180,26 @@ class ReferenceAdvisor(advisors.Advisor):
                 # A zero-width band is a decision ("any failed unit is a
                 # fault"), not an over-tight number. No percentile improves it.
                 continue
-            if window["available_days"] < self.min_history_days:
+
+            # READ, then judge the truncation. Checking the flag before the
+            # read is dead code: the flag is set BY the read, so a pre-check
+            # reasons over the newest capped slice and calls it the window.
+            points = []
+            for row in read_series(since, target, metric) or ():
+                try:
+                    value = float(row.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                points.append((float(row.get("ts") or 0), value))
+            series = advisors.series_key(target, metric)
+            if getattr(snapshot, "truncated", {}).get(series):
                 continue
             values = [value for _ts, value in points]
             if len(values) < self.min_samples:
                 continue
             stamps = [ts for ts, _value in points]
-            span_days = (max(stamps) - min(stamps)) / DAY
+            span_days = (max(stamps) - min(stamps)) / DAY if len(stamps) > 1 \
+                else 0.0
             # 90% of the minimum span: a full week of minute samples starts one
             # interval after `since`, and demanding the exact span would make
             # the advisor permanently silent on a healthy store.
@@ -182,25 +210,28 @@ class ReferenceAdvisor(advisors.Advisor):
             direction = getattr(spec, "direction", "")
             if direction == "high_is_good":
                 gap = spec.amber - observed
-                sign = -1
             elif direction == "low_is_good":
                 gap = observed - spec.amber
-                sign = 1
             else:
                 continue
             if gap <= 0:
                 continue
 
-            width = abs(spec.green - spec.amber)
-            bound = self.max_step_fraction * max(abs(spec.green), width, 1e-9)
-            step = round(min(gap, bound), 6)
+            # ONLY the failing edge moves, by at most 25% of the band WIDTH.
+            step = round(min(gap, self.max_step_fraction
+                             * abs(spec.amber - spec.green)), 6)
             if step <= 0:
                 continue
-            proposed = {"green": round(spec.green + sign * step, 6),
-                        "amber": round(spec.amber + sign * step, 6)}
+            if direction == "high_is_good":
+                # amber <= green: move amber DOWN, never past green.
+                proposed_amber = min(spec.green, spec.amber - step)
+            else:
+                # amber >= green: move amber UP, never below green.
+                proposed_amber = max(spec.green, spec.amber + step)
+            proposed = {"green": spec.green, "amber": proposed_amber}
             unit = getattr(spec, "unit", "") or ""
 
-            evidence = _evidence(snapshot, window)
+            evidence = _evidence(snapshot, window, only=series)
             evidence.update({
                 "metric": metric,
                 "target": target,

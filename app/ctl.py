@@ -36,6 +36,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--actor", default="operator")
     ap.add_argument("--list-runs", action="store_true")
+    ap.add_argument("--remedies", action="store_true")
     args = ap.parse_args(argv)
 
     cfg = config_mod.Config()
@@ -54,6 +55,16 @@ def main(argv=None):
             print("%s %s.%s actor=%s dry=%s rc=%s"
                   % (row["ts"], row["module"], row["command"], row["actor"],
                      row["dry_run"], row["exit_status"]))
+        conn.close()
+        return 0
+
+    if args.remedies:
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        for row in store.list_remedies(conn, limit=20):
+            print("%s %s %s dry=%s rc=%s post=%s"
+                  % (row["ts"], row["key"], row["remedy"], row["dry_run"],
+                     row["exit_status"], row["post_check_result"]))
         conn.close()
         return 0
 

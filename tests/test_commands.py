@@ -384,6 +384,48 @@ def test_the_command_run_table_is_in_the_store_summary(results):
     conn.close()
 
 
+def test_the_remedy_audit_is_exposed(results):
+    """`--remedies` is the operator's view of what was tried and what it did.
+
+    The remedy table is written by the healer and read by nobody on the
+    operator's surface, which is the state an audit decays into. The accessor
+    is exercised against a real store (25 rows in, the newest 20 out) and the
+    CLI branch is asserted from the source, since `ctl.py` opens the store and
+    discovers modules at import of `main` -- a text-level pin is the same
+    technique the deploy-routing checks above use for the parser.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        conn = store.connect(os.path.join(tmp, "m.sqlite"))
+        store.init(conn)
+        for i in range(25):
+            store.record_remedy(conn, "k|check|", "action_%02d" % i, {},
+                                dry_run=0, exit_status="ok",
+                                post_check_result="still failing")
+        rows = store.list_remedies(conn)
+        results.check(
+            "list_remedies returns the newest 20, newest first",
+            len(rows) == 20 and rows[0]["remedy"] == "action_24"
+            and rows[-1]["remedy"] == "action_05",
+            "got %d rows, first=%r last=%r -- a remedy audit that returns "
+            "everything, or oldest first, buries the attempt the operator is "
+            "looking for" % (len(rows), rows[0]["remedy"] if rows else None,
+                             rows[-1]["remedy"] if rows else None))
+        conn.close()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "app", "ctl.py")) as fh:
+            text = fh.read()
+        results.check(
+            "ctl.py exposes --remedies and prints the remedy audit",
+            "--remedies" in text and "if args.remedies:" in text
+            and "store.list_remedies(" in text,
+            "ctl.py has no --remedies branch, so the remedy table only has a "
+            "reader inside the healer")
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # The fleet's serial commands. The identity rule is the contract here too: an
 # action refuses when the box's adapter cannot be RESOLVED, and never falls
@@ -891,6 +933,7 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_audit_row_is_written,
          test_the_audit_keeps_a_head_and_the_full_sha,
          test_the_command_run_table_is_in_the_store_summary,
+         test_the_remedy_audit_is_exposed,
          test_serial_break_is_destructive_and_refuses_without_a_resolved_adapter,
          test_a_real_break_is_never_faked,
          test_serial_commands_declare_their_danger_and_the_serial_resource,

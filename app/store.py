@@ -493,6 +493,18 @@ def record_remedy(conn, key, remedy, evidence, dry_run, exit_status,
     )
 
 
+def list_remedies(conn, limit=20):
+    """The newest remedy audit rows, for the operator surfaces.
+
+    Newest first, for the same reason `list_command_runs` is: the attempt an
+    operator is looking for is the one that just failed, not the first one ever
+    made.
+    """
+    rows = conn.execute(
+        "SELECT * FROM remedy ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def record_journal(conn, host, cursor, ts, unit, priority, message):
     """Insert one journal line. Returns True if it was new.
 

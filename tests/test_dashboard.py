@@ -613,6 +613,88 @@ def test_informational_rows_carry_no_colour(results):
 
 
 # ---------------------------------------------------------------------------
+# 9b. Remedy attempts and the command audit are on the operator's page
+# ---------------------------------------------------------------------------
+
+
+def test_the_page_shows_remedy_attempts_and_command_history(results):
+    """A remedy attempt and an operator command must both be visible.
+
+    WHY BOTH HALVES ARE ASSERTED ON THE SUFFIX. An incident's `remedy_attempts`
+    is the only statement on the page that something was TRIED and did not
+    clear it -- and the obvious renderer appends that sentence to every row, or
+    to none. So one incident is given an attempt and one is not, and the
+    assertion is that the suffix is on exactly the one that earned it.
+
+    The command table is the other half: commands are the only part of the
+    platform that changes the fleet, and an audit nobody can read from the
+    page's own surface is an audit that only answers a question asked with a
+    shell on the NAS.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        key = store.incident_key("cubox-1", "disk_free_gb", "mnt")
+        for _ in range(store.CONFIRM_POLLS):
+            d.seq += 1
+            store.sync_incident(d.conn, d.seq, "cubox-1", "disk_free_gb",
+                                "mnt", store.Status.FAIL, "full")
+            store.sync_incident(d.conn, d.seq, "cubox-2", "disk_free_gb",
+                                "mnt", store.Status.FAIL, "full on cubox-2")
+        store.note_remedy_attempt(d.conn, key, "restart did not clear it")
+        store.record_command_run(d.conn, module="fleet", command="serial_status",
+                                 actor="operator", argv={}, dry_run=0,
+                                 exit_status=0, output="ok", duration_ms=1)
+        state = d.state()
+        html = web.render_html(state, d.cfg)
+        results.check(
+            "an incident with attempts and a command run are both visible",
+            any(i["remedy_attempts"] == 1 for i in state["incidents"])
+            and "serial_status" in html
+            and "attempt" in html.lower(),
+            "incidents=%r" % state["incidents"])
+        results.check(
+            "the command audit is in the page model, additively",
+            len(state["command_runs"]) == 1
+            and state["command_runs"][0]["command"] == "serial_status",
+            "command_runs=%r -- the page model carries no command history, so "
+            "the operator's own actions are only reachable over ssh"
+            % (state.get("command_runs"),))
+
+        # THE INCIDENT SECTION, BOUNDED BY ITS OWN </details>. A page-wide
+        # search for the suffix would also find the command table (whose output
+        # carries arbitrary text), and a search for "cubox-1" alone finds the
+        # all-checks rows too -- so the rows are sliced out of the incident
+        # section and identified by the incident's own check id.
+        start = html.find("Live incidents")
+        section = html[start:html.find("</details>", start)]
+        rows = section.split("<tr class=")[1:]
+        with_attempts = [r for r in rows if "cubox-1" in r and "disk_free_gb" in r]
+        without = [r for r in rows if "cubox-2" in r and "disk_free_gb" in r]
+        results.check(
+            "the remedy suffix appears on the incident that has attempts",
+            bool(with_attempts)
+            and all("remedy attempted 1 time(s)" in r for r in with_attempts),
+            "rows=%r" % (with_attempts,))
+        results.check(
+            "an incident with no attempt carries no remedy suffix",
+            bool(without) and not any("remedy attempted" in r for r in without),
+            "rows=%r -- a suffix on a row where no remedy ran says a remedy "
+            "was attempted when it was not" % (without,))
+
+        store.latch_remedy(d.conn, key, "still full")
+        latched = web.render_html(d.state(), d.cfg)
+        results.check(
+            "a latched incident says so in the suffix",
+            "remedy attempted 2 time(s) (LATCHED)" in latched,
+            "the page does not distinguish a latched incident from one still "
+            "being retried, so a row waiting on a human reads as automatic")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # 10. A reading is not shown beside a verdict from another epoch
 # ---------------------------------------------------------------------------
 
@@ -2117,6 +2199,7 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_nothing_is_cached,
          test_collector_rows_are_visible,
          test_informational_rows_carry_no_colour,
+         test_the_page_shows_remedy_attempts_and_command_history,
          test_status_api_is_three_valued,
          test_status_api_is_a_stable_contract,
          test_the_freshness_hero_tracks_the_staleness_it_leads_with,

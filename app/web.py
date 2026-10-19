@@ -54,6 +54,10 @@ import thresholds
 # reason: one missed poll is a hiccup, three is a condition.
 STALE_INTERVALS = 3
 
+# How many operator commands the page shows. ONE constant because the query and
+# the heading that says "last N" must not be two spellings of the same number.
+COMMAND_RUNS_LIMIT = 20
+
 
 # ---------------------------------------------------------------------------
 # The page model
@@ -230,6 +234,10 @@ def build_state(cfg, conn, now=None):
         "extra": extra,
         "missing": missing,
         "incidents": incidents,
+        # Commands are the only part of the platform that changes the fleet, so
+        # their audit belongs on the operator's page and not only behind ssh.
+        # Additive: a consumer of this model that ignores the key is unaffected.
+        "command_runs": store.list_command_runs(conn, limit=COMMAND_RUNS_LIMIT),
         "deferred": [{"id": k, "reason": v.claim} for k, v in sorted(deferred.items())],
         "unclaimed": sorted(unclaimed),
         "counts": {
@@ -1162,15 +1170,54 @@ def render_html(state, cfg):
              "<th>State</th><th>Since</th><th>Obs</th><th>Detail</th></tr>")
         for i in state["incidents"]:
             sev = i["severity"] or "grey"
+            # THE SUFFIX IS THE INCIDENT'S OWN FACT, so it is appended to the
+            # detail cell rather than stated anywhere page-wide: an operator
+            # reading a row needs to know whether a remedy has already been
+            # tried on THIS condition, and a sentence rendered for every row
+            # would say a remedy ran where none did.
+            detail = i["last_detail"] or ""
+            if i.get("remedy_attempts"):
+                detail += " · remedy attempted %d time(s)%s" % (
+                    i["remedy_attempts"],
+                    " (LATCHED)" if i.get("remedy_latched") else "")
             _inc("<tr class=%s><td><span class='pill %s'>%s</span></td>"
                  "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
                  "<td class=detail>%s</td></tr>"
                  % (sev, sev, _esc(sev.upper()), _esc(i["target"]),
                     _esc(i["check_id"]), _esc(i["state"]),
                     _esc(_age(state["now"] - i["first_seen"])),
-                    i["observed_count"], _esc(i["last_detail"] or "")))
+                    i["observed_count"], _esc(detail)))
         _inc("</table></div>")
     incidents_html = "\n".join(incidents)
+
+    # ---- operator commands: what was run against the fleet, and its rc -----
+    #
+    # BELOW THE INCIDENTS, because the two answer the same question in order:
+    # what is wrong, and what has already been done about it. The remedy audit
+    # is the healer's, the command audit is the operator's, and both belong on
+    # the page that exists to be the only surface nobody has to ssh to read.
+    cacc = []
+    _cm = cacc.append
+    _cm("<h2>Operator commands (last %d)</h2>" % COMMAND_RUNS_LIMIT)
+    if not state["command_runs"]:
+        # AN EMPTY LIST SAYS WHICH EMPTY IT IS. "No commands" and "the audit
+        # query failed" are two facts; the row count in the evidence section
+        # below is what distinguishes them, so the sentence points at it rather
+        # than reading as a clean slate.
+        _cm("<div class=note>No operator command is recorded. That means none "
+            "was run in this store, not that the audit is missing -- the "
+            "<code>command_run</code> row count is in the evidence section.")
+    else:
+        _cm("<div class=scroll><table><tr><th>When</th><th>Command</th>"
+            "<th>Actor</th><th>RC</th></tr>")
+        for r in state["command_runs"]:
+            _cm("<tr><td>%s</td><td>%s.%s%s</td><td>%s</td><td>%s</td></tr>"
+                % (_esc(_age(state["now"] - r["ts"])), _esc(r["module"]),
+                   _esc(r["command"]),
+                   " <span class=sub>(dry run)</span>" if r["dry_run"] else "",
+                   _esc(r["actor"]), _esc(r["exit_status"])))
+        _cm("</table></div>")
+    commands_html = "\n".join(cacc)
 
     # ---- the RAG tiles, then every check the registry does not own ----------
     tacc = []
@@ -1317,6 +1364,11 @@ def render_html(state, cfg):
                    incidents_html, open_=True))
     else:
         a(_details("incidents", "No live incident", incidents_html))
+
+    a(_details("commands",
+               ("Operator commands (last %d)" % COMMAND_RUNS_LIMIT)
+               if state["command_runs"] else "No operator command recorded",
+               commands_html))
 
     if state["informational"]:
         a(_details("informational",

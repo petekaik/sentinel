@@ -99,7 +99,10 @@ def _classes(module_checks):
     if not module_checks:
         raise SystemExit("the fleet module declares no checks -- discovery is "
                          "broken, so there is nothing to baseline")
-    return checks.registry(*module_checks)
+    # The platform's own checks run whatever modules are loaded; including them
+    # here keeps the baseline's check set identical to the pre-move registry.
+    return checks.registry(*(tuple(module_checks)
+                             + tuple(checks.platform_modules())))
 
 
 def _copy_fleet_view(cfg, fleet):

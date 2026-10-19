@@ -96,7 +96,8 @@ def fleet_module():
 def check_classes():
     """Every check class the discovered modules provide, through the registry."""
     import checks
-    return checks.registry(*fleet_module().check_classes())
+    return checks.registry(*(tuple(fleet_module().check_classes())
+                             + tuple(checks.platform_modules())))
 
 
 def fleet_config(cfg):

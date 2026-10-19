@@ -186,7 +186,10 @@ class Context:
         # separate from self.worker, which is the box's LIVE /etc copy: the drift
         # check is a comparison between the two, so they must not share a slot.
         self.gen_worker = {}
-        self._backup = None
+        # The sentinel is what separates "nothing was preloaded" (an
+        # unavailable answer with a reason) from a module explicitly saying
+        # "there is no such host" by preloading None.
+        self._backup = _UNSET
         self._tvh_log = None
         self.notes = []
         # Set by the collector for `--host`; the module that owns the targets
@@ -220,7 +223,7 @@ class Context:
             self.attempts[host] = self.attempt_factory(host)
         return self.attempts[host]
 
-    def tvh_log(self, tail=None):
+    def tvh_log(self):
         """The TVH container log, read ONCE per collection.
 
         Two checks read this log -- the log-signals check and EPG freshness --
@@ -274,10 +277,16 @@ class Context:
     def backup_facts(self):
         """Backup-NAS's fact block as preloaded by the module that owns it.
 
-        None means no block is available at all: either no such host is
-        configured (a configuration defect) or the owning module did not
-        preload it. Both are UNKNOWN to every check and neither is green.
+        Three states stay distinct:
+          * NOT PRELOADED -> a transport-failed block with the reason
+            "not preloaded", so a check cannot read it as a clean NAS;
+          * preloaded None -> the module says there is genuinely no such host
+            (a configuration defect), which the checks word as such;
+          * a real block -> its own transport outcome decides.
         """
+        if self._backup is _UNSET:
+            return _NotPreloadedBackup(
+                "not preloaded: no Backup-NAS fact block was fetched this epoch")
         return self._backup
 
     def preload_worker(self, cubox_id, text):
@@ -354,6 +363,10 @@ class _NotPreloaded:
     `if not f.ok` and reaches for a field should fail loudly with AttributeError
     (the collector records that as UNKNOWN with the traceback), rather than read
     a plausible default off an object that never saw the box.
+
+    `ok` is a BOOL here because BoxFacts exposes it as an attribute; the
+    BackupFacts-shaped subclass below exposes it as a METHOD, which is the real
+    asymmetry between the two probes (named in fleet/preload.py).
     """
 
     ok = False
@@ -361,6 +374,17 @@ class _NotPreloaded:
 
     def __init__(self, why):
         self.why = why
+
+
+class _NotPreloadedBackup(_NotPreloaded):
+    """The Backup-NAS-shaped unavailable block: `ok()` is a method there."""
+
+    def ok(self):
+        return False
+
+
+# "Nothing was preloaded", as distinct from a module preloading None.
+_UNSET = object()
 
 
 def registry(*modules):
@@ -392,6 +416,20 @@ def expand(classes, cubox_ids):
         else:
             out.append(cls())
     return out
+
+
+def platform_modules():
+    """The platform's own check modules, registered ONCE per collection.
+
+    `checks.meta` audits every module's thresholds against the classes that will
+    run, so it belongs to the platform's registry rather than to any one
+    module: a second module must not duplicate `spec_coverage`, and disabling a
+    module must not remove the platform's coverage check. Imported lazily
+    because `checks.meta` does `from checks import ...` (a cycle at module
+    import time).
+    """
+    import checks.meta
+    return (checks.meta,)
 
 
 def expansion_targets(modules):

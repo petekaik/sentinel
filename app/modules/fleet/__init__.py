@@ -2,7 +2,6 @@
 
 from module import Module, Setting
 
-from checks import meta as platform_meta
 from modules.fleet import checks as fleet_checks
 from modules.fleet.preload import after_epoch, context, preload
 
@@ -24,10 +23,7 @@ MODULE = Module(
     threshold_file="thresholds.conf",
     context=context,
     preload=preload,
-    # The platform's SpecCoverage audits THIS module's thresholds against THIS
-    # module's registered classes, so it is registered here rather than being
-    # run by the collector on its own -- it is a check about the module's data.
     checks=(fleet_checks.cubox, fleet_checks.fleet, fleet_checks.storage,
-            fleet_checks.backup, fleet_checks.serial, platform_meta),
+            fleet_checks.backup, fleet_checks.serial),
     after_epoch=after_epoch,
 )

@@ -67,8 +67,7 @@ class _BackupCheck(Check):
         if bf is None:
             return None, unknown(
                 self.id, self.target,
-                "no Backup-NAS fact block is available (no host configured, or the module "
-                "did not preload it), so %s cannot be asked at all"
+                "no Backup-NAS host is configured, so %s cannot be asked at all"
                 % what, subject=subject)
         if not bf.ok():
             return None, unknown(
@@ -90,9 +89,7 @@ class BackupReachable(_BackupCheck):
         bf = ctx.backup_facts()
         if bf is None:
             return unknown(self.id, self.target,
-                           "no Backup-NAS fact block is available (no host configured, or the "
-                           "module did not preload it)",
-                           subject="backup")
+                           "no Backup-NAS host is configured", subject="backup")
         if not bf.ok():
             # UNKNOWN, NOT FAIL -- and that is the whole design of this check.
             #

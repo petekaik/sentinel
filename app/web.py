@@ -122,7 +122,8 @@ def build_state(cfg, conn, now=None):
     specs = thresholds.load_many(
         {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
     classes = checks.registry(
-        *[c for m in enabled for c in m.check_classes()])
+        *([c for m in enabled for c in m.check_classes()]
+          + list(checks.platform_modules())))
     claimed, deferred, unclaimed = thresholds.audit(specs, classes)
 
     current, n_current = _rows(conn, NEWEST_EPOCH_SQL)

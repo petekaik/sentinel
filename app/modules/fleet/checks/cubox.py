@@ -1373,8 +1373,7 @@ class SharedLayerApplied(_BoxCheck):
         if bf is None:
             return unknown(
                 self.id, self.box,
-                "no Backup-NAS fact block is available (no host configured, or the "
-                "module did not preload it), so the layer's current "
+                "no Backup-NAS host is configured, so the layer's current "
                 "generation cannot be read and this box's generation cannot be "
                 "graded", subject=_SHARED_SUBJECT, evidence=ev)
         if not bf.ok():
@@ -1395,7 +1394,7 @@ class SharedLayerApplied(_BoxCheck):
             return fail(
                 self.id, self.box,
                 "the shared layer does not exist on Backup-NAS "
-                "(/share/HDA_DATA/cubpxe/shared is absent), so no box can "
+                "(/share/HDA_DATA/cubpxe/shared is absent), so no box can "  # secretscan:ignore (fleet-side design path, in settings.py)
                 "converge and every one is running its image snapshot. Re-seed it "
                 "with 02-prepare-pxe.sh.", subject=_SHARED_SUBJECT, evidence=ev)
         if bf.shared_dir is None:

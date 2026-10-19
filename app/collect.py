@@ -150,21 +150,27 @@ def preload_modules(cfg, ctx, attempts):
     installs the results through the platform's `preload_*` methods. The check
     layer then reads finished data and cannot open a socket of its own.
 
-    A module that raises is ISOLATED: its checks report UNKNOWN, the failure is
-    recorded against the module (with the traceback), and the rest of the epoch
-    proceeds. One broken module must not cost every other module's checks.
+    A module that raises is ISOLATED: its checks report UNKNOWN from the
+    not-preloaded facts and the rest of the epoch proceeds. NO Attempt row is
+    written or modified for a preload failure. `Attempt` answers "can we see
+    this HOST at all?"; a module's `targets` also contain reporting-only
+    targets (`fleet`), and a host the module already contacted successfully
+    must not be re-marked failed because a later pull in the same module threw
+    -- either would open a `host_unreachable` incident no positive observation
+    could resolve. The run note names the cause, and the full traceback stays
+    in `module_errors`.
     """
     ctx.attempt_factory = Attempt
     ctx.attempts = attempts
     for mod in ctx.modules:
         try:
             mod.preload(ctx)
-        except Exception:                          # noqa: BLE001 - isolated
+        except Exception as exc:                   # noqa: BLE001 - isolated
             ctx.module_errors[mod.id] = traceback.format_exc()
-            ctx.note("module %s failed to preload; its checks are UNKNOWN"
-                     % mod.id)
-            for target in mod.targets:
-                _attempt(attempts, target).note(False, "module preload failed")
+            first = (str(exc).strip().splitlines()
+                     or [type(exc).__name__])[0]
+            ctx.note("module %s failed to preload: %s; its checks are UNKNOWN"
+                     % (mod.id, first))
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +420,8 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     specs = thresholds.load_many(
         {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
     classes = checks.registry(
-        *[c for m in enabled for c in m.check_classes()])
+        *([c for m in enabled for c in m.check_classes()]
+          + list(checks.platform_modules())))
     ctx = checks.Context(cfg, specs, {}, docker=None, check_classes=classes,
                          modules=enabled)
     ctx.hosts_only = hosts_only
@@ -622,7 +629,8 @@ def main(argv=None):
         specs = thresholds.load_many(
             {m.id: os.path.join(m._path, m.threshold_file) for m in enabled})
         classes = checks.registry(
-            *[c for m in enabled for c in m.check_classes()])
+            *([c for m in enabled for c in m.check_classes()]
+              + list(checks.platform_modules())))
         claimed, deferred, unclaimed = thresholds.audit(specs, classes)
         print("\nthresholds: %d declared, %d claimed, %d deferred, %d UNCLAIMED"
               % (len(specs), len(claimed), len(deferred), len(unclaimed)))

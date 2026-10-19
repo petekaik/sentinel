@@ -5,7 +5,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import Results                       # noqa: E402
+from harness import Results, check_classes, fleet_module  # noqa: E402
 
 import checks                                     # noqa: E402
 import module as module_mod                       # noqa: E402
@@ -244,6 +244,82 @@ def test_context_settings_resolve_env_over_default(results):
         "a deployment-time default nobody chose" % (got,))
 
 
+def test_preload_failure_opens_no_attempt_and_names_the_cause(results):
+    """A module crash must not manufacture reachability rows.
+
+    `Attempt` answers "can we see this HOST?" and `Module.targets` also carries
+    reporting-only targets (fleet). Marking every target failed would open a
+    `host_unreachable` incident for "fleet" that no positive observation can
+    resolve, and would re-mark hosts the module already contacted successfully.
+    """
+    import collect
+    import config as config_mod
+
+    class Boom:
+        id = "boom"
+        targets = ("cubox-1", "fleet")
+
+        def preload(self, ctx):
+            raise RuntimeError("kaboom at pull")
+
+    cfg = config_mod.Config(env={})
+    ctx = checks.Context(cfg, {}, {}, modules=(Boom(),))
+    attempts = {}
+    collect.preload_modules(None, ctx, attempts)
+    note = " ".join(ctx.notes)
+    results.check(
+        "a preload crash writes NO attempt row (not for a host, not for 'fleet')",
+        attempts == {},
+        "attempts=%r -- escalate() would store a FAIL for every one of these, "
+        "including the reporting target 'fleet'" % (attempts,))
+    results.check(
+        "the run note names the cause and says the checks are UNKNOWN",
+        "kaboom at pull" in note and "UNKNOWN" in note,
+        "note=%r -- a note that says only 'failed' leaves an operator without "
+        "the one fact the traceback had" % (note,))
+    results.check(
+        "the full traceback is still recorded against the module",
+        "kaboom at pull" in ctx.module_errors.get("boom", ""),
+        "module_errors=%r" % (ctx.module_errors,))
+
+
+def test_spec_coverage_is_registered_once_by_the_platform(results):
+    """The coverage audit belongs to the platform, not to a module."""
+    ids = [c.id for c in check_classes() if c.id == "spec_coverage"]
+    fleet_owns_it = [c for c in fleet_module().check_classes()
+                     if getattr(c, "id", "") == "spec_coverage"]
+    results.check(
+        "exactly one spec_coverage class runs, and no module declares it",
+        ids == ["spec_coverage"] and fleet_owns_it == [],
+        "registered %d time(s); declared by a module=%r -- a second module would "
+        "duplicate the row and disabling a module would remove the platform's "
+        "coverage check" % (len(ids), bool(fleet_owns_it)))
+
+
+def test_unpreloaded_facts_are_unavailable_never_empty(results):
+    """'Nothing was preloaded' and 'there is no such host' are different."""
+    import config as config_mod
+    cfg = config_mod.Config(env={})
+    ctx = checks.Context(cfg, {}, {})
+    bf = ctx.backup_facts()
+    results.check(
+        "an un-preloaded Backup-NAS read is a transport-failed block",
+        bf is not None and bf.ok() is False
+        and "not preloaded" in bf.why,
+        "got %r -- None here would be read as 'no host configured'" % (bf,))
+    f = ctx.facts("cubox-1")
+    results.check(
+        "an un-preloaded box read is a transport-failed block",
+        f is not None and f.ok is False and "not preloaded" in f.why,
+        "got %r -- an absent fact block must not read as a clean one" % (f,))
+    ctx.preload_backup_facts(None)
+    results.check(
+        "a module saying 'no host' preloads None, and that stays None",
+        ctx.backup_facts() is None,
+        "got %r -- the genuinely-absent host is a configuration defect, worded "
+        "differently by the checks" % (ctx.backup_facts(),))
+
+
 def test_platform_files_do_not_import_a_specific_module(results):
     """The direction of dependency: platform -> loader, never platform -> module."""
     import re
@@ -277,6 +353,9 @@ TESTS = (test_discovery_finds_and_orders_modules,
          test_discover_enabled_carries_the_module_directory,
          test_expansion_targets_are_the_per_box_ids,
          test_context_settings_resolve_env_over_default,
+         test_preload_failure_opens_no_attempt_and_names_the_cause,
+         test_spec_coverage_is_registered_once_by_the_platform,
+         test_unpreloaded_facts_are_unavailable_never_empty,
          test_platform_files_do_not_import_a_specific_module)
 
 

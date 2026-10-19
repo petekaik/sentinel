@@ -74,6 +74,9 @@ def preload(ctx):
     bhost = fleet.hosts.get("backup")
     if bhost is None:
         ctx.note("no backup host configured -- its checks will be UNKNOWN")
+        # None is the module's explicit "there is genuinely no such host",
+        # which the checks word differently from "not preloaded".
+        ctx.preload_backup_facts(None)
     else:
         a = ctx.attempt("backup")
         bf = backupfacts.pull(bhost, fleet.backupfacts_script, fleet,

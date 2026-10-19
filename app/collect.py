@@ -47,6 +47,7 @@ import traceback
 import advisors
 import checks
 import config as config_mod
+import intelligence
 from module import owned_check_ids
 import modules as module_loader
 import store
@@ -472,8 +473,9 @@ def run_advisors_for_epoch(cfg, conn, ctx):
     disappear it. Advisor time is consequently not part of the epoch's
     `duration_ms`; each advisor's own row records its duration and overrun.
 
-    AN EMPTY SELECTOR RUNS NOTHING. Unlike `SENTINEL_MODULES`, an advisor costs
-    time every epoch, so it must be named to run.
+    AN EMPTY SELECTION RUNS NOTHING. `SENTINEL_ADVISORS` defaults to the
+    reference advisor; `none` is the explicit off switch and parses to no ids,
+    which is the only way to reach this early return.
 
     Selection is isolated per module AND per advisor: module code may raise,
     and an advisor object may be malformed (no readable id, a frozen dataclass
@@ -486,6 +488,29 @@ def run_advisors_for_epoch(cfg, conn, ctx):
         return []
     try:
         picked, matched = [], set()
+
+        # PLATFORM ADVISORS FIRST. The reference advisor belongs to no module
+        # (`module = "platform"`), so it cannot be discovered through
+        # `ctx.modules`; and it is the DEFAULT selection, so if the selector
+        # could not see it every default epoch would record "selector names no
+        # advisor". A malformed platform object is isolated like any other.
+        for adv in intelligence.platform_advisors():
+            try:
+                adv_id = str(adv.id)
+            except Exception:                  # noqa: BLE001 - isolated
+                name = type(adv).__name__
+                ctx.module_errors["platform:advisors:%s" % name] = \
+                    traceback.format_exc()
+                _note_advisor_problem(
+                    conn, ctx, name, "platform",
+                    "advisor object %s has no readable id; skipped" % name)
+                continue
+            qualified = "platform.%s" % adv_id
+            if adv_id not in ids and qualified not in ids:
+                continue
+            matched.update((adv_id, qualified))
+            picked.append(adv)
+
         for mod in ctx.modules:
             try:
                 declared = mod.advisors()
@@ -536,7 +561,8 @@ def run_advisors_for_epoch(cfg, conn, ctx):
 
         return advisors.run_advisors(
             picked, conn, ctx,
-            history_cap_days=getattr(cfg, "advisor_max_history_days", 30))
+            history_cap_days=getattr(cfg, "advisor_max_history_days", 30),
+            specs=getattr(ctx, "specs", None))
     except Exception as exc:                       # noqa: BLE001 - isolated
         lines = str(exc).splitlines()
         ctx.note("advisors could not run: %s"

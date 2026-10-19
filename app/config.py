@@ -90,13 +90,15 @@ class Config:
             if x.strip())
 
         # Advisor selection. `SENTINEL_ADVISORS` is a comma-separated list of
-        # `module.advisor` or bare `advisor` ids, and -- unlike the module
-        # selector -- EMPTY MEANS NONE: an advisor costs time in every epoch,
-        # so it runs only when it has been named. The history cap bounds what
-        # an advisor can ask the snapshot for.
-        self.advisor_ids = tuple(
-            x.strip() for x in _env("SENTINEL_ADVISORS", "", e).split(",")
-            if x.strip())
+        # `module.advisor` or bare `advisor` ids. THE REFERENCE ADVISOR IS THE
+        # DEFAULT: unset (or empty, which `_env` treats the same way) selects
+        # it, and an explicit list REPLACES that default rather than adding to
+        # it. `none` is the explicit off switch -- without it there would be no
+        # way to ask for silence, because "unset" already means the default.
+        # The history cap bounds what an advisor can ask the snapshot for.
+        raw = _env("SENTINEL_ADVISORS", "reference", e).strip()
+        self.advisor_ids = () if raw.lower() == "none" else tuple(
+            x.strip() for x in raw.split(",") if x.strip())
         cap = int(_env("SENTINEL_ADVISOR_MAX_HISTORY_DAYS", "30", e))
         if cap < 0:
             # REFUSED, not clamped: a negative cap would silently mean "no

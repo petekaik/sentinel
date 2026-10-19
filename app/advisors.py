@@ -34,8 +34,11 @@ class Insight:
 class Snapshot:
     """Read-only, windowed views of the store. No writes, no database handle."""
 
-    def __init__(self, conn, now=None, caps=None, max_days=None):
+    def __init__(self, conn, now=None, caps=None, max_days=None, specs=None):
         self._conn = conn
+        # The epoch's loaded threshold specs, keyed by spec id. A copy, like
+        # every other read: an advisor may look up the band but cannot edit it.
+        self.specs = dict(specs or {})
         self.now = now if now is not None else time.time()
         self.requested_days = 0
         self.available_days = 0.0
@@ -200,7 +203,8 @@ def _record(conn, advisor_id, insight, snap):
         store.record_insight(conn, advisor=advisor_id, **insight.__dict__)
 
 
-def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30):
+def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
+                 specs=None):
     """Run each advisor once, in order, bounded and isolated. NEVER raises.
 
     ONE FRESH SNAPSHOT PER ADVISOR, so no advisor can see what another read,
@@ -218,10 +222,15 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30):
     PROPAGATED. The epoch has already stored its evidence and its own record
     before this runs, and an advisor must not be able to take either down.
     """
+    # The threshold specs travel with the snapshot so an advisor can compare a
+    # metric to its band. `specs` is explicit for a caller with no ctx (the
+    # offline suites); otherwise the epoch's context is the one source of them.
+    if specs is None:
+        specs = getattr(ctx, "specs", None)
     out = []
     for adv in advisors:
         t0 = time.time()
-        snap = Snapshot(conn, max_days=history_cap_days)
+        snap = Snapshot(conn, max_days=history_cap_days, specs=specs)
         status, detail = "ok", ""
         try:
             days = min(int(getattr(adv, "history_days", 7)),

@@ -234,8 +234,8 @@ def test_the_snapshot_offers_no_write_path(results):
     s = advisors.Snapshot(_Conn(0), 0)
     public = {n for n in dir(s) if not n.startswith("_")}
     allowed = {"check_runs", "samples", "incidents", "logs", "thresholds",
-               "settings", "window", "requested_days", "available_days",
-               "now", "caps", "truncated", "max_days"}
+               "settings", "specs", "window", "requested_days",
+               "available_days", "now", "caps", "truncated", "max_days"}
     results.check(
         "only the read API is public on a snapshot",
         public <= allowed, "unexpected public names: %r" % sorted(public - allowed))
@@ -586,15 +586,16 @@ def test_the_selector_gates_advisors_and_accepts_both_forms(results):
                 return []
 
         ctx = _FakeCtx([_FakeModule("fleet", [Adv()])])
-        cfg = config_mod.Config(env={"SENTINEL_ADVISORS": ""})
+        cfg = config_mod.Config(env={"SENTINEL_ADVISORS": "none"})
         results.check(
-            "an empty selector parses to no advisors and runs none",
+            "SENTINEL_ADVISORS=none parses to no advisors and runs none",
             cfg.advisor_ids == ()
             and collect.run_advisors_for_epoch(cfg, conn, ctx) == []
             and conn.execute("SELECT COUNT(*) AS n FROM advisor_run")
             .fetchone()["n"] == 0,
-            "ids=%r notes=%r. Empty means none; an advisor running unasked is "
-            "work nobody configured." % (cfg.advisor_ids, ctx.notes))
+            "ids=%r notes=%r. `none` is the explicit off switch; an advisor "
+            "running unasked is work nobody configured."
+            % (cfg.advisor_ids, ctx.notes))
 
         for selector in ("adv", "fleet.adv"):
             cfg.advisor_ids = (selector,)
@@ -963,6 +964,350 @@ def test_a_raising_advisor_cannot_lose_the_epoch_record(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# The reference advisor (Task 17). Statistics only: no network, no proposal.
+# ---------------------------------------------------------------------------
+
+
+def test_the_reference_advisor_states_the_window_it_used(results):
+    import intelligence
+
+    class Snap:
+        now = 1_800_000_000
+        requested_days = 0
+        available_days = 0.0
+
+        def window(self, d):
+            self.requested_days = d
+            self.available_days = 4.0
+            return 1, 4.0
+
+        def incidents(self, since):
+            return [{"check_id": "disk_free_gb", "state": "resolved"}]
+
+    out = intelligence.ReferenceAdvisor().advise(None, Snap())
+    results.check(
+        "the reference advisor reports requested and available history",
+        len(out) == 1
+        and out[0].kind == "report"
+        and out[0].module == "platform"
+        and out[0].evidence["window"] == {"requested_days": 7,
+                                          "available_days": 4.0}
+        and "4.0" in out[0].title,
+        "out=%r. The advisor must state the history it ACTUALLY had (4 days), "
+        "never the 7 it asked for, and it belongs to the platform -- it spans "
+        "every module." % (out,))
+
+
+def test_the_incident_report_groups_by_module_and_check(results):
+    import intelligence
+
+    class Mod:
+        id = "fleet"
+        extra_check_ids = ("disk_free_gb",)
+
+        def check_classes(self):
+            return ()
+
+        def advisors(self):
+            return []
+
+    class Snap:
+        requested_days = 0
+        available_days = 0.0
+        truncated = {}
+
+        def window(self, d):
+            self.requested_days = d
+            self.available_days = 7.0
+            return 0, 7.0
+
+        def incidents(self, since):
+            return [
+                {"check_id": "disk_free_gb", "state": "open"},
+                {"check_id": "disk_free_gb", "state": "resolved"},
+                {"check_id": "host_unreachable", "state": "open"},
+            ]
+
+    out = intelligence.ReferenceAdvisor().advise(_FakeCtx([Mod()]), Snap())
+    results.check(
+        "incidents are reported by module/check, with live and closed counts",
+        out[0].body.splitlines() == [
+            "host_unreachable: 1 incident(s) (1 live, 0 closed)",
+            "fleet/disk_free_gb: 2 incident(s) (1 live, 1 closed)"]
+        and out[0].severity == "notable",
+        "body=%r. An incident row carries no module column, so the report has "
+        "to attribute the check through the module contract; a bare check id "
+        "loses which module owns it." % (out[0].body,))
+
+
+def test_the_reference_advisor_is_on_by_default_and_none_switches_it_off(results):
+    results.check(
+        "an unset selector defaults to the reference advisor",
+        config_mod.Config(env={}).advisor_ids == ("reference",),
+        "ids=%r. The reference advisor is the one advisor the platform runs "
+        "unasked; a default of no advisors leaves the intelligence layer "
+        "empty by default." % (config_mod.Config(env={}).advisor_ids,))
+    results.check(
+        "SENTINEL_ADVISORS=none disables every advisor",
+        config_mod.Config(
+            env={"SENTINEL_ADVISORS": "none"}).advisor_ids == (),
+        "`none` is the explicit sentinel: without it, 'unset' already means "
+        "the default, so there would be no way to ask for silence.")
+    results.check(
+        "an explicit list overrides the default instead of adding to it",
+        config_mod.Config(
+            env={"SENTINEL_ADVISORS": "adv"}).advisor_ids == ("adv",),
+        "ids=%r. A list that silently added the default would run an advisor "
+        "nobody configured." % (
+            config_mod.Config(
+                env={"SENTINEL_ADVISORS": "adv"}).advisor_ids,))
+
+    tmp, conn = _store()
+    try:
+        ctx = _FakeCtx([])
+        out = collect.run_advisors_for_epoch(config_mod.Config(env={}), conn,
+                                             ctx)
+        results.check(
+            "the default actually runs the reference advisor, attributed to "
+            "the platform",
+            len(out) == 1 and out[0]["advisor"] == "reference"
+            and out[0]["module"] == "platform" and out[0]["ok"] is True,
+            "out=%r. Parsing the default is not running it." % (out,))
+
+        before = conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_run").fetchone()["n"]
+        out = collect.run_advisors_for_epoch(
+            config_mod.Config(env={"SENTINEL_ADVISORS": "none"}), conn, ctx)
+        after = conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_run").fetchone()["n"]
+        results.check(
+            "none runs nothing and records nothing",
+            out == [] and after == before,
+            "out=%r rows %d -> %d" % (out, before, after))
+
+        class Adv(_Good):
+            id = "adv"
+
+            def advise(self, ctx_, snapshot):
+                return []
+
+        out = collect.run_advisors_for_epoch(
+            config_mod.Config(env={"SENTINEL_ADVISORS": "adv"}), conn,
+            _FakeCtx([_FakeModule("fleet", [Adv()])]))
+        results.check(
+            "an explicit list replaces the default reference advisor",
+            [e["advisor"] for e in out] == ["adv"],
+            "out=%r. An explicit selection must not also run the default."
+            % (out,))
+    finally:
+        _close(tmp, conn)
+
+
+def _add_series(conn, now, metric, values, span_days=7.0, target="cubox-1"):
+    """Evenly spaced samples over `span_days`, newest at `now`."""
+    n = len(values)
+    for i, value in enumerate(values):
+        ts = now - span_days * DAY + (span_days * DAY) * i / max(1, n - 1)
+        conn.execute(
+            "INSERT INTO sample (ts, epoch_seq, target, metric, value) "
+            "VALUES (?,?,?,?,?)", (ts, i, target, metric, value))
+
+
+def _mem_spec():
+    import thresholds
+    return thresholds.Spec(
+        "mem_available_mb", metric="mem_available_mb",
+        direction="high_is_good", green=600, amber=300, unit="MB")
+
+
+def test_a_p95_outside_the_band_yields_a_bounded_suggestion(results):
+    import intelligence
+
+    tmp, conn = _store()
+    try:
+        # `run_advisors` makes its own snapshot at the real clock, so this
+        # series is anchored to it rather than to a synthetic timestamp.
+        now = time.time()
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        _add_series(conn, now, "mem_available_mb", [100.0] * 30)
+        out = advisors.run_advisors(
+            [intelligence.ReferenceAdvisor()], conn=conn, ctx=None,
+            history_cap_days=30, specs={"mem_available_mb": _mem_spec()})
+        rows = store.list_insights(conn)
+        ev = json.loads(rows[0]["evidence_json"]) if rows else {}
+        results.check(
+            "an observed p95 below the amber edge suggests a bounded band",
+            len(rows) == 1 and rows[0]["kind"] == "threshold_suggestion"
+            and rows[0]["module"] == "platform"
+            and rows[0]["target"] == "cubox-1"
+            and rows[0]["check_id"] == "mem_available_mb"
+            and ev.get("observed") == 100.0 and ev.get("percentile") == 95
+            and ev.get("current") == {"green": 600, "amber": 300}
+            and ev.get("proposed") == {"green": 450.0, "amber": 150.0}
+            and ev.get("max_step") == 150.0
+            and ev.get("window") == {"requested_days": 7,
+                                     "available_days": 7.0},
+            "rows=%r evidence=%r. p95=100 sits below amber=300; the whole band "
+            "moves 150 (25%% of green, the bounded step) toward it, giving "
+            "green 450 / amber 150." % ([dict(r) for r in rows], ev))
+        results.check(
+            "the suggestion names the current band, the percentile and the "
+            "proposed numbers",
+            rows and all(k in rows[0]["title"] for k in ("600", "300", "100"))
+            and all(k in rows[0]["body"] for k in ("450", "150")),
+            "title=%r body=%r" % (rows and rows[0]["title"],
+                                  rows and rows[0]["body"]))
+        results.check(
+            "the advisor writes no proposal and changes no threshold",
+            store.list_proposals(conn) == []
+            and out[0]["status"] == "ok" and out[0]["module"] == "platform",
+            "proposals=%r out=%r. Even a correctly bounded suggestion stops "
+            "at the insight; only a human decision turns it into a change."
+            % (store.list_proposals(conn), out))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_p95_inside_the_band_yields_no_suggestion(results):
+    import intelligence
+
+    tmp, conn = _store()
+    try:
+        now = 1_800_000_000
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        _add_series(conn, now, "mem_available_mb", [700.0] * 30)
+        out = intelligence.ReferenceAdvisor().advise(
+            None, advisors.Snapshot(conn, now,
+                                    specs={"mem_available_mb": _mem_spec()}))
+        results.check(
+            "a percentile inside the band produces no suggestion",
+            out == [],
+            "out=%r. p95=700 is above green=600; the band already matches "
+            "the fleet and a change would only loosen a working bound."
+            % (out,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_short_or_thin_history_yields_no_suggestion(results):
+    import intelligence
+
+    now = 1_800_000_000
+
+    def advise(conn):
+        return intelligence.ReferenceAdvisor().advise(
+            None, advisors.Snapshot(
+                conn, now, specs={"mem_available_mb": _mem_spec()}))
+
+    tmp, conn = _store()
+    try:
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 2 * DAY, 1, "cubox-1", "c", "ok"))
+        _add_series(conn, now, "mem_available_mb", [100.0] * 30,
+                    span_days=2.0)
+        results.check(
+            "a store holding only 2 days cannot support a 7-day suggestion",
+            advise(conn) == [],
+            "available history is 2 days; the minimum is 7.")
+    finally:
+        _close(tmp, conn)
+
+    tmp, conn = _store()
+    try:
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        _add_series(conn, now, "mem_available_mb", [100.0] * 30,
+                    span_days=1.0)
+        results.check(
+            "a percentile from one day does not stand in for the window",
+            advise(conn) == [],
+            "the store is 8 days old, but this metric's samples span 1 day; "
+            "nothing shows the value sat outside the band ACROSS the window.")
+    finally:
+        _close(tmp, conn)
+
+    tmp, conn = _store()
+    try:
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        _add_series(conn, now, "mem_available_mb", [100.0] * 5)
+        results.check(
+            "a full week with too few samples suggests nothing",
+            advise(conn) == [],
+            "5 samples cannot establish a p95; the minimum is 20.")
+    finally:
+        _close(tmp, conn)
+
+
+def test_every_insight_states_the_window_and_any_truncation(results):
+    import intelligence
+
+    tmp, conn = _store()
+    try:
+        now = 1_800_000_000
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 4 * DAY, 1, "cubox-1", "c", "ok"))
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO incident (key, target, check_id, state, "
+                "first_seen, last_seen, first_epoch_seq) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("k%d" % i, "cubox-1", "c%d" % i, "open", now - 100 + i,
+                 now - 100 + i, i))
+        snap = advisors.Snapshot(conn, now, caps={"rows": 2,
+                                                  "log_bytes": 200000})
+        ev = intelligence.ReferenceAdvisor().advise(None, snap)[0].evidence
+        results.check(
+            "the insight states the history that existed, not the request",
+            ev.get("window") == {"requested_days": 7, "available_days": 4.0},
+            "evidence=%r. requested_days keeps the ask; available_days is "
+            "what the store actually held (4 days)." % (ev,))
+        results.check(
+            "a capped read travels with the insight as a truncation flag",
+            ev.get("truncated") == {"incidents": True},
+            "evidence=%r. A capped slice is indistinguishable from a short "
+            "window unless the truncation is recorded." % (ev,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_the_runner_hands_threshold_specs_to_every_snapshot(results):
+    class Specs(advisors.Advisor):
+        id = "specs"
+        history_days = 1
+        seen = None
+
+        def advise(self, ctx, snapshot):
+            type(self).seen = dict(snapshot.specs)
+            return []
+
+    Specs.seen = None
+    tmp, conn = _store()
+    try:
+        ctx = _FakeCtx([_FakeModule("fleet", [Specs()])])
+        ctx.specs = {"mem_available_mb": "SPEC"}
+        out = collect.run_advisors_for_epoch(
+            config_mod.Config(env={"SENTINEL_ADVISORS": "specs"}), conn, ctx)
+        results.check(
+            "the runner passes the epoch's threshold specs into the snapshot",
+            Specs.seen == {"mem_available_mb": "SPEC"}
+            and [e["advisor"] for e in out] == ["specs"],
+            "seen=%r out=%r. Without the specs an advisor can only summarise; "
+            "it cannot compare a metric against its configured band."
+            % (Specs.seen, out))
+    finally:
+        _close(tmp, conn)
+
+
 TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_request_shorter_than_history_is_the_request,
          test_an_empty_store_reports_no_history,
@@ -990,7 +1335,15 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_a_store_insert_failure_is_caught,
          test_a_dry_run_epoch_runs_no_advisor,
          test_the_runner_reads_the_epoch_that_just_finished,
-         test_a_raising_advisor_cannot_lose_the_epoch_record)
+         test_a_raising_advisor_cannot_lose_the_epoch_record,
+         test_the_reference_advisor_states_the_window_it_used,
+         test_the_incident_report_groups_by_module_and_check,
+         test_the_reference_advisor_is_on_by_default_and_none_switches_it_off,
+         test_a_p95_outside_the_band_yields_a_bounded_suggestion,
+         test_a_p95_inside_the_band_yields_no_suggestion,
+         test_a_short_or_thin_history_yields_no_suggestion,
+         test_every_insight_states_the_window_and_any_truncation,
+         test_the_runner_hands_threshold_specs_to_every_snapshot)
 
 
 def main():

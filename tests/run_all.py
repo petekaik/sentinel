@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                     # noqa: E402
 
 import test_checks_fixtures as fixture_tests    # noqa: E402
+import test_advisors as advisor_tests           # noqa: E402
 import test_collect_offline as collect_tests    # noqa: E402
 import test_commands as command_tests           # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
@@ -55,6 +56,9 @@ SUITES = (
     ("checks/* -- the shared dynamic layer (T2): converging vs stuck, the "
      "subjects incidents resolve by, and worker_drift's box-side authority",
      shared_tests.TESTS),
+    ("advisors -- the read-only snapshot: honest history windows, bounded "
+     "reads, and no write path",
+     advisor_tests.TESTS),
     ("proxy/ -- the publishing stack's access rules (offline, text-level)",
      proxy_tests.TESTS),
 )

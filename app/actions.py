@@ -52,11 +52,13 @@ class Authority(dict):
 
 class Action:
     def __init__(self, id, title, triggers, danger, dry_run, run, verify,
-                 limits=None):
+                 limits=None, resources_for=None):
         if danger not in ("read_only", "state_changing", "destructive"):
             raise ValueError("unknown danger %r" % danger)
         if not callable(dry_run) or not callable(run):
             raise TypeError("dry_run and run are required callables")
+        if resources_for is not None and not callable(resources_for):
+            raise TypeError("resources_for must be callable")
         self.id = id
         self.title = title
         self.triggers = tuple(triggers)
@@ -65,6 +67,19 @@ class Action:
         self.run = run
         self.verify = verify
         self.limits = limits or Limits()
+        # The RESOURCES this action needs for one incident, resolved from the
+        # incident rather than declared flat: two boxes' state mounts are two
+        # different resources, and a flat declaration would either serialize
+        # both boxes or lock nothing. `()` means "no resource beyond the
+        # engine's own per-incident and per-module locks", which heal.attempt
+        # always adds.
+        self._resources_for = resources_for
+
+    def resources_for(self, incident):
+        """The resources one execution of this action needs, as a tuple."""
+        if self._resources_for is None:
+            return ()
+        return tuple(self._resources_for(incident) or ())
 
 
 def _matches(action, incident):
@@ -138,7 +153,11 @@ def allowed(action, incident, policy=None, module_id=None):
         return False, "advisory only"
     if level == "propose":
         return False, "propose: needs operator approval"
-    if level == "scoped" and action.id not in tuple(policy.get("allow", ())):
+    # BOTH SIDES LOWERCASED for the allow-list: config.py lowercases the
+    # entries, but an action declared elsewhere (or a policy built by hand)
+    # must match the same way rather than on a case coincidence.
+    if level == "scoped" and action.id.lower() not in tuple(
+            str(a).lower() for a in policy.get("allow", ())):
         return False, "scoped: %r is not in the allow-list" % action.id
     if action.danger == "destructive" and not policy.get("destructive"):
         return False, "destructive action requires ALLOW_DESTRUCTIVE"

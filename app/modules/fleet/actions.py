@@ -175,6 +175,19 @@ def _wrappers(impl):
             lambda ctx, incident: impl(ctx, incident, False))
 
 
+def _state_resource(incident):
+    """The state mount of the box the incident names, as one lock name.
+
+    Per box, not per module: two boxes' mounts are independent repairs, and a
+    flat resource would make one box's cycle block the other's.
+    """
+    return ("fleet:state:%s" % (incident.get("target") or ""),)
+
+
+def _transcode_resource(incident):
+    return ("fleet:transcode:%s" % (incident.get("target") or ""),)
+
+
 def actions_list():
     state_dry, state_run = _wrappers(_state_mount_cycle)
     worker_dry, worker_run = _wrappers(_transcode_restart)
@@ -187,13 +200,20 @@ def actions_list():
             triggers=[("state_dir_tmpfs", "*"), ("state_save_age_min", "*")],
             danger="state_changing", dry_run=state_dry, run=state_run,
             verify=("state_dir_tmpfs", "*"),
+            resources_for=_state_resource,
             limits=actions.Limits(max_attempts=2, cooldown_s=1800, per_hour=3)),
         actions.Action(
             "transcode_restart", "Restart the transcode worker",
-            # DeadlockKills (the VPU freeze) and StallWatchPresent (the worker
-            # watchdog that reports it).
-            triggers=[("deadlock_kills", "*"), ("stall_watch", "*")],
+            # CURRENT-STATE signals only. A restart cannot clear a HISTORICAL
+            # fact: `deadlock_kills` counts kills over a 360-minute window and
+            # `stall_watch` reports whether the deployed worker can detect a
+            # stall at all, so either trigger would restart a healthy worker
+            # for six hours after a fault that may already be over. The two
+            # checks below describe the box NOW: the age of the job in flight
+            # (JobHeartbeat) and the idle-pass cadence (PassCadence).
+            triggers=[("heartbeat_age_min", "*"), ("pass_cadence_min", "*")],
             danger="state_changing", dry_run=worker_dry, run=worker_run,
-            verify=("deadlock_kills", "*"),
+            verify=("heartbeat_age_min", "*"),
+            resources_for=_transcode_resource,
             limits=actions.Limits(max_attempts=2, cooldown_s=1800, per_hour=3)),
     ]

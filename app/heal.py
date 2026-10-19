@@ -12,10 +12,11 @@ condition cleared, and collapsing the two is the false-green shape this platform
 exists to prevent. The return value says "executed", never "fixed".
 """
 
-import threading
+import json
 import time
 
 import actions
+import commands
 import module
 import store
 
@@ -24,32 +25,14 @@ def _call_bounded(fn, ctx, incident, timeout_s):
     """Run one action callable, bounded by `action.limits.timeout_s`.
 
     Returns `("ok", value)`, `("error", exception)` or `("timeout", None)`.
-
-    A DAEMON THREAD, NOT A KILL. Python cannot stop a running thread, so a call
-    that does not return is ABANDONED: it keeps running and may still finish its
-    side effect. The point is to bound the EPOCH, not the thread -- this fleet's
-    history is hard NFS mounts and D-state, and the collector must write its
-    record and let the next epoch proceed. `timeout_s=None` means no bound.
+    The bounding lives in `commands.call_bounded` -- one implementation, so a
+    command and an action cannot disagree about what a timeout means (an
+    abandoned daemon thread, and a recorded failure).
 
     The handler's own exception is carried back rather than raised: the caller
     audits it and returns a refusal, so nothing escapes into `collect_once`.
     """
-    box = {}
-
-    def target():
-        try:
-            box["value"] = fn(ctx, incident)
-        except BaseException as exc:                # noqa: BLE001 - carried back
-            box["error"] = exc
-
-    worker = threading.Thread(target=target, daemon=True)
-    worker.start()
-    worker.join(timeout_s)
-    if worker.is_alive():
-        return "timeout", None
-    if "error" in box:
-        return "error", box["error"]
-    return "ok", box.get("value")
+    return commands.call_bounded(lambda: fn(ctx, incident), timeout_s)
 
 
 def _record_failure(conn, incident, action, seq, dry_run, exit_status, detail):
@@ -88,14 +71,36 @@ def _remedies_last_hour(conn, key):
     return row[0] if row else 0
 
 
+def _resources(action, incident, module_id):
+    """Everything one execution must hold, in one tuple.
+
+    The action's own resources (resolved from the incident) plus the engine's
+    two invariants: ONE in-flight attempt per incident, and ONE per module. The
+    module cap is what keeps two incidents of the same action from running at
+    once -- a `transcode_restart` aimed at two boxes in the same epoch is still
+    two restarts, and the collector and an operator's `--approve` can otherwise
+    overlap.
+    """
+    out = list(action.resources_for(incident))
+    out.append("heal:incident:%s" % incident["key"])
+    if module_id:
+        out.append("heal:module:%s" % module_id)
+    return tuple(out)
+
+
 def attempt(action, incident, ctx, policy, conn, seq,
-            dry_run_fn=None, run_fn=None):
+            dry_run_fn=None, run_fn=None, module_id=None):
     """Run the gate sequence for one action, then execute or refuse.
 
     THE GATES, IN ORDER. Permission first (the authority ladder owns "did an
     operator grant this"), then the incident's own latch, then the action's
-    attempt budget, then its cooldown and hourly rate, then a required dry run,
-    and only then `run()`.
+    attempt budget, then its cooldown and hourly rate, then the RESOURCE LOCKS,
+    then a required dry run, and only then `run()`.
+
+    The resource locks are flock files under `cfg.lock_dir`, so the collector
+    and a one-shot `ctl --approve` process serialize on the same incident and
+    the same module. A held resource is a refusal, not an attempt: nothing ran,
+    so nothing is counted.
 
     `conn` is optional so the gate order can be tested without a store; when it
     is None the store-dependent gates (hourly cap, audit) are skipped, which is
@@ -114,10 +119,10 @@ def attempt(action, incident, ctx, policy, conn, seq,
                        % action.limits.max_attempts}
 
     # Cooldown keys off the incident row's own timestamp, which the state
-    # machine updates only when an attempt FAILED (`note_remedy_attempt`) or
-    # latched. A run that exited 0 but did not clear the condition is still
-    # bounded by the hourly cap below, so a working-then-regressing action
-    # cannot run once a minute forever.
+    # machine advances on EVERY executed attempt (`note_remedy_attempt`) --
+    # a run that exited 0 but did not clear the condition included. Success is
+    # the next OK observation, not the exit status, so an ineffective restart
+    # must cool down exactly like a failed one.
     last = incident.get("remedy_last_at")
     if last is not None:
         remaining = action.limits.cooldown_s - (time.time() - float(last))
@@ -132,13 +137,28 @@ def attempt(action, incident, ctx, policy, conn, seq,
                     "why": "per-hour cap reached (%d in the last hour)"
                            % recent}
 
+    # RESERVE BEFORE THE DRY RUN, SO THE DRY RUN AND THE RUN ARE ONE HOLD. The
+    # dry run reads the same state the run acts on; releasing between them would
+    # let a second process slip in and make the decision stale. A held resource
+    # refuses the whole attempt -- nothing ran, so nothing is counted.
+    lock_dir = getattr(getattr(ctx, "cfg", None), "lock_dir", None)
+    try:
+        with commands.reserve(_resources(action, incident, module_id),
+                              lock_dir=lock_dir):
+            return _execute(action, incident, ctx, conn, seq,
+                            dry_run_fn, run_fn, action.limits.timeout_s)
+    except commands.CommandError as exc:
+        return {"executed": False, "why": "resource held: %s" % exc}
+
+
+def _execute(action, incident, ctx, conn, seq, dry_run_fn, run_fn, timeout_s):
+    """The dry run and the run, inside the resource hold. Returns the outcome."""
     # 1. DRY RUN FIRST, ALWAYS, BOUNDED BY THE ACTION'S TIMEOUT. A dry run that
     # cannot say what it would do means the action is not understood well
     # enough to run. A REFUSAL, TIMEOUT OR EXCEPTION IS A FAILED ATTEMPT: it
     # advances the incident's counter and cooldown, so a permanently failing
     # dry run cools down and eventually latches instead of being retried every
     # epoch forever.
-    timeout_s = action.limits.timeout_s
     state, value = _call_bounded(dry_run_fn or action.dry_run, ctx, incident,
                                  timeout_s)
     if state == "timeout":
@@ -189,8 +209,12 @@ def attempt(action, incident, ctx, policy, conn, seq,
             evidence={"subject": incident.get("subject"), "seq": seq,
                       "dry_run": dr.detail},
             dry_run=False, exit_status=str(0 if out.ok else 1))
-        if not out.ok:
-            store.note_remedy_attempt(conn, incident["key"], out.detail)
+        # EVERY EXECUTED ATTEMPT COUNTS, successful exit or not. The engine
+        # cannot know whether the condition cleared -- that is the next OK
+        # observation's job -- so an exit status of 0 buys the attempt no
+        # discount. Without this, a restart that exits 0 and changes nothing is
+        # retried every cooldown forever and never reaches the latch.
+        store.note_remedy_attempt(conn, incident["key"], out.detail)
 
     return {"executed": True,
             "why": "executed; success is the next OK observation"}
@@ -232,27 +256,71 @@ def _propose(cfg, conn, module_id, action, inc, key):
         rationale=rationale, expires_at=time.time() + ttl_s)
 
 
+def _advisory(cfg, conn, module_id, action, inc, key):
+    """Surface an `advisory`-level recommendation as a deduped insight.
+
+    ADVISORY IS NOT EXECUTION. Nothing runs and no proposal is written; the
+    operator gets one `diagnosis` insight per `(incident, action)` inside the
+    proposal TTL, with the rationale and the evidence on it. Without this an
+    advisory authority was indistinguishable from `off` on every surface,
+    which is the "declared but not implemented" shape this project has paid
+    for twice.
+
+    Returns True when a row was written, False when the current recommendation
+    was already stored.
+    """
+    ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
+    since = time.time() - ttl_s
+    for row in store.recent_insights(
+            conn, kind="diagnosis", module=module_id,
+            target=inc.get("target"), check_id=inc.get("check_id"),
+            subject=inc.get("subject", ""), since=since):
+        try:
+            ev = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, ValueError):
+            ev = {}
+        if (ev.get("action_id") == action.id
+                and ev.get("incident_key") == key):
+            return False
+    rationale = (inc.get("last_detail")
+                 or "incident %s matches action %s" % (key, action.id))
+    store.record_insight(
+        conn, advisor="", module=module_id,
+        target=inc.get("target") or "", check_id=inc.get("check_id") or "",
+        subject=inc.get("subject") or "", kind="diagnosis",
+        severity="notable", confidence=0.0,
+        title="Recommended: %s" % action.id,
+        body=("The module's authority is `advisory`, so nothing runs "
+              "automatically. Recommended action %r (%s): %s"
+              % (action.id, action.title, rationale)),
+        evidence={"action_id": action.id, "incident_key": key,
+                  "rationale": rationale, "action_title": action.title})
+    return True
+
+
 def consider(cfg, conn, seq, results, ctx):
     """The collector seam: consider confirmed incidents for enabled modules.
 
     BOTH ENGINE SWITCHES ARE READ HERE. `MONITOR_REMEDIES`
-    (`cfg.remedies_enabled`) is the process kill switch and is checked before
-    any incident is read; `SENTINEL_REMEDIATION` (`policy["enabled"]`) is the
-    per-epoch master switch and is enforced by `actions.allowed`, per action.
+    (`cfg.remedies_enabled`) is the EXECUTION kill switch: with it off nothing
+    runs and no proposal is written. It is deliberately NOT an early return,
+    because an `advisory` authority is advice rather than execution and must
+    still surface its recommendation. `SENTINEL_REMEDIATION`
+    (`policy["enabled"]`) is the per-epoch master switch and is enforced by
+    `actions.allowed`, per action.
 
     There is NO module-level authority skip: `actions.allowed()` is asked per
     action, which is what lets an action-level override
     (`<MODULE>_ACTION_<ID>_AUTHORITY`) lift one action out of a module-level
     `off` -- the override works "in either direction", as `config.py` documents.
     """
-    if not getattr(cfg, "remedies_enabled", False):
-        return []
     # The collector already skips the healer on a dry run; this keeps the seam
     # safe if anything calls it directly. `ctx.cfg` is the same Config, checked
     # because the collector's contract is "a dry run claims nothing".
     if (getattr(cfg, "dry_run", False)
             or getattr(getattr(ctx, "cfg", None), "dry_run", False)):
         return []
+    can_execute = bool(getattr(cfg, "remedies_enabled", False))
 
     # The expiry deadline passes without an epoch having to notice at the tick
     # it lapses, so the sweep runs here -- once per epoch, before anything is
@@ -312,16 +380,24 @@ def consider(cfg, conn, seq, results, ctx):
             # allowed to take, and there is none.
             action = None
             proposal_for = None
+            advisory_for = None
             for cand in declared.values():
-                if actions.allowed(cand, inc, policy)[0]:
+                ok, why = actions.allowed(cand, inc, policy)
+                if ok and can_execute:
                     action = cand
                     break
+                if advisory_for is None and why == "advisory only":
+                    # The ladder answered "advisory only" only after the
+                    # incident, trigger and engine switches passed, so this is
+                    # an eligible recommendation.
+                    advisory_for = cand
                 # A `propose`-level action passes every OTHER gate. Asking the
                 # ladder with the level forced to `full` is the same question
                 # an approval will ask, so the destructive switch and the
                 # engine switch still refuse here -- a proposal nobody could
-                # approve must not be written.
-                if (proposal_for is None
+                # approve must not be written. With MONITOR_REMEDIES off an
+                # approval could not execute either, so no proposal is written.
+                if (proposal_for is None and can_execute
                         and actions.effective_level(cand, policy) == "propose"
                         and actions.allowed(
                             cand, inc, actions.approval_policy(policy,
@@ -332,8 +408,15 @@ def consider(cfg, conn, seq, results, ctx):
             # budget; checking only on the execution path let a propose-level
             # action keep writing proposals against an incident every executor
             # had already given up on. A module that permits NOTHING (action and
-            # proposal_for both None) still leaves the counter untouched.
+            # proposal_for both None) still leaves the counter untouched — and
+            # so does advice, which is a diagnosis rather than an attempt.
             if action is None and proposal_for is None:
+                if advisory_for is not None and conn is not None:
+                    wrote = _advisory(cfg, conn, mod.id, advisory_for, inc, key)
+                    out.append((key, advisory_for.id,
+                                {"executed": False,
+                                 "why": ("advisory: insight written" if wrote
+                                         else "advisory: insight already current")}))
                 continue
             if inc.get("remedy_attempts", 0) >= cap:
                 store.latch_remedy(conn, key, "remedy attempts exhausted")
@@ -349,5 +432,6 @@ def consider(cfg, conn, seq, results, ctx):
                 continue
 
             out.append((key, action.id,
-                        attempt(action, inc, ctx, policy, conn, seq)))
+                        attempt(action, inc, ctx, policy, conn, seq,
+                                module_id=mod.id)))
     return out

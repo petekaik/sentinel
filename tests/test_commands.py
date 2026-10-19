@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 from unittest import mock
 
@@ -371,6 +372,88 @@ def test_the_audit_keeps_a_head_and_the_full_sha(results):
         "different tails share one digest" % (len(row["output_head"]),
                                               row["output_sha"]))
     conn.close()
+
+
+def test_a_command_timeout_is_enforced_and_audited(results):
+    """`Command.timeout_s` bounds the CALLER, and a timeout is rc=1.
+
+    MUTATION THIS EXISTS FOR: declaring `timeout_s` and never using it. The
+    field then reads as a guarantee while a handler on a hard mount holds the
+    operator's CLI (or the epoch) forever.
+    """
+    tmp = tempfile.mkdtemp()
+    conn = store.connect(os.path.join(tmp, "m.sqlite"))
+    store.init(conn)
+    calls = []
+
+    def slow(ctx, args, dry_run=False):
+        time.sleep(0.3)
+        calls.append(1)
+        return commands.Result(True, "too late")
+
+    cmd = commands.Command(id="slow", title="Slow", args=[], timeout_s=0.05,
+                           handler=slow)
+    t0 = time.time()
+    try:
+        commands.dispatch("fleet", cmd, {}, actor="test", conn=conn)
+        got, failed = "", False
+    except commands.CommandFailed as exc:
+        got, failed = str(exc), True
+    elapsed = time.time() - t0
+    rows = store.list_command_runs(conn)
+    results.check(
+        "a hung handler cannot hold the caller past its timeout",
+        failed and "timed out" in got and elapsed < 0.25,
+        "failed=%r detail=%r elapsed=%.3f" % (failed, got, elapsed))
+    results.check(
+        "the timeout leaves an audit row with rc=1",
+        len(rows) == 1 and rows[0]["command"] == "slow"
+        and rows[0]["exit_status"] == 1,
+        "rows=%r -- a timed-out command with no audit reads as one that never "
+        "ran" % (rows,))
+    conn.close()
+
+
+def test_ctl_refuses_dry_run_for_deciding_verbs(results):
+    """A deciding verb under --dry-run is a refusal, never a silent execution.
+
+    `--approve`, `--reject` and `--revert-threshold` change something by
+    definition; accepting the flag and ignoring it is the worst of both. The
+    `--run` path keeps the flag, which is the control that proves the refusal
+    is specific to deciding verbs.
+    """
+    outcomes = {}
+    for argv in (["--approve", "1", "--dry-run"],
+                 ["--dry-run", "--approve", "1"],
+                 ["--reject", "1", "--dry-run"],
+                 ["--revert-threshold", "mem", "--dry-run"]):
+        outcomes[tuple(argv)] = _run_ctl(argv, {})[0]
+    results.check(
+        "every deciding verb refuses --dry-run with a non-zero exit",
+        all(rc != 0 for rc in outcomes.values()),
+        "outcomes=%r -- with the guard dropped each of these opens the store "
+        "and performs the decision the flag promised not to make"
+        % (outcomes,))
+
+    sysfs = _fleet_sysfs([("ttyUSB0", "1-1.2", "SYNTH001")])
+    try:
+        env = {"MONITOR_CHECKS": _harness_checks_conf(),
+               "MONITOR_DB": os.path.join(tempfile.mkdtemp(), "m.sqlite"),
+               "SERIAL_SYSFS": sysfs,
+               "SERIAL_CAPTURE_DIR": tempfile.mkdtemp(prefix="sentinel-cap-")}
+        rc, out = _run_ctl(["--run", "fleet.serial_status", "--dry-run"], env)
+        results.check(
+            "--dry-run still works for --run, which is what makes the refusal "
+            "specific rather than a blanket ban",
+            rc == 0 and "adapter" in out, "rc=%r out=%r" % (rc, out))
+    finally:
+        import shutil
+        shutil.rmtree(sysfs)
+
+
+def _harness_checks_conf():
+    from harness import CHECKS_CONF
+    return CHECKS_CONF
 
 
 def test_the_command_run_table_is_in_the_store_summary(results):
@@ -1008,6 +1091,8 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_a_handler_crash_is_audited_and_named,
          test_audit_row_is_written,
          test_the_audit_keeps_a_head_and_the_full_sha,
+         test_a_command_timeout_is_enforced_and_audited,
+         test_ctl_refuses_dry_run_for_deciding_verbs,
          test_the_command_run_table_is_in_the_store_summary,
          test_the_remedy_audit_is_exposed,
          test_serial_break_is_destructive_and_refuses_without_a_resolved_adapter,

@@ -5,7 +5,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import Results, check_classes, fleet_module  # noqa: E402
+from harness import CHECKS_CONF, Results, check_classes, fleet_module  # noqa: E402
 
 import checks                                     # noqa: E402
 import config as config_mod                       # noqa: E402
@@ -579,6 +579,74 @@ def test_spec_coverage_never_reads_green_on_an_empty_audit(results):
         % (res.status, res.detail))
 
 
+def test_the_platform_checks_conf_is_merged_with_module_specs(results):
+    """`MONITOR_CHECKS` must be LOADED, not merely documented as loaded.
+
+    MUTATION THIS EXISTS FOR: the platform file becoming dead at runtime after
+    the module split. The knob stayed, the docs said it was loaded, and a
+    platform/meta spec written there would silently never apply -- the
+    declared-but-not-implemented shape. The merge is also where a duplicate id
+    across the two sources becomes a startup error rather than one band
+    silently grading another check.
+    """
+    import inspect
+    import thresholds
+    import collect
+    import web
+    from checks.meta import SpecCoverage
+
+    root = tempfile.mkdtemp()
+    try:
+        path = os.path.join(root, "checks.conf")
+        with open(path, "w") as fh:
+            fh.write("[platform_probe]\ndirection = low_is_good\n"
+                     "green = 1\namber = 2\n")
+        cfg = config_mod.Config(env={"MONITOR_CHECKS": path})
+        enabled = loader.discover_enabled(cfg)
+        specs = thresholds.load_effective(thresholds.spec_mapping(cfg, enabled))
+        results.check(
+            "the platform file's spec is loaded with the module specs",
+            "platform_probe" in specs and specs["platform_probe"].owner == "config"
+            and "mem_available_mb" in specs,
+            "specs=%r -- the platform file was ignored at runtime"
+            % (sorted(specs),))
+        results.check(
+            "every runtime reader merges through one mapping",
+            "spec_mapping(" in inspect.getsource(collect.collect_once)
+            and "spec_mapping(" in inspect.getsource(web.build_state),
+            "a reader that loads only module files cannot see a platform spec")
+
+        with open(path, "w") as fh:
+            fh.write("[mem_available_mb]\ndirection = high_is_good\n"
+                     "green = 600\namber = 300\n")
+        cfg = config_mod.Config(env={"MONITOR_CHECKS": path})
+        try:
+            thresholds.load_effective(
+                thresholds.spec_mapping(cfg, loader.discover_enabled(cfg)))
+            duplicate = ""
+        except thresholds.ConfigError as exc:
+            duplicate = str(exc)
+        results.check(
+            "a spec id declared in both the platform and a module file is a "
+            "startup error",
+            "duplicate" in duplicate and "mem_available_mb" in duplicate,
+            "error=%r -- two bands for one check silently grade one of them"
+            % (duplicate,))
+
+        # The SpecCoverage audit says WHICH file family it audited; naming the
+        # retired single file sends the operator to edit nothing.
+        spec = thresholds.Spec("x", green=2, amber=1)
+        res = SpecCoverage().run(
+            checks.Context(cfg, {"x": spec}, {}, check_classes=[]))
+        results.check(
+            "an unclaimed spec names the module threshold files, not checks.conf",
+            "thresholds.conf" in res.detail and "in checks.conf" not in res.detail,
+            "detail=%r" % (res.detail,))
+    finally:
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_the_collector_freezes_a_disabled_modules_incidents_every_epoch(results):
     """The helpers are useless unless collect_once actually calls them, per epoch."""
     import sqlite3
@@ -594,7 +662,8 @@ def test_the_collector_freezes_a_disabled_modules_incidents_every_epoch(results)
     for _ in range(store.CONFIRM_POLLS):
         store.sync_incident(conn, seq, "cubox-1", "mem_available_mb", "host",
                             store.Status.FAIL, "low")
-    cfg = config_mod.Config(env={"FLEET_ENABLED": "0"})
+    cfg = config_mod.Config(env={"FLEET_ENABLED": "0",
+                                 "MONITOR_CHECKS": CHECKS_CONF})
 
     def incident():
         return conn.execute(
@@ -704,6 +773,7 @@ TESTS = (test_discovery_finds_and_orders_modules,
          test_a_disabled_module_freezes_its_incidents,
          test_a_disabled_module_freezes_only_its_own_checks,
          test_spec_coverage_never_reads_green_on_an_empty_audit,
+         test_the_platform_checks_conf_is_merged_with_module_specs,
          test_the_collector_freezes_a_disabled_modules_incidents_every_epoch,
          test_a_fleet_with_no_modules_does_not_read_green,
          test_spec_coverage_is_registered_once_by_the_platform,

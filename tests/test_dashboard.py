@@ -2260,6 +2260,50 @@ def test_insights_and_proposals_are_rendered_and_empty_safe(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_the_empty_approvals_queue_names_the_engine_switch(results):
+    """"Nothing pending" and "nothing could execute" are different facts.
+
+    The inbox was identical with MONITOR_REMEDIES on and off, so an operator
+    looking at an empty queue could not tell whether the fleet needed no
+    decision or the execution engine was simply switched off.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        off = Dash(tmpdir, MONITOR_REMEDIES="0")
+        off.epoch()
+        off_state, off_html = off.state(), off.html()
+
+        on = Dash(tmpdir, MONITOR_REMEDIES="1")
+        on.epoch()
+        on_state, on_html = on.state(), on.html()
+
+        results.check(
+            "build_state exposes the execution switch",
+            off_state.get("remedies_enabled") is False
+            and on_state.get("remedies_enabled") is True,
+            "off=%r on=%r" % (off_state.get("remedies_enabled"),
+                              on_state.get("remedies_enabled")))
+        results.check(
+            "the status API exposes it too, additively",
+            web.build_status(off.cfg, off.conn)["remedies_enabled"] is False
+            and web.build_status(on.cfg, on.conn)["remedies_enabled"] is True,
+            "an integrator cannot tell an empty queue from a disabled engine")
+        results.check(
+            "an empty queue with the engine off says so",
+            "No pending proposal" in off_html
+            and "MONITOR_REMEDIES=0" in off_html
+            and "DISABLED" in off_html,
+            "the off page does not name the switch")
+        results.check(
+            "an empty queue with the engine on reads as 'nothing to decide'",
+            "No pending proposal" in on_html
+            and "MONITOR_REMEDIES=0" not in on_html
+            and "nothing waiting for a human" in on_html,
+            "the on page reads as disabled or says nothing")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
          test_each_enabled_module_renders_its_own_section,
          test_a_disabled_module_is_loud_and_has_no_tiles,
@@ -2283,7 +2327,8 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_refresh_script_has_the_hooks_it_looks_for,
          test_the_newest_epoch_read_uses_an_index,
          test_the_page_fits_a_phone_without_being_asked,
-         test_insights_and_proposals_are_rendered_and_empty_safe)
+         test_insights_and_proposals_are_rendered_and_empty_safe,
+         test_the_empty_approvals_queue_names_the_engine_switch)
 
 
 def main():

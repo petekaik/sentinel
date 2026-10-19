@@ -440,6 +440,71 @@ def test_a_raising_healer_cannot_lose_the_epoch_record(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_host_restricts_the_per_box_expansion(results):
+    """`--host` must narrow what is EVALUATED, not only what is fetched.
+
+    Before the filter, the preload contacted one box while the checker expanded
+    every per_box check for both -- so the other box produced a full set of
+    UNKNOWN rows and its incidents could be frozen/resolved by an epoch that
+    never observed it.
+    """
+    import shutil
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with Fleet(tmpdir) as f:
+            f.down = False
+            for seq in range(1, store.CONFIRM_POLLS + 1):
+                store.sync_incident(f.conn, seq, "cubox-2", "mem_available_mb",
+                                    "host", store.Status.FAIL, "low")
+            before = f.conn.execute(
+                "SELECT state FROM incident WHERE target = 'cubox-2' "
+                "AND check_id = 'mem_available_mb'").fetchone()["state"]
+            summary = collect.collect_once(f.cfg, f.conn,
+                                           hosts_only=["cubox-1"])
+            seq = summary["seq"]
+            rows = f.conn.execute(
+                "SELECT target FROM check_run WHERE epoch_seq = ?", (seq,)
+            ).fetchall()
+            cubox2 = [r["target"] for r in rows if r["target"] == "cubox-2"]
+            cubox1 = [r["target"] for r in rows if r["target"] == "cubox-1"]
+            after = f.conn.execute(
+                "SELECT state FROM incident WHERE target = 'cubox-2' "
+                "AND check_id = 'mem_available_mb'").fetchone()["state"]
+            results.check(
+                "--host cubox-1 stores no cubox-2 check rows",
+                before == "open" and cubox2 == [],
+                "before=%r cubox-2 rows=%r -- expanding the other box "
+                "evaluates a host nobody fetched" % (before, cubox2))
+            results.check(
+                "and it does not freeze or resolve cubox-2's incident",
+                after == "open",
+                "state=%r -- an epoch that did not observe a box must not "
+                "decide anything about it" % (after,))
+            results.check(
+                "the control: cubox-1's own checks still ran",
+                bool(cubox1), "cubox-1 rows=%r" % (cubox1,))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_the_healer_loads_with_remedies_off(results):
+    """MONITOR_REMEDIES is the EXECUTION switch, not the advice switch.
+
+    An advisory-level authority surfaces recommendations through the healer;
+    with the healer absent because the execution switch is off, `advisory` on
+    every surface would look exactly like `off`.
+    """
+    cfg = config_mod.Config(env={"MONITOR_REMEDIES": "0",
+                                 "MONITOR_CHECKS": CHECKS_CONF})
+    healer = collect._load_healer(cfg)
+    results.check(
+        "the healer is loaded even when MONITOR_REMEDIES=0, so advisory advice "
+        "can still appear",
+        healer is not None and callable(getattr(healer, "consider", None)),
+        "healer=%r -- the engine reads the switch itself and executes nothing "
+        "while it is off" % (healer,))
+
+
 def test_showconf_lists_modules_including_disabled(results):
     """`--showconf` must answer what was found, not only what runs.
 
@@ -450,7 +515,8 @@ def test_showconf_lists_modules_including_disabled(results):
     tmpdir = tempfile.mkdtemp()
     try:
         def showconf(extra):
-            env = {"MONITOR_DB": os.path.join(tmpdir, "none.sqlite")}
+            env = {"MONITOR_DB": os.path.join(tmpdir, "none.sqlite"),
+                   "MONITOR_CHECKS": CHECKS_CONF}
             env.update(extra)
             buf = io.StringIO()
             with mock.patch.dict(os.environ, env, clear=True):
@@ -480,6 +546,8 @@ def test_showconf_lists_modules_including_disabled(results):
 TESTS = (test_outage_keeps_its_history, test_blip_leaves_no_trace,
          test_unknown_is_never_green, test_transport_argv_is_the_measured_one,
          test_a_raising_healer_cannot_lose_the_epoch_record,
+         test_host_restricts_the_per_box_expansion,
+         test_the_healer_loads_with_remedies_off,
          test_showconf_lists_modules_including_disabled)
 
 

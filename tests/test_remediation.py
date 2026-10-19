@@ -15,12 +15,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness                                    # noqa: E402
 from harness import Results                       # noqa: E402
 
 import actions                                    # noqa: E402
+import commands                                   # noqa: E402
 import config as config_mod                       # noqa: E402
 import store                                      # noqa: E402
 
@@ -34,7 +36,8 @@ def _act(**kw):
                 dry_run=lambda ctx, inc: actions.Result(True, "ok"),
                 run=lambda ctx, inc: actions.Result(True, "done"),
                 verify=("c", "*"),
-                limits=actions.Limits(max_attempts=2))
+                limits=actions.Limits(max_attempts=2),
+                resources_for=None)
     base.update(kw)
     return actions.Action(**base)
 
@@ -179,6 +182,26 @@ def test_config_authority_reads_the_module_env(results):
                   policy["enabled"] is False, repr(policy))
     results.check("MONITOR_REMEDIES is still a separate process switch",
                   cfg.remedies_enabled is True, repr(cfg.remedies_enabled))
+
+
+def test_allow_entries_are_case_insensitive(results):
+    """`FLEET_ALLOW` is compared with action ids, which are lowercase.
+
+    The natural thing an operator types is the same shape as the action's own
+    env key -- `STATE_MOUNT_CYCLE` -- so a case-sensitive comparison would
+    silently select nothing, leaving a `scoped` module that can never execute.
+    """
+    cfg = config_mod.Config(env={
+        "FLEET_AUTHORITY": "scoped",
+        "FLEET_ALLOW": "STATE_MOUNT_CYCLE",
+    })
+    policy = cfg.authority("fleet")
+    ok, why = actions.allowed(_act(id="state_mount_cycle"), OPEN, policy)
+    results.check(
+        "FLEET_ALLOW=STATE_MOUNT_CYCLE grants the lowercase action id",
+        ok and "scoped" in why, "allow=%r why=%r" % (policy["allow"], why))
+    ok, why = actions.allowed(_act(id="transcode_restart"), OPEN, policy)
+    results.check("an unlisted action is still refused", not ok, why)
 
 
 def test_config_authority_reads_action_level_overrides(results):
@@ -724,6 +747,153 @@ def test_success_is_not_claimed_by_exit_status(results):
                   "out=%r" % (out,))
 
 
+def test_a_successful_execution_still_consumes_an_attempt(results):
+    """Exiting 0 is not evidence the condition cleared, so it is still an attempt.
+
+    MUTATION THIS EXISTS FOR: counting an attempt only when `out.ok` is false.
+    Then a restart that exits 0 and leaves the incident open is retried every
+    cooldown forever and never reaches the latch -- the exact ineffective-remedy
+    loop the attempt budget exists to stop.
+    """
+    heal = _heal()
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        ran = []
+        a = _act(run=lambda ctx, inc: (ran.append(1)
+                                       or actions.Result(True, "done")),
+                 limits=actions.Limits(max_attempts=1, cooldown_s=0,
+                                       per_hour=99))
+        out = heal.consider(_Cfg(_policy()), conn, 4, [_Ran()],
+                            _Ctx([_Mod([a])]))
+        after = conn.execute("SELECT * FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()
+        results.check(
+            "a run that exited 0 still advances the attempt counter and "
+            "cooldown",
+            out and out[0][2]["executed"] and ran == [1]
+            and after["remedy_attempts"] == 1
+            and after["remedy_last_at"] is not None,
+            "out=%r ran=%r attempts=%r last=%r"
+            % (out, ran, after["remedy_attempts"], after["remedy_last_at"]))
+
+        # The next epoch finds the budget spent and latches -- the latch is
+        # reached by an EXECUTED action, not only by a failed one.
+        out = heal.consider(_Cfg(_policy()), conn, 5, [_Ran()],
+                            _Ctx([_Mod([a])]))
+        latched = conn.execute("SELECT * FROM incident WHERE key = ?",
+                               (row["key"],)).fetchone()
+        results.check(
+            "so the next epoch latches instead of executing again",
+            not out[0][2]["executed"] and out[0][2]["why"] == "latched"
+            and latched["state"] == "latched" and ran == [1],
+            "out=%r ran=%r state=%r" % (out, ran, latched["state"]))
+
+    # AND A LATER OK OBSERVATION STILL RESOLVES. The engine counting the
+    # attempt must not make the incident unclosable.
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        row = _open_row(conn)
+        heal.attempt(_act(), row, None, _policy(), conn, 4)
+        state = store.sync_incident(conn, 5, "t", "c", "s",
+                                    store.Status.OK, "cleared")
+        results.check(
+            "a later OK observation resolves an incident whose remedy was "
+            "attempted",
+            state == "resolved"
+            and conn.execute("SELECT state FROM incident WHERE key = ?",
+                             (row["key"],)).fetchone()["state"] == "resolved",
+            "state=%r -- counting the attempt must not become a verdict" % state)
+
+
+def test_a_held_resource_refuses_the_attempt(results):
+    """The engine reserves per incident, per module and per action resource."""
+    heal = _heal()
+    ran = []
+    a = _act(run=lambda ctx, inc: (ran.append(1)
+                                   or actions.Result(True, "done")),
+             resources_for=lambda inc: ("fleet:state:cubox-1",))
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(lock_dir=tmp))
+        for held in ("fleet:state:cubox-1", "heal:incident:k",
+                     "heal:module:m"):
+            with commands.reserve([held], lock_dir=tmp):
+                out = heal.attempt(a, _inc(), ctx, _policy(), None, 1,
+                                   module_id="m")
+            results.check(
+                "a held %s refuses the attempt before the dry run" % held,
+                not out["executed"] and "resource" in out["why"] and ran == [],
+                "out=%r ran=%r -- without the reserve two processes execute "
+                "one repair at once" % (out, ran))
+        # The control: with nothing held the same call executes.
+        out = heal.attempt(a, _inc(), ctx, _policy(), None, 1, module_id="m")
+        results.check("with nothing held the same attempt executes",
+                      out["executed"] and ran == [1], "out=%r ran=%r"
+                      % (out, ran))
+
+
+def test_two_incidents_of_one_action_serialize_on_the_module(results):
+    """A module cap of one: the second incident cannot run while the first does."""
+    heal = _heal()
+    ran = []
+    a = _act(run=lambda ctx, inc: (ran.append(inc["key"])
+                                   or actions.Result(True, "done")))
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = types.SimpleNamespace(cfg=types.SimpleNamespace(lock_dir=tmp))
+        with commands.reserve(["heal:module:m"], lock_dir=tmp):
+            out = heal.attempt(a, _inc(key="k2"), ctx, _policy(), None, 1,
+                               module_id="m")
+        results.check(
+            "a second incident of the same module is refused while the first "
+            "holds the module",
+            not out["executed"] and "resource" in out["why"] and ran == [],
+            "out=%r ran=%r" % (out, ran))
+
+
+def test_an_advisory_authority_surfaces_an_insight_and_never_executes(results):
+    heal = _heal()
+    ran = []
+    a = _act(run=lambda ctx, inc: (ran.append(1)
+                                   or actions.Result(True, "done")))
+    policy = {"authority": "advisory", "allow": (), "destructive": False}
+    with tempfile.TemporaryDirectory() as tmp:
+        conn = _fresh_conn(tmp)
+        _open_row(conn)
+        out = heal.consider(_Cfg(policy), conn, 4, [_Ran()], _Ctx([_Mod([a])]))
+        rows = store.list_insights(conn)
+        evidence = json.loads(rows[0]["evidence_json"]) if rows else {}
+        results.check(
+            "an advisory incident writes one diagnosis insight and runs nothing",
+            ran == [] and len(rows) == 1 and rows[0]["kind"] == "diagnosis"
+            and rows[0]["module"] == "m" and rows[0]["target"] == "t"
+            and rows[0]["check_id"] == "c" and rows[0]["subject"] == "s"
+            and rows[0]["title"] == "Recommended: a"
+            and evidence.get("action_id") == "a"
+            and evidence.get("incident_key") == "t|c|s"
+            and out and "advisory" in out[0][2]["why"],
+            "rows=%r out=%r ran=%r -- an advisory level that surfaces nothing "
+            "is indistinguishable from off" % (rows, out, ran))
+        heal.consider(_Cfg(policy), conn, 5, [_Ran()], _Ctx([_Mod([a])]))
+        results.check(
+            "the recommendation is deduped per (incident, action)",
+            len(store.list_insights(conn)) == 1,
+            "rows=%r -- one insight per epoch is the same sentence repeated"
+            % (store.list_insights(conn),))
+
+        # WITH THE EXECUTION SWITCH OFF, ADVICE STILL APPEARS. MONITOR_REMEDIES
+        # is the execution kill switch, not the advice switch.
+        out = heal.consider(_Cfg(policy, remedies=False), conn, 6, [_Ran()],
+                            _Ctx([_Mod([a])]))
+        results.check(
+            "with MONITOR_REMEDIES=0 no action runs but advisory advice still "
+            "appears",
+            ran == [] and len(store.list_insights(conn)) == 1 and out,
+            "out=%r ran=%r insights=%r. An advisory authority is not an "
+            "execution and must not be silenced by the execution switch."
+            % (out, ran, store.list_insights(conn)))
+
+
 def test_an_executed_attempt_is_audited(results):
     heal = _heal()
     with tempfile.TemporaryDirectory() as tmp:
@@ -746,9 +916,16 @@ def test_an_executed_attempt_is_audited(results):
         results.check("the audit row names the epoch it acted on",
                       evidence.get("seq") == 4,
                       "evidence=%r" % (evidence,))
-        results.check("a run that exited 0 does not count as a failed attempt",
-                      after["remedy_attempts"] == 0,
-                      "remedy_attempts=%r" % (after["remedy_attempts"],))
+        # CHANGED ON PURPOSE (finding: success-but-ineffective execution). An
+        # exit status of 0 is not evidence the condition cleared, so every
+        # EXECUTED attempt consumes the incident's budget. The separate test
+        # above proves the latch this makes reachable.
+        results.check("an executed attempt counts against the budget even when "
+                      "the command exited 0",
+                      after["remedy_attempts"] == 1,
+                      "remedy_attempts=%r -- an effective-looking failure that "
+                      "is not counted repeats every cooldown forever"
+                      % (after["remedy_attempts"],))
 
 
 def test_a_failed_run_is_executed_and_noted(results):
@@ -868,6 +1045,18 @@ def test_fleet_actions_are_declared(results):
     wired = {a.id for a in harness.fleet_module().actions()}
     results.check("the fleet module exposes the actions to the engine",
                   set(declared) <= wired, "wired=%r" % sorted(wired))
+    results.check(
+        "each fleet action declares a PER-BOX resource, so two boxes' repairs "
+        "do not serialize and one box's cannot run twice",
+        declared["state_mount_cycle"].resources_for({"target": "cubox-1"})
+        == ("fleet:state:cubox-1",)
+        and declared["transcode_restart"].resources_for({"target": "cubox-2"})
+        == ("fleet:transcode:cubox-2",)
+        and declared["transcode_restart"].resources_for({"target": "cubox-1"})
+        != declared["transcode_restart"].resources_for({"target": "cubox-2"}),
+        "state=%r transcode=%r"
+        % (declared["state_mount_cycle"].resources_for({"target": "cubox-1"}),
+           declared["transcode_restart"].resources_for({"target": "cubox-1"})))
 
 
 def test_fleet_action_triggers_name_real_checks(results):
@@ -899,14 +1088,46 @@ def test_fleet_action_triggers_name_real_checks(results):
         not inconsistent, "inconsistent=%r" % (inconsistent,))
     triggers = {a.id: {cid for cid, _ in a.triggers} for a in declared}
     results.check(
-        "the worker is restarted on a deadlock kill or a stall-watch report",
-        triggers.get("transcode_restart") == {"deadlock_kills", "stall_watch"},
-        "triggers=%r" % (triggers.get("transcode_restart"),))
+        "the worker is restarted on CURRENT-STATE signals only -- the age of "
+        "the job in flight and the idle pass cadence -- never on a historical "
+        "kill count or a static capability check",
+        triggers.get("transcode_restart")
+        == {"heartbeat_age_min", "pass_cadence_min"},
+        "triggers=%r -- deadlock_kills is a 360-minute window and stall_watch "
+        "never changes, so either would restart a healthy worker for hours"
+        % (triggers.get("transcode_restart"),))
     results.check(
         "the state mount is cycled on the checks that report it unusable",
         triggers.get("state_mount_cycle")
         == {"state_dir_tmpfs", "state_save_age_min"},
         "triggers=%r" % (triggers.get("state_mount_cycle"),))
+
+
+def test_transcode_restart_ignores_historical_and_capability_signals(results):
+    """A restart cannot clear history, so a historical signal must not fire it.
+
+    `deadlock_kills` counts kills over a 360-minute window, and `stall_watch`
+    is a static "can this worker detect a stall" fact. Both look alarming for
+    hours after a fault is over (or forever, for the capability check), and a
+    worker restart against either is a repair aimed at nothing.
+    """
+    from modules.fleet import actions as fleet_actions
+    action = {a.id: a for a in fleet_actions.actions_list()}["transcode_restart"]
+    policy = {"authority": "full", "allow": (), "destructive": True}
+    for check_id in ("deadlock_kills", "stall_watch"):
+        ok, why = actions.allowed(
+            action, {"state": "open", "target": "cubox-1",
+                     "subject": "cubox-1", "check_id": check_id}, policy)
+        results.check(
+            "%s does NOT trigger the restart action" % check_id,
+            not ok and "trigger" in why, "why=%r" % (why,))
+    for check_id, subject in (("heartbeat_age_min", "job"),
+                              ("pass_cadence_min", "cubox-1")):
+        ok, why = actions.allowed(
+            action, {"state": "open", "target": "cubox-1",
+                     "subject": subject, "check_id": check_id}, policy)
+        results.check(
+            "%s DOES trigger the restart action" % check_id, ok, why)
 
 
 def test_fleet_actions_are_off_by_default(results):
@@ -1265,6 +1486,7 @@ TESTS = (test_off_by_default,
          test_action_level_authority_overrides_the_module,
          test_config_authority_defaults_are_off,
          test_config_authority_reads_the_module_env,
+         test_allow_entries_are_case_insensitive,
          test_config_authority_reads_action_level_overrides,
          test_action_declarations_are_validated,
          test_authority_off_never_executes,
@@ -1285,12 +1507,17 @@ TESTS = (test_off_by_default,
          test_a_latched_incident_is_not_latched_again,
          test_stale_evidence_aborts,
          test_success_is_not_claimed_by_exit_status,
+         test_a_successful_execution_still_consumes_an_attempt,
+         test_a_held_resource_refuses_the_attempt,
+         test_two_incidents_of_one_action_serialize_on_the_module,
+         test_an_advisory_authority_surfaces_an_insight_and_never_executes,
          test_an_executed_attempt_is_audited,
          test_a_failed_run_is_executed_and_noted,
          test_cooldown_blocks_a_recent_attempt,
          test_the_per_hour_cap_bounds_executions,
          test_fleet_actions_are_declared,
          test_fleet_action_triggers_name_real_checks,
+         test_transcode_restart_ignores_historical_and_capability_signals,
          test_fleet_actions_are_off_by_default,
          test_fleet_action_dry_runs_do_not_ssh,
          test_fleet_action_commands_are_the_documented_repairs,

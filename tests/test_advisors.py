@@ -601,6 +601,92 @@ def test_a_per_advisor_history_override_is_read_and_still_capped(results):
         _close(tmp, conn)
 
 
+def test_the_per_advisor_override_reaches_the_real_reference_advisor(results):
+    """The override must change what the advisor ASKS FOR, not only the cap.
+
+    MUTATION THIS EXISTS FOR: resolving `days` in the runner and never telling
+    the advisor. `ReferenceAdvisor.advise()` calls `snapshot.window(self.
+    history_days)` again, so the second call overwrote both `requested_days` and
+    `since` with the class default 7 -- the override parsed, the run row said
+    14, and the advice still came from 7 days.
+    """
+    import intelligence
+
+    tmp, conn = _store()
+    try:
+        now = time.time()
+        # A check_run row gives the snapshot real history; without one every
+        # window is 0.0 days and the advisor's incident report is empty.
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        conn.execute(
+            "INSERT INTO incident (key, target, check_id, state, first_seen, "
+            "last_seen, first_epoch_seq) VALUES (?,?,?,?,?,?,?)",
+            ("cubox-1|c|s", "cubox-1", "c", "open", now - 300, now - 300, 1))
+        cfg = config_mod.Config(env={
+            "SENTINEL_ADVISORS": "reference",
+            "SENTINEL_ADVISOR_REFERENCE_HISTORY_DAYS": "14",
+        })
+        ctx = _FakeCtx([])
+        ctx.cfg = cfg
+        out = collect.run_advisors_for_epoch(cfg, conn, ctx)
+        rows = store.list_insights(conn)
+        evidence = json.loads(rows[0]["evidence_json"]) if rows else {}
+        results.check(
+            "the reference advisor's insight reflects the 14-day override, not "
+            "its 7-day default",
+            out and out[0]["advisor"] == "reference"
+            and out[0]["requested_days"] == 14
+            and evidence.get("window", {}).get("requested_days") == 14,
+            "out=%r evidence=%r -- the runner resolved the override and then "
+            "the advisor asked for its own default again"
+            % (out, evidence))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_repeated_advisor_insight_is_updated_not_duplicated(results):
+    """The reference advisor runs every epoch; one claim is one current row."""
+    import intelligence
+
+    tmp, conn = _store()
+    try:
+        now = time.time()
+        conn.execute(
+            "INSERT INTO check_run (ts, epoch_seq, target, check_id, status) "
+            "VALUES (?,?,?,?,?)", (now - 8 * DAY, 1, "cubox-1", "c", "ok"))
+        conn.execute(
+            "INSERT INTO incident (key, target, check_id, state, first_seen, "
+            "last_seen, first_epoch_seq) VALUES (?,?,?,?,?,?,?)",
+            ("cubox-1|c|s", "cubox-1", "c", "open", now - 300, now - 300, 1))
+        cfg = config_mod.Config(env={"SENTINEL_ADVISORS": "reference"})
+        ctx = _FakeCtx([])
+        ctx.cfg = cfg
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        first = store.list_insights(conn)
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        again = store.list_insights(conn)
+        results.check(
+            "a repeated insight updates the same row instead of inserting",
+            len(first) == 1 and [r["id"] for r in again] == [first[0]["id"]],
+            "first=%r again=%r -- a row per epoch is the same sentence once a "
+            "minute" % ([r["id"] for r in first], [r["id"] for r in again]))
+
+        # AFTER THE WINDOW a still-true claim is new evidence, not a repeat.
+        conn.execute("UPDATE insight SET ts = ? WHERE id = ?",
+                     (time.time() - 2 * advisors.INSIGHT_DEDUPE_S, first[0]["id"]))
+        collect.run_advisors_for_epoch(cfg, conn, ctx)
+        later = store.list_insights(conn)
+        results.check(
+            "after the dedupe window the advisor writes a fresh row",
+            len(later) == 2 and later[0]["id"] != first[0]["id"],
+            "ids=%r -- suppressing forever would hide a report that changed"
+            % ([r["id"] for r in later],))
+    finally:
+        _close(tmp, conn)
+
+
 class _FakeCtx:
     def __init__(self, modules):
         self.modules = modules
@@ -1726,8 +1812,15 @@ def test_the_llm_api_key_never_reaches_a_record_or_the_config_summary(results):
 
 
 def _open_incident(conn, target="t", check_id="c", subject="s"):
-    """Drive the real state machine to a confirmed `open` row."""
+    """Drive the real state machine to a confirmed `open` row.
+
+    A `check_run` row travels with each observation because the approval gate
+    requires the incident's evidence to exist in the NEWEST epoch -- an
+    incident created out of thin air is exactly the stale evidence it refuses.
+    """
     for seq in range(1, store.CONFIRM_POLLS + 1):
+        store.record_check(conn, seq, target, check_id, store.Status.FAIL,
+                           "bad", subject=subject)
         store.sync_incident(conn, seq, target, check_id, subject,
                             store.Status.FAIL, "bad", {"why": "fixture"})
     return dict(conn.execute(
@@ -1918,6 +2011,124 @@ def test_an_action_approval_executes_audits_and_marks_executed(results):
             and runs[0]["exit_status"] == 0,
             "runs=%r -- a human decision that becomes an action must be "
             "visible in the command audit" % (runs,))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_proposal_claim_is_atomic_and_releasable(results):
+    """Two concurrent approvals must not both execute one proposal.
+
+    The conditional UPDATE is the mechanism; the check-then-execute path in
+    `approve_proposal` cannot promise it, because both processes can read
+    `pending` before either writes. A refused execution releases the claim so
+    the proposal stays decidable, and `mark_proposal_executed` only accepts a
+    row that is still `approved`.
+    """
+    tmp, conn = _store()
+    try:
+        inc = _open_incident(conn)
+        pid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        first = store.claim_proposal(conn, pid, "operator")
+        second = store.claim_proposal(conn, pid, "intruder")
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "exactly one of two claims wins, and it records the decider",
+            first == 1 and second == 0 and row["state"] == "approved"
+            and row["actor"] == "operator" and row["decided_at"] > 0,
+            "first=%r second=%r row=%r" % (first, second, row))
+
+        released = store.release_proposal(conn, pid)
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "a refused execution releases the claim back to pending",
+            released == 1 and row["state"] == "pending"
+            and row["decided_at"] is None and row["actor"] is None
+            and row["executed_at"] is None,
+            "released=%r row=%r" % (released, row))
+
+        results.check(
+            "an unclaimed (pending) proposal cannot skip the claim into "
+            "executed",
+            store.mark_proposal_executed(conn, pid) == 0
+            and store.get_proposal(conn, pid)["state"] == "pending",
+            "row=%r" % (store.get_proposal(conn, pid),))
+
+        results.check(
+            "the released proposal can be claimed again",
+            store.claim_proposal(conn, pid, "operator") == 1
+            and store.mark_proposal_executed(conn, pid) == 1
+            and store.get_proposal(conn, pid)["state"] == "executed",
+            "row=%r" % (store.get_proposal(conn, pid),))
+    finally:
+        _close(tmp, conn)
+
+
+def test_an_approval_refuses_stale_evidence_and_stays_pending(results):
+    """An approval acts on the NEWEST epoch, not on a row that outlived it."""
+    tmp, conn = _store()
+    try:
+        ran = []
+        mod = _ActMod([_action(ran=ran)])
+        inc = _open_incident(conn)
+        pid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        conn.execute("DELETE FROM check_run")
+        try:
+            ctl.approve_proposal(_ProposalCfg(), conn, {"m": mod}, pid,
+                                 "operator", ctx=object())
+            got = ""
+        except ctl.ProposalRefused as exc:
+            got = str(exc)
+        results.check(
+            "an approval with no check_run row in the newest epoch is refused "
+            "and the proposal stays pending",
+            "newest epoch" in got and ran == []
+            and store.get_proposal(conn, pid)["state"] == "pending",
+            "refusal=%r ran=%r row=%r"
+            % (got, ran, store.get_proposal(conn, pid)))
+
+        # WITH FRESH EVIDENCE the same approval executes -- so the refusal
+        # above is the freshness gate, not an unrelated failure.
+        store.record_check(conn, 9, "t", "c", store.Status.FAIL, "still bad",
+                           subject="s")
+        msg = ctl.approve_proposal(_ProposalCfg(), conn, {"m": mod}, pid,
+                                   "operator", ctx=object())
+        results.check(
+            "with a check_run row in the newest epoch the approval executes",
+            ran == [1] and "executed" in msg
+            and store.get_proposal(conn, pid)["state"] == "executed",
+            "ran=%r msg=%r row=%r"
+            % (ran, msg, store.get_proposal(conn, pid)))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_refused_execution_releases_the_proposal(results):
+    """A dry run that says no leaves the proposal decidable, not approved."""
+    tmp, conn = _store()
+    try:
+        ran = []
+        a = actions.Action(
+            id="a", title="a", triggers=[("c", "*")],
+            danger="state_changing",
+            dry_run=lambda ctx, inc: actions.Result(False, "dry-run says no"),
+            run=lambda ctx, inc: (ran.append(1) or actions.Result(True, "done")),
+            verify=("c", "*"), limits=actions.Limits(max_attempts=5))
+        mod = _ActMod([a])
+        inc = _open_incident(conn)
+        pid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        try:
+            ctl.approve_proposal(_ProposalCfg(), conn, {"m": mod}, pid,
+                                 "operator", ctx=object())
+            got = ""
+        except ctl.ProposalRefused as exc:
+            got = str(exc)
+        results.check(
+            "an execution refusal releases the claim and leaves the proposal "
+            "pending",
+            "not executed" in got and ran == []
+            and store.get_proposal(conn, pid)["state"] == "pending",
+            "refusal=%r ran=%r row=%r"
+            % (got, ran, store.get_proposal(conn, pid)))
     finally:
         _close(tmp, conn)
 
@@ -2662,6 +2873,8 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_insights_carry_the_window_and_each_run_is_recorded,
          test_the_history_cap_is_applied_to_every_advisor,
          test_a_per_advisor_history_override_is_read_and_still_capped,
+         test_the_per_advisor_override_reaches_the_real_reference_advisor,
+         test_a_repeated_advisor_insight_is_updated_not_duplicated,
          test_a_negative_history_cap_refuses_to_start,
          test_the_selector_gates_advisors_and_accepts_both_forms,
          test_a_selector_that_names_nothing_is_a_loud_error,
@@ -2695,6 +2908,9 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_propose_writes_one_pending_proposal_and_never_runs,
          test_an_expired_proposal_is_not_reused,
          test_an_action_approval_executes_audits_and_marks_executed,
+         test_a_proposal_claim_is_atomic_and_releasable,
+         test_an_approval_refuses_stale_evidence_and_stays_pending,
+         test_a_refused_execution_releases_the_proposal,
          test_an_approval_refuses_every_unsafe_state,
          test_reject_decides_and_never_executes,
          test_an_approved_threshold_changes_grading_without_a_rebuild,

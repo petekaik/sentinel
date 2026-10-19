@@ -16,10 +16,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MONITOR = os.path.dirname(HERE)
 APP = os.path.join(MONITOR, "app")
 FIXTURES = os.path.join(HERE, "fixtures")
-# The fleet module's threshold file. The platform's root checks.conf is
-# comment-only since Task 3; a suite that pointed there would load {} and every
-# spec-graded check would report UNKNOWN for a missing spec.
-CHECKS_CONF = os.path.join(APP, "modules", "fleet", "thresholds.conf")
+# The two threshold sources, kept separate because the RUNTIME now merges them:
+# `CHECKS_CONF` is the platform file (`MONITOR_CHECKS`, comment-only today), and
+# `FLEET_THRESHOLDS` is the fleet module's own file. A suite that pointed
+# MONITOR_CHECKS at the fleet file would make the runtime load the same specs
+# twice and fail on duplicate ids; `load_specs` reads the fleet file directly so
+# a check fixture still grades against its own bands.
+CHECKS_CONF = os.path.join(MONITOR, "checks.conf")
+FLEET_THRESHOLDS = os.path.join(APP, "modules", "fleet", "thresholds.conf")
 
 if APP not in sys.path:
     sys.path.insert(0, APP)
@@ -109,7 +113,7 @@ def load_specs(cfg, conn=None):
     file's band; a test that applies an override passes its connection.
     """
     import thresholds
-    return thresholds.load_effective({"config": cfg.checks_conf}, conn)
+    return thresholds.load_effective({"fleet": FLEET_THRESHOLDS}, conn)
 
 
 def fleet_config(cfg):

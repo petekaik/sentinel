@@ -832,6 +832,15 @@ class VpuPresent(_BoxCheck):
     spec = None
     title = "VPU driver, nodes and encoder"
 
+    # ONE SUBJECT ON EVERY PATH (item 75). sync_incident resolves the row it
+    # looks up BY (target, check_id, subject), so a check that fails under one
+    # subject and passes under another opens a row no green observation can
+    # ever close. This check did exactly that until 2026-10-19: three failure
+    # subjects and subject="vpu" on success left two `v4l2m2m` rows open after
+    # the encoder was confirmed present. `v4l2m2m` is the subject kept because
+    # it is what the live incidents are keyed by.
+    SUBJECT = "v4l2m2m"
+
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
         if unk:
@@ -852,26 +861,26 @@ class VpuPresent(_BoxCheck):
             return fail(self.id, self.box,
                         "the coda_vpu module is NOT loaded -- the VPU is not "
                         "bound, so every transcode falls back to CPU or fails",
-                        subject="coda_vpu", evidence=ev)
+                        subject=self.SUBJECT, evidence=ev)
         if nnodes == 0:
             return fail(self.id, self.box,
                         "no /dev/video* nodes -- the VPU is bound but exposed "
-                        "nothing", subject="video_nodes", evidence=ev)
+                        "nothing", subject=self.SUBJECT, evidence=ev)
         if enc is None:
             return unknown(self.id, self.box,
                            "coda_vpu is loaded and %d video nodes exist, but "
                            "the ffmpeg encoder list could not be read, so "
                            "'the VPU encoder works' is UNVERIFIED" % nnodes,
-                           subject="v4l2m2m", evidence=ev)
+                           subject=self.SUBJECT, evidence=ev)
         if enc == 0:
             return fail(self.id, self.box,
                         "ffmpeg reports NO v4l2m2m encoder -- the VPU FFmpeg is "
                         "missing or was built without --enable-v4l2-m2m",
-                        subject="v4l2m2m", evidence=ev)
+                        subject=self.SUBJECT, evidence=ev)
         return ok(self.id, self.box,
                   "coda_vpu loaded, %d video nodes, %d v4l2m2m entry(ies), "
                   "firmware %s" % (nnodes, enc, fw or "(none listed)"),
-                  subject="vpu", evidence=ev)
+                  subject=self.SUBJECT, evidence=ev)
 
 
 class StateDirOnTmpfs(_BoxCheck):

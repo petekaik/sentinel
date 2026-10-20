@@ -218,6 +218,25 @@ class Context:
                            % module_id)
         return {s.key: s.resolve(self.cfg.env) for s in mod.settings}
 
+    def merge_dynamic_specs(self):
+        """Add the settings-declared bands to `self.specs`; A FILE SPEC WINS.
+
+        Dynamic ids are the module's, and a module that names one the same as a
+        declared threshold would otherwise replace the operator's file-declared
+        band with whatever the settings happened to say -- a silent override of
+        the file that every reader then grades against. The collision is noted
+        rather than resolved: the fix is a namespaced id, not a precedence rule
+        nobody can see.
+        """
+        for sid, spec in self.dynamic_specs.items():
+            if sid in self.specs:
+                self.note(
+                    "module-declared threshold %r collides with a declared "
+                    "spec; the declared spec is kept (namespace dynamic ids by "
+                    "module)" % sid)
+                continue
+            self.specs[sid] = spec
+
     def attempt(self, host):
         """The platform's per-host attempt record for this epoch."""
         if host not in self.attempts:

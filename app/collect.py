@@ -203,7 +203,7 @@ def evaluate(instances, ctx):
                 "THIS CHECK RAISED, so its verdict is unknown rather than "
                 "healthy. Traceback: %s"
                 % traceback.format_exc().strip().replace("\n", " | ")[-900:],
-                subject="check-error",
+                subject=getattr(chk, "subject", "check-error"),
                 evidence={"exception": True},
             )
             res.duration_ms = int((_now() - t0) * 1000)
@@ -724,12 +724,28 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     static = checks.expand(classes, targets)
     # SETTINGS-DRIVEN INSTANCES. Built from the SAME preloaded ctx (so a module
     # that builds one per configured device sees the settings the epoch is about
-    # to grade against) and added to ctx.specs so `result_from_spec` can find
-    # the band they declare at run time. A dynamic instance is never per_box:
-    # its target is the module's reporting target (`snmp`) and its subject names
-    # the device, so the incident key stays (target, check_id, subject).
-    dynamic = [i for m in enabled for i in m.check_instances(ctx)]
-    ctx.specs.update(ctx.dynamic_specs)
+    # to grade against). A dynamic instance is never per_box: its target is the
+    # module's reporting target (`snmp`) and its subject names the device, so
+    # the incident key stays (target, check_id, subject).
+    #
+    # ISOLATED PER MODULE, like `preload` and `after_epoch`. Settings are
+    # operator input: malformed JSON in `.env` makes `check_instances` raise,
+    # and an escaping exception here would kill the WHOLE epoch -- taking every
+    # other module's checks down with it. The module's own checks are absent
+    # this epoch and the reason is in the run note.
+    dynamic = []
+    for m in enabled:
+        try:
+            dynamic.extend(m.check_instances(ctx))
+        except Exception as exc:                   # noqa: BLE001 - isolated
+            ctx.module_errors[m.id + ":check_instances"] = \
+                traceback.format_exc()
+            first = (str(exc).strip().splitlines()
+                     or [type(exc).__name__])[0]
+            ctx.note("module %s failed to build its settings-driven checks: "
+                     "%s; they are absent from this epoch" % (m.id, first))
+            continue
+    ctx.merge_dynamic_specs()
     results = evaluate(static + dynamic, ctx)
 
     # THIS ORDER MATTERS. The attempt rows are written BEFORE the escalation

@@ -176,7 +176,26 @@ class Module:
         return self._checks
 
     def check_instances(self, ctx):
-        """Instances built from settings. Empty unless the module says otherwise."""
+        """Instances built from settings. Empty unless the module says otherwise.
+
+        THE CONTRACT, because these instances bypass the class registry:
+
+          * NEVER `per_box`. Set `target` to the module's own reporting target
+            (`snmp`) and put the configured device in `subject`; the incident key
+            is `(target, check_id, subject)`, so the subject is what keeps two
+            devices apart.
+          * Each instance sets `spec` to the spec ID it grades against, and the
+            Module registers that spec in `ctx.dynamic_specs` as it builds the
+            instance. File-declared specs win a collision (the collision is
+            noted), so NAMESPACE dynamic ids by module: `snmp_cpu_sw1`, not
+            `cpu`.
+          * Give each instance a UNIQUE `metric` name per (target, epoch). The
+            dashboard looks a reading up by `(target, metric, epoch)`, so two
+            instances sharing a metric would each display the other's number.
+          * Settings are operator input: a parse failure should raise, and both
+            readers isolate it -- the collector notes it and continues the epoch;
+            the page renders an UNKNOWN `check_instances` row for the module.
+        """
         if self._check_instances is not None:
             return list(self._check_instances(ctx))
         return []

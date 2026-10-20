@@ -40,6 +40,7 @@ a slow query cannot block the collector's writer.
 import html
 import json
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import checks
@@ -92,15 +93,53 @@ def _rows(conn, sql, args=()):
     return rows, len(rows)
 
 
-# THE NEWEST EPOCH'S ROWS, in one statement, and NAMED rather than inlined
-# because `tests/test_dashboard.py` asserts that the store can serve it with an
-# index. A check that re-typed this SQL would agree with any change to it
-# (items 84, 58) -- and the failure it guards is invisible: without
-# `check_run_epoch` this is a full scan, correct in every output and slow enough
-# that the page looks like a dead monitor. See the index in store.py's SCHEMA.
-NEWEST_EPOCH_SQL = ("SELECT target, check_id, status, detail, ts, epoch_seq "
-                    "FROM check_run "
+# THE INCIDENT KEY IS `(target, check_id, subject)`, so the newest-epoch read
+# must carry the subject too: a module's settings-driven instances share one
+# check id and differ only in their subject, and keying rows without it made two
+# configured devices show each other's verdict (one read OK, the other read
+# "no result"). `tests/test_dashboard.py` asserts the store can serve this with
+# an index, and re-typing it there would agree with any change to it (items 84,
+# 58). See the index in store.py's SCHEMA.
+NEWEST_EPOCH_SQL = ("SELECT target, check_id, subject, status, detail, ts, "
+                    "epoch_seq FROM check_run "
                     "WHERE epoch_seq = (SELECT MAX(epoch_seq) FROM check_run)")
+
+
+class _InstanceBuildFailure:
+    """A visible UNKNOWN row for a module whose `check_instances` raised.
+
+    A module whose settings do not parse (malformed JSON in `.env`, say) must
+    not take down the page, and it must not silently lose its checks either: a
+    row that vanishes reads exactly like a green one. So the page renders this
+    placeholder, carrying the failure's first line, in the module's own section.
+    """
+
+    id = "check_instances"
+    title = "Settings-driven checks could not be built"
+    spec = None
+    informational = False
+
+    def __init__(self, module, detail):
+        self.module_owner = module
+        self.target = module.targets[0] if module.targets else module.id
+        self.subject = module.id
+        self.forced_detail = detail
+
+
+def _pop_result(by_key, chk):
+    """The stored row for one instance, keyed by subject where it has one.
+
+    A dynamic instance declares its `subject` (the device); two instances of one
+    check id differ ONLY by that, so the subject is part of the key. A static
+    check has no `subject` attribute and writes exactly one row, so its pair is
+    enough -- and looking it up by pair keeps every existing check's row.
+    """
+    if hasattr(chk, "subject"):
+        return by_key.pop((chk.target, chk.id, chk.subject or ""), None)
+    for key in list(by_key):
+        if key[0] == chk.target and key[1] == chk.id:
+            return by_key.pop(key)
+    return None
 
 
 def build_state(cfg, conn, now=None):
@@ -145,13 +184,29 @@ def build_state(cfg, conn, now=None):
     # THE PAGE RENDERS THE SAME INSTANCES THE COLLECTOR EVALUATES. A module's
     # `check_instances` are built from settings, so they exist on no registry and
     # a class-only page would silently omit every device the operator configured.
-    # A settings-only Context: no preload hook is called, so building the page
-    # cannot touch the fleet.
+    # A settings-only Context: `context()` must do no I/O, and `preload` is
+    # never called, so building the page cannot touch the fleet.
     ctx = checks.Context(cfg, specs, {}, modules=enabled)
     static = checks.expand(classes, checks.expansion_targets(enabled))
     dynamic = []
     for m in enabled:
-        instances = m.check_instances(ctx)
+        try:
+            # The collector's preload calls these two in this order; a
+            # `check_instances` that reads state installed by `context` must see
+            # it here too, or the page and the epoch disagree about the fleet.
+            m.context(ctx)
+            instances = m.check_instances(ctx)
+        except Exception as exc:                   # noqa: BLE001 - isolated
+            ctx.module_errors[m.id + ":check_instances"] = \
+                traceback.format_exc()
+            first = (str(exc).strip().splitlines()
+                     or [type(exc).__name__])[0]
+            detail = ("module %s could not build its settings-driven checks, "
+                      "so they are NOT being evaluated: %s"
+                      % (m.id, first))
+            ctx.note(detail)
+            dynamic.append(_InstanceBuildFailure(m, detail))
+            continue
         for inst in instances:
             # Attribute the row to its module for the same reason a class is:
             # the page names who owns the check.
@@ -159,13 +214,15 @@ def build_state(cfg, conn, now=None):
         dynamic.extend(instances)
     # The band the page displays, not just the file's: a dynamic spec is
     # declared by the module when it builds its instances, and it must render
-    # with its own unit/note like any file-declared one.
-    specs.update(ctx.dynamic_specs)
+    # with its own unit/note like any file-declared one. A FILE spec wins a
+    # collision -- see Context.merge_dynamic_specs.
+    ctx.merge_dynamic_specs()
     claimed, deferred, unclaimed = thresholds.audit(
         specs, classes, extra_claimed=set(ctx.dynamic_specs))
 
     current, n_current = _rows(conn, NEWEST_EPOCH_SQL)
-    by_key = {(r["target"], r["check_id"]): r for r in current}
+    by_key = {(r["target"], r["check_id"], r["subject"] or ""): r
+              for r in current}
 
     # CONFIRMED ONLY, and taken from the store's own definition rather than a
     # second copy of the rule (item 84). This query used LIVE_SQL, which
@@ -180,25 +237,29 @@ def build_state(cfg, conn, now=None):
 
     tiles, informational, others, missing = [], [], [], []
     for chk in static + dynamic:
-        row = by_key.pop((chk.target, chk.id), None)
+        row = _pop_result(by_key, chk)
+        forced = getattr(chk, "forced_detail", None)
         spec = specs.get(chk.spec) if chk.spec else None
-        owner = module_of.get(chk.id)
+        owner = module_of.get(chk.id) or getattr(chk, "module_owner", None)
         item = {
             "target": chk.target,
             "check_id": chk.id,
+            "subject": getattr(chk, "subject", None),
             "module": owner.id if owner else None,
             "title": chk.title or chk.id,
             "spec": chk.spec,
             "informational": bool(getattr(chk, "informational", False)),
-            "status": row["status"] if row else store.Status.UNKNOWN.value,
-            "detail": row["detail"] if row else
-                      "no result is stored for the newest epoch, so this check's "
-                      "verdict is UNKNOWN -- not healthy",
+            "status": (store.Status.UNKNOWN.value if forced
+                       else row["status"] if row
+                       else store.Status.UNKNOWN.value),
+            "detail": forced or (row["detail"] if row else
+                                 "no result is stored for the newest epoch, so "
+                                 "this check's verdict is UNKNOWN -- not healthy"),
             "value": None, "unit": spec.unit if spec else "",
             "spec_note": spec.note if spec else None,
             "unavailable_reason": spec.unavailable_reason if spec else None,
             "claim": spec.claim if spec else None,
-            "has_result": row is not None,
+            "has_result": row is not None or forced is not None,
         }
         # THE READING AND THE VERDICT MUST COME FROM THE SAME EPOCH.
         #
@@ -234,12 +295,13 @@ def build_state(cfg, conn, now=None):
     # and the journal capture rows are emitted by collect.py, not by a Check
     # class -- and "we cannot see cubox-1" is exactly the row an operator must
     # never lose because the renderer was built from the wrong list.
-    extra = [{"target": t, "check_id": c, "title": c, "status": r["status"],
+    extra = [{"target": t, "check_id": c, "subject": s, "title": c,
+              "status": r["status"],
               "detail": r["detail"], "from": "collector", "module": None,
               "spec": None, "value": None, "unit": "", "has_result": True,
               "informational": False, "spec_note": None,
               "unavailable_reason": None, "claim": None}
-             for (t, c), r in sorted(by_key.items())]
+             for (t, c, s), r in sorted(by_key.items())]
 
     summary = store.db_summary(conn)
 

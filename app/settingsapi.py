@@ -219,6 +219,30 @@ def module_manifests(cfg, conn, modules, specs):
     return out
 
 
+def _typed_value(setting, raw):
+    """One env/default value as the type the declaration says it is.
+
+    AN ENV LIST IS A JSON STRING. Returning it unresolved made the SPA render
+    every `.env`-configured list as empty (`Array.isArray("...")` is false), and
+    the first save then replaced the whole list with the blank one the editor
+    showed. Parsing here also types ints and bools, so `source: env` and
+    `source: db` describe the same kind of value.
+
+    A value that cannot be parsed is returned AS WRITTEN: the settings view is
+    where an operator has to see the broken value in order to fix it, and a 500
+    on the read surface would be a worse answer than the string itself.
+    """
+    try:
+        value = setting.parse(raw)
+        if setting.kind == "list":
+            rows, _why = setting.parse_item(value)
+            if rows is not None:
+                value = rows
+        return value
+    except (TypeError, ValueError):
+        return raw
+
+
 def settings_view(cfg, conn, modules):
     """Effective values per module: `{key: {value, source, secret_set}}`.
 
@@ -226,6 +250,10 @@ def settings_view(cfg, conn, modules):
     `default` (the declaration) -- because "the value is X" without "because of
     what" is how a UI shows a number nobody can change. A secret never carries a
     value on any source; `secret_set` says whether an override exists.
+
+    Every non-secret value is TYPED, whichever layer it came from: a list
+    setting supplied only by `.env` is a list, not its JSON text (see
+    `_typed_value`).
     """
     check_declarations(modules)
     values = store.setting_rows(conn)
@@ -243,11 +271,11 @@ def settings_view(cfg, conn, modules):
                                      "source": source}
                 continue
             if key in values:
-                value = values[key]
+                value = values[key]                     # stored typed value
             elif setting.key in base:
-                value = base[setting.key]
+                value = _typed_value(setting, base[setting.key])
             else:
-                value = setting.default
+                value = _typed_value(setting, setting.default)
             view[setting.key] = {"value": value, "source": source}
         out[mod.id] = view
     return out
@@ -275,11 +303,56 @@ def _declared(mod):
     return {s.key: s for s in mod.settings}
 
 
+def _effective_values(cfg, conn, mod, body, declared):
+    """Every declared setting's effective value: stored/env under the body.
+
+    THE MODULE HOOK MUST SEE BOTH SIDES OF A CROSS-FIELD RULE. The SPA sends
+    only the fields the operator touched, so a checks-only save would otherwise
+    hand `validate_settings` a check row and no device list to resolve it
+    against -- and the rule would be skipped exactly when it matters.
+
+    The body wins (it is the pending write), then the DB override, then `.env`,
+    then the declaration's default. A stored or env value that cannot be parsed
+    is refused here rather than passed on half-understood: the field is named,
+    so the operator knows which value to fix.
+    """
+    stored = store.setting_rows(conn)
+    base = dict(getattr(cfg, "_base_env", {}) or {})
+    out = {}
+    for setting in mod.settings:
+        key = (mod.id, setting.key)
+        if setting.key in body:
+            out[setting.key] = body[setting.key]
+            continue
+        if key in stored:
+            out[setting.key] = stored[key]
+            continue
+        raw = base.get(setting.key)
+        if raw is None or raw == "":
+            raw = setting.default
+        try:
+            value = setting.parse(raw)
+            if setting.kind == "list":
+                rows, _why = setting.parse_item(value)
+                if rows is not None:
+                    value = rows
+        except (TypeError, ValueError) as exc:
+            raise SettingsError(
+                "invalid_value",
+                "%s's stored/.env value cannot be parsed: %s"
+                % (setting.key, exc), setting.key)
+        out[setting.key] = value
+    return out
+
+
 def write_settings(cfg, conn, mod, body, actor):
     """Validate and write one module's settings, returning its new view.
 
     Validation is done for the WHOLE body before the first row is written: a
     body whose second key is a typo must not leave the first one in force.
+    The module's cross-field hook receives the MERGED effective values (body
+    over stored over env), so a partial body is still validated against the
+    configuration it will join.
     """
     check_declarations([mod])
     declared = _declared(mod)
@@ -287,6 +360,13 @@ def write_settings(cfg, conn, mod, body, actor):
     for key, value in (body or {}).items():
         if key not in declared:
             raise SettingsError("unknown_key", "unknown setting %r" % key, key)
+        if declared[key].secret and (value is None or value == ""):
+            # A BLANK SECRET IS "UNCHANGED", NOT "CLEAR IT". The read surface
+            # never returns a secret, so a form cannot echo the stored value
+            # back; writing the blank it shows would erase a credential nobody
+            # meant to touch. Removing the override (DELETE) is the way to
+            # clear one.
+            continue
         try:
             values[key] = declared[key].parse(value)
         except (TypeError, ValueError) as exc:
@@ -296,8 +376,8 @@ def write_settings(cfg, conn, mod, body, actor):
             if parsed is None:
                 raise SettingsError("invalid_value", why, key)
             values[key] = parsed
-    # Module cross-field validation (e.g. an OID naming a missing device).
-    why = mod.validate_settings(values)
+    effective = _effective_values(cfg, conn, mod, values, declared)
+    why = mod.validate_settings(effective)
     if why:
         raise SettingsError("invalid_value", why)
     for key, value in values.items():

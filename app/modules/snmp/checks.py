@@ -28,12 +28,29 @@ import re
 import thresholds
 from checks import Check, ok, fail, unknown
 
-SYSTEM_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
-
 
 def _slug(text):
     """A check-id/metric-safe form of a device name or label."""
     return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_") or "oid"
+
+
+def _allocate(base, used):
+    """A slug no earlier row in this device has taken.
+
+    ALLOCATED AGAINST THE SET, not counted per base: with labels "CPU load",
+    "CPU load" and "CPU load 2", a per-base counter hands the second row
+    `cpu_load_2` and the third row's own base is `cpu_load_2` -- two different
+    OID rows sharing one check id, one spec and one metric, so each shows the
+    other's number. The `used` set is the only thing that makes the result
+    unique for every input.
+    """
+    slug = base
+    n = 2
+    while slug in used:
+        slug = "%s_%d" % (base, n)
+        n += 1
+    used.add(slug)
+    return slug
 
 
 class SnmpReachable(Check):
@@ -86,7 +103,6 @@ class SnmpOid(Check):
         self.row = row
         self.id = check_id
         self.spec = spec_id
-        self.unit = row.get("unit") or ""
         self.subject = "%s:%s" % (device, row.get("label") or row.get("oid"))
         # The row's label IS the human name of this reading; showing the OID
         # instead would make the dashboard a list of dotted numbers.
@@ -166,13 +182,43 @@ class SnmpOid(Check):
                                      evidence=evidence)
 
 
+class SnmpOrphan(Check):
+    """A check row whose device is not configured.
+
+    A name typo in `.env` (or a device removed while its OID rows stayed) must
+    not make the row VANISH: a check that is absent from the board reads exactly
+    like a green one. It is UNKNOWN with the missing device named, so the
+    operator sees what to fix. Not emitted for a deliberately DISABLED device:
+    that is a decision, not a typo, and its rows are meant to stop reporting.
+    """
+
+    target = "snmp"
+    spec = None
+
+    def __init__(self, device, row, check_id):
+        self.device = device
+        self.row = row
+        self.id = check_id
+        self.title = row.get("label") or row.get("oid") or check_id
+        self.subject = "%s:%s" % (device, row.get("label") or row.get("oid"))
+
+    def run(self, ctx):
+        return unknown(
+            self.id, self.target,
+            "this SNMP_CHECKS row names device %r, which is not in "
+            "SNMP_DEVICES, so its OID %s was never polled -- fix the device "
+            "name or add the device" % (self.device, self.row.get("oid")),
+            subject=self.subject,
+            evidence={"device": self.device, "oid": self.row.get("oid")})
+
+
 def instances(ctx):
     """Build the module's checks from its settings, and register their bands.
 
-    A check row whose device is absent or disabled is skipped rather than
-    invented: validation refuses that at save time, and `.env` is the
-    operator's own file. The alternative -- an UNKNOWN row per orphan -- would
-    report a configuration typo as a device fault.
+    A check row for a device that is present but DISABLED is skipped (it is
+    deliberately off). A row for a device that is ABSENT becomes an UNKNOWN
+    `SnmpOrphan` naming it -- silently dropping it would make a typo read as a
+    clean board.
     """
     cfg = ctx.snmp
     out = []
@@ -181,25 +227,21 @@ def instances(ctx):
         out.append(SnmpReachable(dev["name"]))
 
     by_name = {d["name"]: d for d in cfg.devices}
-    seen = {}
+    # One set of allocated slugs PER SLUGGED DEVICE: two distinct device names
+    # can slug to one string, and uniqueness by declaration is not uniqueness
+    # by metric.
+    used = {}
     for row in cfg.checks:
         dev = by_name.get(row["device"])
-        if dev is None or not dev["enabled"]:
+        if dev is not None and not dev["enabled"]:
             continue
-        # UNIQUE SLUGS. Two rows may legitimately carry one label; a second
-        # `cpu_load` becomes `cpu_load_2`, because the dashboard looks a
-        # reading up by metric name and the incident key is
-        # (target, check_id, subject). Keyed by the SLUGGED device too: two
-        # distinct device names can slug to one string, and "unique by
-        # declaration" is not unique by metric.
-        device_slug = _slug(dev["name"])
-        base = _slug(row["label"] or row["oid"])
-        key = (device_slug, base)
-        count = seen.get(key, 0) + 1
-        seen[key] = count
-        slug = base if count == 1 else "%s_%d" % (base, count)
-
+        device_slug = _slug(row["device"])
+        slug = _allocate(_slug(row["label"] or row["oid"]),
+                         used.setdefault(device_slug, set()))
         check_id = "snmp_%s_%s" % (device_slug, slug)
+        if dev is None:
+            out.append(SnmpOrphan(row["device"], row, check_id))
+            continue
         spec_id = "snmp.%s.%s" % (device_slug, slug)
         ctx.dynamic_specs[spec_id] = thresholds.Spec(
             spec_id, metric=spec_id, unit=row.get("unit") or "",

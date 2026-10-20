@@ -7,7 +7,9 @@ this directory describes the model.
 There are NO static check classes here. The device list is operator data, so the
 instances come from `check_instances` (see `checks.instances`) and their
 threshold bands are registered in `ctx.dynamic_specs` as they are built -- which
-is also why `checks=()` is deliberate rather than an omission.
+is also why `checks=()` is deliberate rather than an omission. Ownership follows
+the same rule: `owned_check_ids` names the dynamic ids so disabling the module
+freezes their incidents instead of leaving them open forever.
 """
 
 from module import Module, Setting
@@ -24,21 +26,24 @@ MODULE = Module(
     settings=[
         Setting(
             "SNMP_DEVICES", "[]", "list", label="Devices",
-            help="One row per device. The name is the check subject, so it "
-                 "must be unique; the community string is a secret.",
+            help="One row per device. The name is the check subject and the "
+                 "key into SNMP_COMMUNITIES, so it must be unique.",
             item_fields=[
                 {"key": "name", "label": "Name", "kind": "str",
                  "required": True},
                 {"key": "address", "label": "Address", "kind": "str",
                  "required": True},
                 {"key": "port", "label": "Port", "kind": "int", "default": 161},
-                {"key": "community", "label": "Community", "kind": "str",
-                 "secret": True, "required": True},
                 {"key": "version", "label": "Version", "kind": "str",
                  "choices": ["v2c"]},
                 {"key": "enabled", "label": "Enabled", "kind": "bool",
                  "default": True},
             ]),
+        Setting(
+            "SNMP_COMMUNITIES", "{}", "json", label="Communities",
+            secret=True,
+            help="Map of device name to community string. Write-only: a blank "
+                 "value on save keeps the stored map."),
         Setting(
             "SNMP_CHECKS", "[]", "list", label="OID checks",
             help="One row per polled OID. `gauge` grades against the "
@@ -59,7 +64,8 @@ MODULE = Module(
                 {"key": "expected", "label": "Expected", "kind": "int"},
             ]),
         Setting("SNMP_TIMEOUT_S", "3", "int", label="Timeout (s)",
-                help="Per-request UDP timeout; the client retries once."),
+                help="Per-request UDP timeout, at least 1; the client retries "
+                     "once."),
     ],
     threshold_file="thresholds.conf",
     context=preload.configure,
@@ -67,4 +73,8 @@ MODULE = Module(
     checks=(),
     check_instances=snmp_checks.instances,
     validate_settings=validate,
+    # The reachability id exists in no class either (it is built per device by
+    # `check_instances`), so the static half of the ownership rule names it.
+    extra_check_ids=("snmp_reachable",),
+    owned_check_ids=preload.owned_ids,
 )

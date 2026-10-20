@@ -1,16 +1,23 @@
-"""The SNMP module's settings: devices and the OID rows graded on them.
+"""The SNMP module's settings: devices, their communities, and the OID rows.
 
-Both lists are JSON values in one env key each, exactly like every other
-setting, so the operator can configure the module from `.env` OR from the
-settings page. This file owns three things and nothing else:
+Three settings, all JSON/env values like every other setting, so the module is
+configured from `.env` OR from the settings page:
 
-  * PARSING (`SnmpConfig`) -- tolerant of omitted optional fields, loud about
-    anything that cannot mean what it says (a v3 device, malformed JSON).
-  * VALIDATION (`validate`) -- the cross-field rules that must refuse a SAVE
-    rather than surface as a failing poll an epoch later. A malformed OID is
-    the worked example: it polls, the poll errors, and the dashboard shows a
-    grey row whose real cause ("you typed 1.3.6.x") is nowhere.
-  * The OID grammar (dotted-numeric), shared by both.
+  * `SNMP_DEVICES`      -- one row per device (name, address, port, version, enabled);
+  * `SNMP_COMMUNITIES`  -- a TOP-LEVEL SECRET map `{device name: community}`;
+  * `SNMP_CHECKS`       -- one row per polled OID.
+
+WHY THE COMMUNITY IS NOT A DEVICE FIELD. The read API and the audit log redact
+a setting declared `secret=True`, and they redact the WHOLE setting -- there is
+no item-level secret machinery. A `community` field inside `SNMP_DEVICES` would
+therefore be published by `GET /api/v1/settings` and written in clear into
+`setting_change`, which is a credential on the LAN and at rest. The map is one
+secret value, so the existing machinery covers it exactly, and a blank write
+means "unchanged" (the read surface never returns it, so a form cannot echo it
+back).
+
+This file owns parsing (`SnmpConfig`), the save-time cross-field rules
+(`validate`), and the OID grammar.
 """
 
 import json
@@ -29,7 +36,7 @@ KINDS = ("gauge", "state")
 # Polled by `preload` for a device whose checks would otherwise mean NO request
 # at all. A device with no checks is still a configured device, and "is it up?"
 # is the one question every device can answer.
-SYS_UPTIME_OID = ".1.3.6.1.2.1.1.3.0"
+SYSTEM_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
 
 
 def _env(name, default, env):
@@ -91,6 +98,22 @@ def _json_list(key, env):
     return value
 
 
+def _json_map(key, env):
+    raw = env.get(key)
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("%s is not valid JSON: %s" % (key, exc))
+    if not isinstance(value, dict):
+        raise ValueError("%s must be a JSON object mapping device name to "
+                         "community, got %s" % (key, type(value).__name__))
+    return value
+
+
 def _rows(key, env):
     rows = []
     for i, item in enumerate(_json_list(key, env)):
@@ -100,13 +123,29 @@ def _rows(key, env):
     return rows
 
 
-class SnmpConfig:
-    """The configured devices and OID rows, as the preload and checks read them.
+def _communities_error(communities):
+    """The map's own rules: an object of non-empty string values."""
+    if not isinstance(communities, dict):
+        return ("SNMP_COMMUNITIES must be a JSON object mapping device name to "
+                "community")
+    for name, community in communities.items():
+        if not isinstance(name, str) or not name.strip():
+            return "SNMP_COMMUNITIES has an empty device name"
+        if not isinstance(community, str) or not community.strip():
+            return ("SNMP_COMMUNITIES[%r] must be a non-empty string"
+                    % name)
+    return None
 
-    Device rows carry every field with its default applied (`port` 161,
-    `version` v2c, `enabled` true), so a check never repeats a default. OID
-    rows keep the operator's values; a missing band stays `None` and the check
-    reports UNKNOWN with the reason rather than inventing a threshold.
+
+class SnmpConfig:
+    """The configured devices, communities and OID rows, as the checks read them.
+
+    A device row carries every field with its default applied (`port` 161,
+    `version` v2c, `enabled` true). A device with NO community entry keeps an
+    empty `community` here and is refused a poll by `preload` with a reason --
+    never a silent blank request. OID rows keep the operator's values; a missing
+    band stays `None` and the check reports UNKNOWN rather than inventing a
+    threshold.
     """
 
     def __init__(self, cfg, env=None):
@@ -116,36 +155,62 @@ class SnmpConfig:
         if env is None:
             env = getattr(cfg, "env", None)
         e = os.environ if env is None else env
-        self.cfg = cfg
-        self.devices = [self._device(row, i)
-                        for i, row in enumerate(_rows("SNMP_DEVICES", e))]
-        self.checks = [self._check(row, i)
-                       for i, row in enumerate(_rows("SNMP_CHECKS", e))]
-        try:
-            self.timeout_s = int(_env("SNMP_TIMEOUT_S", 3, e))
-        except (TypeError, ValueError):
-            raise ValueError("SNMP_TIMEOUT_S must be an integer number of "
-                             "seconds")
+        self.communities = _json_map("SNMP_COMMUNITIES", e)
+        why = _communities_error(self.communities)
+        if why:
+            raise ValueError(why)
+        self.devices = []
+        names = set()
+        for i, row in enumerate(_rows("SNMP_DEVICES", e)):
+            dev = self._device(row, i, self.communities)
+            if dev["name"] in names:
+                raise ValueError(
+                    "SNMP_DEVICES[%d].name %r is a duplicate; the device name "
+                    "is the check subject, so two devices cannot share one"
+                    % (i, dev["name"]))
+            names.add(dev["name"])
+            self.devices.append(dev)
+        self.checks = [self._check(row) for row in _rows("SNMP_CHECKS", e)]
+        timeout = _int(_env("SNMP_TIMEOUT_S", 3, e))
+        if timeout is None or timeout < 1:
+            raise ValueError("SNMP_TIMEOUT_S must be an integer of at least 1 "
+                             "second")
+        self.timeout_s = timeout
 
     @staticmethod
-    def _device(row, i):
+    def _device(row, i, communities):
+        name = str(row.get("name") or "").strip()
+        address = str(row.get("address") or "").strip()
+        if not name:
+            raise ValueError("SNMP_DEVICES[%d].name is required" % i)
+        if not address:
+            raise ValueError("SNMP_DEVICES[%d].address is required" % i)
+        if "community" in row:
+            raise ValueError(
+                "SNMP_DEVICES[%d] carries a community field; communities live "
+                "in the SNMP_COMMUNITIES map, which is a secret value" % i)
+        port = _int(row.get("port"))
+        if port is None:
+            port = 161
+        if not 0 < port < 65536:
+            raise ValueError("SNMP_DEVICES[%d].port must be between 1 and "
+                             "65535" % i)
         version = str(row.get("version") or "v2c").strip()
         if version != "v2c":
             raise ValueError(
                 "SNMP_DEVICES[%d] version %r is not supported; this module "
                 "speaks v2c only" % (i, version))
-        port = _int(row.get("port"))
         return {
-            "name": str(row.get("name") or "").strip(),
-            "address": str(row.get("address") or "").strip(),
-            "port": 161 if port is None else port,
-            "community": str(row.get("community") or ""),
+            "name": name,
+            "address": address,
+            "port": port,
+            "community": communities.get(name, ""),
             "version": version,
             "enabled": _flag(row.get("enabled"), True),
         }
 
     @staticmethod
-    def _check(row, i):
+    def _check(row):
         def num(key):
             return _int(row.get(key))
 
@@ -162,15 +227,19 @@ class SnmpConfig:
         }
 
 
-def _device_error(devices):
-    """Device-list rules: required fields and unique names."""
+def _device_error(devices, communities):
+    """Device-list rules: required fields, unique names, port and version."""
     names = []
     for i, row in enumerate(devices):
         if not isinstance(row, dict):
             return "SNMP_DEVICES[%d] is not an object" % i
-        for field in ("name", "address", "community"):
+        if "community" in row:
+            return ("SNMP_DEVICES[%d] carries a community field; communities "
+                    "live in the SNMP_COMMUNITIES map, which is a secret value"
+                    % i)
+        for field in ("name", "address"):
             if not str(row.get(field) or "").strip():
-                return ("SNMP_DEVICES[%d].%s is required" % (i, field))
+                return "SNMP_DEVICES[%d].%s is required" % (i, field)
         name = str(row["name"]).strip()
         if name in names:
             return ("SNMP_DEVICES[%d].name %r is a duplicate; the device name "
@@ -187,11 +256,21 @@ def _device_error(devices):
         if version != "v2c":
             return ("SNMP_DEVICES[%d].version must be v2c; SNMP v3 is not "
                     "supported" % i)
+    if communities is not None:
+        for i, row in enumerate(devices):
+            name = str(row.get("name") or "").strip()
+            if not str(communities.get(name) or "").strip():
+                return ("SNMP_COMMUNITIES has no entry for device %r; every "
+                        "device needs a community string" % name)
+        for key in communities:
+            if key not in names:
+                return ("SNMP_COMMUNITIES names device %r, which is not in "
+                        "SNMP_DEVICES" % key)
     return None
 
 
 def _check_error(row, i, names):
-    """One OID row's rules. `names` is None when the body carries no device list."""
+    """One OID row's rules. `names` is None when no device list is available."""
     if not isinstance(row, dict):
         return "SNMP_CHECKS[%d] is not an object" % i
     label = str(row.get("label") or "").strip()
@@ -241,16 +320,21 @@ def _check_error(row, i, names):
 def validate(values):
     """The module's cross-field check on a settings write: error or None.
 
-    `values` holds the keys in the SAVE BODY, not the effective settings -- the
-    SPA sends only the fields the operator touched, so a checks-only save has
-    no device list to resolve against. The reference rule is therefore applied
-    whenever `SNMP_DEVICES` is in the body, and skipped (not guessed at) when
-    it is not; every rule that needs only one row is always applied.
+    `values` is the MERGED effective set: `write_settings` resolves stored and
+    env values first and lays the request body over them, so a checks-only save
+    still sees the device list and the community map it must be validated
+    against. Passing a partial dict directly is still legal -- a rule whose
+    other half is absent is skipped, not guessed at -- but the API never does.
     """
     devices = values.get("SNMP_DEVICES")
+    communities = values.get("SNMP_COMMUNITIES")
+    if communities is not None:
+        why = _communities_error(communities)
+        if why:
+            return why
     names = None
     if devices is not None:
-        why = _device_error(devices)
+        why = _device_error(devices, communities)
         if why:
             return why
         names = [str(row["name"]).strip() for row in devices]
@@ -260,4 +344,9 @@ def validate(values):
             why = _check_error(row, i, names)
             if why:
                 return why
+    if values.get("SNMP_TIMEOUT_S") is not None:
+        n = _int(values["SNMP_TIMEOUT_S"])
+        if n is None or n < 1:
+            return ("SNMP_TIMEOUT_S must be an integer of at least 1 second, "
+                    "got %r" % (values["SNMP_TIMEOUT_S"],))
     return None

@@ -78,7 +78,7 @@ def _owners(ctx):
     owners = {}
     for mod in getattr(ctx, "modules", ()) or ():
         try:
-            for check_id in owned_check_ids(mod):
+            for check_id in owned_check_ids(mod, ctx):
                 owners.setdefault(check_id, mod.id)
         except Exception:                          # noqa: BLE001 - isolated
             continue

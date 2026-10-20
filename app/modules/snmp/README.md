@@ -18,9 +18,18 @@ settings page.
 ## The model
 
 ```
-SNMP_DEVICES   one row per device:  name, address, port, community, version, enabled
-SNMP_CHECKS    one row per OID:     device, oid, label, unit, direction, green, amber, kind, expected
+SNMP_DEVICES      one row per device:  name, address, port, version, enabled
+SNMP_COMMUNITIES  the secret map:      {device name: community string}
+SNMP_CHECKS       one row per OID:     device, oid, label, unit, direction, green, amber, kind, expected
 ```
+
+The community lives in its own setting because it is a **secret**: the settings
+API and the audit log redact a whole setting declared `secret=True`, and there
+is no item-level secret machinery. A `community` field inside `SNMP_DEVICES`
+would be published by `GET /api/v1/settings` and written in clear into the
+change log. `SNMP_COMMUNITIES` is therefore write-only -- the read surface says
+only that it is set, and a blank value on save means **unchanged** (use DELETE
+to remove the override).
 
 For each **enabled device** the module produces:
 
@@ -34,7 +43,22 @@ the **subject**, because the incident key is `(target, check_id, subject)` —
 two devices share the target and must not share a verdict.
 
 A device with **no** OID rows still gets the reachability poll (a `GET` of
-`sysUpTime.0`), so "configured and never polled" cannot happen.
+`sysUpTime.0`), so "configured and never polled" cannot happen. A device with
+**no community entry** is not polled at all: its reachability row is FAIL
+naming `SNMP_COMMUNITIES`, and its OID rows are UNKNOWN. Polling with a blank
+credential would either be refused by the agent or silently succeed against an
+agent that accepts one -- and the operator would never learn the credential is
+missing.
+
+A check row whose device is **absent** from `SNMP_DEVICES` (a typo in `.env`,
+or a device removed while its rows stayed) is an UNKNOWN row naming the missing
+device, never a dropped row: a row that vanishes reads exactly like a green
+one. A device that is present but **disabled** is a decision, not a typo -- its
+rows stop reporting entirely.
+
+One epoch's SNMP cost is bounded by devices x distinct OIDs x (timeout x 2
+attempts). There is no aggregate deadline: a very large device list lengthens
+the epoch rather than truncating it (a documented follow-up if one ever does).
 
 Dynamic threshold bands are registered in `ctx.dynamic_specs` as the instances
 are built: every OID row gets a spec and a metric named
@@ -80,32 +104,40 @@ letting a typo become a grey row an epoch later:
 * a gauge row has no numeric `green`/`amber`, or the band is ordered the wrong
   way for its `direction`;
 * a `state` row has no numeric `expected`;
-* two devices share a name, or a device's `name`/`address`/`community` is empty;
-* a device's `version` is not `v2c`.
+* two devices share a name, or a device's `name`/`address` is empty;
+* a device's `version` is not `v2c`, or its `port` is outside 1..65535;
+* a device has no non-empty entry in `SNMP_COMMUNITIES`, or the map names a
+  device that is not configured, or a value is not a non-empty string;
+* a `community` field appears inside a device row (it belongs in the map);
+* `SNMP_TIMEOUT_S` is below 1.
 
-The write hook sees only the keys in the request body, and the settings page
-sends only the fields the operator touched. A checks-only save therefore
-cannot resolve `device` against a device list it was not given; the reference
-rule is enforced whenever both lists travel together, which is how the module
-is configured initially.
+The settings page sends only the fields the operator touched, and a checks-only
+save must still be checked against the devices it names. `write_settings`
+therefore resolves the effective values first -- the body over the stored
+override over `.env` over the declaration's default -- and passes that MERGED
+set to the hook. Passing a partial dict to `validate_settings` directly is
+still legal (a rule whose other half is absent is skipped), but the API never
+does it.
 
 ## Settings
 
 | Key | Kind | Default | Meaning |
 |---|---|---|---|
 | `SNMP_DEVICES` | list | `[]` | devices (fields above) |
+| `SNMP_COMMUNITIES` | json | `{}` | **secret** map of device name to community |
 | `SNMP_CHECKS` | list | `[]` | OID rows (fields above) |
-| `SNMP_TIMEOUT_S` | int | `3` | per-request UDP timeout; one retry is fixed in the client |
+| `SNMP_TIMEOUT_S` | int | `3` | per-request UDP timeout (>= 1); one retry is fixed in the client |
 
-`community` is declared `secret` in the row schema: it is never included in a
-check detail, evidence or log line, and `snmp.py`'s errors carry the host and
-the OID instead. The manifest publishes the field's *declaration*, never a
-value.
+`SNMP_COMMUNITIES` is `secret=True`, so the read API reports only `secret_set`
+and the audit log stores `<redacted>` on both the old and the new side of every
+write. It never reaches a check detail, evidence or log line, and `snmp.py`'s
+errors carry the host and the OID instead.
 
 ```bash
 # A state row: port 1 must report ifOperStatus up (1).
 SNMP_DEVICES='[{"name":"switch-1","address":"192.0.2.200","port":161,
-                "community":"change-me","version":"v2c","enabled":true}]'
+                "version":"v2c","enabled":true}]'
+SNMP_COMMUNITIES='{"switch-1":"change-me"}'
 SNMP_CHECKS='[{"device":"switch-1","oid":"1.3.6.1.2.1.2.2.1.8.1",
                "label":"Port 1 status","kind":"state","expected":1}]'
 ```
@@ -116,7 +148,7 @@ SNMP_CHECKS='[{"device":"switch-1","oid":"1.3.6.1.2.1.2.2.1.8.1",
 |---|---|
 | `ber.py` | minimal BER codec (integers, octet strings, OIDs, sequences) |
 | `snmp.py` | the v2c `GET` client: bounded UDP timeout, one retry, one error type per failure |
-| `settings.py` | parsing (`SnmpConfig`) and the save-time rules (`validate`) |
+| `settings.py` | parsing (`SnmpConfig`), the community map, and the save-time rules (`validate`) |
 | `preload.py` | one poll per enabled device per epoch; installs `ctx.snmp_facts` |
 | `checks.py` | `SnmpReachable` / `SnmpOid` and the dynamic `instances(ctx)` |
 | `thresholds.conf` | deliberately comment-only: bands live on the settings rows |
@@ -124,3 +156,9 @@ SNMP_CHECKS='[{"device":"switch-1","oid":"1.3.6.1.2.1.2.2.1.8.1",
 The module opens no platform attempt row: an SNMP device is not an ssh host, so
 a failed poll must not become a fleet `host_unreachable` incident owned by the
 wrong module.
+
+Disabling the module freezes the incidents its settings created. The ids exist
+in no Check class, so the module supplies `owned_check_ids` in its contract and
+the platform's disablement freeze, remedy engine and insight attribution all
+read it through `module.owned_check_ids(mod, ctx)`; without it, switching the
+module off would leave its per-device incidents open forever.

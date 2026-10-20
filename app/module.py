@@ -131,7 +131,7 @@ class Module:
                  threshold_file="thresholds.conf", context=None, preload=None,
                  checks=(), commands=None, actions=None, advisors=None,
                  after_epoch=None, extra_check_ids=(), check_instances=None,
-                 validate_settings=None):
+                 validate_settings=None, owned_check_ids=None):
         for value, want, name in ((id, str, "id"), (title, str, "title"),
                                   (order, int, "order")):
             if not isinstance(value, want):
@@ -153,6 +153,7 @@ class Module:
         self._after_epoch = after_epoch
         self._check_instances = check_instances
         self._validate_settings = validate_settings
+        self._owned_check_ids = owned_check_ids
 
         # CHECK IDS THE MODULE OWNS THAT ARE NOT Check CLASSES. The collector
         # emits a few incidents itself (`host_unreachable`, `journal_capture`),
@@ -201,10 +202,37 @@ class Module:
         return []
 
     def validate_settings(self, values):
-        """Cross-field check on a settings write: an error string or None."""
+        """Cross-field check on a settings write: an error string or None.
+
+        `values` is the MERGED effective set (stored/env values under the
+        body), not just the request body: the settings page sends only the
+        fields the operator touched, and a cross-field rule must still see the
+        other side. `settingsapi.write_settings` does the merge.
+        """
         if self._validate_settings is not None:
             return self._validate_settings(values)
         return None
+
+    def owned_check_ids(self, ctx=None):
+        """Every incident check id this module owns, for disablement.
+
+        The default is the static rule: its Check classes plus
+        `extra_check_ids`. A module whose checks are built from settings
+        (`check_instances`) must override this -- see the constructor's
+        `owned_check_ids` hook -- or disabling it leaves those incidents open
+        forever, because their ids exist in no class list. `ctx` is a
+        settings-only Context; the hook may ignore it.
+        """
+        if self._owned_check_ids is not None:
+            try:
+                return set(self._owned_check_ids(ctx))
+            except Exception:                  # noqa: BLE001 - isolated
+                # SETTINGS ARE OPERATOR INPUT. A malformed `.env` must not take
+                # the disablement freeze down for every module; the static half
+                # (the reachability row) still freezes, and the module's own
+                # config error is visible on the page and in the run note.
+                return _static_owned_check_ids(self)
+        return _static_owned_check_ids(self)
 
     def commands(self):
         return list(self._commands())
@@ -222,8 +250,15 @@ class Module:
         return None
 
 
-def owned_check_ids(mod):
-    """Every incident check id `mod` owns: its Check classes plus `extra_check_ids`.
+def _static_owned_check_ids(mod):
+    """The contract's default rule: classes plus collector-emitted ids."""
+    import checks
+    return ({c.id for c in checks.registry(*mod.check_classes())}
+            | set(getattr(mod, "extra_check_ids", ())))
+
+
+def owned_check_ids(mod, ctx=None):
+    """Every incident check id `mod` owns. THE PLATFORM HELPER.
 
     OWNERSHIP IS BY CHECK ID, NEVER BY TARGET. Two modules can share a
     reporting target (`storage`, `fleet`), so a target set cannot say whose
@@ -232,7 +267,13 @@ def owned_check_ids(mod):
     collect` from `heal.py` would create a duplicate `collect` module when
     `collect.py` runs as `__main__`. The `checks` import is lazy to keep this
     module import-light.
+
+    A module may own ids that exist only in its settings (`check_instances`);
+    those arrive through `Module.owned_check_ids`, which this calls. `ctx` is
+    a settings-only Context -- the disablement freeze and the two readers below
+    never run preload, so no device or host is contacted.
     """
-    import checks
-    return ({c.id for c in checks.registry(*mod.check_classes())}
-            | set(getattr(mod, "extra_check_ids", ())))
+    method = getattr(mod, "owned_check_ids", None)
+    if callable(method):
+        return set(method(ctx))
+    return _static_owned_check_ids(mod)

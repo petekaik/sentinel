@@ -425,7 +425,7 @@ def _fleet_view(ctx):
 # when collect.py runs as `__main__`.
 
 
-def freeze_disabled_modules(conn, seq, enabled, all_modules=None):
+def freeze_disabled_modules(conn, seq, enabled, all_modules=None, cfg=None):
     """Freeze every incident owned by a module that is not enabled.
 
     EVERY EPOCH, because a freeze is one UNKNOWN observation rather than a
@@ -435,13 +435,19 @@ def freeze_disabled_modules(conn, seq, enabled, all_modules=None):
 
     `all_modules` exists so the offline suite can drive two modules that share
     a reporting target; production always discovers.
+
+    `cfg` builds the settings-only Context a module may need to name the check
+    ids its settings declare (`check_instances`). Without it those ids are
+    unknowable and the module's incidents would stay open while it is off.
     """
     enabled_ids = {m.id for m in enabled}
+    ctx = checks.Context(cfg, {}, {}, modules=()) if cfg is not None else None
     for mod in (all_modules if all_modules is not None
                 else module_loader.discover()):
         if mod.id in enabled_ids:
             continue
-        for row in store.live_incidents_for_checks(conn, owned_check_ids(mod)):
+        for row in store.live_incidents_for_checks(
+                conn, owned_check_ids(mod, ctx)):
             store.freeze_incident(conn, seq, row,
                                   "module %r is disabled" % mod.id)
 
@@ -694,7 +700,7 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
 
     # Skipped on a dry run, whose whole contract is "claims nothing".
     if not (dry_run or cfg.dry_run):
-        freeze_disabled_modules(conn, seq, enabled)
+        freeze_disabled_modules(conn, seq, enabled, cfg=cfg)
 
     # THRESHOLDS ARE DATA, INCLUDING A LIVE OVERRIDE. An approved band change
     # lives in the store, so the epoch must load the effective band rather than

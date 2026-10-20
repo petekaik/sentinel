@@ -353,7 +353,7 @@ def consider(cfg, conn, seq, results, ctx):
         cap = min(a.limits.max_attempts for a in declared.values())
 
         for inc in store.live_incidents_for_checks(
-                conn, module.owned_check_ids(mod)):
+                conn, module.owned_check_ids(mod, ctx)):
             key = inc["key"]
 
             # ALREADY LATCHED IS A TERMINAL STATE FOR THIS ENGINE. The reader

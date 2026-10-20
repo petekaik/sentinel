@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                                   # noqa: E402
 from test_dashboard import CACHE, _serve, make_cfg            # noqa: E402
 
+import config as config_mod                                   # noqa: E402
 import module                                                 # noqa: E402
 import modules as module_loader                               # noqa: E402
 import settingsapi                                            # noqa: E402
@@ -58,9 +59,15 @@ def _fleet():
 
 
 def _secret_module():
+    """A secret with a NON-EMPTY default, because that is what leaks.
+
+    A default of `""` would make the manifest assertion vacuous; a real secret
+    setting (an SNMP community, an API key) has a meaningful default that must
+    not be published either.
+    """
     return module.Module(
         id="probe", title="Probe",
-        settings=[module.Setting("PROBE_TOKEN", "", secret=True),
+        settings=[module.Setting("PROBE_TOKEN", "default-s3cret", secret=True),
                   module.Setting("PROBE_NAME", "probe")])
 
 
@@ -95,6 +102,12 @@ def test_manifest_carries_the_schema_and_never_a_secret(results):
         and "s3cret" not in json.dumps(spec)
         and item["kind"] == "str",
         "item=%r" % (item,))
+    results.check(
+        "a secret's DEFAULT and CHOICES never reach the manifest",
+        item["default"] is None and item["choices"] == []
+        and "default-s3cret" not in json.dumps(spec),
+        "item=%r -- a published default is a read of the secret before anyone "
+        "writes one" % (item,))
     conn.close()
 
 
@@ -126,6 +139,22 @@ def test_duplicate_setting_keys_are_refused(results):
             cfg, conn, m)),
         "duplicate declared keys must not be arbitrated silently by module "
         "order in store.setting_env")
+
+    def reserves(key):
+        mod = module.Module(id="probe", title="Probe",
+                            settings=[S(key, "")])
+        try:
+            settingsapi.module_manifests(cfg, conn, [mod], {})
+            return False
+        except settingsapi.SettingsError as exc:
+            return exc.code == "reserved_key" and key in exc.message
+
+    results.check(
+        "a module cannot declare a platform-owned key",
+        reserves("SENTINEL_WRITE_TOKEN") and reserves("SENTINEL_LLM_KEY")
+        and reserves("SENTINEL_ADVISOR_FLEET_HISTORY_DAYS"),
+        "the write token and the process's own configuration are read from "
+        "the same effective env the overlay writes to")
     conn.close()
 
 
@@ -247,6 +276,90 @@ def test_a_secret_never_survives_a_read(results):
     conn.close()
 
 
+def test_a_disabled_modules_broken_thresholds_do_not_break_the_manifest(results):
+    tmp = tempfile.mkdtemp()
+    conn = _store(tmp)
+    cfg = _cfg(tmp, BROKEN_ENABLED="0")
+    broken = module.Module(id="broken", title="Broken", order=99,
+                           threshold_file="does-not-exist.conf")
+    broken._path = tempfile.mkdtemp()
+    fleet = _fleet()
+    try:
+        specs = settingsapi.specs_for(cfg, conn, [fleet, broken])
+        manifests = settingsapi.module_manifests(cfg, conn, [fleet, broken],
+                                                specs)
+        ok = (any(m["id"] == "broken" for m in manifests)
+              and any(m["id"] == "fleet" and m["checks"] for m in manifests))
+        detail = "modules=%r" % ([m["id"] for m in manifests],)
+    except Exception as exc:                          # noqa: BLE001 - a verdict
+        ok, detail = False, "raised %r" % (exc,)
+    results.check(
+        "a disabled module's broken threshold file cannot take the manifest "
+        "down, and the module still appears",
+        ok, detail)
+
+    cfg_enabled = _cfg(tmp, BROKEN_ENABLED="1")
+    try:
+        settingsapi.specs_for(cfg_enabled, conn, [broken])
+        loud = False
+    except thresholds.ConfigError:
+        loud = True
+    results.check(
+        "an ENABLED module's broken threshold file still fails loudly",
+        loud,
+        "silence here would grade its checks against no band at all")
+    conn.close()
+
+
+def test_a_secret_value_is_masked_in_validation_errors(results):
+    tmp = tempfile.mkdtemp()
+    conn = _store(tmp)
+    cfg = _cfg(tmp)
+    probe = module.Module(
+        id="probe", title="Probe",
+        settings=[module.Setting("PROBE_INT", 0, "int", secret=True),
+                  module.Setting("PROBE_BOOL", "false", "bool", secret=True)])
+    messages = []
+    for key in ("PROBE_INT", "PROBE_BOOL"):
+        try:
+            settingsapi.write_settings(cfg, conn, probe, {key: "hunter2"}, "op")
+        except settingsapi.SettingsError as exc:
+            messages.append(exc.message)
+    results.check(
+        "a rejected secret value is not echoed in the error message",
+        len(messages) == 2
+        and all("hunter2" not in m and "redacted" in m for m in messages),
+        "messages=%r -- the write path turns this straight into an API "
+        "response" % (messages,))
+    conn.close()
+
+
+def test_a_persisted_override_applies_to_the_next_collection(results):
+    """The DB overlay must reach the collector, not only the web handlers."""
+    import collect
+    from test_collect_offline import Fleet
+
+    tmp = tempfile.mkdtemp()
+    f = Fleet(tmp)
+    store.put_setting(f.conn, "fleet", "FLEET_ENABLED", False, "op")
+    # A FRESH Config has never seen the store, so only collect_once's own
+    # reload can tell it that fleet is disabled.
+    fresh = config_mod.Config(env=dict(f.cfg._base_env))
+    with f:
+        collect.collect_once(fresh, f.conn)
+    row = f.conn.execute("SELECT MAX(epoch_seq) AS s FROM check_run").fetchone()
+    ids = {r[0] for r in f.conn.execute(
+        "SELECT DISTINCT check_id FROM check_run WHERE epoch_seq = ?",
+        (row["s"],))}
+    results.check(
+        "a persisted override is in effect in a fresh process's collection",
+        fresh.module_enabled("fleet") is False and "env_fail_lines" not in ids,
+        "enabled=%r check ids=%r -- reload_settings must be called by "
+        "collect_once as well as by the web handlers"
+        % (fresh.module_enabled("fleet"), sorted(ids)))
+    f.conn.close()
+
+
 def test_enablement_and_auth(results):
     tmp = tempfile.mkdtemp()
     conn = _store(tmp)
@@ -350,6 +463,41 @@ def test_the_read_surface(results):
         httpd.server_close()
 
 
+def test_api_errors_are_json(results):
+    tmp = tempfile.mkdtemp()
+    cfg = _cfg(tmp)
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    conn.close()
+    httpd, base = _serve(cfg)
+    try:
+        for path in ("/api/v1/nope", "/api/v1/modules/"):
+            code, hdrs, body = _req(base + path)
+            results.check(
+                "GET %s is a JSON 404, not the legacy text page" % path,
+                code == 404 and body["error"]["code"] == "no_route"
+                and hdrs.get("Cache-Control") == CACHE,
+                "code=%s body=%r" % (code, body))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    # A broken threshold file is a real configuration error; the API's job is
+    # to say so in JSON, WITHOUT handing an internals traceback to the caller.
+    bad = _cfg(tmp, MONITOR_CHECKS=os.path.join(tmp, "missing.conf"))
+    httpd, base = _serve(bad)
+    try:
+        code, _, body = _req(base + "/api/v1/modules")
+        results.check(
+            "an /api/v1 internal error is a JSON 500 with no traceback",
+            code == 500 and body["error"]["code"] == "internal"
+            and "Traceback" not in body["error"]["message"],
+            "code=%s body=%r" % (code, body))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_the_write_surface(results):
     tmp = tempfile.mkdtemp()
     cfg = _cfg(tmp)
@@ -367,8 +515,16 @@ def test_the_write_surface(results):
 
         code, _, body = _req(url, "PUT", {"RECORDINGS_PATH": "/tmp/rec"},
                              token="wrong")
-        results.check("a write with a wrong token is 401",
-                      code == 401, "code=%s body=%r" % (code, body))
+        probe = store.connect(cfg.db_path, read_only=True)
+        try:
+            untouched = store.setting_rows(probe) == {}
+        finally:
+            probe.close()
+        results.check(
+            "a write with a wrong token is 401 and writes nothing",
+            code == 401 and untouched,
+            "code=%s untouched=%r -- auth is checked before the store is "
+            "touched" % (code, untouched))
 
         code, _, body = _req(url, "PUT", {"RECORDINGS_PATH": "/tmp/rec"},
                              token="tok")
@@ -410,6 +566,7 @@ def test_the_write_surface(results):
         after = store.connect(cfg.db_path, read_only=True)
         try:
             gone = ("fleet", "RECORDINGS_PATH") not in store.setting_rows(after)
+            before = len(store.setting_changes(after))
         finally:
             after.close()
         results.check(
@@ -417,6 +574,22 @@ def test_the_write_surface(results):
             code == 200 and gone
             and body["RECORDINGS_PATH"]["source"] != "db",
             "code=%s body=%r" % (code, body))
+
+        # Resetting a key that has no row must be a no-op, not a phantom audit
+        # entry: the change log records changes, not requests.
+        code, _, body = _req(
+            base + "/api/v1/modules/fleet/settings/RECORDINGS_PATH",
+            "DELETE", token="tok")
+        after = store.connect(cfg.db_path, read_only=True)
+        try:
+            same = len(store.setting_changes(after)) == before
+        finally:
+            after.close()
+        results.check(
+            "DELETE of a declared-but-unset key writes no audit row",
+            code == 200 and same,
+            "code=%s changes before=%d -- a null reset row is evidence of a "
+            "change that did not happen" % (code, before))
 
         code, _, body = _req(
             base + "/api/v1/modules/fleet/settings/BOGUS", "DELETE",
@@ -442,6 +615,21 @@ def test_the_write_surface(results):
             "enablement refuses a string rather than reading it as true",
             code == 422 and body["error"]["code"] == "invalid_value",
             "code=%s body=%r" % (code, body))
+
+        # A DISABLED module must remain configurable, or disabling one is a
+        # one-way door with no UI left to undo it.
+        code, _, body = _req(url, "PUT", {"RECORDINGS_PATH": "/tmp/disabled"},
+                             token="tok")
+        after = store.connect(cfg.db_path, read_only=True)
+        try:
+            written = store.setting_rows(after).get(
+                ("fleet", "RECORDINGS_PATH")) == "/tmp/disabled"
+        finally:
+            after.close()
+        results.check(
+            "a disabled module still accepts a settings write",
+            code == 200 and written and body["RECORDINGS_PATH"]["source"] == "db",
+            "code=%s body=%r written=%r" % (code, body, written))
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -477,8 +665,12 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_write_validation_and_audit,
          test_strict_booleans_at_the_write_boundary,
          test_a_secret_never_survives_a_read,
+         test_a_disabled_modules_broken_thresholds_do_not_break_the_manifest,
+         test_a_secret_value_is_masked_in_validation_errors,
+         test_a_persisted_override_applies_to_the_next_collection,
          test_enablement_and_auth,
          test_the_read_surface,
+         test_api_errors_are_json,
          test_the_write_surface,
          test_writes_disabled_without_a_token)
 

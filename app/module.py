@@ -29,16 +29,16 @@ class Setting:
             # STRICT: `int(True)` is 1 and `int(5.9)` is 5, so a bool or a
             # fractional float would pass while meaning something else.
             if isinstance(value, bool):
-                raise ValueError("%s must be an integer, got %r"
-                                 % (self.key, value))
+                raise ValueError("%s must be an integer, got %s"
+                                 % (self.key, self._echo(value)))
             if isinstance(value, float) and not value.is_integer():
-                raise ValueError("%s must be an integer, got %r"
-                                 % (self.key, value))
+                raise ValueError("%s must be an integer, got %s"
+                                 % (self.key, self._echo(value)))
             try:
                 return int(value)
             except (TypeError, ValueError):
-                raise ValueError("%s must be an integer, got %r"
-                                 % (self.key, value))
+                raise ValueError("%s must be an integer, got %s"
+                                 % (self.key, self._echo(value)))
         if self.kind == "bool":
             if isinstance(value, bool):
                 return value
@@ -53,7 +53,7 @@ class Setting:
                 return False
             raise ValueError(
                 "%s must be a boolean (true/false, 1/0, yes/no, on/off), "
-                "got %r" % (self.key, value))
+                "got %s" % (self.key, self._echo(value)))
         if self.kind in ("json", "list"):
             import json
             parsed = value if not isinstance(value, str) else json.loads(value)
@@ -90,10 +90,25 @@ class Setting:
             out.append(row)
         return out, ""
 
+    def _echo(self, value):
+        """A value as an error message may show it. A secret is masked.
+
+        The write path turns `ValueError` into an API message, and a message
+        that echoes `"hunter2"` is a read of the secret by another route.
+        """
+        return "<redacted>" if self.secret else repr(value)
+
     def schema(self):
+        # A SECRET'S DEFAULT AND CHOICES ARE VALUES TOO. A default community
+        # string or API key published in `/api/v1/modules` would defeat the
+        # `secret` flag before the operator ever wrote one; `choices` can name
+        # the vendor's allowed credentials. Both are withheld -- a secret is
+        # described by its key, label and kind only.
         return {"key": self.key, "label": self.label, "kind": self.kind,
-                "default": self.default, "help": self.help,
-                "secret": self.secret, "choices": list(self.choices or ()),
+                "default": None if self.secret else self.default,
+                "help": self.help,
+                "secret": self.secret,
+                "choices": [] if self.secret else list(self.choices or ()),
                 "required": self.required, "group": self.group,
                 "item_fields": [dict(f) for f in self.item_fields],
                 "set": False}

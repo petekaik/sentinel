@@ -681,6 +681,10 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
 def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     """One epoch. Returns a summary dict for the CLI/self-test."""
     t0 = _now()
+    # THE DB OVERLAY APPLIES ON THE NEXT COLLECTION, and this is the collection.
+    # Only the web handlers used to reload, so a persisted override was inert in
+    # `--once` and after a restart until somebody opened the settings page.
+    cfg.reload_settings(conn)
     seq = store.next_epoch_seq(conn)
 
     enabled = module_loader.discover_enabled(cfg)

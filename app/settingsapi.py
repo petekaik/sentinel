@@ -22,6 +22,7 @@ import hmac
 
 import checks
 import store
+import thresholds
 
 
 class SettingsError(RuntimeError):
@@ -34,8 +35,23 @@ class SettingsError(RuntimeError):
         self.field = field
 
 
+# PLATFORM-OWNED KEYS. These are read by `Config.__init__`/`reload_settings` or
+# by the process's own wiring, so a module that declared one would let the
+# settings API rewrite the monitor's own configuration -- including the write
+# token itself, which `authorized` reads from the same effective env.
+RESERVED_KEYS = frozenset((
+    "SENTINEL_WRITE_TOKEN",
+    "MONITOR_DB", "MONITOR_CHECKS", "MONITOR_PORT", "MONITOR_INTERVAL",
+    "MONITOR_SSH_KEY", "MONITOR_KNOWN_HOSTS", "MONITOR_SSH_TIMEOUT",
+    "MONITOR_REMEDIES", "MONITOR_DRY_RUN",
+    "SENTINEL_MODULES", "SENTINEL_REMEDIATION", "SENTINEL_ADVISORS",
+    "SENTINEL_PROPOSAL_TTL_H",
+))
+RESERVED_PREFIXES = ("SENTINEL_ADVISOR_", "SENTINEL_LLM_")
+
+
 def check_declarations(modules):
-    """Refuse a key declared twice, within one module or across modules.
+    """Refuse a key declared twice, or a platform-owned key at all.
 
     The cross-module half is the load-bearing one: `store` keys a row by
     `(module, key)`, but `store.setting_env` flattens it to the bare key for the
@@ -52,6 +68,14 @@ def check_declarations(modules):
                     "module %r declares setting %r more than once"
                     % (mod.id, setting.key), setting.key)
             seen.add(setting.key)
+            if (setting.key in RESERVED_KEYS
+                    or setting.key.startswith(RESERVED_PREFIXES)):
+                raise SettingsError(
+                    "reserved_key",
+                    "setting %r is platform-owned and cannot be declared by "
+                    "module %r; the overlay is keyed by the bare env name, so "
+                    "a module could otherwise rewrite the monitor's own "
+                    "configuration" % (setting.key, mod.id), setting.key)
             other = owner.get(setting.key)
             if other is not None and other != mod.id:
                 raise SettingsError(
@@ -61,6 +85,22 @@ def check_declarations(modules):
                     "one module may own it"
                     % (setting.key, other, mod.id), setting.key)
             owner[setting.key] = mod.id
+
+
+def specs_for(cfg, conn, modules):
+    """Threshold specs for the ENABLED modules, plus the platform file.
+
+    A DISABLED module is still in the manifest, but its threshold file is not
+    loaded: a module being switched off must not be able to take the manifest
+    down with a broken or missing file (the checks then report an empty
+    unit/direction instead of a 500). An enabled module's broken file still
+    fails loudly -- that one is a real configuration error.
+    """
+    enabled = {m.id for m in modules if cfg.module_enabled(m.id)}
+    mapping = {mid: path
+               for mid, path in thresholds.spec_mapping(cfg, modules).items()
+               if mid == "config" or mid in enabled}
+    return thresholds.load_effective(mapping, conn)
 
 
 def _specs_for(mod, specs):
@@ -205,13 +245,17 @@ def reset_setting(cfg, conn, mod, key, actor):
     """Delete one override so `.env`/the default applies again.
 
     The declaration is looked up first: a typo must not reach the store and
-    leave an audit row for a key the module never owned. SECRECY IS NOT PASSED
-    HERE -- `store.delete_setting` redacts from the flag the ROW carries, which
-    is the only authority that survives a redeclaration.
+    leave an audit row for a key the module never owned. An UNSET key is a
+    no-op -- deleting a row that does not exist would write a phantom `reset`
+    with a null old value, and the change log is evidence, not a request log.
+    SECRECY IS NOT PASSED HERE -- `store.delete_setting` redacts from the flag
+    the ROW carries, which is the only authority that survives a redeclaration.
     """
     check_declarations([mod])
     if key not in _declared(mod):
         raise SettingsError("unknown_key", "unknown setting %r" % key, key)
+    if (mod.id, key) not in store.setting_rows(conn):
+        return settings_view(cfg, conn, [mod]).get(mod.id, {})
     store.delete_setting(conn, mod.id, key, actor)
     return settings_view(cfg, conn, [mod]).get(mod.id, {})
 

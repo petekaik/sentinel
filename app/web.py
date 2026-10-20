@@ -1602,10 +1602,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/v1/modules":
                 cfg.reload_settings(conn)
                 discovered = module_loader.discover()
-                specs = thresholds.load_effective(
-                    thresholds.spec_mapping(cfg, discovered), conn)
                 self._json(200, settingsapi.module_manifests(
-                    cfg, conn, discovered, specs))
+                    cfg, conn, discovered,
+                    settingsapi.specs_for(cfg, conn, discovered)))
                 return
             if path == "/api/v1/settings":
                 cfg.reload_settings(conn)
@@ -1623,6 +1622,13 @@ class Handler(BaseHTTPRequestHandler):
                 # proposal re-offered beside an open one reads as still open.
                 self._json(200, store.list_proposals(conn, state="pending"))
                 return
+            if path.startswith("/api/v1"):
+                # AN API 404 IS JSON. Falling through to the legacy plain-text
+                # path would answer a fetch() with something it cannot parse,
+                # and `/api/v1/modules/` (a trailing slash) must say the same
+                # thing as any other unmatched route.
+                self._error(404, "no_route", "no such /api/v1 route")
+                return
             state = build_state(cfg, conn)
             if path == "/api/state.json":
                 self._send(200, json.dumps(state, default=str, indent=1),
@@ -1634,6 +1640,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "no such path\n", "text/plain; charset=utf-8")
         except Exception as exc:                   # noqa: BLE001 - rendered
             import traceback
+            if path.startswith("/api/v1"):
+                # JSON, and NO traceback: an unauthenticated caller must not be
+                # handed the container's paths and internals as a consolation
+                # prize for reaching a broken route.
+                self._error(500, "internal",
+                            "the request failed: %s" % exc)
+                return
             self._send(500,
                        "THE DASHBOARD FAILED TO RENDER: %s\n\n%s\n\n"
                        "An error page means UNKNOWN, never green.\n"

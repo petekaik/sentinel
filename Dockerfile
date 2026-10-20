@@ -97,6 +97,17 @@ WORKDIR /app
 # what makes `docker run` without compose still work.
 COPY app/ /app/
 
+# THE SPA IS A COMMITTED BUILD, AND AN IMAGE WITHOUT IT MUST NOT START.
+# `app/static/` is Vite's output (scripts/build-frontend.sh), built at
+# development time and committed; the image carries no Node runtime. Without
+# this gate a tree where the build was never run produces an image that boots,
+# reports healthy, and answers every page request with a 500 -- a monitor that
+# looks up while it cannot draw the one surface an operator reads. Failing the
+# build is the loud version of the same fact.
+#
+# `-s` rather than `-f`: a zero-byte index.html is not a shell.
+RUN test -s /app/static/index.html
+
 # Compose overrides every one of these; they are the defaults a bare
 # `docker run` gets, and they are the CONTAINER paths, not the NAS paths.
 #

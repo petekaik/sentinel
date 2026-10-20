@@ -1,44 +1,52 @@
-"""The dashboard: RAG-first, read-only, and incapable of showing green on no data.
+"""The HTTP surface: the SPA shell, the versioned API and the health probe.
 
-WHAT THIS PAGE IS FOR, AND THE ONE THING IT MUST NEVER DO
+WHAT THIS PROCESS IS FOR, AND THE ONE THING IT MUST NEVER DO
 
-There is no push notification by operator decision, so this page is the ONLY
-dead-man switch in the design: if the collector has died, the page is the one
-place a human would notice. Which means the page must fail LOUD, and it must
-therefore be impossible for it to show a clean fleet while measuring nothing.
+There is no push notification by operator decision, so this service is the ONLY
+dead-man switch in the design: if the collector has died, the dashboard is the
+one place a human would notice. Which means it must fail LOUD, and the data it
+serves must make it impossible to show a clean fleet while measuring nothing.
 
-Four concrete rules follow from that, and each one is a defect that the obvious
+Four concrete rules follow from that, and each one is a defect the obvious
 implementation ships:
 
-  * NO CACHING, ANYWHERE. `Cache-Control: no-store` on every response including
-    the API and the health probe. A cached 200 served while the backend is dead is
-    a false GREEN -- and a reverse proxy in front of this would produce exactly
-    that, so the header is not politeness, it is the mechanism.
-  * STALENESS IS THE FIRST THING ON THE PAGE and it degrades the whole document,
-    not one tile. Past 3 poll intervals the page says so in a red banner and says
-    what it means: the contents describe the fleet as it WAS.
-  * A CHECK WITH NO RESULT RENDERS UNKNOWN, NEVER GREEN. The check list is built
-    from the check REGISTRY, not from the store, so a check that has never run
-    appears with "no result stored for this epoch" rather than being absent. An
-    absent row reads as "fine".
-  * "0 ROWS" IS NOT "NO PROBLEMS". Every query's row count is reported in the
-    footer, so an empty read is visible as an empty read. That is item 72's shape
+  * NO CACHING OF ANY OBSERVATION. `Cache-Control: no-store` on the API, the
+    health probe and the SPA shell. A cached 200 served while the backend is dead
+    is a false GREEN -- and a reverse proxy in front of this would produce
+    exactly that, so the header is not politeness, it is the mechanism. The one
+    exception is the hashed asset bundle: its name changes when its bytes do,
+    so it can never go stale, and `shell.py` is the other named exception.
+  * STALENESS DEGRADES THE VERDICT. Past 3 poll intervals the API's verdict is
+    `unknown` and the reason says the rows describe the fleet as it WAS. The SPA
+    renders that verdict; it does not get to out-vote it.
+  * A CHECK WITH NO RESULT IS UNKNOWN, NEVER GREEN. The check list is built from
+    the check REGISTRY, not from the store, so a check that has never run appears
+    with "no result stored for this epoch" rather than being absent. An absent
+    row reads as "fine".
+  * "0 ROWS" IS NOT "NO PROBLEMS". Every query's row count is carried in the
+    model, so an empty read is visible as an empty read. That is item 72's shape
     (a gate printing "Coverage is complete" while reporting done 0), and SQLite
-    makes it easy to hit: `SQLITE_BUSY` returns an EMPTY RESULT SET rather than an
-    error.
+    makes it easy to hit: `SQLITE_BUSY` returns an EMPTY RESULT SET rather than
+    an error.
 
-THE TILES ARE DERIVED, NOT LISTED. The RAG tiles come from the check registry
-plus the threshold specs the checks declare, so adding a check adds its tile and
+THE TILES ARE DERIVED, NOT LISTED. The RAG rows come from the check registry
+plus the threshold specs the checks declare, so adding a check adds its row and
 no list in this file has to be kept in step. A spec that no check claims can never
 be silently missing either: `checks/meta.py::SpecCoverage` turns that into a FAIL
-row, which this page renders like any other.
+row, which the API reports like any other.
 
-Read-only throughout: the store is opened `mode=ro`, so a render cannot write and
-a slow query cannot block the collector's writer.
+Read-only throughout: the store is opened `mode=ro`, so a request cannot write
+and a slow query cannot block the collector's writer.
+
+THE SPA IS A COMMITTED BUILD, NOT A RUNTIME DEPENDENCY. `app/static/` holds
+Vite's output (built by `scripts/build-frontend.sh`, committed, never built in
+the image). `index.html` and the hashed bundle are constants of the image, so
+they are served from disk with a path-traversal guard and no Node anywhere.
 """
 
-import html
 import json
+import mimetypes
+import os
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -355,33 +363,16 @@ def build_state(cfg, conn, now=None):
     }
 
 
-def _tally(state):
-    """Colour counts for everything that is a HEALTH verdict.
-
-    `informational` is deliberately excluded: those rows carry no colour by
-    operator ruling, and counting them as green would put a number on the page
-    that says "verified healthy" about a thermometer. They are counted
-    separately, and the two counts are shown side by side so the exclusion is
-    visible rather than looking like an arithmetic mistake.
-    """
-    out = {"green": 0, "amber": 0, "red": 0, "grey": 0, "informational": 0}
-    for section in ("tiles", "extra", "others"):
-        for item in state[section]:
-            out[_status(item["status"]).rag] += 1
-    out["informational"] = len(state["informational"])
-    return out
-
-
 # ---------------------------------------------------------------------------
 # The status API
 #
 # WHY THERE ARE NOW TWO JSON ENDPOINTS, AND WHY THIS IS NOT DUPLICATION.
 #
-# `/api/state.json` serialises the PAGE MODEL: tiles, sections, per-check detail,
-# the tally, the row counts -- everything `render_html` needs and nothing more. It
-# was published because the page had to come from somewhere, and it is genuinely
-# useful for debugging the page. But its shape is the page's shape, so every
-# layout change is a breaking change for anything that consumes it.
+# `/api/state.json` serialises the full MODEL: tiles, sections, per-check detail,
+# the colour counts, the row counts -- everything the dashboard shows and nothing
+# more. It is genuinely useful for debugging the board. But its shape is the
+# board's shape, so every layout change is a breaking change for anything that
+# consumes it.
 #
 # `/api/status.json` is the CONTRACT instead: a small fixed key set, additive
 # changes only, versioned. It exists because an integration wants to answer "is
@@ -443,9 +434,10 @@ def _verdict(items):
 def _verdict_items(state):
     """The rows that carry a health verdict: everything with a colour.
 
-    Informational rows are EXCLUDED, matching `_tally` and the operator's ruling
-    that temperature is FYI -- there is no active cooling, so there is no action
-    attached to the number, and putting a health word on it would imply one.
+    Informational rows are EXCLUDED, matching the API's `counts` and the
+    operator's ruling that temperature is FYI -- there is no active cooling, so
+    there is no action attached to the number, and putting a health word on it
+    would imply one.
     `others` is included: those are spec-less checks, which are still checks.
     """
     return state["tiles"] + state["extra"] + state["others"]
@@ -456,191 +448,6 @@ def _rag_counts(items):
     for it in items:
         out[_status(it["status"]).rag] += 1
     return out
-
-
-def _n(count):
-    """`1 check is` / `2 checks are`, for the band's reason line.
-
-    THE BAND IS THE LINE A PHONE READS FIRST, and `1 checks are red` on it is
-    exactly the sort of detail that makes a page read as generated. §4.1's
-    wireframe writes the same line as `2 checks are red, 1 is amber`, so the
-    agreement is spec copy rather than polish. The numbers themselves are left
-    alone -- the wireframe is a sketch and does not say what a zero count should
-    read as, so it keeps saying `0 amber` rather than going silent.
-    """
-    return "%d %s" % (count, "check is" if count == 1 else "checks are")
-
-
-def _band_verdict(state):
-    """The band's verdict and its reason. Staleness DOMINATES, exactly as it
-    does in `build_status`.
-
-    WITHOUT THIS BRANCH THE BAND IS A LIAR. A page past three poll intervals
-    still carries the last epoch's coloured rows, and every one of them
-    describes the fleet as it was. A band reading OK above the red STALE banner
-    is the false green this page exists to prevent, and the API already refuses
-    it -- the page must not be the weaker of the two readers.
-
-    "NEVER COLLECTED" AND "TOO OLD" ARE TWO FACTS, NOT ONE. They share a verdict
-    -- UNKNOWN, because in both cases the rows below describe nothing current --
-    but the reason must not. A page that has never collected saying "the last
-    collection is too old" asserts a collection that was never made, and it
-    contradicts the banner two lines below it, which says NO COLLECTION HAS EVER
-    BEEN RECORDED. This is the same rule as an absent row never reading as fine,
-    one level up: "the answer is no" must never share a sentence with "I could
-    not ask". The `none` sentence is the API's own, verbatim (`build_status`),
-    so the two readers cannot drift.
-    """
-    if state["staleness"] == "none":
-        return "unknown", ("no collection has ever been recorded, so this "
-                           "document knows nothing about the fleet")
-    if state["staleness"] == "stale":
-        return "unknown", ("the last collection is too old to say anything about "
-                           "now, whatever the rows below still read")
-    items = _verdict_items(state)
-    verdict, _why = _verdict(items)
-    n = _rag_counts(items)
-    if verdict == "fail":
-        why = "%s red, %d amber" % (_n(n["red"]), n["amber"])
-    elif verdict == "warn":
-        why = "%s amber, and nothing red" % _n(n["amber"])
-    elif verdict == "ok":
-        why = "%s green, none red or amber" % _n(n["green"])
-        if n["grey"]:
-            # THE BAND MUST NOT LET A READER BELIEVE THE BOARD IS FULLY KNOWN.
-            # The verdict is still ok -- that is the platform's existing rule
-            # and changing it is not this design's business -- but a board where
-            # 15 checks could not be asked is not the same board as one where 15
-            # answered green, and the band is what a phone reads first.
-            #
-            # This sentence and the section note below it overlap deliberately.
-            # Two honest statements on a monitoring page beat one folded-away
-            # count, and the note is where the counts are spelled out.
-            why += "; %d reported nothing" % n["grey"]
-    else:
-        why = "nothing reported a colour"
-    return verdict, why
-
-
-def _verdict_band(state):
-    verdict, why = _band_verdict(state)
-    return ("<div class='band %s'><div class=bst>%s</div>"
-            "<div class=bwhy>%s</div></div>"
-            % (verdict, _esc(verdict.upper()), _esc(why)))
-
-
-def _whats_wrong(state):
-    """The graded rows that are actually a problem, or the honest statement
-    that there are none.
-
-    THE THREE EMPTY CASES ARE THREE DIFFERENT SENTENCES. "No check is red" and
-    "no check reported anything" are not the same fact, and a page that renders
-    one string for both collapses "we could not ask" into "it is fine" -- which
-    is the collapse this whole project is built to prevent.
-    """
-    items = _verdict_items(state)
-    n = _rag_counts(items)
-    flagged = [i for i in items if _status(i["status"]).rag in ("red", "amber")]
-    if flagged:
-        flagged.sort(key=lambda i: (0 if _status(i["status"]).rag == "red" else 1,
-                                    i["target"], i["check_id"]))
-        out = []
-        for it in flagged:
-            rag = _status(it["status"]).rag
-            out.append(
-                "<div class='wcard %s'><div class=wtop>"
-                "<span class='pill %s'>%s</span>"
-                "<span class=wt>%s</span>"
-                "<span class=wc>%s</span></div>"
-                "<div class=wd>%s</div></div>"
-                % (rag, rag, _esc(it["status"]), _esc(it["target"]),
-                   _esc(it["title"]), _esc(it["detail"])))
-        return "".join(out)
-    if n["green"] == 0:
-        return ("<div class=note>No check reported a colour. This is UNKNOWN, "
-                "not a clean fleet.</div>")
-    if n["grey"]:
-        return ("<div class=note>No check is red or amber. %d reported green; "
-                "%d reported nothing and are UNKNOWN.</div>"
-                % (n["green"], n["grey"]))
-    return "<div class=note>No check is red or amber.</div>"
-
-
-def _whats_wrong_section(state):
-    n = len([i for i in _verdict_items(state)
-             if _status(i["status"]).rag in ("red", "amber")])
-    return ("<h2>%s</h2>%s"
-            % (_esc("What's wrong (%d)" % n if n else "What's wrong"),
-               _whats_wrong(state)))
-
-
-def _tally_strip(state):
-    """One segment per verdict-bearing check, grouped by target.
-
-    WHY THIS EXISTS AT ALL. "All green" and "all grey" render identically today,
-    differing only in the colour of a 5px left border, so the rule this project
-    cares about most -- an absent answer is not a good answer -- is invisible at
-    a glance. As a strip they are different shapes.
-
-    INFORMATIONAL ROWS ARE EXCLUDED. They carry no colour by operator ruling, so
-    drawing a temperature reading as a grey segment would make a perfectly
-    healthy board look partly unknown -- collapsing "no colour by ruling" into
-    UNKNOWN, which is the exact confusion this strip exists to remove. The
-    consequence is that the strip has fewer segments than the all-checks list
-    has rows, so every count here names what it counts.
-
-    GROUPED, NOT LISTED, AND THE GROUPING IS WHY IT IS SORTED. A red cluster is
-    how you read "the problem is in cubox-2" without scanning -- that is §4.4's
-    second reason for the strip existing at all, and it is a claim about
-    ADJACENCY, so it needs the target's segments to actually sit together.
-
-    THE REGISTRY'S ORDER DOES NOT GIVE THAT, and this is the one place the plan
-    was wrong. `checks.expand` yields one class's per-box instances adjacent, so
-    targets INTERLEAVE: measured on the real registry, 71 rows carry 5 distinct
-    targets in 55 contiguous runs -- `backup, backup, backup, cubox-1, cubox-2,
-    cubox-1, ...`. A gap-wherever-the-target-changes rule over that order draws
-    55 wrappers of ~1.3 segments each, which is not a grouping at all: a red
-    segment sits between two gaps and nothing tells you which box it came from,
-    §4.4's "wraps by target group" on a phone has no groups to wrap by, and the
-    strip is ~40% gaps on a 390px screen.
-
-    SO THE STRIP SORTS BY TARGET, stably, so the registry's order survives
-    WITHIN each target. §4.4's headline says "grouped by target" and its order
-    bullet exists so that "the strip and the list can never disagree about
-    MEMBERSHIP" -- and the sort changes no membership: it is the same 71 rows.
-    Where the two cannot both hold, the headline and the reason for existing
-    win.
-
-    WHAT THE SORT DOES AND DOES NOT BRING INTO LINE, stated honestly because an
-    earlier draft overstated it: the page's "All checks by target" table already
-    iterates its targets in sorted order, so the GROUP order agrees with it. It
-    does not agree WITHIN a target -- that table orders each target's rows by
-    check_id, while this strip keeps the registry's order -- and the sort also
-    places a collector-emitted row inside its target's group, where §4.4's order
-    bullet would have those rows last. Neither changes membership, and both are
-    deliberate: the group is the unit this strip exists to show.
-
-    IT IS AN INDICATOR, NOT A CONTROL. At 5px per segment on a 390px phone these
-    are far below any tap target and they do not pretend otherwise: no cursor,
-    no hover, no title promising navigation.
-    """
-    items = sorted(_verdict_items(state), key=lambda it: it["target"])
-    n = _rag_counts(items)
-    label = ("%d graded: %d green, %d amber, %d red, %d unknown"
-             % (len(items), n["green"], n["amber"], n["red"], n["grey"]))
-    out, group, seen = [], [], None
-    for it in items:
-        if seen is not None and it["target"] != seen:
-            out.append("<span class=seg-group>%s</span>" % "".join(group))
-            group = []
-        seen = it["target"]
-        group.append("<span class='seg %s' aria-label='%s %s: %s'></span>"
-                     % (_status(it["status"]).rag, _esc(it["target"]),
-                        _esc(it["check_id"]), _esc(it["status"])))
-    if group:
-        out.append("<span class=seg-group>%s</span>" % "".join(group))
-    return ("<div class=strip role=img aria-label='%s'>%s</div>"
-            % (_esc(label), "".join(out)))
 
 
 def build_status(cfg, conn, now=None):
@@ -796,328 +603,10 @@ def build_status(cfg, conn, now=None):
     }
 
 
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
-
-CSS = """
-:root { --bg:#0e1216; --panel:#161c22; --fg:#e6edf3; --dim:#8b949e;
-        --line:#232c35; --ok:#3fb950; --warn:#e3b341; --fail:#f85149;
-        --unknown:#7d8590; }
-* { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--fg);
-       font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
-/* THE PAGE INSETS ITSELF, BECAUSE THE VIEWPORT META ASKS IT TO. `viewport-fit=cover`
-   and the black-translucent status bar put the document UNDER the Dynamic Island
-   and the home indicator on purpose, so the page must keep its own content out
-   from behind them -- and `env()` is only non-zero in exactly that configuration.
-   Measured on an iPhone 15 Pro, installed to the home screen 2026-10-07: without
-   this, the title and the target list sat behind the camera housing. Left and
-   right are for landscape, where the island eats one edge. */
-.wrap { max-width:1200px; margin:0 auto;
-        padding:calc(18px + env(safe-area-inset-top, 0px))
-                calc(16px + env(safe-area-inset-right, 0px))
-                calc(60px + env(safe-area-inset-bottom, 0px))
-                calc(16px + env(safe-area-inset-left, 0px)); }
-h1 { font-size:17px; margin:0 0 2px; }
-h2 { font-size:15px; font-weight:600; color:var(--fg); margin:22px 0 8px;
-     border-bottom:1px solid var(--line); padding-bottom:5px; }
-.sub { color:var(--dim); font-size:12px; }
-.hero { padding:14px 0 4px; }
-.hero .hage { font-size:38px; line-height:1.05; font-weight:600;
-              letter-spacing:-.02em; }
-.hero.fresh .hage { color:var(--fg); }
-.hero.lagging .hage { color:var(--warn); }
-.hero.stale .hage, .hero.none .hage { color:var(--fail); }
-.hero .hsub { font-size:12.5px; color:var(--dim); margin-top:2px; }
-.hero .hscale { display:flex; justify-content:space-between;
-                font-size:10.5px; color:var(--dim); margin:9px 0 4px; }
-.hero .hbar { height:6px; border-radius:3px; background:#1b2229;
-              border:1px solid var(--line); overflow:hidden; }
-.hero .hbar i { display:block; height:100%; background:var(--ok); }
-.hero.lagging .hbar i { background:var(--warn); }
-.hero.stale .hbar i { background:var(--fail); }
-.banner { padding:10px 13px; border-radius:5px; margin:12px 0 0;
-          border:1px solid var(--line); font-weight:600; }
-.banner.red { background:#3a1416; border-color:var(--fail); color:#ffb4b0; }
-.banner.amber { background:#2e2510; border-color:var(--warn); color:#f0d18a; }
-.banner.ok { background:#0f2415; border-color:#1d5c2c; color:#8fdc9f; }
-.banner.none { background:#2a1a1a; border-color:var(--fail); color:#ffb4b0; }
-.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(255px,1fr));
-        gap:9px; }
-.tile { border:1px solid var(--line); border-left-width:5px; border-radius:5px;
-        padding:9px 11px; background:#171b21; }
-.tile.green { border-left-color:var(--ok); }
-.tile.amber { border-left-color:var(--warn); }
-.tile.red { border-left-color:var(--fail); }
-.tile.grey { border-left-color:var(--unknown); }
-.tile .t { font-size:11px; color:var(--dim); letter-spacing:.05em; }
-.tile .v { font-size:19px; margin:3px 0 2px; }
-.tile .d { font-size:11.5px; color:var(--dim); }
-.tile .badge { float:right; font-size:10px; padding:1px 6px; border-radius:9px;
-               background:#232a34; color:var(--dim); }
-table { width:100%; border-collapse:collapse; font-size:12.5px; }
-/* EVERY TABLE SCROLLS INSIDE ITSELF, NEVER THE PAGE. The incident table is seven
-   columns wide and carries a free-text `detail`, so on a 393 pt screen it forced
-   the DOCUMENT wider and the whole page scrolled sideways under the reader's
-   thumb -- measured on an iPhone 15 Pro 2026-10-07. `overflow-wrap` makes the
-   ordinary case wrap instead; the wrapper is for the genuinely unbreakable token
-   (a path, a digest), where scrolling one table beats scrolling the page. */
-.scroll { overflow-x:auto; }
-th { text-align:left; color:var(--dim); font-weight:500; font-size:11px;
-     letter-spacing:.05em; padding:5px 7px;
-     border-bottom:1px solid var(--line); }
-td { padding:5px 7px; border-bottom:1px solid #1c212a; vertical-align:top;
-     overflow-wrap:anywhere; }
-tr.red td:first-child { border-left:3px solid var(--fail); }
-tr.amber td:first-child { border-left:3px solid var(--warn); }
-tr.grey td:first-child { border-left:3px solid var(--unknown); }
-tr.green td:first-child { border-left:3px solid var(--ok); }
-.pill { display:inline-block; min-width:52px; text-align:center; padding:1px 5px;
-        border-radius:3px; font-size:10.5px; font-weight:600; }
-.pill.green { background:#12351d; color:#7ee08f; }
-.pill.amber { background:#3a2f10; color:#e8c46a; }
-.pill.red { background:#43181a; color:#ff9d99; }
-.pill.grey { background:#272c34; color:#a8b0bd; }
-.detail { color:var(--dim); }
-.foot { margin-top:26px; padding-top:11px; border-top:1px solid var(--line);
-        color:var(--dim); font-size:11.5px; }
-.foot code { color:var(--fg); }
-.note { background:#171b21; border:1px solid var(--line); border-radius:5px;
-        padding:9px 11px; color:var(--dim); font-size:12px; margin:7px 0; }
-a { color:#6cb6ff; }
-.band { padding:11px 13px; border-radius:5px; margin:12px 0 0;
-        border:1px solid var(--line); border-left-width:6px; }
-.band .bst { font-size:19px; font-weight:700; letter-spacing:.01em; }
-.band .bwhy { font-size:12.5px; color:var(--dim); margin-top:1px; }
-.band.ok { border-left-color:var(--ok); background:#101a12; }
-.band.warn { border-left-color:var(--warn); background:#1d1a10; }
-.band.fail { border-left-color:var(--fail); background:#1f1113; }
-.band.unknown { border-left-color:var(--unknown); background:var(--panel); }
-.band.ok .bst { color:#8fdc9f; }
-.band.warn .bst { color:#e8c46a; }
-.band.fail .bst { color:#ff9d99; }
-.band.unknown .bst { color:#a8b0bd; }
-.wcard { border:1px solid var(--line); border-left-width:5px; border-radius:5px;
-         padding:10px 12px; background:var(--panel); margin:7px 0; }
-.wcard.red { border-left-color:var(--fail); }
-.wcard.amber { border-left-color:var(--warn); }
-.wcard .wtop { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; }
-.wcard .wt { font-size:13px; }
-.wcard .wc { font-size:11.5px; color:var(--dim); }
-.wcard .wd { font-size:12px; color:var(--dim); margin-top:5px;
-             overflow-wrap:anywhere; }
-.strip { display:flex; flex-wrap:wrap; gap:8px; margin:13px 0 2px; }
-.strip .seg-group { display:flex; gap:1px; }
-.strip .seg { width:5px; height:20px; border-radius:1px; display:block; }
-.strip .seg.green { background:var(--ok); }
-.strip .seg.amber { background:var(--warn); }
-.strip .seg.red { background:var(--fail); }
-.strip .seg.grey { background:var(--unknown); }
-details { margin:9px 0; border-top:1px solid var(--line); padding-top:8px; }
-/* The pull-to-refresh strip. Height 0 until a pull gives it one, and NO TRANSITION
-   WHILE THE FINGER IS DOWN -- a transition on a height that tracks a thumb lags
-   it. `.settle` is added for the release only. Empty by default, so an element
-   whose script never ran is invisible rather than a claim about anything. */
-.pull { height:0; overflow:hidden; display:flex; align-items:center;
-        justify-content:center; font-size:11.5px; color:var(--dim); }
-.pull.settle { transition:height .18s ease; }
-.pull.ready, .pull.busy { color:var(--fg); }
-summary { cursor:pointer; font-size:13px; color:var(--fg); padding:5px 0;
-          list-style:none; }
-summary::-webkit-details-marker { display:none; }
-summary::before { content:"▸ "; color:var(--dim); }
-details[open] > summary::before { content:"▾ "; }
-summary:focus-visible { outline:2px solid #6cb6ff; outline-offset:2px; }
-
-/* The only motion this page has is the refresh swap and the disclosure
-   opening. A reader who asked for none still gets a page that updates -- it
-   just stops moving while it does. */
-@media (prefers-reduced-motion: reduce) {
-  * { transition:none !important; animation:none !important;
-      scroll-behavior:auto !important; }
-}
-"""
-
-
-# THE REACTIVE LAYER, AND WHY IT RE-FETCHES THE PAGE
-#
-# The obvious implementation is a client-side renderer that fetches
-# /api/status.json and patches the tiles. It is also a SECOND render_html that
-# has to be kept identical to the first one forever, which is item 7's shape and
-# has already cost this project twice. So the script fetches `/` and swaps the
-# DOM: the server stays the only thing that knows how to draw this page.
-#
-# TWO FAILURE MODES ARE DESIGNED IN, because both are the stale-sample defect in
-# new clothes. If the fetch fails, the band AND the hero above it both flip to
-# UNKNOWN, naming the monitor as unreachable -- a page that has stopped being
-# able to check must not go on asserting health, and the freshness claim is the
-# one that asserts it loudest. If the swap brings a stale page, that page carries
-# its own red banner and arrives stating its own age.
-REFRESH_JS = """
-(function () {
-  var el = document.getElementById('live');
-  var ms = %d;
-  var timer = null;
-
-  function snapshot() {
-    // BY ID, NOT BY POSITION. The incidents section appears and disappears as
-    // incidents open and resolve, so an index shifts and the wrong section
-    // reopens -- a bug that only shows up on the one day it matters.
-    //
-    // BOTH STATES, NOT ONLY THE OPEN ONES. Recording only the open sections meant
-    // a section the reader had COLLAPSED came back open every interval: the swap
-    // reinstates the server's own default and nothing ever closes it again. A
-    // section the reader shut is a decision, and the swap has to carry it the
-    // same way it carries an open one.
-    var st = {};
-    el.querySelectorAll('details').forEach(function (d) {
-      if (d.id) { st[d.id] = d.open; }
-    });
-    return st;
-  }
-
-  function restore(st) {
-    Object.keys(st).forEach(function (id) {
-      var d = el.querySelector('#' + CSS.escape(id));
-      if (d) { d.open = st[id]; }
-    });
-  }
-
-  function unreachable() {
-    // THE HERO TOO, NOT ONLY THE BAND. The band carries the verdict, but the
-    // hero carries the freshness claim above it, and leaving the hero alone puts
-    // "12s ago" with a green bar directly over "cannot reach the monitor" -- a
-    // page asserting a fresh reading it can no longer take.
-    var h = el.querySelector('.hero');
-    if (h) {
-      h.className = 'hero none';
-      h.innerHTML = '<div class=hage>unknown</div>' +
-                    '<div class=hsub>this page can no longer reach the ' +
-                    'monitor</div>';
-    }
-    var b = el.querySelector('.band');
-    if (b) {
-      b.className = 'band unknown';
-      b.innerHTML = '<div class=bst>UNKNOWN</div><div class=bwhy>' +
-                    'cannot reach the monitor, so this page cannot say ' +
-                    'anything about the fleet</div>';
-    }
-  }
-
-  function tick() {
-    if (document.hidden) { return Promise.resolve(); }
-    // A PROXY THAT HANGS IS NOT A PROXY THAT REFUSES. A refused connection
-    // reaches the catch at once; one that accepts and never answers leaves the
-    // fetch pending forever, so neither branch below ever runs and the page
-    // keeps its old, green self. Twice the poll interval, so a slow-but-working
-    // poll can never trip it.
-    var ctl = (typeof AbortController === 'function')
-                ? new AbortController() : null;
-    var to = ctl ? setTimeout(function () { ctl.abort(); },
-                              Math.max(3000, ms * 2)) : null;
-    return fetch('/', {cache: 'no-store',
-                signal: ctl ? ctl.signal : undefined}).then(function (r) {
-      if (!r.ok) { throw new Error('http ' + r.status); }
-      return r.text();
-    }).then(function (text) {
-      var doc = new DOMParser().parseFromString(text, 'text/html');
-      var fresh = doc.getElementById('live');
-      if (!fresh) { throw new Error('no #live in the response'); }
-      var prev = snapshot();
-      var y = window.scrollY;
-      el.innerHTML = fresh.innerHTML;
-      restore(prev);
-      window.scrollTo(0, y);
-    }).catch(unreachable).then(function () {
-      if (to) { clearTimeout(to); }
-    });
-  }
-
-  function arm() {
-    if (timer) { clearInterval(timer); }
-    timer = document.hidden ? null : setInterval(tick, ms);
-  }
-
-  // ---- pull to refresh ----------------------------------------------------
-  //
-  // WHY THE GESTURE EXISTS AT ALL, given the interval above: an INDICATOR, not
-  // freshness. The page is already current within a second of the app coming
-  // back to the foreground, but nothing on screen says so, and a reader who has
-  // just been told the fleet is on fire should not have to trust that.
-  //
-  // IT CALLS tick(), IT DOES NOT FETCH. One fetch path means one failure path:
-  // a pull that cannot reach the monitor lands in the same `unreachable()` the
-  // interval uses, so the band goes UNKNOWN exactly as it would have, and there
-  // is no second copy of "what to show when the fetch dies" to get wrong.
-  //
-  // IT CAN ONLY START AT THE TOP (`window.scrollY <= 0`), so it never competes
-  // with scrolling. The listeners are PASSIVE and nothing is preventDefaulted:
-  // the gesture reads the finger, it does not take it.
-  var pull = document.getElementById('pull');
-  var PULL_MAX = 34;        // the strip's height when fully drawn
-  var PULL_ARM = 60;        // finger travel, not drawn height, that arms it
-  var startY = null, armed = false, pulling = false;
-
-  function draw(h, cls, text) {
-    if (!pull) { return; }
-    pull.style.height = h + "px";
-    pull.className = "pull" + (cls ? " " + cls : "");
-    pull.textContent = text;
-  }
-
-  document.addEventListener('touchstart', function (e) {
-    if (pulling || e.touches.length !== 1) { return; }
-    startY = (window.scrollY <= 0) ? e.touches[0].clientY : null;
-    armed = false;
-  }, {passive: true});
-
-  document.addEventListener('touchmove', function (e) {
-    if (startY === null || e.touches.length !== 1) { return; }
-    var dy = e.touches[0].clientY - startY;
-    if (dy <= 0) {                     // the finger went up: a scroll, stand down
-      startY = null;
-      armed = pulling = false;
-      draw(0, "settle", "");
-      return;
-    }
-    pulling = true;
-    armed = dy >= PULL_ARM;
-    draw(Math.min(dy * 0.5, PULL_MAX), armed ? "ready" : "",
-         armed ? "release to refresh" : "pull to refresh");
-  }, {passive: true});
-
-  document.addEventListener('touchend', function () {
-    if (startY === null) { return; }
-    startY = null;
-    if (!pulling) { return; }
-    pulling = false;
-    if (!armed) { draw(0, "settle", ""); return; }
-    armed = false;
-    // "refreshing" is the only claim the strip makes, and it stops when the
-    // fetch stops -- including when the fetch fails, by which time the band has
-    // taken over and says something true about the fleet instead.
-    draw(PULL_MAX, "settle busy", "refreshing");
-    tick().then(function () { draw(0, "settle", ""); });
-  }, {passive: true});
-
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { tick(); }
-    arm();
-  });
-  arm();
-})();
-"""
-
-
-def _esc(s):
-    return html.escape("" if s is None else str(s), quote=False)
-
-
 def _span(seconds):
-    """A duration, without the "ago". For thresholds and scales.
+    """A duration, without the "ago". For thresholds and the health probe.
 
-    Extracted rather than typed a second time: `_age` and the hero's scale end
+    Extracted rather than typed a second time: `_age` and any other formatter
     must agree about what "3.0 min" means, and two formatters drift.
     """
     if seconds < 90:
@@ -1133,459 +622,40 @@ def _age(seconds):
     return _span(seconds) + " ago"
 
 
-def _freshness(state):
-    """The hero: the age of the last collection, against the stale threshold.
+# THE COMMITTED SPA BUILD, and the two rules that make it safe to cache.
+#
+# Vite writes the bundle under a content-hashed name, so `assets/index-<hash>.js`
+# can never describe different bytes than it did yesterday: it is not an
+# observation, and `immutable` cannot serve a stale reading. `index.html` is NOT
+# hashed -- it is the pointer to whatever bundle the image carries -- so it is
+# served no-store like every other response. That is also why there is no
+# service worker: it could only cache the one thing that must not be cached.
+STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+ASSET_CACHE = "public, max-age=31536000, immutable"
+# Vite emits files, not inline script, so the shell needs no 'unsafe-inline'
+# and no third-party origin. If a later change adds either, this header is what
+# makes the browser say so instead of the review.
+SHELL_CSP = "default-src 'self'"
 
-    WHY THE AGE AND NOT THE VERDICT. This is a dead-man switch, so the first
-    question is never "how is the fleet" but "is this page still being told
-    anything". Everything below the hero is only as current as this number, and
-    a page that leads with a verdict is a page that leads with a claim it may no
-    longer be able to make.
 
-    The bar is drawn in POLL INTERVALS because that is the unit the threshold is
-    actually stated in -- "three intervals" -- and reading the margin off a
-    number is arithmetic the operator should not have to do at 2am.
+def _static_file(path):
+    """(bytes, content type) for a file under app/static, or (None, None).
+
+    THE TRAVERSAL GUARD IS THE REALPATH PREFIX, not a search for '..': a symlink
+    inside static/ escapes just as well as a dotted segment, and realpath
+    resolves both. The separator is part of the prefix for the same reason --
+    without it, a sibling directory named `static-secrets` would pass.
     """
-    st = state["staleness"]
-    if st == "none":
-        # NO BAR, deliberately. A track at 0% reads as "0s ago", and "never
-        # collected" is the opposite of that.
-        return ("<div class='hero none'><div class=hage>never</div>"
-                "<div class=hsub>no collection has ever been recorded</div>"
-                "</div>")
-    age = state["last_age_s"]
-    limit = state["stale_after_s"]
-    pct = max(0.0, min(100.0, 100.0 * age / limit)) if limit else 100.0
-    return ("<div class='hero %s'><div class=hage>%s</div>"
-            "<div class=hscale><span>current</span><span>stale at %s</span></div>"
-            "<div class=hbar role=img aria-label='last collection %s, stale past "
-            "%s'><i style='width:%.1f%%'></i></div></div>"
-            % (st, _esc(_age(age)), _esc(_span(limit)), _esc(_age(age)),
-               _esc(_span(limit)), pct))
-
-
-def _details(sid, summary, body, open_=False):
-    """A native disclosure. No script, no framework, no custom accordion.
-
-    `<details>` is the platform's own answer and it works with a keyboard, a
-    screen reader and a thumb without anything from us.
-
-    The id is not decoration: the reactive layer restores which sections were
-    open after it swaps the DOM, and it does that BY ID, so a section appearing
-    or disappearing between renders does not shift every section after it.
-    """
-    return ("<details id='sec-%s'%s><summary>%s</summary>%s</details>"
-            % (_esc(sid), " open" if open_ else "", _esc(summary), body))
-
-
-def render_html(state, cfg):
-    out = []
-    a = out.append
-    a("<!doctype html><meta charset=utf-8>")
-    a("<meta name=viewport content='width=device-width,initial-scale=1,"
-      "viewport-fit=cover'>")
-    a("<title>sentinel</title>")
-    a("<link rel=manifest href=/manifest.webmanifest>")
-    a("<link rel=apple-touch-icon href=/icons/icon-180.png>")
-    a("<meta name=apple-mobile-web-app-capable content=yes>")
-    a("<meta name=apple-mobile-web-app-title content=sentinel>")
-    a("<meta name=apple-mobile-web-app-status-bar-style content=black-translucent>")
-    a("<meta name=theme-color content='#0e1216'>")
-    a("<style>%s</style>" % CSS)
-    a("<div class=wrap>")
-    # OUTSIDE #live, DELIBERATELY. The reactive layer swaps #live's innerHTML every
-    # interval, so an indicator inside it is detached by the first refresh and the
-    # gesture then writes into a node nobody can see -- a control that works once.
-    a("<div class=pull id=pull></div>")
-    a("<h1>sentinel</h1>")
-    # THE TARGET LIST IS DERIVED, NOT TYPED. §4.6's subtitle names the four
-    # tenants, and writing those four names here as a literal would be a CuBox
-    # literal in the presentation layer -- the one thing CLAUDE.md says the page
-    # must not become, stale the moment a second adapter lands.
-    watched = sorted({r["target"] for r in
-                      state["tiles"] + state["extra"] + state["others"]
-                      + state["informational"]})
-    # THE SUBTITLE NAMES THE CADENCE, because "refreshed on every load" was the
-    # whole truth once and now reads as "nothing happens while you watch" -- the
-    # page updates itself in place and the one reader who asked was told
-    # otherwise by this line. It is the interval, the moment the app returns to
-    # the foreground, and a pull, in that order of importance.
-    a("<div class=sub>Watching %s. Refreshed on load and every %ds while it is "
-      "open &mdash; nothing here is cached.</div>"
-      % (_esc(", ".join(watched) or "nothing yet"), cfg.interval))
-    a("<div id=live>")
-
-    # ---- the hero: how current this page is --------------------------------
-    a(_freshness(state))
-
-    # ---- the band: the verdict, with staleness dominating it ----------------
-    a(_verdict_band(state))
-
-    # ---- the staleness banner: directly under the band, so that everything
-    # BELOW it is the fleet's rows and the sentence it carries about them is
-    # true. Above it sit only the hero (this page's age) and the band (which
-    # staleness already dominates, so it cannot assert a green fleet). It used to
-    # sit after the wrong-rows section, and then "EVERYTHING BELOW DESCRIBES THE
-    # FLEET AS IT WAS" excluded the one section an operator reads first.
-    st = state["staleness"]
-    if st == "none":
-        a("<div class='banner none'>NO COLLECTION HAS EVER BEEN RECORDED. The "
-          "store is empty, so this page knows NOTHING about the fleet. That is "
-          "not a clean fleet -- it is a monitor that has not run. Start the "
-          "collector and check whether it can write to its database.</div>")
-    elif st == "stale":
-        a("<div class='banner red'>STALE: last collection was %s, past the %d "
-          "poll intervals (%ds) that count as current. EVERYTHING BELOW "
-          "DESCRIBES THE FLEET AS IT WAS, NOT AS IT IS -- and if the collector "
-          "has stopped, these rows will keep showing the last thing it saw "
-          "indefinitely. Check the collector container first.</div>"
-          % (_age(state["last_age_s"]), STALE_INTERVALS, state["stale_after_s"]))
-    elif st == "lagging":
-        a("<div class='banner amber'>Last collection was %s -- later than one "
-          "poll interval but not yet stale.</div>" % _age(state["last_age_s"]))
-    else:
-        a("<div class='banner ok'>Last collection %s &middot; epoch %s &middot; "
-          "%s checks in %sms &middot; %s error(s)</div>"
-          % (_age(state["last_age_s"]),
-             state["last"]["epoch_seq"] if state["last"] else "?",
-             state["last"]["checks_run"] if state["last"] else "?",
-             state["last"]["duration_ms"] if state["last"] else "?",
-             state["last"]["errors"] if state["last"] else "?"))
-
-    if state["last"] and state["last"].get("note"):
-        a("<div class=note>collector note: %s</div>" % _esc(state["last"]["note"]))
-
-    # ---- the strip: one segment per graded check, grouped by target --------
-    a(_tally_strip(state))
-
-    a(_whats_wrong_section(state))
-
-    tally = _tally(state)
-    a("<div class=sub style='margin-top:8px'>%d green &middot; %d amber &middot; "
-      "%d red &middot; %d grey (UNKNOWN is never green)%s</div>"
-      % (tally["green"], tally["amber"], tally["red"], tally["grey"],
-         # The informational count is shown SEPARATELY and named as uncounted,
-         # because the alternative is a reader adding the columns up and finding
-         # that they do not reach the number of rows on the page.
-         (" &middot; %d informational, no colour assigned"
-          % tally["informational"]) if tally["informational"] else ""))
-
-    # ---- live incidents ------------------------------------------------------
-    incidents = []
-    _inc = incidents.append
-    _inc("<h2>Live incidents (%d)</h2>" % len(state["incidents"]))
-    if not state["incidents"]:
-        _inc("<div class=note>No live incident. One that can no longer be "
-             "observed would appear here too -- so an empty list means no check "
-             "is currently reporting a problem <em>and</em> none is frozen. A "
-             "condition still being confirmed after a single poll is not yet an "
-             "incident and is not shown.</div>")
-    else:
-        _inc("<div class=scroll><table><tr><th>Sev</th><th>Target</th><th>Check</th>"
-             "<th>State</th><th>Since</th><th>Obs</th><th>Detail</th></tr>")
-        for i in state["incidents"]:
-            sev = i["severity"] or "grey"
-            # THE SUFFIX IS THE INCIDENT'S OWN FACT, so it is appended to the
-            # detail cell rather than stated anywhere page-wide: an operator
-            # reading a row needs to know whether a remedy has already been
-            # tried on THIS condition, and a sentence rendered for every row
-            # would say a remedy ran where none did.
-            detail = i["last_detail"] or ""
-            if i.get("remedy_attempts"):
-                detail += " · remedy attempted %d time(s)%s" % (
-                    i["remedy_attempts"],
-                    " (LATCHED)" if i.get("remedy_latched") else "")
-            _inc("<tr class=%s><td><span class='pill %s'>%s</span></td>"
-                 "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
-                 "<td class=detail>%s</td></tr>"
-                 % (sev, sev, _esc(sev.upper()), _esc(i["target"]),
-                    _esc(i["check_id"]), _esc(i["state"]),
-                    _esc(_age(state["now"] - i["first_seen"])),
-                    i["observed_count"], _esc(detail)))
-        _inc("</table></div>")
-    incidents_html = "\n".join(incidents)
-
-    # ---- operator commands: what was run against the fleet, and its rc -----
-    #
-    # BELOW THE INCIDENTS, because the two answer the same question in order:
-    # what is wrong, and what has already been done about it. The remedy audit
-    # is the healer's, the command audit is the operator's, and both belong on
-    # the page that exists to be the only surface nobody has to ssh to read.
-    cacc = []
-    _cm = cacc.append
-    _cm("<h2>Operator commands (last %d)</h2>" % COMMAND_RUNS_LIMIT)
-    if not state["command_runs"]:
-        # AN EMPTY LIST SAYS WHICH EMPTY IT IS. "No commands" and "the audit
-        # query failed" are two facts; the row count in the evidence section
-        # below is what distinguishes them, so the sentence points at it rather
-        # than reading as a clean slate.
-        _cm("<div class=note>No operator command is recorded. That means none "
-            "was run in this store, not that the audit is missing -- the "
-            "<code>command_run</code> row count is in the evidence section.")
-    else:
-        _cm("<div class=scroll><table><tr><th>When</th><th>Command</th>"
-            "<th>Actor</th><th>RC</th></tr>")
-        for r in state["command_runs"]:
-            _cm("<tr><td>%s</td><td>%s.%s%s</td><td>%s</td><td>%s</td></tr>"
-                % (_esc(_age(state["now"] - r["ts"])), _esc(r["module"]),
-                   _esc(r["command"]),
-                   " <span class=sub>(dry run)</span>" if r["dry_run"] else "",
-                   _esc(r["actor"]), _esc(r["exit_status"])))
-        _cm("</table></div>")
-    commands_html = "\n".join(cacc)
-
-    # ---- recommendations: what the advisors claim --------------------------
-    #
-    # ADDITIVE OUTPUT, NOT AN INCIDENT. An insight has no state machine and no
-    # check can resolve it, so it is presented as advice and never as a
-    # verdict. Platform-level insights (the reference advisor's incident report
-    # and threshold suggestions) are included: filtering by module would hide
-    # the only advisor the default deployment runs.
-    racc = []
-    _rec = racc.append
-    insights = state.get("insights", [])
-    _rec("<h2>Recommendations (%d)</h2>" % len(insights))
-    if not insights:
-        _rec("<div class=note>No advisor insight is stored. That means no "
-             "advisor produced one, not that the fleet has nothing worth "
-             "recommending &mdash; the <code>insight</code> row count is in the "
-             "evidence section.</div>")
-    else:
-        _rec("<div class=scroll><table><tr><th>When</th><th>Kind</th>"
-             "<th>Source</th><th>Title</th></tr>")
-        for row in insights:
-            source = row["module"]
-            if row.get("target"):
-                source += " &middot; " + row["target"]
-            _rec("<tr><td>%s</td><td>%s</td><td>%s</td><td class=detail>%s"
-                 "</td></tr>"
-                 % (_esc(_age(state["now"] - row["ts"])), _esc(row["kind"]),
-                    _esc(source), _esc(row["title"])))
-        _rec("</table></div>")
-    recommendations_html = "\n".join(racc)
-
-    # ---- approvals: the pending proposal queue -----------------------------
-    #
-    # AN EXPIRED PROPOSAL IS SHOWN AS EXPIRED, not as pending. The row is still
-    # `pending` in a store the collector has not swept since the deadline, and
-    # presenting it as actionable is exactly the kind of stale-but-data-shaped
-    # claim this page exists not to make.
-    pacc = []
-    _app = pacc.append
-    proposals = state.get("proposals", [])
-    _app("<h2>Approvals (%d)</h2>" % len(proposals))
-    if not proposals:
-        # TWO EMPTY QUEUES. `MONITOR_REMEDIES=0` stops execution at the process
-        # level, so nothing could run even if something were queued. Saying only
-        # "nothing pending" would read as "the fleet needs no decision", which
-        # is the opposite of "the engine is switched off".
-        if state.get("remedies_enabled"):
-            _app("<div class=note>No pending proposal. A "
-                 "<code>propose</code>-level remedy writes one here rather than "
-                 "acting; an empty queue means the engine has nothing waiting "
-                 "for a human.</div>")
-        else:
-            _app("<div class=note>No pending proposal, and automated remedies "
-                 "are DISABLED (<code>MONITOR_REMEDIES=0</code>): an approval "
-                 "could not execute even if one were queued. Set "
-                 "<code>MONITOR_REMEDIES=1</code> to enable execution; "
-                 "advisory-level recommendations are still surfaced above."
-                 "</div>")
-    else:
-        _app("<div class=scroll><table><tr><th>Key</th><th>Kind</th>"
-             "<th>Module</th><th>Rationale</th><th>Expiry</th></tr>")
-        for row in proposals:
-            if not row["expires_at"]:
-                expiry = "never"
-            elif row.get("expired"):
-                expiry = "EXPIRED %s ago" % _span(state["now"] - row["expires_at"])
-            else:
-                expiry = "%s remaining" % _span(row["expires_at"] - state["now"])
-            _app("<tr><td>%s</td><td>%s</td><td>%s</td><td class=detail>%s"
-                 "</td><td>%s</td></tr>"
-                 % (_esc(row["id"]), _esc(row["kind"]), _esc(row["module"]),
-                    _esc(row["rationale"]), _esc(expiry)))
-        _app("</table></div>")
-    approvals_html = "\n".join(pacc)
-
-    # ---- the RAG tiles, then every check the registry does not own ----------
-    tacc = []
-    _tc = tacc.append
-
-    # A DISABLED MODULE IS LOUD, ABOVE THE TILES. Its checks are absent by
-    # construction, and an absent section reads exactly like a healthy one --
-    # so the reason it is absent is stated rather than inferred.
-    for m in state.get("disabled_modules", []):
-        _tc("<div class=note>Module %s is DISABLED by configuration. Its "
-            "checks are not running; its incidents are frozen, not resolved "
-            "(a latched incident still waits for a human).</div>"
-            % _esc(m["title"]))
-
-    def _grid(items):
-        _tc("<div class=grid>")
-        for t in items:
-            colour = _status(t["status"]).rag
-            if t["value"] is None:
-                val = "--"
-            else:
-                val = ("%g%s" % (t["value"],
-                                 (" " + t["unit"]) if t["unit"] else ""))
-            _tc("<div class='tile %s'><span class=badge>%s</span>"
-                "<div class=t>%s &middot; %s</div><div class=v>%s</div>"
-                "<div class=d>%s</div></div>"
-                % (colour, _esc(t["target"]), _esc(t["title"]),
-                   _esc(t["status"]), _esc(val), _esc(t["detail"])))
-        _tc("</div>")
-
-    # ONE SECTION PER ENABLED MODULE, in discovery order (module `order`, then
-    # id). A tile whose check belongs to no enabled module is rendered under a
-    # fallback heading rather than dropped -- a vanishing row reads as green.
-    grouped = {}
-    for t in state["tiles"]:
-        grouped.setdefault(t.get("module"), []).append(t)
-    for m in state.get("modules", []):
-        items = grouped.pop(m["id"], [])
-        _tc("<h2>%s (%d)</h2>" % (_esc(m["title"]), len(items)))
-        _grid(items)
-    for mid, items in grouped.items():
-        _tc("<h2>%s (%d)</h2>"
-            % (_esc("Critical metrics" if mid is None else mid), len(items)))
-        _grid(items)
-    rows = state["extra"] + state["tiles"] + state["others"] + state["informational"]
-    by_target = {}
-    for r in rows:
-        by_target.setdefault(r["target"], []).append(r)
-    _tc("<h2>All checks by target</h2>")
-    for target in sorted(by_target):
-        items = sorted(by_target[target], key=lambda x: x["check_id"])
-        _tc("<div class=scroll><table><tr><th colspan=3>%s (%d checks)</th></tr>"
-            % (_esc(target), len(items)))
-        for it in items:
-            colour = _status(it["status"]).rag
-            src = " <span class=sub>(collector)</span>" if it.get("from") else ""
-            _tc("<tr class=%s><td style='width:80px'>"
-                "<span class='pill %s'>%s</span>"
-                "</td><td style='width:210px'>%s%s</td><td class=detail>%s</td>"
-                "</tr>"
-                % (colour, colour, _esc(it["status"]), _esc(it["check_id"]), src,
-                   _esc(it["detail"])))
-        _tc("</table></div>")
-    tiles_and_checks_html = "\n".join(tacc)
-
-    # ---- informational -----------------------------------------------------
-    iacc = []
-    _inf = iacc.append
-    if state["informational"]:
-        _inf("<h2>Informational &mdash; not health metrics</h2>")
-        _inf("<div class=note>These are reported so the row EXISTS, and no colour "
-             "is assigned. A missing row would read as &ldquo;fine&rdquo;.</div>")
-        _inf("<div class=scroll><table><tr><th>Target</th><th>Reading</th>"
-             "<th>Detail</th></tr>")
-        for it in state["informational"]:
-            # The unit is appended only when there IS one: "%s %s" with an empty
-            # unit leaves a trailing space in the cell, which is invisible on the
-            # page but makes every grep for a reading in this table miss.
-            val = "--" if it["value"] is None else "%g" % it["value"]
-            if it["unit"]:
-                val = "%s %s" % (val, it["unit"])
-            _inf("<tr><td>%s<br><span class=sub>%s</span></td><td>%s</td>"
-                 "<td class=detail>%s</td></tr>"
-                 % (_esc(it["target"]), _esc(it["title"]), _esc(val),
-                    _esc(it["detail"])))
-        _inf("</table></div>")
-    informational_html = "\n".join(iacc)
-
-    # ---- thresholds with no check behind them ------------------------------
-    dacc = []
-    _def = dacc.append
-    if state["deferred"] or state["unclaimed"]:
-        _def("<h2>Thresholds with no check behind them</h2>")
-        for d in state["deferred"]:
-            _def("<div class=note><b>%s</b> &mdash; deliberately not implemented:"
-                 " %s</div>" % (_esc(d["id"]), _esc(d["reason"])))
-        for u in state["unclaimed"]:
-            _def("<div class='note' style='border-color:#da3633'><b>%s</b> "
-                 "&mdash; UNCLAIMED. No check reads this and no reason is "
-                 "recorded. This is a defect in the monitor, not a status of the "
-                 "fleet.</div>" % _esc(u))
-    deferred_html = "\n".join(dacc)
-
-    # ---- footer: the row counts, so an empty read is visible ----------------
-    eacc = []
-    _ev = eacc.append
-    _ev("<h2>Evidence of what this render actually read</h2>")
-    _ev("<div class=note>Row counts, so &ldquo;0 rows&rdquo; can never be mistaken "
-        "for &ldquo;0 problems&rdquo;. SQLite returns an EMPTY RESULT SET for a "
-        "busy database rather than an error, which is the same shape as this "
-        "project's <code>done 0 / orphan 18</code> gate that printed "
-        "&ldquo;Coverage is complete&rdquo;.</div>")
-    _ev("<div class=scroll><table><tr><th>Table</th><th>Rows</th></tr>")
-    for name, n in sorted(state["counts"]["tables"].items()):
-        _ev("<tr><td>%s</td><td>%s</td></tr>" % (_esc(name), _esc(n)))
-    _ev("</table></div>")
-    _ev("<div class=foot>interval %ds &middot; stale past %ds &middot; "
-        "database %s &middot; rendered %s &middot; "
-        "<a href='/api/status.json'>/api/status.json</a> (versioned, for "
-        "integration) &middot; "
-        "<a href='/api/state.json'>/api/state.json</a> (this page's own model) "
-        "&middot; nothing on this page is cached, and it is regenerated on every "
-        "load</div>"
-        % (cfg.interval, state["stale_after_s"], _esc(cfg.db_path),
-           time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(state["now"]))))
-    evidence_html = "\n".join(eacc)
-
-    # ---- everything else, behind native disclosure -------------------------
-    #
-    # THE ORDER IS THE SPEC'S, NOT THE READER'S GUESS. §4.1's wireframe (:90-94)
-    # and §4.5's table (:174-175) both put `All N checks` above the incident
-    # section, and they agree with each other, so the disclosure follows them.
-    # Each summary states its own count so a shut section still says how much is
-    # behind it: a collapsed list that does not say how many rows it holds reads
-    # as an empty one -- the same defect as an absent row reading as fine, one
-    # level up.
-    all_rows = (len(state["extra"]) + len(state["tiles"]) + len(state["others"])
-                + len(state["informational"]))
-    a(_details("checks", "All %d checks" % all_rows, tiles_and_checks_html))
-
-    n = len(state["incidents"])
-    if n:
-        a(_details("incidents", "%d live incident%s" % (n, "" if n == 1 else "s"),
-                   incidents_html, open_=True))
-    else:
-        a(_details("incidents", "No live incident", incidents_html))
-
-    a(_details("commands",
-               ("Operator commands (last %d)" % COMMAND_RUNS_LIMIT)
-               if state["command_runs"] else "No operator command recorded",
-               commands_html))
-
-    # Both are always rendered, empty-safe: a section that vanishes when the
-    # queue empties is indistinguishable from one whose query broke.
-    a(_details("recommendations",
-               "Recommendations (%d)" % len(state.get("insights", [])),
-               recommendations_html))
-    a(_details("approvals",
-               "Approvals (%d)" % len(state.get("proposals", [])),
-               approvals_html))
-
-    if state["informational"]:
-        a(_details("informational",
-                   "Informational (%d) — not health metrics by ruling"
-                   % len(state["informational"]), informational_html))
-
-    if state["deferred"] or state["unclaimed"]:
-        a(_details("thresholds",
-                   "Thresholds with no check behind them (%d)"
-                   % (len(state["deferred"]) + len(state["unclaimed"])),
-                   deferred_html))
-
-    a(_details("evidence",
-               "Evidence — %d row counts from this render"
-               % len(state["counts"]["tables"]), evidence_html))
-    a("</div>")                                   # #live
-    a("<script id=refresh>%s</script>" % (REFRESH_JS % (cfg.interval * 1000)))
-    a("</div>")                                   # .wrap
-    return "\n".join(out)
+    rel = path.lstrip("/")
+    full = os.path.realpath(os.path.join(STATIC, rel))
+    if not full.startswith(os.path.realpath(STATIC) + os.sep):
+        return None, None
+    try:
+        with open(full, "rb") as fh:
+            return (fh.read(),
+                    mimetypes.guess_type(full)[0] or "application/octet-stream")
+    except OSError:
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -1606,16 +676,18 @@ class Handler(BaseHTTPRequestHandler):
         import sys
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
-    def _send(self, code, body, ctype, cache=None):
+    def _send(self, code, body, ctype, cache=None, extra=None):
         raw = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         # THE DEAD-MAN SWITCH DEPENDS ON THESE LINES, and `cache` is the ONE
-        # documented way past them: the app shell is a constant of the image and
-        # not an observation, so an icon may be cached and nothing that carries
-        # a reading may be. See shell.py.
+        # documented way past them: the app shell and the hashed bundle are
+        # constants of the image and not observations, so they may be cached and
+        # nothing that carries a reading may be. See shell.py and ASSET_CACHE.
         self.send_header("Cache-Control", cache or OBSERVATION_CACHE)
+        for name, value in (extra or {}).items():
+            self.send_header(name, value)
         if cache is None:
             # HTTP/1.0 belt-and-braces, for the observation rule only. With
             # Cache-Control present these are ignored (RFC 7234 s5.4), so
@@ -1665,10 +737,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, body, "text/plain; charset=utf-8")
                 return
             if path == "/api/status.json":
-                # The integration contract. Deliberately computed from its own
-                # `build_state` call rather than reusing the one the page needs,
-                # because this endpoint must work even for a caller that never
-                # asks for the page.
+                # The integration contract. It builds its own `build_state`
+                # rather than borrowing one from a request that happens to have
+                # made it, because this endpoint must work for a caller that
+                # never asks for anything else.
                 self._send(200, json.dumps(build_status(cfg, conn), default=str,
                                            indent=1),
                            "application/json")
@@ -1711,15 +783,56 @@ class Handler(BaseHTTPRequestHandler):
                 # thing as any other unmatched route.
                 self._error(404, "no_route", "no such /api/v1 route")
                 return
-            state = build_state(cfg, conn)
             if path == "/api/state.json":
+                state = build_state(cfg, conn)
                 self._send(200, json.dumps(state, default=str, indent=1),
                            "application/json")
                 return
-            if path in ("/", "/index.html"):
-                self._send(200, render_html(state, cfg), "text/html; charset=utf-8")
+            # HASHED ASSETS. The name carries the digest, so an immutable cache
+            # can never answer with bytes from a different build.
+            #
+            # FLAT, ONE SEGMENT, DELIBERATELY. Vite writes
+            # `assets/<name>-<hash>.<ext>`; without this check,
+            # `/assets/../index.html` normalises out of the asset directory and
+            # serves the SHELL with the immutable cache header -- measured, 200
+            # `text/html` immutable. The shell is the pointer to the current
+            # bundle, so caching it forever is exactly the staleness the design
+            # refuses. A traversal elsewhere in static/ is already refused by
+            # `_static_file`; this refuses the one that stays inside it.
+            if path.startswith("/assets/"):
+                name = path[len("/assets/"):]
+                body, ctype = (_static_file(path)
+                               if name and "/" not in name else (None, None))
+                if body is None:
+                    self._send(404, "no such asset\n",
+                               "text/plain; charset=utf-8")
+                    return
+                self._send(200, body, ctype, cache=ASSET_CACHE)
                 return
-            self._send(404, "no such path\n", "text/plain; charset=utf-8")
+            # AN API PATH IS NEVER THE SPA. Without this branch, `/api/typo`
+            # would answer index.html with 200 and a fetch() would try to parse
+            # HTML as JSON.
+            if path == "/api" or path.startswith("/api/"):
+                self._send(404, "no such path\n", "text/plain; charset=utf-8")
+                return
+            # EVERY OTHER PATH IS A CLIENT ROUTE -> THE SHELL. A deep link
+            # (/modules/fleet) is reloaded by the browser as a fresh request, so
+            # the SPA has to own the whole non-API URL space. It is served
+            # no-store because it is the pointer to whatever bundle this image
+            # carries; a cached old shell would point at deleted asset names.
+            body, ctype = _static_file("/index.html")
+            if body is None:
+                self._send(500,
+                           "THE SPA BUILD IS MISSING from the image: "
+                           "app/static/index.html\n\n"
+                           "That is not an empty dashboard -- it is an image "
+                           "built without its committed frontend. Run "
+                           "scripts/build-frontend.sh and commit app/static.\n",
+                           "text/plain; charset=utf-8")
+                return
+            self._send(200, body, ctype,
+                       extra={"Content-Security-Policy": SHELL_CSP})
+            return
         except Exception as exc:                   # noqa: BLE001 - rendered
             import traceback
             if path.startswith("/api/v1"):
@@ -1730,7 +843,7 @@ class Handler(BaseHTTPRequestHandler):
                             "the request failed: %s" % exc)
                 return
             self._send(500,
-                       "THE DASHBOARD FAILED TO RENDER: %s\n\n%s\n\n"
+                       "THE DASHBOARD FAILED TO ANSWER: %s\n\n%s\n\n"
                        "An error page means UNKNOWN, never green.\n"
                        % (exc, traceback.format_exc()),
                        "text/plain; charset=utf-8")

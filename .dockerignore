@@ -17,6 +17,12 @@ tests/
 .venv/
 venv/
 
+# The SPA is DEVELOPMENT-time source; the image serves its COMMITTED build from
+# app/static/ (COPY app/), and carries no Node runtime. Shipping frontend/ would
+# put node_modules and a toolchain in the build context with nothing to run.
+frontend/
+**/node_modules/
+
 # The operator's file, and the material the deploy script installs on the NAS.
 # These are bind-mounted, not baked: an image that carried a private key would
 # leak it into every `docker save` and every layer cache.

@@ -660,6 +660,68 @@ def test_writes_disabled_without_a_token(results):
         httpd.server_close()
 
 
+def test_the_committed_spa_is_served(results):
+    """The served shell is the COMMITTED build, and the static path is bounded.
+
+    Node is a development-time dependency: `scripts/build-frontend.sh` writes
+    `app/static/`, the build is committed, and the image carries no toolchain.
+    So the thing to assert is not "the build works" (the frontend suite owns
+    that) but "the artefact the container serves is present and self-consistent"
+    -- a tree where the build was never run would otherwise boot healthy and
+    answer every page request with a 500.
+    """
+    index_path = os.path.join(web.STATIC, "index.html")
+    results.check(
+        "app/static/index.html is committed with the tree",
+        os.path.isfile(index_path) and os.path.getsize(index_path) > 0,
+        "missing or empty: %s -- the image's `RUN test -s` gate exists because "
+        "this is the file every page request serves" % index_path)
+    try:
+        with open(index_path, encoding="utf-8") as fh:
+            index = fh.read()
+    except OSError as exc:
+        index = ""
+        results.check("the built shell is readable", False, str(exc))
+    results.check(
+        "the shell mounts the SPA on id=root",
+        'id="root"' in index,
+        "the built index has no #root -- the bundle would mount on null and the "
+        "page would be blank with no error a server log can see")
+
+    # THE TRAVERSAL GUARD, from both spellings. The guard is a realpath prefix,
+    # not a '..' search, because a symlink escapes the same way a dotted segment
+    # does -- so the test asks the function, not a regex.
+    results.check(
+        "a path traversal cannot leave app/static",
+        web._static_file("/../etc/passwd") == (None, None)
+        and web._static_file("/assets/../../etc/passwd") == (None, None)
+        and web._static_file("/%2e%2e/etc/passwd") == (None, None),
+        "a traversal returned bytes -- realpath+prefix must reject a sibling "
+        "escape and an encoded one before open() is ever called")
+
+    assets = os.path.join(web.STATIC, "assets")
+    names = sorted(os.listdir(assets)) if os.path.isdir(assets) else []
+    hashed = [n for n in names if n.endswith((".js", ".css"))]
+    results.check(
+        "the build emitted a hashed bundle",
+        bool(hashed), "no .js/.css under %s" % assets)
+    if hashed:
+        name = hashed[0]
+        full = os.path.realpath(os.path.join(assets, name))
+        body, ctype = web._static_file("/assets/" + name)
+        with open(full, "rb") as fh:
+            want = fh.read()
+        results.check(
+            "a hashed asset resolves inside app/static and serves its bytes",
+            body == want and want
+            and full.startswith(os.path.realpath(web.STATIC) + os.sep)
+            and ctype in ("text/javascript", "application/javascript",
+                          "text/css"),
+            "name=%r ctype=%r bytes=%r -- a route that resolves elsewhere is a "
+            "route that can serve a file it should not"
+            % (name, ctype, len(body) if body else None))
+
+
 TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_duplicate_setting_keys_are_refused,
          test_write_validation_and_audit,
@@ -672,7 +734,8 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_the_read_surface,
          test_api_errors_are_json,
          test_the_write_surface,
-         test_writes_disabled_without_a_token)
+         test_writes_disabled_without_a_token,
+         test_the_committed_spa_is_served)
 
 
 def main():

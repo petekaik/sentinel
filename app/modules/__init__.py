@@ -54,6 +54,12 @@ def discover(package=__name__, path=None):
                 % (info.name, declared.id))
         if declared.id in found:
             problems.append("duplicate module id %r" % declared.id)
+        # Every reader that turns a module into a threshold mapping needs its
+        # directory (`thresholds.spec_mapping`), and discovery is the one place
+        # that knows it. `discover_enabled` used to be the only setter, so a
+        # caller holding the DISCOVERED list -- which the settings API is, by
+        # design, so a disabled module stays configurable -- got AttributeError.
+        declared._path = os.path.dirname(mod.__file__)
         found[declared.id] = declared
     if problems:
         raise ModuleError("; ".join(problems))

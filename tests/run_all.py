@@ -22,6 +22,7 @@ from harness import Results                     # noqa: E402
 
 import test_checks_fixtures as fixture_tests    # noqa: E402
 import test_advisors as advisor_tests           # noqa: E402
+import test_api_v1 as api_tests                 # noqa: E402
 import test_collect_offline as collect_tests    # noqa: E402
 import test_commands as command_tests           # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
@@ -54,6 +55,9 @@ SUITES = (
     ("store.py -- the settings overlay: typed values, their env form, and an "
      "audit row a secret cannot leak through",
      settings_tests.TESTS),
+    ("api/v1 -- manifests, effective views, strict writes, and a token-gated "
+     "surface that never reads back a secret",
+     api_tests.TESTS),
     ("web.py -- the dashboard contract (never green on no data, never cached)",
      dash_tests.TESTS),
     ("checks/* -- the real check classes against verbatim fleet captures",

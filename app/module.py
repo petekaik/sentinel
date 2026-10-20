@@ -42,7 +42,18 @@ class Setting:
         if self.kind == "bool":
             if isinstance(value, bool):
                 return value
-            return str(value).strip().lower() in ("1", "true", "yes", "on")
+            # STRICT, because this is the API's write boundary: mapping an
+            # unknown spelling to False stores a value the operator did not
+            # ask for and cannot see (`"flase"` would read back as "no"). The
+            # documented spellings are accepted; everything else is refused.
+            text = str(value).strip().lower()
+            if text in ("true", "1", "yes", "on"):
+                return True
+            if text in ("false", "0", "no", "off"):
+                return False
+            raise ValueError(
+                "%s must be a boolean (true/false, 1/0, yes/no, on/off), "
+                "got %r" % (self.key, value))
         if self.kind in ("json", "list"):
             import json
             parsed = value if not isinstance(value, str) else json.loads(value)

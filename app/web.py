@@ -44,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import checks
 import modules as module_loader
+import settingsapi
 import shell
 import store
 import thresholds
@@ -1590,6 +1591,38 @@ class Handler(BaseHTTPRequestHandler):
                                            indent=1),
                            "application/json")
                 return
+            # /api/v1 -- the SPA's surface. EVERY read uses the DISCOVERED
+            # modules, not only the enabled ones: a disabled module must stay
+            # configurable, or disabling it from the UI would be a one-way door.
+            # Settings are reloaded per request so a write is visible on the
+            # next read without a restart.
+            if path == "/api/v1/status":
+                self._json(200, build_status(cfg, conn))
+                return
+            if path == "/api/v1/modules":
+                cfg.reload_settings(conn)
+                discovered = module_loader.discover()
+                specs = thresholds.load_effective(
+                    thresholds.spec_mapping(cfg, discovered), conn)
+                self._json(200, settingsapi.module_manifests(
+                    cfg, conn, discovered, specs))
+                return
+            if path == "/api/v1/settings":
+                cfg.reload_settings(conn)
+                self._json(200, settingsapi.settings_view(
+                    cfg, conn, module_loader.discover()))
+                return
+            if path == "/api/v1/incidents":
+                self._json(200, store.live_incidents(conn))
+                return
+            if path == "/api/v1/insights":
+                self._json(200, store.list_insights(conn))
+                return
+            if path == "/api/v1/proposals":
+                # PENDING only: the page is an action surface, and a decided
+                # proposal re-offered beside an open one reads as still open.
+                self._json(200, store.list_proposals(conn, state="pending"))
+                return
             state = build_state(cfg, conn)
             if path == "/api/state.json":
                 self._send(200, json.dumps(state, default=str, indent=1),
@@ -1606,6 +1639,95 @@ class Handler(BaseHTTPRequestHandler):
                        "An error page means UNKNOWN, never green.\n"
                        % (exc, traceback.format_exc()),
                        "text/plain; charset=utf-8")
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # /api/v1 writes
+    # ------------------------------------------------------------------
+
+    def _json(self, code, obj):
+        # `cache=None` is what makes `_send` emit Observation `no-store`: an
+        # /api/v1 read cached by a proxy is a stale configuration page, and the
+        # same header is what keeps the write responses honest too.
+        self._send(code, json.dumps(obj, default=str), "application/json")
+
+    def _error(self, code, err_code, message, field=None):
+        self._json(code, {"error": {"code": err_code, "message": message,
+                                    "field": field}})
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def do_PUT(self):
+        self._settings_write("PUT")
+
+    def do_DELETE(self):
+        self._settings_write("DELETE")
+
+    def _settings_write(self, method):
+        """`/api/v1/modules/<id>/{settings,settings/<key>,enabled}`.
+
+        Auth is checked BEFORE the store is opened: an unauthenticated caller
+        must not be able to make the server touch the database at all. A
+        `writes_disabled` refusal is a SettingsError raised by `authorized`, so
+        it becomes the documented 403.
+        """
+        cfg = self.cfg
+        try:
+            if not settingsapi.authorized(cfg, self.headers):
+                self._error(401, "unauthorized", "missing or wrong write token")
+                return
+        except settingsapi.SettingsError as exc:
+            self._error(403, exc.code, exc.message, exc.field)
+            return
+
+        conn = store.connect(cfg.db_path)
+        try:
+            cfg.reload_settings(conn)
+            parts = [p for p in self.path.split("?")[0].split("/") if p]
+            prefix_ok = len(parts) >= 5 and parts[:3] == ["api", "v1",
+                                                          "modules"]
+            # A DISABLED module must accept settings changes too.
+            mod = ({m.id: m for m in module_loader.discover()}.get(parts[3])
+                   if prefix_ok else None)
+            if mod is None:
+                self._error(404, "no_module", "unknown module")
+                return
+            try:
+                body = self._body()
+            except ValueError as exc:
+                self._error(422, "invalid_body",
+                            "the request body is not JSON: %s" % exc)
+                return
+            if not isinstance(body, dict):
+                # A list or a bare value is not a settings document. Refused
+                # here so neither branch below has to trust the shape.
+                self._error(422, "invalid_body",
+                            "the request body must be a JSON object")
+                return
+            tail = parts[4:]
+            if method == "PUT" and tail == ["settings"]:
+                out = settingsapi.write_settings(cfg, conn, mod, body,
+                                                 "operator")
+            elif method == "PUT" and tail == ["enabled"]:
+                out = settingsapi.set_enabled(cfg, conn, mod,
+                                              body.get("enabled"), "operator")
+            elif method == "DELETE" and len(tail) == 2 and tail[0] == "settings":
+                out = settingsapi.reset_setting(cfg, conn, mod, tail[1],
+                                                "operator")
+            else:
+                self._error(404, "no_route", "no such /api/v1 route")
+                return
+            self._json(200, out)
+        except settingsapi.SettingsError as exc:
+            self._error(422, exc.code, exc.message, exc.field)
+        except Exception as exc:                   # noqa: BLE001 - rendered
+            # A JSON 500 rather than a dropped connection: the SPA must be able
+            # to show WHAT failed, not just that the request died.
+            self._error(500, "internal",
+                        "the write failed: %s" % exc)
         finally:
             conn.close()
 

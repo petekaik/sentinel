@@ -49,15 +49,27 @@ def sequence(*parts):
 
 
 def parse(data, i=0):
+    # BOUNDS ARE CHECKED, NOT SLICED AROUND. An unchecked slice
+    # (`data[i:i + n]`) silently returns fewer bytes than the length claims,
+    # and a 2-byte integer read as `int.from_bytes(b"", ...)` returns 0 -- a
+    # truncated reply would grade as a device reporting zero.
+    if i + 2 > len(data):
+        raise ValueError("truncated TLV")
     tag = data[i]; i += 1
     n = data[i]; i += 1
     if n & 0x80:
         k = n & 0x7f
+        if i + k > len(data):
+            raise ValueError("truncated TLV")
         n = int.from_bytes(data[i:i + k], "big"); i += k
+    if i + n > len(data):
+        raise ValueError("truncated TLV")
     return tag, data[i:i + n], i + n
 
 
 def parse_int(v):
+    if not v:
+        raise ValueError("empty integer")
     return int.from_bytes(v, "big", signed=True)
 
 

@@ -30,7 +30,13 @@ def _request(community, oid, request_id):
 
 
 def get(host, community, oid, port=161, timeout=3.0, retries=1):
-    """(value, type) for one OID, or raise SnmpError/SnmpTimeout."""
+    """(value, type) for one OID, or raise SnmpError/SnmpTimeout.
+
+    EVERY failure is a SnmpError. A decode fault is wrapped because callers
+    isolate per device -- a raw IndexError from a truncated datagram would
+    escape that isolation and blank the module's rows for the epoch instead of
+    failing the one device that sent it.
+    """
     rid = int.from_bytes(os.urandom(4), "big") & 0x7fffffff
     packet = _request(community, oid, rid)
     for _ in range(retries + 1):
@@ -41,27 +47,40 @@ def get(host, community, oid, port=161, timeout=3.0, retries=1):
             data, _ = sock.recvfrom(65535)
         except socket.timeout:
             continue
+        except OSError as exc:                   # gaierror, unreachable, ...
+            raise SnmpError("cannot query %s: %s" % (host, exc))
         finally:
             sock.close()
-        _, msg, _ = ber.parse(data, 0)
-        _, _version, i = ber.parse(msg, 0)
-        _, _community, i = ber.parse(msg, i)
-        _ptag, pdu, _ = ber.parse(msg, i)
-        _, _req, j = ber.parse(pdu, 0)
-        _, err_status, j = ber.parse(pdu, j)
-        _, err_index, j = ber.parse(pdu, j)
-        _, varbinds, j = ber.parse(pdu, j)
-        _, vb, _ = ber.parse(varbinds, 0)
-        _, name, k = ber.parse(vb, 0)
-        vtag, value, _ = ber.parse(vb, k)
-        if ber.parse_int(err_status):
-            raise SnmpError("error-status %d at %d"
-                            % (ber.parse_int(err_status),
-                               ber.parse_int(err_index)))
+        try:
+            _, msg, _ = ber.parse(data, 0)
+            _, _version, i = ber.parse(msg, 0)
+            _, _community, i = ber.parse(msg, i)
+            ptag, pdu, _ = ber.parse(msg, i)
+            _, req, j = ber.parse(pdu, 0)
+            req_id = ber.parse_int(req)
+            _, err_status, j = ber.parse(pdu, j)
+            _, err_index, j = ber.parse(pdu, j)
+            _, varbinds, j = ber.parse(pdu, j)
+            _, vb, _ = ber.parse(varbinds, 0)
+            _, name, k = ber.parse(vb, 0)
+            name_text = ber.parse_oid(name)
+            vtag, value, _ = ber.parse(vb, k)
+            status = ber.parse_int(err_status)
+            index = ber.parse_int(err_index)
+        except (IndexError, ValueError):
+            raise SnmpError("malformed response from %s" % host)
+        # A LATE DATAGRAM IS NOT THIS REQUEST'S ANSWER. The socket is fresh per
+        # attempt, but an ephemeral port can be reused, so the request-id (and
+        # the GetResponse tag) decide whether this reply is ours; anything else
+        # is treated like a lost packet and the retry still runs.
+        if ptag != 0xA2 or req_id != rid:
+            continue
+        if status:
+            raise SnmpError("error-status %d at %d" % (status, index))
         if vtag == 0x80:
-            raise SnmpError("no such object: %s" % ber.parse_oid(name))
+            raise SnmpError("no such object: %s" % name_text)
         if vtag == 0x81:
-            raise SnmpError("no such instance: %s" % ber.parse_oid(name))
+            raise SnmpError("no such instance: %s" % name_text)
         if vtag in (0x02, 0x41, 0x42, 0x43):     # integer/counter/gauge/ticks
             return ber.parse_int(value), "integer"
         if vtag == 0x04:

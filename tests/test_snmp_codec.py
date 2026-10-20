@@ -99,20 +99,22 @@ def _request_parts(data):
             ber.parse_int(rid), ber.parse_oid(name))
 
 
-def _reply_with(value_tlv, status=0, index=0, vb_oid=OID):
-    """A reply builder: the response echoes the request's id and name."""
+def _reply_with(value_tlv, status=0, index=0, vb_oid=OID, rid=None,
+                pdu_tag=0xA2):
+    """A reply builder: the response echoes the request's id unless overridden."""
 
     def build(request):
         _, msg, _ = ber.parse(request, 0)
         _, _version, i = ber.parse(msg, 0)
         _, _community, i = ber.parse(msg, i)
         _, pdu, _ = ber.parse(msg, i)
-        _, rid, _ = ber.parse(pdu, 0)
+        _, req_rid, _ = ber.parse(pdu, 0)
         return ber.sequence(
             ber.integer(1),
             ber.octet("public"),
-            ber.tlv(0xA2,
-                    ber.tlv(0x02, rid)
+            ber.tlv(pdu_tag,
+                    (ber.integer(rid) if rid is not None
+                     else ber.tlv(0x02, req_rid))
                     + ber.integer(status)
                     + ber.integer(index)
                     + ber.sequence(ber.sequence(
@@ -239,9 +241,11 @@ def test_get_returns_string_and_integer(results):
         "discarding a good packet" % ((value, kind),))
     results.check(
         "the agent decoded a v2c GET for the requested OID",
-        parts == (1, "public", 0xA0, parts[3] if parts else None, OID),
+        parts is not None and parts[:3] == (1, "public", 0xA0)
+        and isinstance(parts[3], int) and parts[4] == OID,
         "version/community/pdu-tag/oid=%r -- the request is only a GET if the "
-        "agent sees an A0 PDU at version 1 for that OID" % (parts,))
+        "agent sees an A0 PDU with an integer id at version 1 for that OID"
+        % (parts,))
 
     with FakeAgent(_reply_with(ber.integer(42))) as agent:
         value, kind = snmp.get("127.0.0.1", "public", OID,
@@ -291,6 +295,106 @@ def test_no_such_object_and_no_such_instance_are_errors(results):
             "not exist, and an absence must never read as a value" % (text,))
 
 
+def test_the_codec_refuses_truncation(results):
+    """A short datagram must be an error, never a shorter value.
+
+    `data[i:i + n]` on a truncated TLV silently yields fewer bytes, and an
+    empty payload read as an integer is 0 -- so an unchecked parse turns a
+    damaged reply into a device reporting zero.
+    """
+    bad = []
+    cases = (
+        ("an integer with no payload", lambda: ber.parse_int(b"")),
+        ("a TLV that claims four bytes and carries two",
+         lambda: ber.parse(b"\x02\x04\x00\x00")),
+        ("a header cut in half", lambda: ber.parse(b"\x30")),
+        ("a long-form length with no length bytes",
+         lambda: ber.parse(b"\x30\x82")),
+    )
+    for name, thunk in cases:
+        try:
+            got = thunk()
+            bad.append((name, "returned %r" % (got,)))
+        except ValueError:
+            pass
+        except Exception as exc:                  # noqa: BLE001 - reported
+            bad.append((name, "%s: %s" % (type(exc).__name__, exc)))
+    results.check(
+        "the codec raises ValueError on a truncated TLV and an empty integer",
+        not bad,
+        "bad=%r -- a silent short read is the value-zero path this test "
+        "exists for" % (bad,))
+
+
+def test_a_malformed_reply_is_an_snmp_error(results):
+    """Decode faults are SnmpError, not IndexError/ValueError.
+
+    Task 9 isolates failures per device by catching SnmpError; a raw IndexError
+    would escape that and blank every SNMP row for the epoch.
+    """
+    cases = (
+        ("a short integer (02 04 00 00)",
+         _reply_with(b"\x02\x04\x00\x00")),
+        ("a string that claims five bytes and carries one",
+         _reply_with(b"\x04\x05a")),
+        ("a message cut off before its payload",
+         lambda request: b"\x30\x20"),
+        ("an empty datagram", lambda request: b""),
+    )
+    bad = []
+    for name, reply in cases:
+        with FakeAgent(reply) as agent:
+            try:
+                got = snmp.get("127.0.0.1", "public", OID,
+                               port=agent.port, timeout=1)
+                bad.append((name, "returned %r" % (got,)))
+            except snmp.SnmpError:
+                pass
+            except Exception as exc:              # noqa: BLE001 - reported
+                bad.append((name, "%s: %s" % (type(exc).__name__, exc)))
+    results.check(
+        "a malformed or truncated reply raises SnmpError",
+        not bad,
+        "bad=%r -- the 02 04 00 00 case used to return (0, 'integer'), and "
+        "the others escaped as IndexError" % (bad,))
+
+
+def test_a_reply_to_another_request_is_ignored(results):
+    """A late datagram on a reused port is not this request's answer."""
+    state = {"n": 0}
+
+    def stale_then_fresh(request):
+        state["n"] += 1
+        if state["n"] == 1:
+            return _reply_with(ber.octet("stale"), rid=12345)(request)
+        return _reply_with(ber.octet("fresh"))(request)
+
+    with FakeAgent(stale_then_fresh) as agent:
+        got = snmp.get("127.0.0.1", "public", OID, port=agent.port,
+                       timeout=1)
+        sent = len(agent.seen)
+    results.check(
+        "a reply whose request-id does not match is ignored and the retry is "
+        "answered",
+        got == ("fresh", "string") and sent == 2,
+        "got=%r requests=%d -- accepting the stale reply grades another "
+        "request's value as this OID's" % (got, sent))
+
+    with FakeAgent(_reply_with(ber.octet("next"), pdu_tag=0xA1)) as agent:
+        try:
+            snmp.get("127.0.0.1", "public", OID, port=agent.port,
+                     timeout=0.1)
+            text = None
+        except snmp.SnmpTimeout as exc:
+            text = str(exc)
+        sent = len(agent.seen)
+    results.check(
+        "a GetNext response (0xA1) is not accepted as this GET's answer",
+        text is not None and sent == 2,
+        "exception=%r requests=%d -- a PDU tag nobody checked is a reply "
+        "from a different kind of request" % (text, sent))
+
+
 def test_timeout_after_one_retry(results):
     with FakeAgent(reply=None) as agent:
         try:
@@ -312,31 +416,83 @@ def test_timeout_after_one_retry(results):
         "one dead device into a poll that never ends" % (seen,))
 
 
+def test_an_unsupported_value_tag_is_an_error(results):
+    got = None
+    with FakeAgent(_reply_with(ber.tlv(0x40, b"\x0a\x00\x00\x01"))) as agent:
+        try:
+            got = snmp.get("127.0.0.1", "public", OID, port=agent.port,
+                           timeout=2)
+            text = None
+        except snmp.SnmpError as exc:
+            text = str(exc)
+    results.check(
+        "an unsupported value tag raises SnmpError naming the tag",
+        text is not None and "0x40" in text,
+        "got=%r exception=%r -- returning the raw bytes of a type the checks "
+        "cannot grade would be a value nothing understands" % (got, text))
+
+
+def test_an_unresolvable_host_is_an_snmp_error(results):
+    """A name that does not resolve is SnmpError, not a raw gaierror."""
+    try:
+        snmp.get("no-such-host.invalid", "public", OID, timeout=0.5)
+        text = None
+        timed_out = False
+    except snmp.SnmpError as exc:
+        text = str(exc)
+        timed_out = isinstance(exc, snmp.SnmpTimeout)
+    results.check(
+        "an unresolvable host raises SnmpError naming the host, not a raw "
+        "OSError and not a timeout",
+        text is not None and "no-such-host.invalid" in text
+        and not timed_out,
+        "exception=%r -- a DNS failure read as 'device silent' sends the "
+        "operator to the switch instead of to the resolver" % (text,))
+
+
 def test_the_community_never_reaches_an_exception(results):
-    """The client has no logger; the text of what it raises is the leak risk."""
+    """The client has no logger; the text of what it raises is the leak risk.
+
+    EVERY error path that carries a message is driven with the community as
+    the credential, so mutating any one of them to include it goes red.
+    """
     leaked = []
+    raised = set()
+
+    replies = (
+        ("noSuchObject", _reply_with(ber.tlv(0x80, b""))),
+        ("noSuchInstance", _reply_with(ber.tlv(0x81, b""))),
+        ("error-status", _reply_with(ber.octet(""), status=2, index=1)),
+        ("unsupported tag", _reply_with(ber.tlv(0x40, b"\x0a\x00\x00\x01"))),
+        ("malformed", _reply_with(b"\x02\x04\x00\x00")),
+    )
+    for name, reply in replies:
+        with FakeAgent(reply) as agent:
+            try:
+                snmp.get("127.0.0.1", SECRET_COMMUNITY, OID,
+                         port=agent.port, timeout=2)
+            except snmp.SnmpError as exc:
+                raised.add(name)
+                if SECRET_COMMUNITY in str(exc):
+                    leaked.append((name, str(exc)))
+            else:
+                leaked.append((name, "no exception"))
 
     with FakeAgent(reply=None) as agent:
         try:
             snmp.get("127.0.0.1", SECRET_COMMUNITY, OID, port=agent.port,
                      timeout=0.05)
         except snmp.SnmpError as exc:
+            raised.add("timeout")
             if SECRET_COMMUNITY in str(exc):
                 leaked.append(("timeout", str(exc)))
 
-    with FakeAgent(_reply_with(ber.tlv(0x80, b""))) as agent:
-        try:
-            snmp.get("127.0.0.1", SECRET_COMMUNITY, OID, port=agent.port,
-                     timeout=2)
-        except snmp.SnmpError as exc:
-            if SECRET_COMMUNITY in str(exc):
-                leaked.append(("noSuchObject", str(exc)))
-
     results.check(
-        "the community string never appears in an exception message",
-        not leaked,
-        "leaked in %r -- exception text becomes the incident detail, which "
-        "is stored and shown on the dashboard" % (leaked,))
+        "the community string never appears in any exception message",
+        not leaked and len(raised) == len(replies) + 1,
+        "leaked=%r raised=%r -- exception text becomes the incident detail, "
+        "which is stored and shown on the dashboard, and a path that raised "
+        "nothing makes this test vacuous" % (leaked, sorted(raised)))
 
 
 def test_the_client_holds_no_logger(results):
@@ -353,10 +509,15 @@ TESTS = (
     test_octet_string_round_trip,
     test_oid_round_trip,
     test_sequence_nesting_round_trip,
+    test_the_codec_refuses_truncation,
     test_get_request_bytes_are_the_known_encoding,
     test_get_returns_string_and_integer,
     test_error_status_is_an_error,
     test_no_such_object_and_no_such_instance_are_errors,
+    test_a_malformed_reply_is_an_snmp_error,
+    test_a_reply_to_another_request_is_ignored,
+    test_an_unsupported_value_tag_is_an_error,
+    test_an_unresolvable_host_is_an_snmp_error,
     test_timeout_after_one_retry,
     test_the_community_never_reaches_an_exception,
     test_the_client_holds_no_logger,

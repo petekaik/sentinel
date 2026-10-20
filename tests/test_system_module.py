@@ -52,6 +52,20 @@ MDSTAT_RESYNC = ("Personalities : [raid1]\n"
                  "      [==>.................]  resync = 10.0% "
                  "(104857/1048576) finish=1.0min speed=15728K/sec\n"
                  "\nunused devices: <none>\n")
+MDSTAT_SCRUB = ("Personalities : [raid1]\n"
+                "md0 : active raid1 sda1[0] sdb1[1]\n"
+                "      1048576 blocks super 1.2 [2/2] [UU]\n"
+                "      [==>.................]  check = 10.0% "
+                "(104857/1048576) finish=1.0min speed=15728K/sec\n"
+                "\nunused devices: <none>\n")
+MDSTAT_MISSING_AND_RESYNC = (
+    "Personalities : [raid1]\n"
+    "md0 : inactive\n"
+    "md1 : active raid1 sda1[0] sdb1[1]\n"
+    "      1048576 blocks super 1.2 [2/2] [UU]\n"
+    "      [==>.................]  resync = 10.0% "
+    "(104857/1048576) finish=1.0min speed=15728K/sec\n"
+    "\nunused devices: <none>\n")
 
 _GOOD = {
     "proc/loadavg": LOADAVG,
@@ -311,6 +325,39 @@ def test_missing_figures_are_unknown_never_green(results):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_partial_thermal_read_is_unknown(results):
+    import shutil
+    root = tempfile.mkdtemp()
+    try:
+        _tree(root)
+        # A second zone exists but cannot be read. A directory named `temp`
+        # fails the open deterministically, without depending on file modes
+        # (which root would bypass).
+        os.makedirs(os.path.join(root, "sys/class/thermal/thermal_zone1/temp"))
+        ctx, _ = _ctx(root)
+        f = ctx.system_facts
+        res = _run(system_checks.SystemThermal, ctx)
+        results.check(
+            "a partial thermal read is UNKNOWN, never the readable maximum",
+            f.thermal_zones == 2
+            and f.thermal_values.get(
+                os.path.join(root, "sys/class/thermal/thermal_zone0/temp")) == 45.0
+            and res.status is store.Status.UNKNOWN
+            and "thermal_zone1" in res.detail,
+            "zones=%r values=%r unreadable=%r status=%r detail=%r -- the "
+            "unreadable zone may be the hottest"
+            % (f.thermal_zones, f.thermal_values, f.thermal_unreadable,
+               res.status, res.detail))
+        results.check(
+            "the readable zones still travel in the evidence",
+            res.evidence.get("values")
+            == {os.path.join(root, "sys/class/thermal/thermal_zone0/temp"): 45.0}
+            and bool(res.evidence.get("unreadable")),
+            "evidence=%r" % (res.evidence,))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_a_bad_meminfo_value_is_unknown_not_zero(results):
     import shutil
     root = tempfile.mkdtemp()
@@ -338,27 +385,34 @@ def test_disk_uses_the_worst_mount_and_names_it(results):
         _disk(ctx.system_facts, {"/": 50.0, "/data": 7.0})
         res = _run(system_checks.SystemDisk, ctx)
         results.check(
-            "the lowest free percentage is graded and its mount is the subject",
-            res.status is store.Status.WARN and res.subject == "/data",
+            "the lowest free percentage is graded, with the constant subject",
+            res.status is store.Status.WARN and res.subject == "disk",
             "status=%r subject=%r detail=%r"
             % (res.status, res.subject, res.detail))
         results.check(
-            "the detail lists every mount, so an unlisted one cannot look fine",
-            "/" in res.detail and "/data" in res.detail
+            "the worst mount is named in the detail and evidence, and every "
+            "mount is listed so an unlisted one cannot look fine",
+            res.evidence.get("worst") == "/data"
+            and "/data" in res.detail and "/" in res.detail
             and set(res.evidence["mounts"]) == {"/", "/data"},
             "detail=%r evidence=%r" % (res.detail, res.evidence))
 
-        # A mount that cannot be stat'ed is named while the readable ones are
-        # still graded. Only when NOTHING could be read does the check go grey.
+        # ANY unreadable configured mount makes the whole check UNKNOWN: the
+        # readable ones are carried as evidence, but a subset is not the answer
+        # the operator asked for.
         ctx.system.mounts = ("/", "/no-such-mount")
         _disk(ctx.system_facts, {"/": 50.0})
         ctx.system_facts.errors["disk:/no-such-mount"] = \
             "cannot stat /no-such-mount: No such file or directory"
         res = _run(system_checks.SystemDisk, ctx)
         results.check(
-            "an unreadable mount is named and the readable mounts still grade",
-            res.status is store.Status.OK and "/no-such-mount unreadable" in res.detail,
-            "status=%r detail=%r" % (res.status, res.detail))
+            "one unreadable mount makes the check UNKNOWN and names it",
+            res.status is store.Status.UNKNOWN
+            and res.subject == "disk"
+            and "/no-such-mount" in res.detail
+            and res.evidence["readable"] == ctx.system_facts.disks,
+            "status=%r subject=%r detail=%r evidence=%r"
+            % (res.status, res.subject, res.detail, res.evidence))
 
         ctx.system.mounts = ("/no-such-mount",)
         ctx.system_facts.disks = {}
@@ -367,6 +421,22 @@ def test_disk_uses_the_worst_mount_and_names_it(results):
             "no readable mount at all is UNKNOWN with the mount named",
             res.status is store.Status.UNKNOWN and "/no-such-mount" in res.detail,
             "status=%r detail=%r" % (res.status, res.detail))
+
+        # FINDING 6: a configured path that exists but is NOT a mount point is
+        # unreadable. `disk_usage` would grade its PARENT filesystem and report
+        # a healthy answer about a different question.
+        subdir = os.path.join(root, "not-a-mount")
+        os.makedirs(subdir, exist_ok=True)
+        ctx, _ = _ctx(root, mounts=subdir)
+        ctx.system_facts.disks = {}
+        res = _run(system_checks.SystemDisk, ctx)
+        results.check(
+            "a configured path that is not a mount point is UNKNOWN, not the "
+            "parent filesystem's free space",
+            res.status is store.Status.UNKNOWN
+            and subdir in res.detail and "not a mount point" in res.detail,
+            "status=%r detail=%r errors=%r"
+            % (res.status, res.detail, ctx.system_facts.errors))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -384,6 +454,11 @@ def test_raid_states(results):
                 (MDSTAT_CLEAN, store.Status.OK, "all [UU] is OK", "md0"),
                 (MDSTAT_DEGRADED, store.Status.FAIL, "[U_] is FAIL", "md0"),
                 (MDSTAT_RESYNC, store.Status.WARN, "a resync is WARN", "md0"),
+                (MDSTAT_SCRUB, store.Status.OK,
+                 "a scrub (check=) is OK, not an array-loss risk", "md0"),
+                (MDSTAT_MISSING_AND_RESYNC, store.Status.UNKNOWN,
+                 "an ungradeable array is UNKNOWN even while another resyncs",
+                 "md0"),
                 (ABSENT, store.Status.UNKNOWN, "no mdstat is UNKNOWN",
                  "no /proc/mdstat")):
             _tree(root, {"proc/mdstat": mdstat})
@@ -433,6 +508,57 @@ def test_uptime_is_informational_and_uncounted(results):
 # ---------------------------------------------------------------------------
 # Selection and disablement: the platform paths, with no platform change
 # ---------------------------------------------------------------------------
+
+
+def test_uptime_lands_in_the_dashboard_informational_bucket(results):
+    import shutil
+    root = tempfile.mkdtemp()
+    try:
+        _tree(root)
+        cfg = config_mod.Config(env={
+            "SENTINEL_MODULES": "system",
+            "MONITOR_CHECKS": os.path.join(os.path.dirname(HERE), "checks.conf"),
+            "SYSTEM_PROC": os.path.join(root, "proc"),
+            "SYSTEM_SYS": os.path.join(root, "sys"),
+            "SYSTEM_MOUNTS": "/",
+        })
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        store.init(conn)
+        seq = store.next_epoch_seq(conn)
+        store.record_collector_run(conn, seq, 1, 1, 0, None)
+        store.record_check(conn, seq, "local", "system_uptime",
+                           store.Status.OK, "up 1 d 2 h")
+        state = web.build_state(cfg, conn)
+        info = [i["check_id"] for i in state["informational"]]
+        coloured = [i["check_id"] for i in state["tiles"] + state["others"]]
+        verdict = [i["check_id"] for i in web._verdict_items(state)]
+        results.check(
+            "an OK system_uptime is in `informational`, not `others` or a tile",
+            info == ["system_uptime"] and "system_uptime" not in coloured,
+            "informational=%r tiles+others=%r -- a spec-less informational "
+            "check is classified by `spec is None` first and would be counted"
+            % (info, coloured))
+        results.check(
+            "and it is not a verdict-bearing row",
+            "system_uptime" not in verdict,
+            "verdict items=%r -- an uptime reading became a health statement"
+            % (verdict,))
+        conn.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_check_without_preload_is_unknown(results):
+    cfg = config_mod.Config(env={"SENTINEL_MODULES": "system"})
+    mod = [m for m in loader.discover_enabled(cfg) if m.id == "system"][0]
+    ctx = checks.Context(cfg, {}, {}, modules=[mod])
+    res = system_checks.SystemLoad().run(ctx)
+    results.check(
+        "a check run with no preloaded facts is UNKNOWN, not healthy or a crash",
+        res.status is store.Status.UNKNOWN
+        and "preload did not run" in res.detail,
+        "status=%r detail=%r" % (res.status, res.detail))
 
 
 def test_selector_excludes_system(results):
@@ -486,9 +612,12 @@ TESTS = (test_discovery_finds_fleet_then_system,
          test_healthy_readings_grade_ok,
          test_threshold_breaches_grade_warn_and_fail,
          test_missing_figures_are_unknown_never_green,
+         test_partial_thermal_read_is_unknown,
          test_a_bad_meminfo_value_is_unknown_not_zero,
          test_disk_uses_the_worst_mount_and_names_it,
          test_raid_states,
          test_uptime_is_informational_and_uncounted,
+         test_uptime_lands_in_the_dashboard_informational_bucket,
+         test_a_check_without_preload_is_unknown,
          test_selector_excludes_system,
          test_disabling_system_freezes_only_its_own_incidents)

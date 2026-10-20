@@ -99,21 +99,42 @@ class SystemMemory(_SystemCheck):
 
 
 class SystemDisk(_SystemCheck):
+    """Free space on the worst configured mount.
+
+    THE SUBJECT IS THE CONSTANT `disk`, NEVER THE MOUNT. The incident key is
+    `(target, check_id, subject)`, and the worst mount CHANGES as space is
+    freed or another mount fills. A mount-keyed row would be opened under
+    `/data` and, once `/data` recovered while `/` became the worst-but-healthy
+    mount, no later observation would ever be filed under `/data` again -- a
+    permanent false red. The worst mount, and every mount's figures, travel in
+    the detail and the evidence instead.
+
+    PARTIAL IS UNKNOWN. If ANY configured mount cannot be read (missing,
+    not a mount point, unstatable) the check is UNKNOWN naming it. Grading the
+    readable mounts and calling that OK would report a healthy host while one
+    of the mounts the operator asked about was never measured -- and the one
+    that could not be read is plausibly the one that matters.
+    """
+
     id = "system_disk_free_pct"
     spec = "system_disk_free_pct"
     title = "Free space on the graded mounts"
-    SUBJECT = ""        # the worst mount's path, on every path
+    SUBJECT = "disk"
 
     def run(self, ctx):
-        facts, unk = self.facts_or_unknown(ctx, "disk")
+        facts, unk = self.facts_or_unknown(ctx, self.SUBJECT)
         if unk:
             return unk
         cfg = getattr(ctx, "system", None)
-        mounts = cfg.mounts if cfg is not None else tuple(sorted(facts.disks))
+        if cfg is None:
+            return unknown(self.id, self.target,
+                           "the system module's configuration is not installed, "
+                           "so the mount list is unknown", subject=self.SUBJECT)
+        mounts = cfg.mounts
         if not mounts:
             return unknown(self.id, self.target,
                            "SYSTEM_MOUNTS names no mounts, so free space is not "
-                           "assessed", subject="disk")
+                           "assessed", subject=self.SUBJECT)
 
         # Every configured mount is named, read or not: the detail is the whole
         # answer, and a silently omitted mount reads as one that is fine.
@@ -128,19 +149,24 @@ class SystemDisk(_SystemCheck):
             else:
                 bits.append("%s %.1f%% free" % (mount, disk["pct_free"]))
 
-        if not facts.disks:
+        if unreadable:
             return unknown(
                 self.id, self.target,
-                "NO configured mount could be read, so free space is UNKNOWN: %s"
-                % "; ".join("%s (%s)" % (m, unreadable.get(m, ""))
-                            for m in mounts),
-                subject="disk", evidence={"unreadable": unreadable})
+                "free space is UNKNOWN because %d configured mount(s) could not "
+                "be read: %s. Readable mounts: %s."
+                % (len(unreadable),
+                   "; ".join("%s (%s)" % (m, why)
+                             for m, why in sorted(unreadable.items())),
+                   ", ".join("%s %.1f%% free" % (m, facts.disks[m]["pct_free"])
+                             for m in sorted(facts.disks)) or "none"),
+                subject=self.SUBJECT,
+                evidence={"readable": facts.disks, "unreadable": unreadable})
 
-        # The WORST mount is the verdict, and its path is the subject. Sorting
-        # first makes a tie deterministic rather than dependent on dict order.
+        # Sorting first makes a tie deterministic rather than dependent on dict
+        # order. The worst mount is NAMED in detail and evidence, not keyed.
         worst = min(sorted(facts.disks), key=lambda m: facts.disks[m]["pct_free"])
         res = self.result_from_spec(
-            ctx, facts.disks[worst]["pct_free"], subject=worst,
+            ctx, facts.disks[worst]["pct_free"], subject=self.SUBJECT,
             evidence={"mounts": facts.disks, "worst": worst,
                       "unreadable": unreadable})
         res.detail = "%s (mounts: %s; worst: %s)" % (
@@ -182,13 +208,6 @@ class SystemRaid(_SystemCheck):
                 % ", ".join("%s %s" % (name, "".join(arrays[name]["states"]))
                             for name in degraded),
                 subject=self.SUBJECT, evidence=ev)
-        if resyncing:
-            return warn(
-                self.id, self.target,
-                "md array(s) are rebuilding (%s) -- healthy once the resync "
-                "finishes, but a second failure now would lose the array"
-                % ", ".join(resyncing),
-                subject=self.SUBJECT, evidence=ev)
         if not arrays:
             return unknown(self.id, self.target,
                            "/proc/mdstat exists but declares no md arrays, so "
@@ -197,11 +216,20 @@ class SystemRaid(_SystemCheck):
         missing = [name for name, a in arrays.items() if not a["states"]]
         if missing:
             # An array with no [UU...] line is not proven healthy. Reading it as
-            # one would be a green on a figure nobody measured.
+            # one would be a green on a figure nobody measured. Checked BEFORE
+            # the resync branch: another array rebuilding must not mask an
+            # array whose state cannot be read at all.
             return unknown(
                 self.id, self.target,
                 "md array(s) %s have no member-state line [UU...], so their "
                 "health cannot be graded" % ", ".join(sorted(missing)),
+                subject=self.SUBJECT, evidence=ev)
+        if resyncing:
+            return warn(
+                self.id, self.target,
+                "md array(s) are rebuilding (%s) -- redundancy is intact and "
+                "the array is healthy once the resync finishes, but performance "
+                "is degraded while it runs" % ", ".join(resyncing),
                 subject=self.SUBJECT, evidence=ev)
         return ok(self.id, self.target,
                   "all md arrays clean: %s"
@@ -220,19 +248,44 @@ class SystemThermal(_SystemCheck):
         facts, unk = self.facts_or_unknown(ctx, self.SUBJECT)
         if unk:
             return unk
-        if facts.thermal_max_c is None:
-            if "thermal" in facts.errors:
-                why = facts.errors["thermal"]
-            else:
-                why = ("no thermal zones on this host, so temperature cannot be "
-                       "read")
+        if not facts.thermal_zones:
             return unknown(
-                self.id, self.target, why, subject=self.SUBJECT,
+                self.id, self.target,
+                "no thermal zones on this host, so temperature cannot be read",
+                subject=self.SUBJECT,
+                evidence={"thermal_zones": 0})
+        values = {path: facts.thermal_values[path]
+                  for path in sorted(facts.thermal_values)}
+        # PARTIAL IS NOT THE HOTTEST ZONE. If one zone answered and another did
+        # not, the unanswered one could be the hottest -- so the maximum over
+        # the readable subset is not a temperature for the host.
+        if facts.thermal_unreadable:
+            return unknown(
+                self.id, self.target,
+                "%d of %d thermal zone(s) could not be read, so the hottest "
+                "zone is UNKNOWN (the unreadable one may be the hottest): %s. "
+                "Readable zones: %s."
+                % (len(facts.thermal_unreadable), facts.thermal_zones,
+                   "; ".join("%s (%s)" % (path, why)
+                             for path, why in
+                             sorted(facts.thermal_unreadable.items())),
+                   ", ".join("%s %.1f C" % (path, c)
+                             for path, c in values.items()) or "none"),
+                subject=self.SUBJECT,
                 evidence={"thermal_zones": facts.thermal_zones,
-                          "errors": facts.errors})
+                          "values": values,
+                          "unreadable": facts.thermal_unreadable})
+        if facts.thermal_max_c is None:
+            return unknown(
+                self.id, self.target,
+                "%d thermal zone(s) exist but none reported a value"
+                % facts.thermal_zones,
+                subject=self.SUBJECT,
+                evidence={"thermal_zones": facts.thermal_zones})
         return self.result_from_spec(
             ctx, facts.thermal_max_c, subject=self.SUBJECT,
             evidence={"thermal_zones": facts.thermal_zones,
+                      "values": values,
                       "max_c": facts.thermal_max_c})
 
 
@@ -280,7 +333,10 @@ class SystemUptime(_SystemCheck):
 
 _ARRAY = re.compile(r"^(md\w*)\s*:\s*(.*)$")
 _MEMBER_STATE = re.compile(r"\[([U_]+)\]")
-_REBUILD = re.compile(r"\b(resync|recovery|reshape|check)\s*=", re.IGNORECASE)
+# `check =` is a SCRUB: a read-verify pass with redundancy intact, not a
+# rebuild. Treating it as a rebuild would put every monthly scrub in the amber
+# band for hours on a healthy array.
+_REBUILD = re.compile(r"\b(resync|recovery|reshape)\s*=", re.IGNORECASE)
 
 
 def _parse_mdstat(text):

@@ -17,7 +17,6 @@ MODULE = Module(
     order=20,
     targets=("local",),
     settings=[
-        Setting("SYSTEM_LOCAL_NAME", "local"),
         Setting("SYSTEM_PROC", "/proc"),
         Setting("SYSTEM_SYS", "/sys"),
         Setting("SYSTEM_MOUNTS", "/"),

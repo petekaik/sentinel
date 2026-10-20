@@ -6,10 +6,11 @@ once, before any check runs. A file that is absent or unreadable is recorded in
 on: a host without a thermal zone is not a failed collection, and a host whose
 meminfo cannot be read is not a host with zero free memory.
 
-NO SOCKETS, NO SUBPROCESSES, NO WRITES. The host is the one running the
-container, so "unreachable" is not a failure mode this module can have; the
-attempt notes below still record each section, because "the read ran" and "the
-file was not there" are different facts.
+NO SOCKETS, NO SUBPROCESSES, NO WRITES, AND NO ATTEMPT ROW. This module reads
+the host the container runs on; "unreachable" is not a failure mode it can
+have, and a failed local file read must not become a fleet-owned
+`host_unreachable` row. Every reason stays in `SystemFacts.errors`, where the
+checks turn it into UNKNOWN.
 """
 
 import glob
@@ -43,8 +44,14 @@ class SystemFacts:
         # error. A different value in `errors` means it exists and could not be
         # read, which the RAID check reports as UNKNOWN.
         self.mdstat_text = None
+        # Hottest zone, but only a GRADEABLE figure when `thermal_unreadable`
+        # is empty: a partial read is not "the hottest zone".
         self.thermal_max_c = None
         self.thermal_zones = 0
+        # {zone_path: celsius} for every zone that answered.
+        self.thermal_values = {}
+        # {zone_path: reason} for every zone that did not.
+        self.thermal_unreadable = {}
         # section -> reason, for every read that could not answer.
         self.errors = {}
 
@@ -60,31 +67,13 @@ def preload(ctx):
     """Read every system fact once and install it on `ctx.system_facts`."""
     s = ctx.system
     facts = SystemFacts()
-    a = ctx.attempt(s.local_name)
 
     _loadavg(s.proc, facts)
-    a.note("loadavg" not in facts.errors, facts.errors.get("loadavg", ""))
-
     _meminfo(s.proc, facts)
-    a.note("meminfo" not in facts.errors, facts.errors.get("meminfo", ""))
-
     _uptime(s.proc, facts)
-    a.note("uptime" not in facts.errors, facts.errors.get("uptime", ""))
-
     _disks(s.mounts, facts)
-    if s.mounts:
-        if facts.disks:
-            a.note(True, "")
-        else:
-            a.note(False, "; ".join(
-                facts.errors.get("disk:%s" % m, "cannot stat %s" % m)
-                for m in s.mounts))
-
     _mdstat(s.proc, facts)
-    a.note("mdstat" not in facts.errors, facts.errors.get("mdstat", ""))
-
     _thermal(s.sys, facts)
-    a.note("thermal" not in facts.errors, facts.errors.get("thermal", ""))
 
     ctx.system_facts = facts
 
@@ -182,6 +171,15 @@ def _uptime(proc, facts):
 
 def _disks(mounts, facts):
     for mount in mounts:
+        # `disk_usage` FOLLOWS THE MOUNTPOINT. For a directory that is not a
+        # mount it silently grades the PARENT filesystem, which is a healthy
+        # answer to a different question -- so a configured path that is not a
+        # mount is unreadable, not a reading.
+        if not os.path.ismount(mount):
+            facts.errors["disk:%s" % mount] = (
+                "%s is not a mount point; stat would grade its parent "
+                "filesystem" % mount)
+            continue
         try:
             usage = shutil.disk_usage(mount)
         except OSError as exc:
@@ -218,18 +216,19 @@ def _thermal(sys_dir, facts):
     if not paths:
         # No zone at all is a host fact (a VM or a board without imx_thermal).
         return
-    readings, why = [], []
     for path in paths:
         try:
             raw = _read(path).strip()
         except OSError as exc:
-            why.append("cannot read %s: %s" % (path, exc))
+            facts.thermal_unreadable[path] = "cannot read %s: %s" % (path, exc)
             continue
         try:
-            readings.append(float(raw) / 1000.0)   # millidegrees
+            facts.thermal_values[path] = float(raw) / 1000.0   # millidegrees
         except ValueError:
-            why.append("%s is not a millidegree reading: %r" % (path, raw))
-    if readings:
-        facts.thermal_max_c = max(readings)
-    else:
-        facts.errors["thermal"] = "; ".join(why)
+            facts.thermal_unreadable[path] = (
+                "%s is not a millidegree reading: %r" % (path, raw))
+    if facts.thermal_values and not facts.thermal_unreadable:
+        # ONLY A COMPLETE READ is "the hottest zone"; see SystemThermal.
+        facts.thermal_max_c = max(facts.thermal_values.values())
+    if facts.thermal_unreadable and not facts.thermal_values:
+        facts.errors["thermal"] = "; ".join(facts.thermal_unreadable.values())

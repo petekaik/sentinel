@@ -14,14 +14,26 @@ Everything is read once per epoch by `preload.py`, from paths under
 |---|---|---|---|
 | `/proc/loadavg` | 1/5/15-min load, runnable/total processes | `system_load1_per_cpu` | `cpu` |
 | `/proc/meminfo` | `MemAvailable`, total, swap | `system_mem_available_mb` | `mem` |
-| `shutil.disk_usage` | total/free/% free per mount | `system_disk_free_pct` | worst mount |
+| `shutil.disk_usage` | total/free/% free per mount | `system_disk_free_pct` | `disk` (worst mount in detail) |
 | `/proc/mdstat` | md array member states, resync/recovery | `system_raid_degraded` | `md` |
 | `/sys/class/thermal/thermal_zone*/temp` | hottest zone, millidegrees | `system_thermal_c` | `thermal` |
 | `/proc/uptime` | seconds since boot | `system_uptime` (informational) | `uptime` |
 
-No sockets, no subprocesses, no writes. A missing file is not a zero: the
-check reports UNKNOWN with the reason. `/proc/mdstat` absent and no thermal
-zone are both normal host facts and are stated as such.
+No sockets, no subprocesses, no writes, and no collection-attempt row: v1 is
+local-only, so "unreachable" is not a question it can answer, and a failed
+local file read must not become a fleet-owned `host_unreachable` row.
+
+A missing file is not a zero: the check reports UNKNOWN with the reason.
+`/proc/mdstat` absent and no thermal zone are both normal host facts and are
+stated as such. **Partial reads are also UNKNOWN**: if any configured mount is
+unreadable (including a path that is not a mount point — `disk_usage` would
+otherwise grade its parent filesystem) or any thermal zone cannot be read, the
+check does not grade a subset. The unreadable item is named, and the values
+that were read travel in the evidence.
+
+The disk check's subject is the constant `disk`, never the mount path. The
+worst mount changes as space moves, and a mount-keyed incident would be opened
+under one mount and never resolved once another became the worst.
 
 `system_uptime` is `informational`: it is rendered without a RAG colour and
 does not count toward the dashboard's verdict. It names the
@@ -33,13 +45,17 @@ every possible uptime and is not a health bound (the threshold file says so).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `SYSTEM_LOCAL_NAME` | `local` | target/attempt name for this host |
 | `SYSTEM_PROC` | `/proc` | procfs root |
 | `SYSTEM_SYS` | `/sys` | sysfs root |
 | `SYSTEM_MOUNTS` | `/` | comma-separated mounts graded for free space |
 | `SYSTEM_ENABLED` | `1` | platform-wide per-module switch |
 
 CPU count comes from `os.cpu_count()` (minimum 1); load is graded per CPU.
+Every check reports under the target `local`; there is no setting for it.
+
+On the dashboard the spec-graded checks appear in the module's own
+"System resources" section; the spec-less RAID check is listed in the
+all-checks-by-target table, and uptime is in the informational section.
 
 ## Adding remote hosts later
 

@@ -130,6 +130,8 @@ input, select, textarea, button { font:inherit; color:var(--fg);
                                   border-radius:4px; padding:6px 8px; }
 input[type="checkbox"] { width:auto; padding:0; }
 textarea { width:100%; resize:vertical; }
+pre { white-space:pre-wrap; overflow-wrap:anywhere; margin:4px 0 0;
+      font-size:12px; }
 button { cursor:pointer; }
 button:hover:not(:disabled) { border-color:#3a4755; }
 button:disabled, input:disabled, select:disabled, textarea:disabled {

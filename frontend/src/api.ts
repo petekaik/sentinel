@@ -144,6 +144,24 @@ export type CheckManifest = {
   targets: string[];
 };
 
+/* One declared argument of a command. The manifest carries the SCHEMA -- the
+   SPA builds the form from it -- and never a value. */
+export type CommandArg = {
+  name: string;
+  choices?: string[] | null;
+  default?: string | number | null;
+  required?: boolean;
+};
+
+export type CommandField = {
+  id: string;
+  title: string;
+  /* "read_only" | "state_changing" | "destructive". Only the last one asks
+     for a confirmation, and the server enforces that independently. */
+  danger?: string | null;
+  args?: CommandArg[];
+};
+
 export type ModuleManifest = {
   id: string;
   title: string;
@@ -155,9 +173,35 @@ export type ModuleManifest = {
      rows such as host_unreachable). Ownership is by id, never by target. */
   extra_check_ids: string[];
   settings: SettingField[];
-  commands: { id: string; title: string; danger?: string | null }[];
+  commands: CommandField[];
   actions: { id: string; title: string; danger?: string | null }[];
 };
+
+/* An approval asks for a change; it cannot act until a human decides it. The
+   server returns pending and expired as two lists because a lapsed row may not
+   be decided and must not be offered beside a live one. */
+export type Proposal = {
+  id: number;
+  ts: number;
+  module: string;
+  kind: string;
+  payload_json: string;
+  rationale: string;
+  state: string;
+  expires_at: number;
+  decided_at?: number | null;
+  actor?: string | null;
+  executed_at?: number | null;
+};
+
+export type ProposalsPayload = {
+  pending: Proposal[];
+  expired: Proposal[];
+};
+
+export type ProposalDecision = { ok: boolean; message: string };
+
+export type CommandResult = { ok: boolean; detail: string; output?: string };
 
 export type SettingState = {
   value: any;
@@ -235,7 +279,25 @@ export const api = {
   settings: () => req<SettingsView>("GET", "/api/v1/settings"),
   incidents: (signal?: AbortSignal) =>
     req<IncidentsPayload>("GET", "/api/v1/incidents", undefined, signal),
-  proposals: () => req<any[]>("GET", "/api/v1/proposals"),
+  proposals: () => req<ProposalsPayload>("GET", "/api/v1/proposals"),
+  approveProposal: (id: number) =>
+    req<ProposalDecision>("POST", `/api/v1/proposals/${id}/approve`),
+  rejectProposal: (id: number) =>
+    req<ProposalDecision>("POST", `/api/v1/proposals/${id}/reject`),
+  runCommand: (
+    module: string,
+    id: string,
+    body: {
+      args?: Record<string, unknown>;
+      dry_run?: boolean;
+      confirm?: boolean;
+    },
+  ) =>
+    req<CommandResult>(
+      "POST",
+      `/api/v1/commands/${encodeURIComponent(module)}/${encodeURIComponent(id)}`,
+      body,
+    ),
   putSettings: (id: string, body: unknown) =>
     req<ModuleSettingsView>("PUT", `/api/v1/modules/${id}/settings`, body),
   deleteSetting: (id: string, key: string) =>

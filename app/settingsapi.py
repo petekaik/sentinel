@@ -211,7 +211,17 @@ def module_manifests(cfg, conn, modules, specs):
             # modules can share.
             "extra_check_ids": list(mod.extra_check_ids),
             "settings": settings,
-            "commands": [{"id": c.id, "title": c.title, "danger": c.danger}
+            # THE ARGUMENTS ARE PART OF THE CONTRACT, not an extra: the SPA
+            # renders one form per command from this list, and a command whose
+            # required argument is invisible can only be run by guessing. The
+            # manifest still carries no VALUE of anything.
+            "commands": [{"id": c.id, "title": c.title, "danger": c.danger,
+                          "args": [{"name": a.name,
+                                    "choices": list(a.choices) if a.choices
+                                    else None,
+                                    "default": a.default,
+                                    "required": a.required}
+                                   for a in c.args]}
                          for c in mod.commands()],
             "actions": [{"id": a.id, "title": a.title, "danger": a.danger}
                         for a in mod.actions()],

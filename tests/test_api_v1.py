@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -27,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                                   # noqa: E402
 from test_dashboard import CACHE, _serve, make_cfg            # noqa: E402
 
+import commands                                               # noqa: E402
 import config as config_mod                                   # noqa: E402
 import module                                                 # noqa: E402
 import modules as module_loader                               # noqa: E402
@@ -112,6 +114,22 @@ def test_manifest_carries_the_schema_and_never_a_secret(results):
             by_check["state_export_present"]["targets"],
             by_check["shared_layer_parity"]["targets"],
             by_check["serial_adapter"]["targets"]))
+
+    # THE ARGUMENTS ARE THE FORM THE SPA RENDERS. A command whose required
+    # argument is missing from the manifest can only be run by guessing.
+    by_command = {c["id"]: c for c in fleet["commands"]}
+    serial_arm = by_command["serial_arm"]
+    results.check(
+        "each command carries its argument schema",
+        serial_arm["args"] == [
+            {"name": "box", "choices": None, "default": None,
+             "required": True},
+            {"name": "min", "choices": None, "default": None,
+             "required": False}]
+        and by_command["serial_status"]["args"] == []
+        and by_command["serial_break"]["danger"] == "destructive",
+        "serial_arm=%r serial_status=%r -- the SPA builds one args form from "
+        "this list" % (serial_arm, by_command["serial_status"]))
 
     probe = _secret_module()
     settingsapi.write_settings(cfg, conn, probe, {"PROBE_TOKEN": "s3cret"},
@@ -482,13 +500,25 @@ def test_the_read_surface(results):
             and hdrs.get("Cache-Control") == CACHE,
             "code=%s body=%r" % (code, body))
 
-        for name in ("insights", "proposals"):
-            code, hdrs, body = _req(base + "/api/v1/" + name)
-            results.check(
-                "GET /api/v1/%s answers a JSON list, uncached" % name,
-                code == 200 and isinstance(body, list)
-                and hdrs.get("Cache-Control") == CACHE,
-                "code=%s body=%r" % (code, body))
+        code, hdrs, body = _req(base + "/api/v1/insights")
+        results.check(
+            "GET /api/v1/insights answers a JSON list, uncached",
+            code == 200 and isinstance(body, list)
+            and hdrs.get("Cache-Control") == CACHE,
+            "code=%s body=%r" % (code, body))
+
+        # TWO LISTS, because a lapsed proposal may not be decided. The GET
+        # reads through a `mode=ro` connection and cannot sweep, so the split
+        # must come from `expires_at` -- and every row must land in exactly one
+        # list, never both.
+        code, hdrs, body = _req(base + "/api/v1/proposals")
+        results.check(
+            "GET /api/v1/proposals is {pending, expired}, uncached",
+            code == 200 and isinstance(body, dict)
+            and isinstance(body.get("pending"), list)
+            and isinstance(body.get("expired"), list)
+            and hdrs.get("Cache-Control") == CACHE,
+            "code=%s body=%r" % (code, body))
 
         # The legacy contract is additive: this suite must not have moved it.
         code, _, body = _req(base + "/api/status.json")
@@ -698,6 +728,241 @@ def test_writes_disabled_without_a_token(results):
         httpd.server_close()
 
 
+def _proposal(conn, **over):
+    base = dict(module="fleet", kind="threshold_change",
+                payload={"spec_id": "state_save_age_min", "module": "fleet",
+                         "green": 20, "amber": 45},
+                rationale="p95 outside the band",
+                expires_at=time.time() + 3600)
+    base.update(over)
+    return store.record_proposal(conn, **base)
+
+
+def test_proposals_are_a_two_list_board(results):
+    """A lapsed row is EXPIRED, not pending -- and it appears in one list only."""
+    tmp = tempfile.mkdtemp()
+    cfg = _cfg(tmp)
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    live = _proposal(conn)
+    lapsed = _proposal(conn, rationale="this one lapsed",
+                       expires_at=time.time() - 5)
+    conn.close()
+    httpd, base = _serve(cfg)
+    try:
+        code, _, body = _req(base + "/api/v1/proposals")
+        ids = {
+            "pending": [r["id"] for r in body.get("pending", [])],
+            "expired": [r["id"] for r in body.get("expired", [])],
+        }
+        results.check(
+            "a pending proposal is pending and a lapsed one is expired",
+            code == 200 and ids["pending"] == [live]
+            and ids["expired"] == [lapsed],
+            "code=%s ids=%r live=%r lapsed=%r -- the split is from expires_at, "
+            "because this read cannot sweep on a mode=ro connection"
+            % (code, ids, live, lapsed))
+        results.check(
+            "no proposal is offered in both lists",
+            not set(ids["pending"]) & set(ids["expired"]),
+            "ids=%r" % (ids,))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_proposal_decisions_via_api(results):
+    """Approval runs the engine, audits, and a refusal leaves the row pending."""
+    tmp = tempfile.mkdtemp()
+    cfg = _cfg(tmp)
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    pid = _proposal(conn)
+    conn.close()
+    httpd, base = _serve(cfg)
+    try:
+        url = base + "/api/v1/proposals/%d/approve" % pid
+        code, _, body = _req(url, "POST")
+        conn = store.connect(cfg.db_path)
+        try:
+            still_pending = store.get_proposal(conn, pid)["state"] == "pending"
+            audited = store.list_command_runs(conn)
+        finally:
+            conn.close()
+        results.check(
+            "an unauthenticated approval is 401 and decides nothing",
+            code == 401 and body["error"]["code"] == "unauthorized"
+            and still_pending and audited == [],
+            "code=%s body=%r pending=%r audit=%r"
+            % (code, body, still_pending, audited))
+
+        code, _, body = _req(url, "POST", token="tok")
+        conn = store.connect(cfg.db_path)
+        try:
+            row = store.get_proposal(conn, pid)
+            override = store.get_threshold_override(conn, "state_save_age_min")
+            audit = store.list_command_runs(conn)
+        finally:
+            conn.close()
+        results.check(
+            "an authenticated approval executes the change through the engine",
+            code == 200 and body.get("ok") is True
+            and "state_save_age_min" in body.get("message", "")
+            and row["state"] == "executed" and override is not None
+            and override["amber"] == 45,
+            "code=%s body=%r row=%r override=%r"
+            % (code, body, row, override))
+        results.check(
+            "the approval is audited as a command run",
+            any(r["command"] == "approve_proposal" and r["exit_status"] == 0
+                for r in audit),
+            "audit=%r" % (audit,))
+
+        # A REFUSAL IS NOT A DECISION. A proposal naming a spec that is not in
+        # the merged set must be refused by the engine and left PENDING.
+        conn = store.connect(cfg.db_path)
+        try:
+            bad = _proposal(conn, payload={"spec_id": "no_such_spec",
+                                           "module": "fleet",
+                                           "green": 1, "amber": 2})
+        finally:
+            conn.close()
+        code, _, body = _req(
+            base + "/api/v1/proposals/%d/approve" % bad, "POST", token="tok")
+        conn = store.connect(cfg.db_path)
+        try:
+            refused_pending = store.get_proposal(conn, bad)["state"] == "pending"
+            refused_audit = store.list_command_runs(conn)
+        finally:
+            conn.close()
+        results.check(
+            "a refused approval is a 409 and leaves the proposal pending",
+            code == 409 and body["error"]["code"] == "refused"
+            and refused_pending,
+            "code=%s body=%r pending=%r" % (code, body, refused_pending))
+        results.check(
+            "the refusal is audited too, so a pending row shows an attempt",
+            any(r["command"] == "approve_proposal" and r["exit_status"] == 1
+                for r in refused_audit),
+            "audit=%r" % (refused_audit,))
+
+        # Rejection: a token-gated decision with no engine to run.
+        conn = store.connect(cfg.db_path)
+        try:
+            rej = _proposal(conn, rationale="reject me")
+        finally:
+            conn.close()
+        code, _, body = _req(
+            base + "/api/v1/proposals/%d/reject" % rej, "POST")
+        results.check(
+            "an unauthenticated rejection is 401",
+            code == 401 and body["error"]["code"] == "unauthorized",
+            "code=%s body=%r" % (code, body))
+        code, _, body = _req(
+            base + "/api/v1/proposals/%d/reject" % rej, "POST", token="tok")
+        conn = store.connect(cfg.db_path)
+        try:
+            rejected = store.get_proposal(conn, rej)
+        finally:
+            conn.close()
+        results.check(
+            "an authenticated rejection decides the row",
+            code == 200 and body.get("ok") is True
+            and rejected["state"] == "rejected",
+            "code=%s body=%r row=%r" % (code, body, rejected))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_commands_via_api(results):
+    """The command surface: auth, the confirm gate, dispatch and its audit."""
+    tmp = tempfile.mkdtemp()
+    cfg = _cfg(tmp)
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    conn.close()
+
+    calls = []
+
+    def handler(ctx, args, dry_run=False):
+        calls.append((dict(args), dry_run))
+        return commands.Result(True, "ran with %r" % (args,), "command output")
+
+    # THE FAKE KEEPS THE REAL `fleet` ID on purpose: `discover_enabled` resolves
+    # each discovered module's own package path, so an invented id would fail
+    # there before the endpoint under test ran.
+    fake = module.Module(
+        id="fleet", title="Fleet",
+        commands=lambda: [
+            commands.Command("peek", "Peek", handler,
+                             args=[commands.Arg("target")]),
+            commands.Command("wipe", "Wipe", handler, danger="destructive"),
+        ])
+    saved = module_loader.discover
+    module_loader.discover = lambda: [fake]
+    httpd, base = _serve(cfg)
+    try:
+        def audit_rows():
+            c = store.connect(cfg.db_path, read_only=True)
+            try:
+                return store.list_command_runs(c)
+            finally:
+                c.close()
+
+        code, _, body = _req(base + "/api/v1/commands/fleet/peek", "POST",
+                             {"args": {"target": "x"}})
+        results.check(
+            "an unauthenticated command is 401 and never reaches the handler",
+            code == 401 and body["error"]["code"] == "unauthorized"
+            and calls == [] and audit_rows() == [],
+            "code=%s body=%r calls=%r audit=%r"
+            % (code, body, calls, audit_rows()))
+
+        code, _, body = _req(base + "/api/v1/commands/fleet/wipe", "POST",
+                             {"args": {}}, token="tok")
+        results.check(
+            "a destructive command without confirm is 422 and does not run",
+            code == 422 and body["error"]["code"] == "confirm_required"
+            and calls == [] and audit_rows() == [],
+            "code=%s body=%r calls=%r audit=%r"
+            % (code, body, calls, audit_rows()))
+
+        code, _, body = _req(base + "/api/v1/commands/fleet/wipe", "POST",
+                             {"args": {}, "confirm": True}, token="tok")
+        results.check(
+            "a confirmed destructive command runs and is audited",
+            code == 200 and body.get("ok") is True
+            and calls == [({}, False)]
+            and [r["command"] for r in audit_rows()] == ["wipe"]
+            and audit_rows()[0]["exit_status"] == 0,
+            "code=%s body=%r calls=%r audit=%r"
+            % (code, body, calls, audit_rows()))
+
+        code, _, body = _req(base + "/api/v1/commands/fleet/peek", "POST",
+                             {"args": {"target": "x"}, "dry_run": True},
+                             token="tok")
+        results.check(
+            "args and dry_run reach the handler through dispatch",
+            code == 200 and body.get("detail") == "ran with {'target': 'x'}"
+            and body.get("output") == "command output"
+            and calls[-1] == ({"target": "x"}, True),
+            "code=%s body=%r calls=%r" % (code, body, calls))
+
+        before = len(audit_rows())
+        code, _, body = _req(base + "/api/v1/commands/fleet/peek", "POST",
+                             {"args": {"bogus": "x"}}, token="tok")
+        results.check(
+            "an invalid argument is a 422 refusal with no audit row",
+            code == 422 and body["error"]["code"] == "refused"
+            and len(audit_rows()) == before,
+            "code=%s body=%r audit=%r" % (code, body, audit_rows()))
+    finally:
+        module_loader.discover = saved
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_the_committed_spa_is_served(results):
     """The served shell is the COMMITTED build, and the static path is bounded.
 
@@ -785,6 +1050,9 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_api_errors_are_json,
          test_the_write_surface,
          test_writes_disabled_without_a_token,
+         test_proposals_are_a_two_list_board,
+         test_proposal_decisions_via_api,
+         test_commands_via_api,
          test_the_committed_spa_is_served)
 
 

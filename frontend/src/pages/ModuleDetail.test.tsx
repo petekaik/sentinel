@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import ModuleDetail from "./ModuleDetail";
@@ -214,4 +214,95 @@ it("renders one check row per target and attributes rows by check ownership", as
   // A collector-emitted check id named by `extra_check_ids` is owned even when
   // its target is not one of the module's reporting targets.
   expect(screen.getByText("extra-check detail")).toBeInTheDocument();
+});
+
+it("renders a command's args form and gates only destructive commands", async () => {
+  const fleet = {
+    ...modules[0],
+    commands: [
+      {
+        id: "serial_status",
+        title: "Serial adapters and arm state",
+        danger: "read_only",
+        args: [],
+      },
+      {
+        id: "serial_break",
+        title: "SysRq BREAK + reboot a box",
+        danger: "destructive",
+        args: [{ name: "box", choices: null, default: null, required: true }],
+      },
+    ],
+  };
+  const calls: { url: string; method?: string; body?: unknown }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({
+        url: String(url),
+        method: init?.method,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      if (url === "/api/v1/modules") return respond(200, [fleet, modules[1]]);
+      if (url === "/api/v1/status") return respond(200, status);
+      if (url === "/api/v1/settings") return respond(200, {});
+      if (url === "/api/v1/commands/fleet/serial_break")
+        return respond(200, {
+          ok: true,
+          detail: "would send BREAK+b to /dev/ttyUSB0",
+          output: "dry-run output",
+        });
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+
+  render(
+    <MemoryRouter initialEntries={["/modules/fleet"]}>
+      <Routes>
+        <Route path="/modules/:id" element={<ModuleDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  const card = (
+    await screen.findByText("SysRq BREAK + reboot a box")
+  ).closest("article") as HTMLElement;
+  expect(within(card).getByText("destructive")).toBeInTheDocument();
+
+  const run = within(card).getByRole("button", { name: "Run" });
+  // Required arg empty: refused before the request is even sent.
+  expect(run).toBeDisabled();
+
+  fireEvent.change(within(card).getByLabelText("box"), {
+    target: { value: "cubox-1" },
+  });
+  // A destructive command still needs the explicit confirmation.
+  expect(run).toBeDisabled();
+
+  fireEvent.click(within(card).getByLabelText(/I understand this is destructive/));
+  expect(run).toBeEnabled();
+  fireEvent.click(run);
+
+  expect(
+    await within(card).findByText("would send BREAK+b to /dev/ttyUSB0"),
+  ).toBeInTheDocument();
+  expect(within(card).getByText("dry-run output")).toBeInTheDocument();
+  expect(
+    calls.filter((c) => c.url === "/api/v1/commands/fleet/serial_break"),
+  ).toEqual([
+    {
+      url: "/api/v1/commands/fleet/serial_break",
+      method: "POST",
+      body: { args: { box: "cubox-1" }, dry_run: false, confirm: true },
+    },
+  ]);
+
+  // The read-only command has no confirmation checkbox at all.
+  const statusCard = screen
+    .getByText("Serial adapters and arm state")
+    .closest("article") as HTMLElement;
+  expect(
+    within(statusCard).queryByLabelText(/I understand this is destructive/),
+  ).toBeNull();
+  expect(within(statusCard).getByRole("button", { name: "Run" })).toBeEnabled();
 });

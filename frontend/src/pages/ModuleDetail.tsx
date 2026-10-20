@@ -3,6 +3,9 @@ import { Link, useParams } from "react-router-dom";
 import {
   api,
   hasToken,
+  isUnauthorized,
+  type CommandField,
+  type CommandResult,
   type ModuleManifest,
   type SettingsView,
   type Status,
@@ -19,6 +22,170 @@ function message(e: unknown): string {
 function value(row: { value: number | null; unit: string }): string {
   if (row.value == null) return "—";
   return `${row.value}${row.unit ? ` ${row.unit}` : ""}`;
+}
+
+/* A command is a form, and the manifest is its schema. Only a DESTRUCTIVE
+   command asks for confirmation -- and the checkbox is not the gate: the server
+   refuses a destructive command without `confirm: true` too, because a
+   hand-written request never saw this button. */
+function CommandPanel({
+  moduleId,
+  cmd,
+  onAuthRequired,
+}: {
+  moduleId: string;
+  cmd: CommandField;
+  onAuthRequired?: (retry: () => void) => void;
+}) {
+  const initial = () =>
+    Object.fromEntries(
+      (cmd.args ?? []).map((a) => [
+        a.name,
+        a.default == null ? "" : String(a.default),
+      ]),
+    );
+  const [args, setArgs] = useState<Record<string, string>>(initial);
+  const [dryRun, setDryRun] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<CommandResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const destructive = cmd.danger === "destructive";
+  const missing = (cmd.args ?? []).some(
+    (a) => a.required && !args[a.name]?.trim(),
+  );
+
+  async function run() {
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      // A blank optional argument is OMITTED, not sent as "": the handler
+      // reads `None` for "not supplied", and "" is a supplied value.
+      const supplied: Record<string, string> = {};
+      for (const a of cmd.args ?? []) {
+        const v = args[a.name]?.trim();
+        if (v) supplied[a.name] = v;
+      }
+      setResult(
+        await api.runCommand(moduleId, cmd.id, {
+          args: supplied,
+          dry_run: dryRun,
+          ...(destructive ? { confirm } : {}),
+        }),
+      );
+    } catch (e) {
+      if (isUnauthorized(e) && onAuthRequired) {
+        onAuthRequired(() => void run());
+        setError("A write token is required to run a command.");
+      } else {
+        setError(message(e));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <article className="module-card">
+      <div className="tile-head">
+        <h3>{cmd.title}</h3>
+        <span
+          className={`pill ${
+            destructive
+              ? "red"
+              : cmd.danger === "state_changing"
+                ? "amber"
+                : "grey"
+          }`}
+        >
+          {cmd.danger ?? "read_only"}
+        </span>
+      </div>
+      <p className="sub">
+        <code>{cmd.id}</code>
+      </p>
+      {(cmd.args ?? []).map((a) => {
+        const id = `${moduleId}-${cmd.id}-${a.name}`;
+        return (
+          <div className="setting" key={a.name}>
+            <label htmlFor={id}>
+              {a.name}
+              {a.required ? "" : " (optional)"}
+            </label>
+            {a.choices?.length ? (
+              <select
+                id={id}
+                value={args[a.name] ?? ""}
+                disabled={busy}
+                onChange={(e) =>
+                  setArgs((prev) => ({ ...prev, [a.name]: e.target.value }))
+                }
+              >
+                <option value="">--</option>
+                {a.choices.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                id={id}
+                type="text"
+                value={args[a.name] ?? ""}
+                disabled={busy}
+                onChange={(e) =>
+                  setArgs((prev) => ({ ...prev, [a.name]: e.target.value }))
+                }
+              />
+            )}
+          </div>
+        );
+      })}
+      <div className="setting-actions">
+        <label>
+          <input
+            type="checkbox"
+            checked={dryRun}
+            disabled={busy}
+            onChange={(e) => setDryRun(e.target.checked)}
+          />{" "}
+          dry run
+        </label>
+        {destructive && (
+          <label>
+            <input
+              type="checkbox"
+              checked={confirm}
+              disabled={busy}
+              onChange={(e) => setConfirm(e.target.checked)}
+            />{" "}
+            I understand this is destructive
+          </label>
+        )}
+        <button
+          type="button"
+          disabled={busy || missing || (destructive && !confirm)}
+          onClick={() => void run()}
+        >
+          {busy ? "Running…" : "Run"}
+        </button>
+      </div>
+      {error && (
+        <p className="banner red" role="alert">
+          {error}
+        </p>
+      )}
+      {result && (
+        <div className="note">
+          <p>{result.detail}</p>
+          {result.output && <pre>{result.output}</pre>}
+        </div>
+      )}
+    </article>
+  );
 }
 
 /* One module: the targets it reports on, the checks it declares, what the status
@@ -378,11 +545,24 @@ export default function ModuleDetail() {
       )}
 
       <h2>Commands</h2>
-      <p className="sub">
-        {mod.commands.length === 0
-          ? "This module exposes no commands."
-          : `${mod.commands.length} command${mod.commands.length === 1 ? "" : "s"} declared. Execution and its confirmation surface arrive in the next task.`}
-      </p>
+      {mod.commands.length === 0 ? (
+        <p className="sub">This module exposes no commands.</p>
+      ) : (
+        <div className="grid">
+          {mod.commands.map((cmd) => (
+            <CommandPanel
+              key={cmd.id}
+              moduleId={mod.id}
+              cmd={cmd}
+              onAuthRequired={(again) => {
+                retry.current = again;
+                setReadOnly(true);
+                setTokenOpen(true);
+              }}
+            />
+          ))}
+        </div>
+      )}
 
       <h2>Settings</h2>
       {settingsError ? (

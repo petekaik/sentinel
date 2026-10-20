@@ -52,6 +52,8 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import checks
+import commands
+import ctl
 import modules as module_loader
 import settingsapi
 import shell
@@ -851,9 +853,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, store.list_insights(conn))
                 return
             if path == "/api/v1/proposals":
-                # PENDING only: the page is an action surface, and a decided
-                # proposal re-offered beside an open one reads as still open.
-                self._json(200, store.list_proposals(conn, state="pending"))
+                # PENDING AND EXPIRED, TWO LISTS. A lapsed proposal is not
+                # pending (nothing may decide it) and not history either, so
+                # mixing them re-offers a dead row beside a live one.
+                #
+                # THE SWEEP IS NOT RUN HERE: this read uses a `mode=ro`
+                # connection, and a GET must not write. `ctl` sweeps before it
+                # decides; for display, a pending row past its deadline is
+                # EXPIRED from its `expires_at` alone (`proposal_expired`),
+                # which is the same rule `ctl._display_state` uses -- the
+                # collector's sweep only converges the stored state.
+                now = time.time()
+                pending_rows = store.list_proposals(conn, state="pending")
+                pending = [r for r in pending_rows
+                           if not store.proposal_expired(r, now)]
+                expired = (store.list_proposals(conn, state="expired")
+                           + [r for r in pending_rows
+                              if store.proposal_expired(r, now)])
+                expired.sort(key=lambda r: r["id"], reverse=True)
+                self._json(200, {"pending": pending, "expired": expired})
                 return
             if path.startswith("/api/v1"):
                 # AN API 404 IS JSON. Falling through to the legacy plain-text
@@ -978,6 +996,125 @@ class Handler(BaseHTTPRequestHandler):
                         "the write failed: %s" % exc)
         finally:
             conn.close()
+
+    def do_POST(self):
+        """`/api/v1/proposals/<id>/{approve,reject}` and
+        `/api/v1/commands/<module>/<id>`.
+
+        Auth is checked BEFORE the store is opened, exactly as
+        `_settings_write` does. Every failure is JSON: a fetch() on an
+        `/api/v1` path must be able to read what went wrong.
+
+        The approvals call `ctl.approve_proposal`/`reject_proposal`, the same
+        module-level functions `--approve`/`--reject` use, so every engine,
+        module and incident gate stays in one place. A refusal is a 409 and
+        leaves the row pending, because a failed approval is not a decision.
+        """
+        cfg = self.cfg
+        try:
+            if not settingsapi.authorized(cfg, self.headers):
+                self._error(401, "unauthorized", "missing or wrong write token")
+                return
+        except settingsapi.SettingsError as exc:
+            self._error(403, exc.code, exc.message, exc.field)
+            return
+
+        conn = store.connect(cfg.db_path)
+        try:
+            cfg.reload_settings(conn)
+            parts = [p for p in self.path.split("?")[0].split("/") if p]
+            try:
+                body = self._body()
+            except ValueError as exc:
+                # READ EVEN WHEN A ROUTE IGNORES IT, so a stray body cannot be
+                # parsed as the next request on this keep-alive connection.
+                self._error(422, "invalid_body",
+                            "the request body is not JSON: %s" % exc)
+                return
+            if (len(parts) == 5 and parts[:3] == ["api", "v1", "proposals"]
+                    and parts[4] in ("approve", "reject")):
+                self._proposal_decision(conn, parts[3], parts[4])
+                return
+            if len(parts) == 5 and parts[:3] == ["api", "v1", "commands"]:
+                self._run_command(cfg, conn, parts[3], parts[4], body)
+                return
+            self._error(404, "no_route", "no such /api/v1 route")
+        except Exception as exc:                   # noqa: BLE001 - rendered
+            self._error(500, "internal",
+                        "the write failed: %s" % exc)
+        finally:
+            conn.close()
+
+    def _proposal_decision(self, conn, raw_id, verb):
+        try:
+            proposal_id = int(raw_id)
+        except ValueError:
+            self._error(409, "refused", "no proposal %r" % (raw_id,))
+            return
+        try:
+            if verb == "approve":
+                message = ctl.approve_proposal(
+                    self.cfg, conn, ctl._modules(self.cfg), proposal_id,
+                    "operator")
+            else:
+                message = ctl.reject_proposal(conn, proposal_id, "operator")
+        except ctl.ProposalRefused as exc:
+            self._error(409, "refused", str(exc))
+            return
+        self._json(200, {"ok": True, "message": message})
+
+    def _run_command(self, cfg, conn, module_id, command_id, body):
+        if not isinstance(body, dict):
+            self._error(422, "invalid_body",
+                        "the request body must be a JSON object")
+            return
+        # THE DISCOVERED SET, not the enabled one: a disabled module's command
+        # must be refused BY dispatch ("module is disabled"), so the operator
+        # sees the real reason rather than "no such module".
+        mod = {m.id: m for m in module_loader.discover()}.get(module_id)
+        if mod is None:
+            self._error(404, "no_module", "unknown module")
+            return
+        cmd = {c.id: c for c in mod.commands()}.get(command_id)
+        if cmd is None:
+            self._error(404, "no_command",
+                        "module %r has no command %r" % (module_id, command_id))
+            return
+        # CONFIRMATION IS A SERVER-SIDE GATE. Disabling a button stops a click,
+        # not a hand-written request -- and a destructive command is exactly
+        # where that difference matters.
+        if cmd.danger == "destructive" and body.get("confirm") is not True:
+            self._error(422, "confirm_required",
+                        "command %r is destructive; resend with "
+                        "\"confirm\": true" % (command_id,))
+            return
+        if not isinstance(body.get("dry_run", False), bool):
+            self._error(422, "invalid_body", "dry_run must be true or false")
+            return
+        argv = body.get("args", {})
+        if not isinstance(argv, dict):
+            self._error(422, "invalid_body", "args must be a JSON object")
+            return
+        try:
+            # dispatch, not run(), because it carries the module-enable gate
+            # and the module context: both are part of the command contract,
+            # not conveniences. The audit row comes from dispatch itself.
+            res = commands.dispatch(
+                mod.id, cmd, argv, actor="operator",
+                dry_run=body.get("dry_run", False), conn=conn,
+                module_enabled=cfg.module_enabled(mod.id),
+                ctx=ctl._context(cfg, ctl._modules(cfg)))
+        except commands.CommandFailed as exc:
+            # The handler RAN and failed: an audit row exists, so this is 500
+            # (the fleet did not do it), not 422 (the request was wrong).
+            self._error(500, "failed", str(exc))
+            return
+        except commands.CommandError as exc:
+            # Refused before anything ran: no handler call, no audit row.
+            self._error(422, "refused", str(exc))
+            return
+        self._json(200, {"ok": True, "detail": res.detail,
+                         "output": res.output})
 
 
 def serve(cfg):

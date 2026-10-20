@@ -42,10 +42,21 @@ MDSTAT_CLEAN = ("Personalities : [raid1]\n"
                 "md0 : active raid1 sda1[0] sdb1[1]\n"
                 "      1048576 blocks super 1.2 [2/2] [UU]\n"
                 "\nunused devices: <none>\n")
-MDSTAT_DEGRADED = ("Personalities : [raid1]\n"
-                   "md0 : active raid1 sda1[0]\n"
-                   "      1048576 blocks super 1.2 [2/1] [U_]\n"
-                   "\nunused devices: <none>\n")
+# QTS's normal layout: more member SLOTS than installed devices. md9/md13
+# expect 128 and carry two; per-disk mirrors carry a phantom partner. `_` is
+# "no device in the slot", not a failure, and a healthy QNAP is full of them.
+MDSTAT_UNPOPULATED = ("Personalities : [raid1]\n"
+                      "md0 : active raid1 sda1[0]\n"
+                      "      1048576 blocks super 1.2 [2/1] [U_]\n"
+                      "\nunused devices: <none>\n")
+MDSTAT_QTS_SLOTS = ("Personalities : [raid1]\n"
+                    "md13 : active raid1 sdb4[0] sda4[128]\n"
+                    "      458880 blocks super 1.0 [128/2] [UU" + "_" * 126
+                    + "]\n\nunused devices: <none>\n")
+MDSTAT_FAULTY = ("Personalities : [raid1]\n"
+                 "md0 : active raid1 sda1[0] sdb1[1]\n"
+                 "      1048576 blocks super 1.2 [2/2] [UF]\n"
+                 "\nunused devices: <none>\n")
 MDSTAT_RESYNC = ("Personalities : [raid1]\n"
                  "md0 : active raid1 sda1[0] sdb1[1]\n"
                  "      1048576 blocks super 1.2 [2/2] [UU]\n"
@@ -452,7 +463,13 @@ def test_raid_states(results):
     try:
         for mdstat, want, name, must_say in (
                 (MDSTAT_CLEAN, store.Status.OK, "all [UU] is OK", "md0"),
-                (MDSTAT_DEGRADED, store.Status.FAIL, "[U_] is FAIL", "md0"),
+                (MDSTAT_UNPOPULATED, store.Status.OK,
+                 "a phantom slot [U_] is OK, not degraded", "unpopulated"),
+                (MDSTAT_QTS_SLOTS, store.Status.OK,
+                 "QTS's 128-slot system array is OK with two disks",
+                 "unpopulated"),
+                (MDSTAT_FAULTY, store.Status.FAIL,
+                 "a faulty member [UF] is FAIL", "FAULTY"),
                 (MDSTAT_RESYNC, store.Status.WARN, "a resync is WARN", "md0"),
                 (MDSTAT_SCRUB, store.Status.OK,
                  "a scrub (check=) is OK, not an array-loss risk", "md0"),

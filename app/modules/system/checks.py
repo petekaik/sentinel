@@ -198,15 +198,23 @@ class SystemRaid(_SystemCheck):
                 "no /proc/mdstat on this host; RAID cannot be assessed",
                 subject=self.SUBJECT)
 
-        arrays, degraded, resyncing = _parse_mdstat(facts.mdstat_text)
+        arrays, faulty, unpopulated, resyncing = _parse_mdstat(facts.mdstat_text)
         state = {name: a["states"] for name, a in arrays.items()}
-        ev = {"arrays": state, "degraded": degraded, "resyncing": resyncing}
-        if degraded:
+        ev = {"arrays": state, "faulty": faulty, "unpopulated": unpopulated,
+              "resyncing": resyncing}
+        if faulty:
+            # `F` IS THE ONLY FAILURE EVIDENCE. QTS builds its system arrays
+            # with far more member SLOTS than installed disks (md9/md13 expect
+            # 128 and carry two) and per-disk mirrors with a phantom partner
+            # (md321/md322/md256 are [2/1]). In mdstat `_` means "no device in
+            # this slot", which is that normal layout; `F` means a member the
+            # kernel was using has FAILED. Grading `_` as degraded made every
+            # QNAP box permanently red on a healthy single-disk volume.
             return fail(
                 self.id, self.target,
-                "md array(s) DEGRADED (a member is missing or failed): %s"
+                "md array(s) have a FAULTY member: %s"
                 % ", ".join("%s %s" % (name, "".join(arrays[name]["states"]))
-                            for name in degraded),
+                            for name in faulty),
                 subject=self.SUBJECT, evidence=ev)
         if not arrays:
             return unknown(self.id, self.target,
@@ -231,10 +239,16 @@ class SystemRaid(_SystemCheck):
                 "the array is healthy once the resync finishes, but performance "
                 "is degraded while it runs" % ", ".join(resyncing),
                 subject=self.SUBJECT, evidence=ev)
-        return ok(self.id, self.target,
-                  "all md arrays clean: %s"
+        detail = ("all md arrays clean: %s"
                   % ", ".join("%s %s" % (name, "".join(a["states"]))
-                              for name, a in sorted(arrays.items())),
+                              for name, a in sorted(arrays.items())))
+        if unpopulated:
+            # Visible, not alarming: these slots are part of the layout and
+            # have never carried a device on this host.
+            detail += ("; %d array(s) have unpopulated member slots (`_`) and "
+                       "no failed member: %s -- normal for this host's slot "
+                       "layout" % (len(unpopulated), ", ".join(unpopulated)))
+        return ok(self.id, self.target, detail,
                   subject=self.SUBJECT, evidence=ev)
 
 
@@ -332,7 +346,7 @@ class SystemUptime(_SystemCheck):
 # ---------------------------------------------------------------------------
 
 _ARRAY = re.compile(r"^(md\w*)\s*:\s*(.*)$")
-_MEMBER_STATE = re.compile(r"\[([U_]+)\]")
+_MEMBER_STATE = re.compile(r"\[([U_F]+)\]")
 # `check =` is a SCRUB: a read-verify pass with redundancy intact, not a
 # rebuild. Treating it as a rebuild would put every monthly scrub in the amber
 # band for hours on a healthy array.
@@ -340,12 +354,16 @@ _REBUILD = re.compile(r"\b(resync|recovery|reshape)\s*=", re.IGNORECASE)
 
 
 def _parse_mdstat(text):
-    """({name: {"states": [...]}}, degraded names, rebuilding names).
+    """({name: {"states": [...]}}, faulty, unpopulated, rebuilding).
 
     An array block starts at `mdN :` and runs until the next one. The member
-    state is the `[UU]` / `[U_]` line; the rebuild marker is any `resync =`,
-    `recovery =` or `reshape =` line inside the block. A `check =` line is a
-    scrub with redundancy intact, not a rebuild, and is not listed here.
+    state is the `[UU]` / `[U_]` / `[UF]` line; the rebuild marker is any
+    `resync =`, `recovery =` or `reshape =` line inside the block. A `check =`
+    line is a scrub with redundancy intact, not a rebuild, and is not listed
+    here.
+
+    `F` (faulty) and `_` (no device in the slot) are deliberately separate:
+    QTS's normal layout has many `_` slots on a healthy host.
     """
     arrays = {}
     order = []
@@ -364,7 +382,10 @@ def _parse_mdstat(text):
         if _REBUILD.search(line):
             arrays[current]["rebuild"] = True
 
-    degraded = [n for n in order
-                if any("_" in s for s in arrays[n]["states"])]
+    faulty = [n for n in order
+              if any("F" in s for s in arrays[n]["states"])]
+    unpopulated = [n for n in order
+                   if any("_" in s for s in arrays[n]["states"])
+                   and n not in faulty]
     resyncing = [n for n in order if arrays[n]["rebuild"]]
-    return arrays, degraded, resyncing
+    return arrays, faulty, unpopulated, resyncing

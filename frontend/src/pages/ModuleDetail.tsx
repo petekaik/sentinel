@@ -222,8 +222,13 @@ export default function ModuleDetail() {
               </tr>
             </thead>
             <tbody>
-              {mod.targets.flatMap((target) =>
-                mod.checks.map((check) => {
+              {/* One row per (check, target) from the manifest's own per-check
+                  target list -- not the module targets cross-product, which
+                  would invent rows for a check that never runs there. Task 9's
+                  dynamic instances arrive as manifest checks with their own
+                  `targets`, so they need no change here. */}
+              {mod.checks.flatMap((check) =>
+                (check.targets ?? []).map((target) => {
                   const bad = flagged.find(
                     (r) => r.check_id === check.id && r.target === target,
                   );

@@ -111,16 +111,30 @@ def _specs_for(mod, specs):
     through the registry -- the same expansion the collector uses. Iterating
     the modules directly would read `cls.id` off a module, which is the shape
     that made the first draft of this function fail.
+
+    EACH CHECK CARRIES THE TARGETS IT ACTUALLY RUNS ON. A non-per-box check has
+    one static target; a `per_box` check binds once per expansion target, which
+    is the module's reporting vocabulary minus the targets named by its
+    non-per-box checks -- exactly `checks.expansion_targets`, so the manifest
+    and the collector cannot disagree about where a check runs. A reader that
+    crossed every check with every module target would multiply the fleet's rows
+    by its checks.
     """
+    per_box_targets = list(checks.expansion_targets([mod]))
     out = []
     for cls in checks.registry(*mod.check_classes()):
         spec_id = getattr(cls, "spec", None)
         spec = specs.get(spec_id) if spec_id else None
+        if getattr(cls, "per_box", False):
+            targets = list(per_box_targets)
+        else:
+            targets = [cls.target] if cls.target else []
         out.append({"id": cls.id,
                     "title": getattr(cls, "title", "") or cls.id,
                     "spec": spec_id,
                     "unit": spec.unit if spec else "",
-                    "direction": spec.direction if spec else ""})
+                    "direction": spec.direction if spec else "",
+                    "targets": targets})
     return out
 
 

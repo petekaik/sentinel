@@ -139,6 +139,9 @@ export type CheckManifest = {
   spec: string | null;
   unit: string;
   direction: string;
+  /* The targets this check actually runs on: one static target, or every
+     expansion target for a per_box check. */
+  targets: string[];
 };
 
 export type ModuleManifest = {

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import ModuleDetail from "./ModuleDetail";
@@ -34,6 +34,15 @@ const modules = [
         spec: "failed_units",
         unit: "",
         direction: "",
+        targets: ["cubox-1", "cubox-2"],
+      },
+      {
+        id: "shared_layer_parity",
+        title: "Layer parity",
+        spec: null,
+        unit: "",
+        direction: "",
+        targets: ["fleet"],
       },
     ],
     extra_check_ids: ["host_unreachable"],
@@ -54,6 +63,7 @@ const modules = [
         spec: "disk",
         unit: "%",
         direction: "high",
+        targets: ["cubox-1"],
       },
     ],
     extra_check_ids: [],
@@ -127,6 +137,16 @@ const status = {
       claim: null,
     },
     {
+      target: "fleet",
+      check_id: "shared_layer_parity",
+      status: "red",
+      detail: "parity detail",
+      spec: null,
+      value: null,
+      unit: "",
+      claim: null,
+    },
+    {
       target: "elsewhere",
       check_id: "host_unreachable",
       status: "red",
@@ -173,6 +193,15 @@ it("renders one check row per target and attributes rows by check ownership", as
   expect((await screen.findAllByText("cubox-1 detail")).length).toBeGreaterThan(0);
   expect(screen.getAllByText("cubox-2 detail").length).toBeGreaterThan(0);
   expect(screen.getAllByText("Failed units")).toHaveLength(2);
+
+  // A fixed-target check inside a multi-target module appears ONCE, on the
+  // target it actually runs on -- not once per module target.
+  const parity = screen.getAllByText("Layer parity");
+  expect(parity).toHaveLength(1);
+  const parityRow = parity[0].closest("tr") as HTMLElement;
+  expect(within(parityRow).getByText("fleet")).toBeInTheDocument();
+  expect(within(parityRow).queryByText("cubox-1")).toBeNull();
+  expect(within(parityRow).queryByText("cubox-2")).toBeNull();
 
   // `disk` is another module's check on a target fleet also reports on. It is
   // excluded by check-id ownership, not by target.

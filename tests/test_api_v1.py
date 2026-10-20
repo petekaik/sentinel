@@ -97,6 +97,21 @@ def test_manifest_carries_the_schema_and_never_a_secret(results):
         "fleet extra_check_ids=%r -- a reader needs the ids, because two "
         "modules can share a target and a target set cannot say whose row it "
         "is" % (fleet.get("extra_check_ids"),))
+    by_check = {c["id"]: c for c in fleet["checks"]}
+    results.check(
+        "each check carries the targets it actually runs on",
+        by_check["failed_units"]["targets"] == ["cubox-1", "cubox-2"]
+        and by_check["state_export_present"]["targets"] == ["backup"]
+        and by_check["shared_layer_parity"]["targets"] == ["fleet"]
+        and by_check["serial_adapter"]["targets"] == ["storage"]
+        and all("targets" in c for m in manifests for c in m["checks"]),
+        "per_box=%r backup=%r fleet=%r storage=%r -- a per_box check expands "
+        "over the module's expansion targets; a fixed check runs on its one "
+        "static target" % (
+            by_check["failed_units"]["targets"],
+            by_check["state_export_present"]["targets"],
+            by_check["shared_layer_parity"]["targets"],
+            by_check["serial_adapter"]["targets"]))
 
     probe = _secret_module()
     settingsapi.write_settings(cfg, conn, probe, {"PROBE_TOKEN": "s3cret"},

@@ -19,6 +19,17 @@ class SnmpTimeout(SnmpError):
     pass
 
 
+class SnmpTransportError(SnmpError):
+    """The socket could not be used (DNS, unreachable, permission, ...).
+
+    The two TRANSPORT failures -- this and SnmpTimeout -- are "I could not
+    ask". Every other SnmpError carries an ANSWER: a noSuchObject, an error-
+    status or a malformed reply all come from something that is alive. The
+    module's preload grades device reachability on exactly that distinction,
+    and telling the two apart by message prefix would rot with the wording.
+    """
+
+
 def _request(community, oid, request_id):
     return ber.sequence(
         ber.integer(1),                       # v2c
@@ -48,7 +59,7 @@ def get(host, community, oid, port=161, timeout=3.0, retries=1):
         except socket.timeout:
             continue
         except OSError as exc:                   # gaierror, unreachable, ...
-            raise SnmpError("cannot query %s: %s" % (host, exc))
+            raise SnmpTransportError("cannot query %s: %s" % (host, exc))
         finally:
             sock.close()
         try:

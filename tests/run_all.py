@@ -35,6 +35,7 @@ import test_serial_identity as serial_tests     # noqa: E402
 import test_settings as settings_tests          # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
 import test_snmp_codec as snmp_tests            # noqa: E402
+import test_snmp_module as snmp_module_tests    # noqa: E402
 import test_system_module as system_tests       # noqa: E402
 
 SUITES = (
@@ -81,6 +82,9 @@ SUITES = (
     ("snmp -- the BER codec and the v2c client against a loopback agent "
      "(no device, no real network)",
      snmp_tests.TESTS),
+    ("snmp -- the settings-driven module: reachability vs OID rows, save-time "
+     "validation, and the dynamic manifest (no device, no real network)",
+     snmp_module_tests.TESTS),
 )
 
 

@@ -149,6 +149,10 @@ def registry_instances(cfg):
     ctx = checks.Context(cfg, {}, {}, modules=mods)
     out = checks.expand(classes, checks.expansion_targets(mods))
     for m in mods:
+        # The SAME order `build_state` uses: a module's settings-driven
+        # instances read state its `context` hook installs (the SNMP module's
+        # parsed device list), and `context` does no I/O.
+        m.context(ctx)
         out.extend(m.check_instances(ctx))
     return out
 

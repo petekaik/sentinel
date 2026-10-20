@@ -103,7 +103,7 @@ def specs_for(cfg, conn, modules):
     return thresholds.load_effective(mapping, conn)
 
 
-def _specs_for(mod, specs):
+def _specs_for(mod, specs, cfg=None):
     """The manifest's check list: the spec each check grades against.
 
     `check_classes()` names the check MODULES (one package per check file --
@@ -119,6 +119,15 @@ def _specs_for(mod, specs):
     and the collector cannot disagree about where a check runs. A reader that
     crossed every check with every module target would multiply the fleet's rows
     by its checks.
+
+    SETTINGS-DRIVEN INSTANCES ARE LISTED TOO. A module whose checks come from
+    `check_instances` has no class for them, so a class-only manifest omits
+    every configured device -- the detail page would show a module with no
+    checks and no reason to think any were configured. The instances are built
+    from a settings-only Context (the `context` hook does no I/O), and a module
+    whose settings do not parse contributes only its static rows: the page
+    already renders that failure as an UNKNOWN `check_instances` row, and it is
+    not this function's job to turn one module's bad `.env` into a 500.
     """
     per_box_targets = list(checks.expansion_targets([mod]))
     out = []
@@ -135,6 +144,42 @@ def _specs_for(mod, specs):
                     "unit": spec.unit if spec else "",
                     "direction": spec.direction if spec else "",
                     "targets": targets})
+    out.extend(_dynamic_specs_for(mod, specs, cfg, {r["id"] for r in out}))
+    return out
+
+
+def _dynamic_specs_for(mod, specs, cfg, seen):
+    """One manifest row per settings-driven instance, from a settings-only ctx.
+
+    No `preload`: building these must never touch a device or a host. The band
+    is the one the module just registered in `ctx.dynamic_specs`, because a
+    dynamic spec is in no threshold file.
+    """
+    if cfg is None:
+        return []
+    try:
+        ctx = checks.Context(cfg, specs, {}, modules=[mod])
+        mod.context(ctx)
+        instances = mod.check_instances(ctx)
+    except Exception:                      # noqa: BLE001 - operator settings
+        return []
+    out = []
+    for inst in instances:
+        ident = getattr(inst, "id", "")
+        if not ident or ident in seen:
+            continue
+        seen.add(ident)
+        spec_id = getattr(inst, "spec", None)
+        spec = specs.get(spec_id) if spec_id else None
+        if spec is None and spec_id:
+            spec = ctx.dynamic_specs.get(spec_id)
+        target = getattr(inst, "target", "")
+        out.append({"id": ident,
+                    "title": getattr(inst, "title", "") or ident,
+                    "spec": spec_id,
+                    "unit": spec.unit if spec else "",
+                    "direction": spec.direction if spec else "",
+                    "targets": [target] if target else []})
     return out
 
 
@@ -158,7 +203,7 @@ def module_manifests(cfg, conn, modules, specs):
             "id": mod.id, "title": mod.title, "order": mod.order,
             "enabled": cfg.module_enabled(mod.id),
             "targets": list(mod.targets),
-            "checks": _specs_for(mod, specs),
+            "checks": _specs_for(mod, specs, cfg),
             # Check ids the module owns but no Check class declares -- the
             # collector emits these (`host_unreachable`, `journal_capture`, ...)
             # under the same module. The manifest names them so a reader can

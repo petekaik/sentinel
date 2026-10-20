@@ -211,7 +211,11 @@ class Context:
         return text
 
     def settings(self, module_id):
-        """A module's declared settings, env > default, typed (Setting.resolve)."""
+        """A module's declared settings, typed (Setting.resolve).
+
+        Read from `cfg.env`, which is already the effective view: DB override
+        > `.env` > default. This method applies no precedence of its own.
+        """
         mod = next((m for m in self.modules if m.id == module_id), None)
         if mod is None:
             raise KeyError("module %r is not loaded; settings are unavailable"

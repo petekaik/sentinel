@@ -367,10 +367,11 @@ no undo.
 **`Cache-Control: no-store` is the rule for every observation** — no
 reverse-proxy cache, no static "last known good" page. A cached 200 served while
 the backend is dead is a false GREEN, and this page is the only dead-man switch
-there is. The two things that are constants of the image rather than
-observations are the only exceptions: the app shell is still `no-store`
-(because it points at the current bundle), and the content-hashed
-`/assets/<name>-<hash>.*` files are `public, max-age=31536000, immutable`.
+there is. The things that are constants of the image rather than observations
+are the only exceptions: the app shell is still `no-store` (because it points
+at the current bundle), the content-hashed `/assets/<name>-<hash>.*` files are
+`public, max-age=31536000, immutable`, and the manifest and icons are
+`public, max-age=86400` (`app/shell.py`).
 
 | Endpoint | Content | For |
 |---|---|---|
@@ -424,7 +425,7 @@ Writes (Bearer token; **not** covered by the LAN bypass):
 |---|---|---|
 | `PUT /api/v1/modules/<id>/settings` | `{key: value, ...}` | validate the whole body, upsert the overrides, audit, return the new effective view; 422 if any key is invalid, and nothing is written |
 | `DELETE /api/v1/modules/<id>/settings/<key>` | — | remove one override (falling back to `.env`/default) and audit; an unset key is a no-op with no audit row |
-| `PUT /api/v1/modules/<id>/enabled` | `{"enabled": true|false}` | write/remove `<ID>_ENABLED`; applies next epoch |
+| `PUT /api/v1/modules/<id>/enabled` | `{"enabled": true|false}` | write `<ID>_ENABLED`; applies next epoch. There is no reset path for this key: it is written directly, and `DELETE .../settings/<key>` refuses it as undeclared |
 | `POST /api/v1/proposals/<id>/approve`, `/reject` | (body ignored) | the human decision, through the existing engine gates; a refusal is a 409 and leaves the row pending |
 | `POST /api/v1/commands/<module>/<id>` | `{args?, confirm?, dry_run?}` | run one operator command, gated and audited; a destructive one needs `confirm: true` |
 
@@ -452,10 +453,12 @@ Validation happens in `app/settingsapi.py`, the **only** writer. The whole body
 is checked before any row is written; a key must be declared by the module; the
 value must parse as its kind and satisfy `choices`/`required`; a `list` row
 must match its `item_fields` **exactly** — required fields present, and an
-undeclared field refused (never silently dropped). An `.env`-supplied list is
-shown with its declared keys only when the schema refuses a row, so a
-credential misplaced in an undeclared `community` field is neither accepted on
-write nor published on read. The module's
+undeclared field refused (never silently dropped). For a well-formed
+`.env`-supplied list whose rows the schema refuses, the view shows declared
+keys only, so a credential misplaced in an undeclared `community` field is
+neither accepted on write nor published on read; a value that cannot be parsed
+at all (broken JSON, or not a list) is deliberately shown as written, because
+an operator has to see a broken value to fix it. The module's
 `validate_settings` hook then sees the **merged effective values** (body over
 stored over env), so a checks-only save is still validated against the devices
 it names. Secrets are accepted on write, reported only as `secret_set`, and
@@ -708,7 +711,8 @@ row naming the device, not a page of red burying it. `noSuchObject` is UNKNOWN
 naming the OID while the device stays reachable. Saving a device makes it
 appear on the next collection; `validate_settings` refuses an unknown device
 name, a malformed OID, an unreachable band order and a v3 version at save time.
-The full model is [`modules/snmp/README.md`](modules/snmp/README.md).
+The full model is
+[`app/modules/snmp/README.md`](../app/modules/snmp/README.md).
 
 ---
 

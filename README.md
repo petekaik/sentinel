@@ -333,8 +333,9 @@ approval flow are in [`docs/architecture.md`](docs/architecture.md).
 | `SENTINEL_PROPOSAL_TTL_H` | `24` | hours an operator has to decide a proposal; zero or negative refuses to start |
 | `SENTINEL_LLM_PROVIDER`, `SENTINEL_LLM_ENDPOINT`, `SENTINEL_LLM_KEY`, `SENTINEL_LLM_MODEL` | empty | the LLM seam. Configuring provider **and** endpoint makes it selectable; it never joins the default selector. No transport ships in this delivery |
 
-`SENTINEL_LLM_KEY` is the only secret in `.env`, and it is never written to the store, a
-log line or `--showconf`.
+`SENTINEL_WRITE_TOKEN` and `SENTINEL_LLM_KEY` are the two secrets in `.env`. Neither is
+written to the store, a log line or `--showconf`; the write token is also never returned
+by a read.
 
 **Addresses and other deployment values are not in this repo.** The defaults in
 `app/config.py` are RFC 5737 documentation placeholders, and a deployment

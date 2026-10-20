@@ -52,9 +52,11 @@ app/modules/<id>/
 | `id` | the package name; discovery refuses a mismatch |
 | `title`, `order` | dashboard label and load order |
 | `targets` | full reporting vocabulary (box ids, host names, `fleet`) |
-| `settings` | `Setting(key, default, kind)` tuples; the platform resolves env > default, typed, via `Context.settings(id)` |
+| `settings` | `Setting(key, default, kind, ...)` declarations: optional `label`, `help`, `secret`, `choices`, `required`, `group`, `item_fields`. Resolved UI > env > default via `Context.settings(id)` |
 | `threshold_file` | the module's own threshold file; `discover_enabled` carries the package path so it is found beside the module |
 | `checks` | the module's check modules; a check with `per_box = True` expands once per box |
+| `check_instances` | optional: settings-driven `Check` instances, built with **no I/O**; see the contract in `Module.check_instances` |
+| `validate_settings` | optional cross-field write check; receives the MERGED effective values (body over stored over env) |
 | `context` | config-only hook, **no I/O**, called before every preload |
 | `preload` | **all** remote/local I/O, once per epoch, under the timeout the module passes (the fleet uses the platform ssh timeout) |
 | `after_epoch` | post-record hook; evidence is durable before it runs |
@@ -150,6 +152,47 @@ the rule on `subject` below. A module that needs a new transport or parser keeps
 it inside `modules/<id>/`; the top-level `probes.py` and `parsers.py` are only
 for protocols and formats every module shares.
 
+## Settings, the write API and the SPA
+
+`/api/v1` is the SPA's data contract; `app/settingsapi.py` is the **only** writer
+of the settings overlay (`web.py` reaches the store through it). A module
+setting is `Setting(key, default, kind, ...)` where `kind` is
+`str|int|bool|json|list`; `secret=True` makes it write-only; a `list` declares
+`item_fields` that each row must match **exactly** — a required field present,
+an undeclared field **refused** (422). Do not reintroduce silent normalisation:
+dropping an undeclared `community` from a device row answered 200 while the
+stored map kept authenticating with the old value.
+
+Precedence is **UI (DB override) > `.env` > declaration default**, rebuilt by
+`Config.reload_settings` at the start of every epoch and on every page request,
+so a save applies on the next collection with no restart.
+`GET /api/v1/settings` names the winning layer (`source: db|env|default`); a
+DELETE on the key restores the file/default. Secrets are accepted on write,
+never returned (`secret_set` only), and redacted in the audit log on both sides.
+Writes need `Authorization: Bearer $SENTINEL_WRITE_TOKEN`, compared with
+`hmac.compare_digest`; unset disables writes (403 `writes_disabled`). The token
+is `.env`-only, never in the DB or a log, and is a RESERVED key no module may
+declare.
+
+**The SPA is a committed build.** Source is `frontend/` (React/TypeScript/Vite);
+output is `app/static/`, produced by `scripts/build-frontend.sh` and committed.
+The runtime image never invokes Node, and the `Dockerfile` fails the build when
+`app/static/index.html` is absent. After any frontend change, rebuild and commit
+`app/static/`.
+
+**No service worker, by decision.** It could only cache the app shell, which is
+the one thing that must not be cached: `index.html` and every `/api/*` response
+are `no-store` (the dead-man rule), while `/assets/<name>-<hash>.*` is
+`immutable` because its name carries the digest. Deep links fall back to
+`index.html`, but `web._static_file` guards with a realpath prefix and
+`/assets/` is flat, so a path cannot escape `app/static/`.
+
+The `snmp` module is the first **settings-driven** one: devices and OID rows are
+settings (`SNMP_DEVICES`, `SNMP_COMMUNITIES` — secret, `SNMP_CHECKS`,
+`SNMP_TIMEOUT_S`), and `check_instances` turns them into one reachability row
+plus one row per OID. Its rules are in `app/modules/snmp/README.md`; the
+platform contract is `Module.check_instances` in `app/module.py`.
+
 ## Rules that keep it honest
 
 These are the platform's whole value, and each has a measured failure behind it in
@@ -206,9 +249,11 @@ Platform env keys (everything else is a module `Setting`): `MONITOR_SSH_KEY`,
 `MONITOR_LOCK_DIR`, `MONITOR_PORT`, `MONITOR_INTERVAL`, `MONITOR_DRY_RUN`,
 `MONITOR_REMEDIES`, `SENTINEL_MODULES`, `<ID>_ENABLED`, `SENTINEL_REMEDIATION`,
 `SENTINEL_ADVISORS`, `SENTINEL_ADVISOR_MAX_HISTORY_DAYS`,
-`SENTINEL_ADVISOR_<ID>_HISTORY_DAYS` (per-advisor, still capped), `SENTINEL_PROPOSAL_TTL_H`
-and `SENTINEL_LLM_{PROVIDER,ENDPOINT,KEY,MODEL}`. No deployed key was renamed by the
+`SENTINEL_ADVISOR_<ID>_HISTORY_DAYS` (per-advisor, still capped), `SENTINEL_PROPOSAL_TTL_H`,
+`SENTINEL_WRITE_TOKEN` (file-only; never a DB setting) and
+`SENTINEL_LLM_{PROVIDER,ENDPOINT,KEY,MODEL}`. No deployed key was renamed by the
 module migration; the fleet keeps `MONITOR_HOST_*`, `RECORDINGS_PATH`, `SERIAL_*`, etc.
+Every module `Setting` can also be written through `/api/v1` (DB override wins).
 
 **The three CuBox-shaped holes that used to live in `collect.py` are closed.**
 `preload()` no longer knows host kinds — each module declares its own `preload`;

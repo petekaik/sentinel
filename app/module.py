@@ -70,16 +70,27 @@ class Setting:
     def parse_item(self, items):
         """Validate a list of dicts against `item_fields`.
 
-        Rows are NORMALISED to the declared fields: an undeclared key is
-        dropped, and a declared optional field is present as `None` when the
-        input omits it. Returns `(rows, "")`, or `(None, why)`.
+        A ROW MUST MATCH ITS SCHEMA EXACTLY: a declared optional field is
+        present as `None` when the input omits it, and an UNDECLARED key is
+        REFUSED. Dropping one silently made a write a no-op that answered 200
+        -- a client rotating an SNMP community through the old device-row shape
+        (`{"name", "address", "community"}`) had the field discarded while the
+        stored map kept authenticating with the old value. Returns
+        `(rows, "")`, or `(None, why)`; the message names the field, never its
+        value, because a row may carry a credential.
         """
         if self.kind != "list":
             return None, "%s is not a list setting" % self.key
+        declared = [field["key"] for field in self.item_fields]
         out = []
         for i, item in enumerate(items or []):
             if not isinstance(item, dict):
                 return None, "%s[%d] is not an object" % (self.key, i)
+            undeclared = [key for key in item if key not in declared]
+            if undeclared:
+                return None, "%s[%d] has undeclared field(s) %s; allowed: %s" % (
+                    self.key, i, ", ".join(repr(k) for k in undeclared),
+                    ", ".join(repr(k) for k in declared) or "(none)")
             row = {}
             for field in self.item_fields:
                 value = item.get(field["key"])

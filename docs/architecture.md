@@ -25,7 +25,10 @@ reader must be able to tell which half of it exists today.
 | `app/advisors.py`, `app/intelligence.py` — the snapshot, runner and reference advisor | **built; reference advisor on by default** |
 | `app/llm_advisor.py` — the LLM seam | **registered only when configured; transport NOT implemented** |
 | `app/dismiss.py` — the operator's exit for an incident no check can close | **built** 2026-10-04 |
-| `app/web.py` — dashboard, `/api/status.json`, `/api/state.json`, `/healthz`, recommendations and approvals | **built** |
+| `app/web.py` — the SPA shell and hashed assets, `/api/v1`, the legacy `/api/status.json` / `/api/state.json`, `/healthz` | **built** |
+| `app/settingsapi.py` — manifests, effective settings views, the one settings writer and the constant-time token check | **built** |
+| `frontend/` + `app/static/` — the React SPA source and its committed Vite build (`scripts/build-frontend.sh`) | **built; no Node in the image** |
+| `app/modules/snmp/` — settings-driven SNMP v2c devices, reachability and OID checks | **built** |
 | `app/main.py` — container entry point, signal handling, dashboard-death exit | **built** |
 | `checks.conf` + `app/modules/fleet/thresholds.conf` — per-module threshold specs, claimed or declared deferred | **built** |
 | `Dockerfile`, `compose.yml`, `.env.example`, `.dockerignore` | **built** |
@@ -161,7 +164,7 @@ library only** — `sqlite3`, `http.server`, `subprocess`, `urllib`. There is no
 | Process | Role |
 |---|---|
 | collector | a loop on `MONITOR_INTERVAL` (default 60 s). Probes every host once, evaluates every check, writes samples + verdicts + incidents |
-| dashboard | a read-only HTTP server on 8787, serving the RAG page, the two JSON endpoints, Recommendations and Approvals |
+| dashboard | an HTTP server on 8787, serving the committed React SPA, `/api/v1`, the two legacy JSON endpoints and `/healthz`; reads keep the LAN bypass, writes need a Bearer token |
 | healer | called by the collector **after** the epoch's evidence is durable and **before** the epoch row is written; executes an action only through the authority ladder |
 | advisors | called **after** `record_collector_run`, one fresh bounded snapshot each; may emit insights and proposed changes only |
 
@@ -361,20 +364,119 @@ no undo.
 
 ## The HTTP surface
 
-Four endpoints, all read-only, all `Cache-Control: no-store` — no reverse-proxy
-cache, no static "last known good" page. A cached 200 served while the backend is
-dead is a false GREEN, and this page is the only dead-man switch there is. The
-header is the mechanism, not politeness.
+**`Cache-Control: no-store` is the rule for every observation** — no
+reverse-proxy cache, no static "last known good" page. A cached 200 served while
+the backend is dead is a false GREEN, and this page is the only dead-man switch
+there is. The two things that are constants of the image rather than
+observations are the only exceptions: the app shell is still `no-store`
+(because it points at the current bundle), and the content-hashed
+`/assets/<name>-<hash>.*` files are `public, max-age=31536000, immutable`.
 
 | Endpoint | Content | For |
 |---|---|---|
-| `GET /` | the RAG page | a human |
+| `GET /` and every non-API path | the committed SPA shell (`index.html`); the SPA owns the URL space, so a deep link reloads | a human |
+| `GET /assets/<name>-<hash>.*` | the immutable hashed bundle | the browser |
+| `GET/PUT/DELETE /api/v1/*` | the SPA's data and write contract (below) | the SPA, and any client that wants typed modules/settings |
 | `GET /api/status.json` | the compact, versioned status document | **integration** |
-| `GET /api/state.json` | the full page model | debugging the page |
+| `GET /api/state.json` | the full page model | debugging |
 | `GET /healthz` | one line of text | the container healthcheck |
 
-`/api/status.json` and `/api/state.json` are both derived from one
-`build_state()`, so the page and the API cannot disagree about what is red.
+`/api/status.json`, `/api/state.json` and `/api/v1/status` are all derived from
+the same `build_state()`, so nothing in the image can disagree about what is red.
+
+### The SPA and its build
+
+The source is `frontend/` (React + TypeScript + Vite, `package-lock.json`
+committed); the output is `app/static/`, produced by
+`scripts/build-frontend.sh` (`npm ci && npm run build`) and **committed with the
+tree**. Node is a development tool only: `Dockerfile` never runs npm, and it
+fails the image build when `app/static/index.html` is absent or empty — an
+image without its committed frontend would boot, report healthy, and 500 every
+page request. After changing frontend source, rebuild and commit `app/static/`.
+
+The server answers the shell before opening the store, so during a database
+outage the app still loads and renders "cannot reach the monitor" from the 503
+on `/api/*`; a shell that 503s is a dead-man switch that cannot say what is
+wrong. The `/assets/` route accepts one flat path segment (a name containing a
+slash is refused) and resolves it through `web._static_file`, which uses a
+**realpath prefix** guard (a symlink escapes
+the same way `..` does); the `/assets/` route additionally refuses any name
+containing a slash, because `/assets/../index.html` would otherwise serve the
+shell with the immutable header — caching the pointer to the current bundle
+forever.
+
+### `/api/v1`
+
+Reads (open on the LAN like the legacy endpoints):
+
+| Endpoint | Content |
+|---|---|
+| `GET /api/v1/status` | the versioned status document (same data as `/api/status.json`) |
+| `GET /api/v1/modules` | one manifest per discovered module: `id`, title, order, `enabled`, targets, checks, **setting schemas**, commands, actions |
+| `GET /api/v1/settings` | effective values per module: `{value, source: db|env|default}`; a secret carries `secret_set` only, never a value |
+| `GET /api/v1/incidents` | live incidents, terminal history and collector freshness |
+| `GET /api/v1/insights` | advisor insights, newest first |
+| `GET /api/v1/proposals` | `{pending, expired}`: proposals awaiting a decision and those whose window lapsed. The store is opened read-only here, so the expired split comes from `expires_at`; an expired row is shown but may not be decided |
+
+Writes (Bearer token; **not** covered by the LAN bypass):
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `PUT /api/v1/modules/<id>/settings` | `{key: value, ...}` | validate the whole body, upsert the overrides, audit, return the new effective view; 422 if any key is invalid, and nothing is written |
+| `DELETE /api/v1/modules/<id>/settings/<key>` | — | remove one override (falling back to `.env`/default) and audit; an unset key is a no-op with no audit row |
+| `PUT /api/v1/modules/<id>/enabled` | `{"enabled": true|false}` | write/remove `<ID>_ENABLED`; applies next epoch |
+| `POST /api/v1/proposals/<id>/approve`, `/reject` | (body ignored) | the human decision, through the existing engine gates; a refusal is a 409 and leaves the row pending |
+| `POST /api/v1/commands/<module>/<id>` | `{args?, confirm?, dry_run?}` | run one operator command, gated and audited; a destructive one needs `confirm: true` |
+
+Errors are `{error:{code,message,field}}` — `422` validation, `401` missing or
+wrong token, `403` writes disabled, `404` unknown module/route, `409` a refusal
+that is not a decision. Every response carries `no-store`.
+
+### Settings precedence and the write token
+
+| Layer | Where | Who writes it |
+|---|---|---|
+| DB override | `setting` row, typed JSON | the settings API only |
+| `.env` | the NAS's monitor directory | a human |
+| declaration default | the module's `Setting` | the module |
+
+`Config.reload_settings` builds the effective view — `os.environ` overlaid with
+every stored row in its env string form — at the **start of every epoch** and on
+**every page request**, so a saved value applies on the next collection with no
+restart. `GET /api/v1/settings` reports which layer won. Deleting a row
+restores the file/default. `<ID>_ENABLED` is written by the enable endpoint and
+obeyed by `module_enabled()`; `SENTINEL_MODULES` and the write token stay
+`.env`-only, and both are RESERVED keys no module may declare.
+
+Validation happens in `app/settingsapi.py`, the **only** writer. The whole body
+is checked before any row is written; a key must be declared by the module; the
+value must parse as its kind and satisfy `choices`/`required`; a `list` row
+must match its `item_fields` **exactly** — required fields present, and an
+undeclared field refused (never silently dropped). An `.env`-supplied list is
+shown with its declared keys only when the schema refuses a row, so a
+credential misplaced in an undeclared `community` field is neither accepted on
+write nor published on read. The module's
+`validate_settings` hook then sees the **merged effective values** (body over
+stored over env), so a checks-only save is still validated against the devices
+it names. Secrets are accepted on write, reported only as `secret_set`, and
+redacted in the change log on both sides; a blank secret on save means
+"unchanged", and DELETE removes the override. Platform-owned keys (including
+`SENTINEL_WRITE_TOKEN`) and a key declared by two modules are refused.
+
+A write needs `Authorization: Bearer $SENTINEL_WRITE_TOKEN`, compared with
+`hmac.compare_digest`. An unset token answers `403 writes_disabled` rather than
+accepting an empty one. The token is never stored in the DB, returned, or
+logged, and rotating it invalidates browser sessions while the page stays
+readable.
+
+### No service worker
+
+There deliberately is not one. A service worker could only usefully cache the
+app shell, and the shell is the one response that must never be cached: a
+cached shell points at bundle names a newer image has deleted, and a cached
+reading is a false green. `index.html` and every `/api/*` response are
+`no-store`; the hashed assets are immutable; the app still installs to the home
+screen from its manifest and icons.
 
 ### `api_version`
 
@@ -513,9 +615,11 @@ about it.
 | `id` | the package name; discovery refuses a mismatch |
 | `title`, `order` | dashboard label and load order |
 | `targets` | the full reporting vocabulary (box ids, host names, `fleet`) |
-| `settings` | `Setting(key, default, kind)` tuples; the platform resolves env > default, typed, via `Context.settings(id)` |
+| `settings` | `Setting(key, default, kind, ...)` declarations (optional `label`, `help`, `secret`, `choices`, `required`, `group`, `item_fields`); resolved UI > env > default, typed, via `Context.settings(id)` |
 | `threshold_file` | the module's own threshold file, found beside the package |
 | `checks` | the module's check modules; a `per_box = True` check expands once per box |
+| `check_instances` | optional settings-driven `Check` instances, built from settings with **no I/O** |
+| `validate_settings` | optional cross-field write check, given the merged effective values |
 | `context` | config-only hook, **no I/O**, installed before every preload |
 | `preload` | **all** remote/local I/O, once per epoch, under the timeout the module passes (the fleet uses the platform ssh timeout) |
 | `after_epoch` | post-record hook, run after the evidence is durable |
@@ -575,6 +679,36 @@ generic epoch. The collector now knows `Attempt`, the epoch phases and the
 `preload_*` installers, and nothing about a CuBox. The fleet itself is
 `app/modules/fleet/`: checks, its own parsers, settings, export, journal capture,
 the two shell probes and its `thresholds.conf`.
+
+### SNMP — the first settings-driven module
+
+`app/modules/snmp/` monitors switches, PDUs, UPSes and anything else with an
+agent, over **SNMP v2c, read-only**: it sends `GET` requests and nothing else.
+There is no per-device code; devices and OID rows are settings rows.
+
+| Setting | Kind | Meaning |
+|---|---|---|
+| `SNMP_DEVICES` | list | `{name, address, port, version, enabled}` — `name` is the check subject and the key into the community map |
+| `SNMP_COMMUNITIES` | json, **secret** | `{device name: community}`; write-only, a blank save means unchanged, a device with no entry is not polled |
+| `SNMP_CHECKS` | list | `{device, oid, label, unit, direction, green, amber, kind, expected}`; `gauge` grades the band, `state` is a numeric equality |
+| `SNMP_TIMEOUT_S` | int | per-request UDP timeout (>= 1); one retry is fixed in the client |
+
+The community lives in its own setting because it is a secret: the API and the
+audit log redact a whole `secret=True` setting, and there is no item-level
+secret machinery. A device row carrying a `community` field is refused at the
+schema boundary (an undeclared `item_fields` key is a 422), not silently
+normalised.
+
+`check_instances(ctx)` turns the settings into rows: one `snmp_reachable` per
+enabled device (`subject = device`) and one OID row per check (`subject =
+<device>:<label>`). All report under the target `snmp`; the device identity is
+the subject, because the incident key is `(target, check_id, subject)`. A
+timeout is **FAIL** on reachability and **UNKNOWN** on every OID row — one red
+row naming the device, not a page of red burying it. `noSuchObject` is UNKNOWN
+naming the OID while the device stays reachable. Saving a device makes it
+appear on the next collection; `validate_settings` refuses an unknown device
+name, a malformed OID, an unreachable band order and a v3 version at save time.
+The full model is [`modules/snmp/README.md`](modules/snmp/README.md).
 
 ---
 
@@ -1282,8 +1416,10 @@ the dashboard says so explicitly.
 | `--remedies` | the remedy audit, newest 20 |
 | `--actor NAME` | modifier for any ctl verb: attribute the command or approval to NAME (default `operator`) |
 
-The dashboard renders one section per enabled module plus an explicit disabled note;
+The SPA renders one section per enabled module plus an explicit disabled note;
 `--modules` and `--list-commands` name the module id of every discovery and every command.
+The page is a committed build, so a frontend change is `scripts/build-frontend.sh`
+plus committing `app/static/` — never a build step on the NAS.
 
 Two things it deliberately does *not* do. It never builds locally: this Mac is
 Apple Silicon and the NAS is x86_64, so a local build produces an aarch64 image
@@ -1320,11 +1456,14 @@ The two knobs that matter most:
 ./test.sh shared   # one suite, by subject substring
 ```
 
-Eleven suites (711 checks at the 2026-10-20 gate): dashboard contract tests (a
+Seventeen suites (961 checks at the 2026-10-20 gate): dashboard contract tests (a
 loopback-only server, real headers), check fixtures captured **verbatim** from the live
 fleet, the collector's offline tests, the shared layer's (T2) checks, module discovery and
 the contract, command dispatch and locks, the authority ladder, advisors and the snapshot,
-serial identity, the incident lifecycle, and the proxy's access rules. New assertions are
+serial identity, the incident lifecycle, the settings overlay and `/api/v1`, the SNMP
+codec and module, and the proxy's access rules. The frontend has its own
+`npm test` (Vitest) and `scripts/build-frontend.sh` must reproduce the committed
+`app/static/`. New assertions are
 mutation-tested — a guard is reverted in a scratch copy and the suite must go **red** —
 because a test that cannot fail is worse than no test (item 26), and a check is a
 restatement of the code it tests until it is written by different code (item 45).

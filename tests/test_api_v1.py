@@ -703,6 +703,65 @@ def test_the_write_surface(results):
         httpd.server_close()
 
 
+def test_a_device_row_cannot_carry_a_community(results):
+    """An undeclared list field is a 422, never a 200 that changed nothing.
+
+    The old device-row shape (`{name, address, community}`) used to parse with
+    `community` silently DROPPED: the write answered 200 while the stored
+    community map still authenticated with the previous value. That is the
+    no-op-that-reads-as-success shape, so the schema boundary refuses it.
+    """
+    tmp = tempfile.mkdtemp()
+    cfg = _cfg(tmp)
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    conn.close()
+    httpd, base = _serve(cfg)
+    try:
+        url = base + "/api/v1/modules/snmp/settings"
+        code, _, body = _req(
+            url, "PUT",
+            {"SNMP_DEVICES": [{"name": "switch-1",
+                               "address": "192.0.2.200",
+                               "version": "v2c", "enabled": True}],
+             "SNMP_COMMUNITIES": {"switch-1": "old-secret"}},
+            token="tok")
+        seeded = code == 200
+        code, _, body = _req(
+            url, "PUT",
+            {"SNMP_DEVICES": [{"name": "switch-1",
+                               "address": "192.0.2.200",
+                               "community": "rotated-secret"}]},
+            token="tok")
+        after = store.connect(cfg.db_path, read_only=True)
+        try:
+            rows = store.setting_rows(after)
+        finally:
+            after.close()
+        # `.get` rather than `body["error"]`: a regression that lets the write
+        # through answers 200, and an assertion that raises KeyError would abort
+        # the suite instead of reporting the FAIL this test exists to show.
+        err = body.get("error") or {}
+        results.check(
+            "a device row carrying a community is a 422, not a silent discard",
+            seeded and code == 422
+            and err.get("code") == "invalid_value"
+            and err.get("field") == "SNMP_DEVICES"
+            and rows[("snmp", "SNMP_COMMUNITIES")] == {"switch-1": "old-secret"}
+            and len(rows[("snmp", "SNMP_DEVICES")]) == 1
+            and "community" not in rows[("snmp", "SNMP_DEVICES")][0],
+            "seeded=%r code=%s rows=%r"
+            % (seeded, code, rows))
+        results.check(
+            "the refusal names the field and never echoes the value",
+            "community" in err.get("message", "")
+            and "rotated-secret" not in json.dumps(body),
+            "body=%r" % (body,))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_writes_disabled_without_a_token(results):
     tmp = tempfile.mkdtemp()
     cfg = _cfg(tmp, SENTINEL_WRITE_TOKEN="")
@@ -1107,6 +1166,7 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_the_read_surface,
          test_api_errors_are_json,
          test_the_write_surface,
+         test_a_device_row_cannot_carry_a_community,
          test_writes_disabled_without_a_token,
          test_proposals_are_a_two_list_board,
          test_proposal_decisions_via_api,

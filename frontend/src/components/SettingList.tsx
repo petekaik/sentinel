@@ -1,9 +1,9 @@
 import type { ItemField, SettingField } from "../api";
 
 /* A repeatable row editor for a `kind="list"` setting. The row shape comes from
-   the manifest's `item_fields`; an undeclared field is never invented here --
-   the backend normalises each row to the declared fields, so the editor shows
-   exactly what it will send. */
+   the manifest's `item_fields`; this editor never invents a field, and the
+   backend REFUSES (422) any row carrying a field `item_fields` does not
+   declare -- so the editor shows exactly what it will send. */
 
 function blank(field: ItemField): unknown {
   if (field.kind === "bool") return false;

@@ -229,6 +229,21 @@ def module_manifests(cfg, conn, modules, specs):
     return out
 
 
+def _display_rows(setting, rows):
+    """A schema-refused list as the READ surface may show it: declared keys only.
+
+    A list that fails `parse_item` is still shown -- an operator has to see a
+    broken value to fix it -- but an undeclared key is dropped HERE. The write
+    path refuses such a row (422); the read path must not echo it, because a
+    credential placed in a `community` field inside `SNMP_DEVICES` would
+    otherwise be published by `GET /api/v1/settings`. This is display only: the
+    module's own parser is what refuses the configuration.
+    """
+    declared = [field["key"] for field in setting.item_fields]
+    return [{key: row.get(key) for key in declared} if isinstance(row, dict)
+            else row for row in rows]
+
+
 def _typed_value(setting, raw):
     """One env/default value as the type the declaration says it is.
 
@@ -246,8 +261,7 @@ def _typed_value(setting, raw):
         value = setting.parse(raw)
         if setting.kind == "list":
             rows, _why = setting.parse_item(value)
-            if rows is not None:
-                value = rows
+            value = rows if rows is not None else _display_rows(setting, value)
         return value
     except (TypeError, ValueError):
         return raw

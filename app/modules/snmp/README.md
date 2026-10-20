@@ -26,10 +26,20 @@ SNMP_CHECKS       one row per OID:     device, oid, label, unit, direction, gree
 The community lives in its own setting because it is a **secret**: the settings
 API and the audit log redact a whole setting declared `secret=True`, and there
 is no item-level secret machinery. A `community` field inside `SNMP_DEVICES`
-would be published by `GET /api/v1/settings` and written in clear into the
-change log. `SNMP_COMMUNITIES` is therefore write-only -- the read surface says
+would be an ordinary, unredacted value: the schema refuses it on a write and
+the read surface drops it, but as part of a non-secret setting it would have no
+secret flag, no audit redaction and no per-item handling. `SNMP_COMMUNITIES` is
+what the machinery actually covers -- it is write-only, the read surface says
 only that it is set, and a blank value on save means **unchanged** (use DELETE
 to remove the override).
+
+A device row must match its declared fields **exactly**. The schema
+(`Setting.parse_item`) refuses an undeclared key with a 422, so the old
+device-row shape `{"name", "address", "community"}` cannot be accepted with the
+field silently dropped -- which would answer 200 while the stored map kept
+authenticating with the old value. A row that reaches the module another way
+(a hand-edited `.env`) is refused by `validate_settings`; both rules exist
+because the API is not the only way a value can arrive.
 
 For each **enabled device** the module produces:
 
@@ -108,8 +118,14 @@ letting a typo become a grey row an epoch later:
 * a device's `version` is not `v2c`, or its `port` is outside 1..65535;
 * a device has no non-empty entry in `SNMP_COMMUNITIES`, or the map names a
   device that is not configured, or a value is not a non-empty string;
-* a `community` field appears inside a device row (it belongs in the map);
+* a `community` field appears inside a device row (it belongs in the map) --
+  for an API write the schema refuses the undeclared key first; this rule
+  catches a row that arrived through `.env`;
 * `SNMP_TIMEOUT_S` is below 1.
+
+Every other undeclared key in a list row is refused by the same schema rule: a
+row is normalized to `item_fields` only in the sense that an omitted optional
+field becomes `None`; an extra field is never discarded.
 
 The settings page sends only the fields the operator touched, and a checks-only
 save must still be checked against the devices it names. `write_settings`

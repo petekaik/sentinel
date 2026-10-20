@@ -162,14 +162,19 @@ def test_setting_metadata_and_list_validation(results):
         and schema["item_fields"][0]["required"] is True
         and "value" not in schema,
         "schema=%r" % (schema,))
-    ok, why = s.parse_item([{"name": "sw1", "community": "public",
-                             "undeclared": "dropped"}])
+    ok, why = s.parse_item([{"name": "sw1", "community": "public"}])
     bad, why2 = s.parse_item([{"community": "public"}])
+    extra, why3 = s.parse_item([{"name": "sw1", "undeclared": "X"}])
     results.check(
         "list items validate required fields and normalise to declared ones",
         ok == [{"name": "sw1", "community": "public"}]
         and bad is None and "name" in why2,
         "ok=%r bad=%r why2=%r" % (ok, bad, why2))
+    results.check(
+        "an undeclared item field is refused, not silently dropped",
+        extra is None and "undeclared" in why3 and "X" not in why3,
+        "extra=%r why3=%r -- a dropped field makes a credential rotation a "
+        "200 that changes nothing" % (extra, why3))
 
 
 def test_setting_parse_validation(results):

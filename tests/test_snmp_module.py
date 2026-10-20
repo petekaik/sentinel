@@ -47,6 +47,7 @@ from modules.snmp.settings import SnmpConfig                 # noqa: E402
 
 COMMUNITY = "suite-community-not-a-real-one"  # secretscan:ignore (test literal)
 COMMUNITY_2 = "suite-second-community"        # secretscan:ignore (test literal)
+WRONG_PLACE = "wrong-place-community"         # secretscan:ignore (test literal)
 
 SYS_UPTIME = "1.3.6.1.2.1.1.3.0"
 LOAD_OID = "1.3.6.1.2.1.25.3.3.1.2.1"
@@ -694,6 +695,21 @@ def test_env_supplied_lists_are_typed_in_the_view(results):
             "view=%r -- a JSON string here renders as an empty list in the "
             "SPA, and the first save then replaces the configured devices with "
             "the blank list it showed" % (view,))
+
+        # A CREDENTIAL IN THE WRONG PLACE IS STILL A CREDENTIAL. `.env` can
+        # carry the old device-row shape; the schema refuses it on a write, and
+        # the read surface must not publish it either.
+        wrong = _device(community=WRONG_PLACE)
+        view = settingsapi.settings_view(
+            _cfg(_env([wrong], [_check()])), conn, [MODULE])["snmp"]
+        results.check(
+            "an undeclared community in an .env device row is not published",
+            isinstance(view["SNMP_DEVICES"]["value"], list)
+            and "community"
+            not in view["SNMP_DEVICES"]["value"][0]
+            and WRONG_PLACE not in json.dumps(view),
+            "view=%r -- parse_item refuses the row, and the read surface must "
+            "drop the undeclared key rather than echo it" % (view,))
     finally:
         conn.close()
 

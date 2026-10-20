@@ -68,7 +68,7 @@ One container, four concerns, one image.
 | Process | Role |
 |---|---|
 | collector | a loop on `MONITOR_INTERVAL` (default 60 s). Probes every host once, evaluates every check, and writes samples, verdicts and incidents |
-| dashboard | a read-only HTTP server serving the RAG page, the JSON endpoints, the Recommendations list and the Approvals inbox |
+| dashboard | an HTTP server on 8787 serving the committed React SPA, the legacy JSON endpoints and `/api/v1` — reads open on the LAN, writes Bearer-token gated |
 | healer | called by the collector *after* the epoch's evidence is durable; executes an action only when that module's authority ladder permits it, every gate passes, and a dry run has succeeded |
 | advisors | run *after* the epoch record is written; each gets a fresh, bounded, read-only snapshot of the store and may only emit insights and proposed changes — never a write to a check, an incident or a threshold |
 
@@ -96,6 +96,77 @@ The full design — every check, the store schema, the HTTP surface, the accepte
 risks — is in [`docs/architecture.md`](docs/architecture.md). That document is
 the authority; this file is the front door.
 
+## The dashboard, the API and the SPA
+
+The page is a **committed React build**: source in `frontend/`, output in
+`app/static/`, built by `scripts/build-frontend.sh` (`npm ci && npm run build`)
+and committed with the tree. Node is a development tool only — the `Dockerfile`
+never runs npm, and the image refuses to build if `app/static/index.html` is
+absent. After changing frontend source, run the build and commit `app/static/`.
+
+There is **no service worker**, by decision. It could only cache the app shell,
+and the shell is the one thing that must never be cached: a cached shell points
+at deleted bundles, and a cached reading is a false green. `index.html` and
+every `/api/*` response are `no-store`; the content-hashed `/assets/<name>-<hash>.*`
+files are immutable. The app installs to the home screen from its manifest
+without one.
+
+### `/api/v1`
+
+| Endpoint | Content |
+|---|---|
+| `GET /api/v1/status` | the versioned status document |
+| `GET /api/v1/modules` | one manifest per module: enablement, checks, setting schemas, commands, actions |
+| `GET /api/v1/settings` | effective values with the layer that won (`db`, `env`, `default`); a secret reports `secret_set` only |
+| `GET /api/v1/incidents` | live incidents, terminal history, collector freshness |
+| `GET /api/v1/insights` | advisor insights, newest first |
+| `GET /api/v1/proposals` | `{pending, expired}` — an expired proposal is shown and may not be decided |
+| `PUT /api/v1/modules/<id>/settings` | validate the whole body, write the overrides, audit; 422 on any invalid key |
+| `DELETE /api/v1/modules/<id>/settings/<key>` | remove one override, falling back to `.env`/default |
+| `PUT /api/v1/modules/<id>/enabled` | enable/disable a module; a disabled module stays configurable |
+| `POST /api/v1/proposals/<id>/{approve,reject}`, `POST /api/v1/commands/<module>/<id>` | the operator surfaces; a destructive command needs explicit confirmation |
+
+Errors are `{error:{code,message,field}}`, and every response is `no-store`.
+The legacy `/api/status.json`, `/api/state.json` and `/healthz` keep their
+shapes.
+
+### Settings, precedence and the write token
+
+Settings are typed overrides in the store: **UI (DB override) > `.env` > module
+default**. The effective view is rebuilt at the start of every epoch and on
+every page request, so a save applies on the **next collection** with no
+restart. A `list` setting is validated against its `item_fields` — every
+required field present and **no undeclared field**, so a device row carrying
+`community` is a 422 rather than a 200 that discards it. Secrets are write-only
+(a blank value on save means unchanged; DELETE removes the override), redacted
+in the audit log, and never returned by a read.
+
+Writes require `Authorization: Bearer $SENTINEL_WRITE_TOKEN`, compared in
+constant time. The token is `.env`-only (never in the DB); unset disables writes
+loudly (403 `writes_disabled`), and rotating it invalidates browser sessions
+while the page stays readable. Reads keep the existing LAN bypass.
+
+### SNMP devices
+
+The `snmp` module monitors switches, PDUs and UPSes over **v2c, read-only** — it
+sends `GET` only and never writes to a device. Devices and OID rows are ordinary
+settings, edited on the settings page or in `.env`:
+
+```
+SNMP_DEVICES      {name, address, port, version, enabled}
+SNMP_COMMUNITIES  {device name: community}    # secret, write-only
+SNMP_CHECKS       {device, oid, label, unit, direction, green, amber, kind, expected}
+SNMP_TIMEOUT_S    per-request UDP timeout (>= 1); one retry is fixed in the client
+```
+
+Each enabled device gets a reachability row (`subject = device`): a timeout is
+**FAIL**. Its OID rows are **UNKNOWN** while the device is down — one dead
+device makes one red row and a column of grey, not a page of red. `noSuchObject`
+is UNKNOWN naming the OID, and the device stays reachable. A device with no
+community entry is not polled at all. The full model, grading table and
+validation rules are in
+[`app/modules/snmp/README.md`](app/modules/snmp/README.md).
+
 ## Status
 
 Stated plainly, because a reader must be able to tell a design from a running
@@ -106,6 +177,8 @@ thing.
 | collector, dashboard, store, checks, `checks.conf`, offline suite | **built and running** |
 | 75 check instances across 4 hosts | **built** |
 | module contract and discovery; the fleet behind `app/modules/fleet/` | **built** |
+| settings store, write API and the committed React SPA (`app/settingsapi.py`, `frontend/`, `app/static/`) | **built** |
+| `snmp` module — settings-driven v2c devices, OID checks and reachability (`app/modules/snmp/`) | **built** |
 | operator commands, resource locks and the command audit (`app/commands.py`, `app/ctl.py`) | **built; `serial_break` is declared but its write path is not wired, and it refuses outside a dry run** |
 | remediation engine and the authority ladder (`app/heal.py`, `app/actions.py`) | **built; off by default** |
 | advisors (`app/advisors.py`, `app/intelligence.py`) | **built; the reference advisor runs by default** |
@@ -128,9 +201,14 @@ default path — the default selector is `reference`.
 ```
 app/           the platform + the adapters (see CLAUDE.md for the seam)
   module.py    the Module/Setting contract
-  modules/     discovered target packages; fleet/ is tenant #1
+  modules/     discovered target packages; fleet/ is tenant #1, snmp the first
+               settings-driven one
   checks/      the check framework and the platform's own meta checks
-  web.py       the dashboard, both JSON endpoints, /healthz
+  web.py       the HTTP surface: the SPA shell, /api/v1, the legacy JSON
+               endpoints and /healthz
+  settingsapi.py  the settings contract: manifests, effective views, writes
+  static/      the committed Vite build (scripts/build-frontend.sh); no Node
+               in the image
   store.py     SQLite: samples, verdicts, incidents, attempts, journal,
                command_run, advisor_run, insight, proposal, threshold_override
   collect.py   the epoch loop: preload everything, then evaluate
@@ -143,6 +221,8 @@ app/           the platform + the adapters (see CLAUDE.md for the seam)
   ctl.py       the operator CLI behind the command/proposal/insight verbs
 tests/         the offline suite (no network, enforced)
   fixtures/    captured fleet artifacts -- see the provenance README
+frontend/      React/TypeScript/Vite source (dev only; output is committed)
+scripts/       build-frontend.sh: npm ci && npm run build -> app/static
 checks.conf    platform/meta thresholds, as data -- restart to apply
 compose.yml    the deployed unit
 deploy.sh      the whole deploy interface
@@ -224,6 +304,13 @@ Two escape hatches:
 |---|---|---|
 | `MONITOR_KEY` | `~/.ssh/cubox-monitor_ed25519` | the key lives somewhere else |
 | `FLEET_REPO` | `~/projects/pvr-cubox-fleet` | the fleet checkout is elsewhere |
+
+**The settings write token is separate and `.env`-only.** `SENTINEL_WRITE_TOKEN`
+enables `PUT`/`DELETE` on `/api/v1`; generate one with `openssl rand -hex 32`.
+Unset means writes are disabled (`403 writes_disabled`), and the token is never
+stored in the database, returned by a read, or logged. Every module setting in
+the table below can also be written from the settings page, where the DB
+override wins over `.env` and applies on the next collection.
 
 ### What the monitor may do, and what it may advise
 

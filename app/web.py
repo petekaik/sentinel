@@ -146,12 +146,16 @@ def build_state(cfg, conn, now=None):
     current, n_current = _rows(conn, NEWEST_EPOCH_SQL)
     by_key = {(r["target"], r["check_id"]): r for r in current}
 
-    incidents, n_incidents = _rows(
-        conn, "SELECT key, target, check_id, subject, state, severity, first_seen, "
-              "last_seen, observed_count, confirm_streak, first_evidence_json, "
-              "last_detail, remedy_attempts, remedy_latched FROM incident "
-              "WHERE state IN (%s) "
-              "ORDER BY severity = 'red' DESC, first_seen ASC" % store.LIVE_SQL)
+    # CONFIRMED ONLY, and taken from the store's own definition rather than a
+    # second copy of the rule (item 84). This query used LIVE_SQL, which
+    # includes `pending` -- rows awaiting their confirmation streak. Measured
+    # 2026-10-19: a one-observation `pending` row from 9.4 days earlier was
+    # still painted RED in this section, while `store.live_incidents`, the
+    # verdict and every count excluded it, and `--dismiss` could not even name
+    # it. A pending row is not an incident; "still live" and "on the board" are
+    # two questions (see CONFIRMED_STATES).
+    incidents = store.live_incidents(conn)
+    n_incidents = len(incidents)
 
     tiles, informational, others, missing = [], [], [], []
     for chk in checks.expand(classes, checks.expansion_targets(enabled)):
@@ -1188,10 +1192,11 @@ def render_html(state, cfg):
     _inc = incidents.append
     _inc("<h2>Live incidents (%d)</h2>" % len(state["incidents"]))
     if not state["incidents"]:
-        _inc("<div class=note>No live incident. A condition that is still being "
-             "confirmed, or one that can no longer be observed, would appear here "
-             "too -- so an empty list means no check is currently reporting a "
-             "problem <em>and</em> none is frozen.</div>")
+        _inc("<div class=note>No live incident. One that can no longer be "
+             "observed would appear here too -- so an empty list means no check "
+             "is currently reporting a problem <em>and</em> none is frozen. A "
+             "condition still being confirmed after a single poll is not yet an "
+             "incident and is not shown.</div>")
     else:
         _inc("<div class=scroll><table><tr><th>Sev</th><th>Target</th><th>Check</th>"
              "<th>State</th><th>Since</th><th>Obs</th><th>Detail</th></tr>")

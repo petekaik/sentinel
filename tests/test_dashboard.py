@@ -2027,6 +2027,40 @@ def test_the_newest_epoch_read_uses_an_index(results):
         "and a live monitor then reads as a dead one" % (plan,))
 
 
+def test_a_pending_incident_is_not_on_the_board(results):
+    """`pending` owns its key but is not an incident (measured 2026-10-19).
+
+    The dashboard selected incidents with LIVE_SQL, so a row with ONE bad poll
+    9.4 days earlier was rendered as a RED live incident while the verdict, the
+    colour counts and `store.live_incidents` all excluded it -- and `--dismiss`
+    could not even name it. Two questions, two lists (CONFIRMED_STATES); the
+    board asks the second one.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        seen = []
+        for _ in range(store.CONFIRM_POLLS):
+            d.seq += 1
+            state = store.sync_incident(d.conn, d.seq, "storage",
+                                        "tvh_response_ms", "tvh-http",
+                                        store.Status.FAIL, "one failed probe")
+            seen.append((state, len(d.state()["incidents"])))
+
+        results.check(
+            "pending is off the board; only a confirmed row is on it",
+            seen[:-1] == [("pending", 0)] * (store.CONFIRM_POLLS - 1)
+            and seen[-1] == ("open", 1),
+            "state and board count per poll: %r. A `pending` row has not "
+            "reached CONFIRM_POLLS, is deleted outright if the condition "
+            "clears, and is not an incident -- showing it as a RED one makes "
+            "the page disagree with its own verdict and puts a row on the "
+            "board that no operator surface can close." % (seen,))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_the_page_fits_a_phone_without_being_asked(results):
     """What the phone reported, and the mechanisms that fix it.
 
@@ -2326,6 +2360,7 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_app_shell_may_cache_and_nothing_else_may,
          test_the_refresh_script_has_the_hooks_it_looks_for,
          test_the_newest_epoch_read_uses_an_index,
+         test_a_pending_incident_is_not_on_the_board,
          test_the_page_fits_a_phone_without_being_asked,
          test_insights_and_proposals_are_rendered_and_empty_safe,
          test_the_empty_approvals_queue_names_the_engine_switch)

@@ -22,6 +22,7 @@ Python 3 stdlib only, deliberately: no pip dependencies to rot in an appliance
 that is expected to run unattended for months.
 """
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -388,12 +389,18 @@ CREATE TABLE IF NOT EXISTS threshold_override (
 -- force, `setting_change` says how it got that way. Both audit columns are
 -- named `_json` and hold either JSON or the literal redaction marker -- a
 -- secret's value is never written here, in either direction.
+--
+-- `secret` IS ON THE ROW, NOT ONLY ON THE CALL. The write that removes a value
+-- (a reset) and the write that replaces it are not the write that declared it
+-- secret, so a flag passed only to `put_setting` would log the old plaintext on
+-- both. The row is the authority, and it travels with the value.
 CREATE TABLE IF NOT EXISTS setting (
     module     TEXT NOT NULL,
     key        TEXT NOT NULL,
     value_json TEXT NOT NULL,
     updated_at REAL NOT NULL,
     actor      TEXT NOT NULL,
+    secret     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (module, key)
 );
 CREATE TABLE IF NOT EXISTS setting_change (
@@ -474,6 +481,14 @@ def _migrate(conn):
     if "subject" not in have:
         conn.execute("ALTER TABLE check_run ADD COLUMN subject TEXT NOT NULL "
                      "DEFAULT ''")
+    # `setting.secret` arrived with the review of the first cut. A row written
+    # before it defaults to NOT secret, which is the only assumption available
+    # -- the flag is not derivable from the value -- and it is the honest one:
+    # nothing has declared that value secret.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(setting)")}
+    if "secret" not in have:
+        conn.execute("ALTER TABLE setting ADD COLUMN secret INTEGER NOT NULL "
+                     "DEFAULT 0")
 
 
 def _ensure_live_index(conn):
@@ -1034,12 +1049,47 @@ def setting_env(conn):
             for (_module, key), value in setting_rows(conn).items()}
 
 
-def _log_change(conn, module, key, action, old, new, actor, secret=False):
-    """Append one audit row. `secret` redacts BOTH sides.
+@contextlib.contextmanager
+def _txn(conn):
+    """One write transaction. `with conn:` is INERT here, not equivalent.
 
-    The old side too, and not only for symmetry: a value's secrecy is declared
-    at the write that marks it secret, so anything written before that is in
-    the store unredacted and rewriting it must not copy it into the log.
+    These connections are autocommit (`isolation_level=None`), so sqlite3 never
+    opens an implicit transaction and `with conn:` commits nothing -- a setting
+    and its audit row would be two independent commits, and a crash between
+    them leaves an override nobody can explain. `BEGIN IMMEDIATE` takes the
+    write lock up front, so two writers serialise here rather than at the first
+    INSERT. Not nestable, and nothing needs it to be.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def _setting_row(conn, module, key):
+    """One row as `(typed value, secret)`, or None. The write path's read.
+
+    Separate from `setting_rows` because that is the bulk read and the flag has
+    no business in its result -- but the write path MUST have it: whether an old
+    value may be written to the audit log depends on the row, not on the call.
+    """
+    row = conn.execute("SELECT value_json, secret FROM setting "
+                       "WHERE module = ? AND key = ?",
+                       (module, key)).fetchone()
+    return (json.loads(row["value_json"]), bool(row["secret"])) if row else None
+
+
+def _log_change(conn, module, key, action, old, new, actor,
+                old_secret=False, new_secret=False):
+    """Append one audit row. Each side is redacted INDEPENDENTLY.
+
+    `old_secret` is the flag the OLD ROW carried (see `_setting_row`), and the
+    caller ORs in the current write's flag: a secret write must not copy a
+    plaintext it is replacing into the log either, because secrecy is declared
+    at the write that marks it and everything before that was stored unmarked.
 
     The marker is stored VERBATIM rather than JSON-encoded. `"<redacted>"` (a
     JSON string) and `<redacted>` (the marker) reading differently is the point
@@ -1050,34 +1100,57 @@ def _log_change(conn, module, key, action, old, new, actor, secret=False):
         "INSERT INTO setting_change (ts, module, key, action, old_json, "
         "new_json, actor) VALUES (?,?,?,?,?,?,?)",
         (time.time(), module, key, action,
-         REDACTED if secret else json.dumps(old),
-         REDACTED if secret else json.dumps(new), actor))
+         REDACTED if old_secret else json.dumps(old),
+         REDACTED if new_secret else json.dumps(new), actor))
 
 
 def put_setting(conn, module, key, value, actor, secret=False):
-    """Write one override and its audit row. `secret` affects ONLY the log."""
-    old = setting_rows(conn).get((module, key))
-    conn.execute(
-        "INSERT INTO setting (module, key, value_json, updated_at, actor) "
-        "VALUES (?,?,?,?,?) ON CONFLICT(module, key) DO UPDATE SET "
-        "value_json = excluded.value_json, updated_at = excluded.updated_at, "
-        "actor = excluded.actor",
-        (module, key, json.dumps(value), time.time(), actor))
-    _log_change(conn, module, key, "set", old, value, actor, secret=secret)
+    """Write one override and its audit row, in ONE transaction.
+
+    `secret` is stored on the row as well as applied to this write's audit
+    entries, so the write that later replaces or deletes the value still knows
+    it must redact. It never affects `setting`'s value: the store keeps the
+    real one, and redaction is about the trail.
+    """
+    with _txn(conn):
+        old = _setting_row(conn, module, key)
+        conn.execute(
+            "INSERT INTO setting (module, key, value_json, updated_at, actor, "
+            "secret) VALUES (?,?,?,?,?,?) ON CONFLICT(module, key) DO UPDATE "
+            "SET value_json = excluded.value_json, updated_at = "
+            "excluded.updated_at, actor = excluded.actor, "
+            "secret = excluded.secret",  # secretscan:ignore -- a column copy
+            (module, key, json.dumps(value), time.time(), actor,
+             1 if secret else 0))
+        _log_change(conn, module, key, "set",
+                    old[0] if old else None, value, actor,
+                    old_secret=(old[1] if old else False) or secret,
+                    new_secret=secret)
 
 
 def delete_setting(conn, module, key, actor):
-    """Remove an override, so the file's value applies again. Audited as `reset`."""
-    old = setting_rows(conn).get((module, key))
-    conn.execute("DELETE FROM setting WHERE module = ? AND key = ?",
-                 (module, key))
-    _log_change(conn, module, key, "reset", old, None, actor)
+    """Remove an override, so the file's value applies again. Audited as `reset`.
+
+    Redacts the old value when the ROW was secret -- the caller does not pass a
+    flag, and must not have to: a reset is not the write that declared secrecy.
+    """
+    with _txn(conn):
+        old = _setting_row(conn, module, key)
+        conn.execute("DELETE FROM setting WHERE module = ? AND key = ?",
+                     (module, key))
+        _log_change(conn, module, key, "reset",
+                    old[0] if old else None, None, actor,
+                    old_secret=old[1] if old else False)
 
 
 def setting_changes(conn, limit=50):
-    """Newest audit rows first, as stored -- `old_json`/`new_json` are text."""
+    """Newest audit rows first, as stored -- `old_json`/`new_json` are text.
+
+    `limit` is CLAMPED at zero: SQLite reads `LIMIT -1` as "no limit", so a
+    negative limit from a caller would hand back the entire trail.
+    """
     rows = conn.execute("SELECT * FROM setting_change ORDER BY id DESC "
-                        "LIMIT ?", (limit,)).fetchall()
+                        "LIMIT ?", (max(0, int(limit)),)).fetchall()
     return [dict(r) for r in rows]
 
 

@@ -297,6 +297,23 @@ it("renders a command's args form and gates only destructive commands", async ()
     },
   ]);
 
+  // A DESTRUCTIVE COMMAND MUST BE RE-ACKNOWLEDGED. The tick is cleared after
+  // the run, so a second click cannot re-send `confirm: true` on a stale
+  // acknowledgement (`serial_break` is a BREAK plus a reboot).
+  expect(
+    within(card).getByLabelText(/I understand this is destructive/),
+  ).not.toBeChecked();
+  expect(within(card).getByRole("button", { name: "Run" })).toBeDisabled();
+
+  // Editing the form discards the audit result of the run it no longer
+  // describes, so the next run cannot be read as this one's outcome.
+  fireEvent.change(within(card).getByLabelText("box"), {
+    target: { value: "cubox-2" },
+  });
+  expect(
+    within(card).queryByText("would send BREAK+b to /dev/ttyUSB0"),
+  ).toBeNull();
+
   // The read-only command has no confirmation checkbox at all.
   const statusCard = screen
     .getByText("Serial adapters and arm state")

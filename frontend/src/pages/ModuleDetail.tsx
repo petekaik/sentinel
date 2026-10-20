@@ -84,6 +84,10 @@ function CommandPanel({
       }
     } finally {
       setBusy(false);
+      // A DESTRUCTIVE COMMAND MUST BE RE-ACKNOWLEDGED FOR THE NEXT RUN. Left
+      // ticked, the next click re-sends `confirm: true` with no fresh
+      // acknowledgement -- and `serial_break` is a BREAK plus a reboot.
+      setConfirm(false);
     }
   }
 
@@ -119,9 +123,12 @@ function CommandPanel({
                 id={id}
                 value={args[a.name] ?? ""}
                 disabled={busy}
-                onChange={(e) =>
-                  setArgs((prev) => ({ ...prev, [a.name]: e.target.value }))
-                }
+                onChange={(e) => {
+                  setArgs((prev) => ({ ...prev, [a.name]: e.target.value }));
+                  // A RESULT DESCRIBES THE RUN IT CAME FROM, not the draft the
+                  // operator has started editing.
+                  setResult(null);
+                }}
               >
                 <option value="">--</option>
                 {a.choices.map((c) => (
@@ -136,9 +143,10 @@ function CommandPanel({
                 type="text"
                 value={args[a.name] ?? ""}
                 disabled={busy}
-                onChange={(e) =>
-                  setArgs((prev) => ({ ...prev, [a.name]: e.target.value }))
-                }
+                onChange={(e) => {
+                  setArgs((prev) => ({ ...prev, [a.name]: e.target.value }));
+                  setResult(null);
+                }}
               />
             )}
           </div>
@@ -150,7 +158,10 @@ function CommandPanel({
             type="checkbox"
             checked={dryRun}
             disabled={busy}
-            onChange={(e) => setDryRun(e.target.checked)}
+            onChange={(e) => {
+              setDryRun(e.target.checked);
+              setResult(null);
+            }}
           />{" "}
           dry run
         </label>

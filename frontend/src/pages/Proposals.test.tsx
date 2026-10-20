@@ -77,7 +77,7 @@ it("approves through the endpoint and refreshes the queue", async () => {
 });
 
 it("opens the token dialog on 401 and keeps the proposal listed", async () => {
-  mockFetch(() =>
+  const calls = mockFetch(() =>
     respond(401, {
       error: { code: "unauthorized", message: "missing or wrong write token" },
     }),
@@ -89,8 +89,11 @@ it("opens the token dialog on 401 and keeps the proposal listed", async () => {
   );
 
   expect(await screen.findByRole("dialog")).toBeInTheDocument();
-  // A 401 is not a decision: the row must still be there to retry.
+  // A 401 is not a decision: the row must still be there to retry, and no
+  // refresh may have run -- a stray load() here would still show the row
+  // because the stub serves it again, so the GET count is the assertion.
   expect(screen.getByText("Restart the stalled worker")).toBeInTheDocument();
+  expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(1);
 });
 
 it("shows a refusal and leaves the proposal pending", async () => {

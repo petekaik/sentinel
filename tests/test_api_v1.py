@@ -889,6 +889,10 @@ def test_commands_via_api(results):
         calls.append((dict(args), dry_run))
         return commands.Result(True, "ran with %r" % (args,), "command output")
 
+    def failing(ctx, args, dry_run=False):
+        calls.append((dict(args), dry_run))
+        return commands.Result(False, "the handler ran and failed", "partial")
+
     # THE FAKE KEEPS THE REAL `fleet` ID on purpose: `discover_enabled` resolves
     # each discovered module's own package path, so an invented id would fail
     # there before the endpoint under test ran.
@@ -898,6 +902,7 @@ def test_commands_via_api(results):
             commands.Command("peek", "Peek", handler,
                              args=[commands.Arg("target")]),
             commands.Command("wipe", "Wipe", handler, danger="destructive"),
+            commands.Command("flaky", "Flaky", failing),
         ])
     saved = module_loader.discover
     module_loader.discover = lambda: [fake]
@@ -957,6 +962,59 @@ def test_commands_via_api(results):
             code == 422 and body["error"]["code"] == "refused"
             and len(audit_rows()) == before,
             "code=%s body=%r audit=%r" % (code, body, audit_rows()))
+
+        # CONFIRM IS THE LITERAL BOOLEAN. `"false"` is truthy in Python, so
+        # `not body.get("confirm")` would accept it and reopen the bypass for
+        # any client that sends a JSON string.
+        before_calls = len(calls)
+        before = len(audit_rows())
+        code, _, body = _req(base + "/api/v1/commands/fleet/wipe", "POST",
+                             {"args": {}, "confirm": "false"}, token="tok")
+        results.check(
+            "confirm must be the boolean true, not a truthy string",
+            code == 422 and body["error"]["code"] == "confirm_required"
+            and len(calls) == before_calls
+            and len(audit_rows()) == before,
+            "code=%s body=%r calls=%r audit=%r"
+            % (code, body, calls, audit_rows()))
+
+        # RAN AND FAILED IS NOT REFUSED. `CommandFailed` subclasses
+        # `CommandError`, so the catch ORDER in `do_POST` decides this: the
+        # audit row with exit_status 1 is the fact that tells the two apart.
+        before = len(audit_rows())
+        code, _, body = _req(base + "/api/v1/commands/fleet/flaky", "POST",
+                             {"args": {}}, token="tok")
+        failed_audit = audit_rows()
+        results.check(
+            "a handler that ran and failed is a 500 with an exit-1 audit row",
+            code == 500 and body["error"]["code"] == "failed"
+            and body["error"]["message"] == "the handler ran and failed"
+            and calls[-1] == ({}, False)
+            and len(failed_audit) == before + 1
+            and failed_audit[0]["command"] == "flaky"
+            and failed_audit[0]["exit_status"] == 1,
+            "code=%s body=%r calls=%r audit=%r"
+            % (code, body, calls, failed_audit))
+
+        # THE MODULE-ENABLE GATE IS dispatch's, which is why this endpoint uses
+        # dispatch rather than run() (run hardcodes module_enabled=True).
+        c = store.connect(cfg.db_path)
+        try:
+            store.put_setting(c, "fleet", "FLEET_ENABLED", False, "test")
+        finally:
+            c.close()
+        before_calls = len(calls)
+        before = len(audit_rows())
+        code, _, body = _req(base + "/api/v1/commands/fleet/peek", "POST",
+                             {"args": {"target": "x"}}, token="tok")
+        results.check(
+            "a disabled module's command is refused before the handler",
+            code == 422 and body["error"]["code"] == "refused"
+            and "disabled" in body["error"]["message"]
+            and len(calls) == before_calls
+            and len(audit_rows()) == before,
+            "code=%s body=%r calls=%r audit=%r"
+            % (code, body, calls, audit_rows()))
     finally:
         module_loader.discover = saved
         httpd.shutdown()

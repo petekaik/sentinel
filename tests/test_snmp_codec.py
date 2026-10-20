@@ -44,6 +44,7 @@ class FakeAgent:
     def __init__(self, reply=None):
         self.reply = reply
         self.seen = []
+        self.malformed = []
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", 0))
         self.sock.settimeout(0.02)
@@ -60,6 +61,13 @@ class FakeAgent:
             except OSError:
                 return
             self.seen.append(data)
+            # A STUB MUST REPRODUCE THE FAILURE MODES, NOT JUST THE INTERFACE
+            # (docs/08 item 81). Real agents drop a varbind that has no NULL,
+            # so this one does too: without this line the suite happily
+            # certified a request every device on the fleet ignored.
+            if not _varbind_has_null(data):
+                self.malformed.append(data)
+                continue
             if self.reply is not None:
                 self.sock.sendto(self.reply(data), addr)
 
@@ -81,6 +89,30 @@ def _wait_for(predicate, timeout=2.0):
             return True
         time.sleep(0.01)
     return predicate()
+
+
+def _varbind_has_null(data):
+    """True when the first varbind ends with the explicit NULL value.
+
+    The check is structural rather than a byte comparison because the length
+    octets shift with the community string: walk to the varbinds and demand a
+    0x05 TLV after the OID.
+    """
+    try:
+        _, msg, _ = ber.parse(data, 0)
+        _, _version, i = ber.parse(msg, 0)
+        _, _community, i = ber.parse(msg, i)
+        _, pdu, _ = ber.parse(msg, i)
+        _, _rid, j = ber.parse(pdu, 0)
+        _, _status, j = ber.parse(pdu, j)
+        _, _index, j = ber.parse(pdu, j)
+        _, varbinds, j = ber.parse(pdu, j)
+        _, vb, _ = ber.parse(varbinds, 0)
+        _, _name, k = ber.parse(vb, 0)
+        vtag, _value, _ = ber.parse(vb, k)
+    except (IndexError, ValueError):
+        return False
+    return vtag == 0x05
 
 
 def _request_parts(data):
@@ -202,18 +234,26 @@ def test_sequence_nesting_round_trip(results):
 
 
 def test_get_request_bytes_are_the_known_encoding(results):
-    """A hand-computed GET, so the test cannot agree with a broken encoder."""
+    """A hand-computed GET, so the test cannot agree with a broken encoder.
+
+    RFC 3416 §4.2.1: the varbind is `SEQUENCE { OID, NULL }` -- the NULL is not
+    decoration, it is what tells an agent this is a request rather than a set.
+    This expectation was WRONG once: it was computed by reading the encoder
+    instead of the RFC, so both omitted the NULL and the whole fleet timed out
+    against real devices while the suite stayed green.
+    """
     expected = (
-        "30 25 "                             # message sequence, 37 bytes
+        "30 27 "                             # message sequence, 39 bytes
         "02 01 01 "                          # version 1 (v2c)
         "04 06 70 75 62 6c 69 63 "           # community "public"
-        "a0 18 "                             # GetRequest, 24 bytes
+        "a0 1a "                             # GetRequest, 26 bytes
         "02 02 04 d2 "                       # request-id 1234
         "02 01 00 "                          # error-status 0
         "02 01 00 "                          # error-index 0
-        "30 0c "
-        "30 0a "
-        "06 08 2b 06 01 02 01 01 01 00"      # OID 1.3.6.1.2.1.1.1.0
+        "30 0e "                             # varbind list, 14 bytes
+        "30 0c "                             # varbind, 12 bytes
+        "06 08 2b 06 01 02 01 01 01 00 "     # OID 1.3.6.1.2.1.1.1.0
+        "05 00"                              # NULL value -- the request marker
     ).split()
     got = snmp._request("public", OID, 1234).hex(" ").split()
     results.check(
@@ -222,6 +262,41 @@ def test_get_request_bytes_are_the_known_encoding(results):
         "got      %s\nexpected %s\n-- a request the agent misparses is a "
         "timeout that reads as a dead device" % (" ".join(got),
                                                  " ".join(expected)))
+
+
+NULL_LESS = ber.sequence(
+    ber.integer(1),
+    ber.octet("public"),
+    ber.tlv(0xA0, ber.integer(1234) + ber.integer(0) + ber.integer(0) +
+            ber.sequence(ber.sequence(ber.oid(OID)))))   # no NULL varbind
+
+
+def test_a_varbind_without_the_null_is_dropped_like_a_real_agent(results):
+    """The stub must be able to FAIL, or it certifies a broken encoder.
+
+    `NULL_LESS` is the exact request this client used to send -- correct
+    lengths, correct OID, no value TLV. If the fake agent answered it, the
+    suite would go green again while every device on the fleet timed out.
+    """
+    with FakeAgent(reply=lambda data: _reply_with(ber.octet("unreachable"))(
+        data)) as agent:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(1)
+        answered = False
+        try:
+            sock.sendto(NULL_LESS, ("127.0.0.1", agent.port))
+            sock.recvfrom(4096)
+            answered = True
+        except socket.timeout:
+            pass
+        finally:
+            sock.close()
+        _wait_for(lambda: bool(agent.malformed))
+    results.check(
+        "the fake agent drops a varbind with no NULL, as real agents do",
+        not answered and bool(agent.malformed),
+        "the stub answered a request real agents ignore -- it cannot catch "
+        "this class of defect")
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +586,7 @@ TESTS = (
     test_sequence_nesting_round_trip,
     test_the_codec_refuses_truncation,
     test_get_request_bytes_are_the_known_encoding,
+    test_a_varbind_without_the_null_is_dropped_like_a_real_agent,
     test_get_returns_string_and_integer,
     test_error_status_is_an_error,
     test_no_such_object_and_no_such_instance_are_errors,

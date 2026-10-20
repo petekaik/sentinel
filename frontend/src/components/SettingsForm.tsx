@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ApiError,
   api,
@@ -165,6 +165,16 @@ export default function SettingsForm({
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState<string | null>(null);
+  // A REFUSED SAVE MUST NOT LOOK LIKE A SAVED ONE. The form-level error renders
+  // beside Save, which on a phone sits at the end of the page: measured on the
+  // SNMP settings page, a whole save was refused (a band rule) and the operator
+  // read the silence as success, then lost the configuration they had typed
+  // because nothing was stored. Bringing the alert into view is the difference
+  // between "that failed" and "that vanished".
+  const alertRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (errors.form) alertRef.current?.scrollIntoView({ block: "center" });
+  }, [errors.form]);
   const [busy, setBusy] = useState(false);
 
   const byKey = Object.fromEntries(settings.map((f) => [f.key, f]));
@@ -378,7 +388,11 @@ export default function SettingsForm({
           </div>
         );
       })}
-      {errors.form && <em role="alert">{errors.form}</em>}
+      {errors.form && (
+        <div className="alert" role="alert" ref={alertRef}>
+          <strong>Not saved.</strong> {errors.form}
+        </div>
+      )}
       {notice && <p className="notice">{notice}</p>}
       <p className="sub">
         Applies on the next collection. The effective value may come from an

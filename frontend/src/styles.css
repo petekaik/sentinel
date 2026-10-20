@@ -11,6 +11,15 @@
         --line:#232c35; --ok:#3fb950; --warn:#e3b341; --fail:#f85149;
         --unknown:#7d8590; }
 * { box-sizing:border-box; }
+/* The same rule for every refusal in the app: a failure is a BOX, not a line of
+   italic text at the bottom of a long form. Measured 2026-10-20 -- a refused
+   settings save rendered above the Save button and went unread. */
+.alert { background:rgba(248,81,73,.12); border-left:3px solid var(--fail);
+         padding:8px 12px; margin:10px 0; color:var(--fg); }
+.alert strong { color:var(--fail); }
+[role="alert"] { display:block; color:var(--fail); margin:4px 0 0; }
+.notice { background:var(--panel); border-left:3px solid var(--line);
+          padding:8px 12px; margin:10px 0; color:var(--dim); font-size:12.5px; }
 body { margin:0; background:var(--bg); color:var(--fg);
        font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
 .wrap { max-width:1200px; margin:0 auto;

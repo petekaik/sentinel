@@ -364,3 +364,40 @@ it("blocks an empty number instead of storing zero", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("Enter an integer");
   expect(fetchMock).not.toHaveBeenCalled();
 });
+
+it("a refused save says so in a box and scrolls it into view", async () => {
+  // MEASURED 2026-10-20: an atomic 422 (a band rule on one row) refused a whole
+  // settings save, the message rendered as one line of <em> at the bottom of a
+  // long form, and the operator read the silence as success -- then lost the
+  // configuration because nothing had been stored.
+  const scrolled: Element[] = [];
+  Element.prototype.scrollIntoView = function (this: Element) {
+    scrolled.push(this);
+  };
+  const fetchMock = vi.fn(async () =>
+    respond(422, {
+      error: {
+        code: "invalid_value",
+        message: "SNMP_CHECKS[0] amber (360000) is below green (8640000)",
+        field: null,
+      },
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+
+  render(
+    <SettingsForm
+      moduleId="probe"
+      settings={[{ key: "PORT", label: "Port", kind: "int" }]}
+      values={{ PORT: { value: 161, source: "db" } }}
+    />,
+  );
+
+  fireEvent.change(screen.getByLabelText("Port"), { target: { value: "162" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  const alert = await screen.findByRole("alert");
+  expect(alert).toHaveTextContent("Not saved.");
+  expect(alert).toHaveTextContent("amber (360000) is below green");
+  expect(scrolled).toContain(alert);
+});

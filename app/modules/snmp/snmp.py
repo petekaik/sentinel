@@ -37,7 +37,13 @@ def _request(community, oid, request_id):
         ber.tlv(0xA0,                         # GetRequest
                 ber.integer(request_id) + ber.integer(0) +
                 ber.integer(0) +
-                ber.sequence(ber.sequence(ber.oid(oid)))))
+                # THE VARBIND ENDS WITH AN EXPLICIT NULL (RFC 3416 §4.2.1).
+                # Leaving it out produced a request that every real agent
+                # silently dropped -- a timeout per device, which the module
+                # then graded as "not answering". The unit test agreed with the
+                # encoder because it was hand-computed from the same bytes, so
+                # the fake agent below now REFUSES a varbind without it.
+                ber.sequence(ber.sequence(ber.oid(oid) + ber.tlv(0x05, b"")))))
 
 
 def get(host, community, oid, port=161, timeout=3.0, retries=1):

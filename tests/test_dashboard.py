@@ -1357,9 +1357,10 @@ def test_each_enabled_module_is_named_with_its_tiles(results):
 
         results.check(
             "the enabled modules are listed with their order and titles",
-            [m["id"] for m in state["modules"]] == ["fleet", "system"]
+            [m["id"] for m in state["modules"]] == ["fleet", "system", "snmp"]
             and state["modules"][0]["title"] == "CuBox fleet"
             and state["modules"][1]["title"] == "System resources"
+            and state["modules"][2]["title"] == "Network devices"
             and all(m["enabled"] for m in state["modules"]),
             "modules=%r -- the model must name what is on"
             % (state["modules"],))
@@ -1384,7 +1385,8 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
     """A disabled module must be stated, and must not leave a green section."""
     tmpdir = tempfile.mkdtemp()
     try:
-        d = Dash(tmpdir, FLEET_ENABLED="0", SYSTEM_ENABLED="0")
+        d = Dash(tmpdir, FLEET_ENABLED="0", SYSTEM_ENABLED="0",
+                 SNMP_ENABLED="0")
         d.epoch()
         state = d.state()
         st = d.status()
@@ -1392,7 +1394,8 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
         results.check(
             "the model separates enabled from disabled modules",
             state["modules"] == []
-            and [m["id"] for m in state["disabled_modules"]] == ["fleet", "system"],
+            and [m["id"] for m in state["disabled_modules"]]
+            == ["fleet", "system", "snmp"],
             "modules=%r disabled=%r -- a disabled module that simply vanishes "
             "reads exactly like one that never existed"
             % (state["modules"], state["disabled_modules"]))
@@ -1424,7 +1427,8 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
         results.check(
             "the API payload carries the module lists, additively",
             st["modules"] == []
-            and [m["id"] for m in st["disabled_modules"]] == ["fleet", "system"],
+            and [m["id"] for m in st["disabled_modules"]]
+            == ["fleet", "system", "snmp"],
             "the status API dropped the module lists")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

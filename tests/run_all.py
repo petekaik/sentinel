@@ -34,6 +34,7 @@ import test_remediation as remediation_tests    # noqa: E402
 import test_serial_identity as serial_tests     # noqa: E402
 import test_settings as settings_tests          # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
+import test_snmp_codec as snmp_tests            # noqa: E402
 import test_system_module as system_tests       # noqa: E402
 
 SUITES = (
@@ -77,6 +78,9 @@ SUITES = (
      system_tests.TESTS),
     ("proxy/ -- the publishing stack's access rules (offline, text-level)",
      proxy_tests.TESTS),
+    ("snmp -- the BER codec and the v2c client against a loopback agent "
+     "(no device, no real network)",
+     snmp_tests.TESTS),
 )
 
 

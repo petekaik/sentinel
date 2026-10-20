@@ -467,10 +467,18 @@ def expansion_targets(modules):
     This is the generic replacement for the old hand-maintained platform check
     list: the checks come from module discovery, and so do the ids they are
     instantiated for.
+
+    A MODULE WITH NO `per_box` CHECK CONTRIBUTES NOTHING. The collector expands
+    the MERGED class list over the MERGED target tuple, so a module's targets
+    would otherwise become bindings for another module's per-box check -- the
+    SNMP module's `snmp` reporting target turned every fleet per-box check into
+    a row on a target that is not a host.
     """
     out = []
     for mod in modules:
-        static = {c.target for c in registry(*mod.check_classes())
-                  if not c.per_box}
+        classes = registry(*mod.check_classes())
+        if not any(c.per_box for c in classes):
+            continue
+        static = {c.target for c in classes if not c.per_box}
         out.extend(t for t in mod.targets if t not in static)
     return tuple(out)

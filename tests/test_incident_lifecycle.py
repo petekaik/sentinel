@@ -362,6 +362,46 @@ def test_the_cap_heals_a_row_that_froze_before_it_existed(results):
         conn.close()
 
 
+def test_recent_incidents_are_terminal_and_newest_close_first(results):
+    """The history read behind the Incidents page.
+
+    Both terminal states belong in it, and a dismissal is the case a naive
+    query gets wrong: `dismiss()` leaves `resolved_at` NULL by design, so
+    ordering on that column alone would sort every dismissed row as if it had
+    been closed at the beginning of time.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        conn = _fresh(tmpdir)
+        _open_red(conn)
+        # Close the first one the only way the state machine allows: a
+        # positive observation.
+        store.sync_incident(conn, 10, T[0], T[1], T[2], store.Status.OK,
+                            "TVH answered", None)
+        # A second incident, closed by a human a moment later.
+        other = ("storage", "disk", "")
+        for seq in (11, 12, 13):
+            store.sync_incident(conn, seq, other[0], other[1], other[2],
+                                store.Status.FAIL, "disk full", None)
+        store.dismiss(conn, store.incident_key(*other), "known", "operator")
+
+        rows = store.recent_incidents(conn)
+        results.check(
+            "history carries resolved AND dismissed rows, and no live ones",
+            {r["state"] for r in rows} == {"resolved", "dismissed"},
+            "states=%r" % [r["state"] for r in rows])
+        results.check(
+            "history is newest close first, despite a NULL resolved_at on the "
+            "dismissed row",
+            [r["key"] for r in rows] == [store.incident_key(*other), KEY],
+            "keys=%r" % [r["key"] for r in rows])
+        results.check(
+            "the history read is bounded",
+            len(store.recent_incidents(conn, limit=1)) == 1,
+            "limit=1 returned %d rows"
+            % len(store.recent_incidents(conn, limit=1)))
+        conn.close()
+
+
 TESTS = (test_unknown_freezes_and_never_resolves,
          test_a_frozen_incident_is_not_painted_red,
          test_the_cap_heals_a_row_that_froze_before_it_existed,
@@ -370,7 +410,8 @@ TESTS = (test_unknown_freezes_and_never_resolves,
          test_a_dismissal_cannot_silence_a_real_fault,
          test_dismiss_refuses_when_there_is_nothing_live,
          test_the_live_state_list_is_enforced_not_retyped,
-         test_the_two_state_lists_are_different_on_purpose)
+         test_the_two_state_lists_are_different_on_purpose,
+         test_recent_incidents_are_terminal_and_newest_close_first)
 
 
 def main():

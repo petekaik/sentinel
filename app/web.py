@@ -150,10 +150,13 @@ def _pop_result(by_key, chk):
     return None
 
 
-def build_state(cfg, conn, now=None):
-    """Everything the page renders, as plain data. No HTML, no side effects."""
-    now = now if now is not None else time.time()
+def _collector_liveness(cfg, conn, now):
+    """The newest collector_run, its age, and the staleness word.
 
+    ONE function because `/api/v1/incidents` must report the same freshness as
+    the status page: two copies of this rule drift, and the copy that renders
+    "no live incident now" beside a stale board is the one that must not.
+    """
     last, n_last = _rows(conn, "SELECT ts, epoch_seq, duration_ms, checks_run, "
                                "errors, note FROM collector_run "
                                "ORDER BY epoch_seq DESC LIMIT 1")
@@ -168,6 +171,14 @@ def build_state(cfg, conn, now=None):
         staleness = "lagging"
     else:
         staleness = "fresh"
+    return last, n_last, age, staleness
+
+
+def build_state(cfg, conn, now=None):
+    """Everything the page renders, as plain data. No HTML, no side effects."""
+    now = now if now is not None else time.time()
+
+    last, n_last, age, staleness = _collector_liveness(cfg, conn, now)
 
     enabled = module_loader.discover_enabled(cfg)
     # WHAT IS OFF IS PART OF THE PAGE. A disabled module that simply vanishes
@@ -817,7 +828,24 @@ class Handler(BaseHTTPRequestHandler):
                     cfg, conn, module_loader.discover()))
                 return
             if path == "/api/v1/incidents":
-                self._json(200, store.live_incidents(conn))
+                # BOTH HALVES OF THE BOARD, and the freshness of the document
+                # that holds them. A list of live rows alone lets an empty
+                # board read "nothing is wrong" while the collector has been
+                # dead for hours -- `live` and `history` are two different
+                # questions, and "no live incident" is only good news on a
+                # fresh read.
+                _, _, age, staleness = _collector_liveness(cfg, conn,
+                                                           time.time())
+                self._json(200, {
+                    "live": store.live_incidents(conn),
+                    "history": store.recent_incidents(conn),
+                    "collector": {
+                        "staleness": staleness,
+                        "last_age_s": age,
+                        "stale_after_s": cfg.interval * STALE_INTERVALS,
+                        "interval_s": cfg.interval,
+                    },
+                })
                 return
             if path == "/api/v1/insights":
                 self._json(200, store.list_insights(conn))

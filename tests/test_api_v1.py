@@ -444,7 +444,23 @@ def test_the_read_surface(results):
             and body.get("verdict") in ("ok", "warn", "fail", "unknown"),
             "code=%s body=%r" % (code, body))
 
-        for name in ("incidents", "insights", "proposals"):
+        # The incident board is an OBJECT, not a list: live rows, terminal
+        # history and the freshness of the read are three facts, and an empty
+        # `live` list on its own would read as a clean fleet.
+        code, hdrs, body = _req(base + "/api/v1/incidents")
+        results.check(
+            "GET /api/v1/incidents carries live incidents, terminal history "
+            "and the collector's freshness",
+            code == 200 and isinstance(body, dict)
+            and isinstance(body.get("live"), list)
+            and isinstance(body.get("history"), list)
+            and body.get("collector", {}).get("staleness")
+            in ("fresh", "lagging", "stale", "none")
+            and body["collector"].get("interval_s") == cfg.interval
+            and hdrs.get("Cache-Control") == CACHE,
+            "code=%s body=%r" % (code, body))
+
+        for name in ("insights", "proposals"):
             code, hdrs, body = _req(base + "/api/v1/" + name)
             results.check(
                 "GET /api/v1/%s answers a JSON list, uncached" % name,

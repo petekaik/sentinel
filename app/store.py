@@ -1464,6 +1464,25 @@ def live_incidents(conn):
     return [dict(r) for r in rows]
 
 
+def recent_incidents(conn, limit=50):
+    """Terminal incidents, most recently closed first -- the board's history.
+
+    BOTH terminal states belong here: `resolved` (a positive observation) and
+    `dismissed` (a human's decision). They are not interchangeable, but each is
+    a row that has left the board and a reader is entitled to see it.
+
+    `dismiss()` deliberately leaves `resolved_at` NULL, so the sort key is
+    whichever close stamp the row actually has. Ordering on `resolved_at` alone
+    would silently drop every dismissed row to the bottom.
+    """
+    rows = conn.execute(
+        "SELECT * FROM incident WHERE state IN ('resolved', 'dismissed') "
+        "ORDER BY COALESCE(resolved_at, dismissed_at) DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def live_incidents_for_targets(conn, targets):
     """Confirmed incidents against any of `targets` -- the rows a layer owns.
 

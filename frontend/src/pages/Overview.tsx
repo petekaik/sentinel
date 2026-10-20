@@ -1,95 +1,66 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, type Status } from "../api";
-import StatusPill from "../components/StatusPill";
+import StaleBanner, { span } from "../components/StaleBanner";
+import StatusPill, { tone } from "../components/StatusPill";
 
 const DEFAULT_INTERVAL_S = 60;
+const REQUEST_TIMEOUT_MS = 15_000;
+const CLOCK_TICK_MS = 5_000;
 const INCIDENT_PREVIEW = 5;
-
-function span(seconds: number | null | undefined): string {
-  if (seconds == null) return "never";
-  if (seconds < 90) return `${Math.round(seconds)}s`;
-  if (seconds < 5400) return `${(seconds / 60).toFixed(1)} min`;
-  return `${(seconds / 3600).toFixed(1)} h`;
-}
-
-function tone(verdict: string): string {
-  return (
-    { ok: "green", warn: "amber", fail: "red", unknown: "grey" }[verdict] ??
-    "grey"
-  );
-}
-
-/* The stale banner is the whole reason this page cannot be a list of green
-   numbers. `fresh` is the only value with nothing to say; every other value
-   says that what follows is not a live description of the fleet. */
-function StaleBanner({ collector }: { collector: Status["collector"] }) {
-  if (collector.staleness === "fresh") return null;
-  const last =
-    collector.last_age_s == null ? "never" : `${span(collector.last_age_s)} ago`;
-
-  if (collector.staleness === "none") {
-    return (
-      <div className="banner red" role="alert">
-        <strong>No collection has ever been recorded.</strong> There is no
-        observation of this fleet at all, so this page knows nothing about it.
-        That is not the same as a healthy fleet.
-      </div>
-    );
-  }
-  if (collector.staleness === "stale") {
-    return (
-      <div className="banner red" role="alert">
-        <strong>STALE — this is not a live verdict.</strong> The last collection
-        was {last}, past the {span(collector.stale_after_s)} limit. Everything
-        below describes the fleet as it was.
-      </div>
-    );
-  }
-  if (collector.staleness === "lagging") {
-    return (
-      <div className="banner amber" role="alert">
-        <strong>Collector lagging.</strong> The last collection was {last}; the
-        page is behind, though not yet past its {span(collector.stale_after_s)}{" "}
-        staleness limit.
-      </div>
-    );
-  }
-  return (
-    <div className="banner amber" role="alert">
-      <strong>Unknown collector state “{collector.staleness}”.</strong> The page
-      cannot say whether the data below is current.
-    </div>
-  );
-}
 
 export default function Overview() {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
+  // When the server last answered. The API's own `staleness` is a fact about
+  // the document at the instant it was built; between polls it cannot notice
+  // that the connection died. This is the client-side half of that rule.
+  const [lastOk, setLastOk] = useState<number | null>(null);
+  const [clock, setClock] = useState(() => Date.now());
   // The collector's own interval, not a second literal: the page must refresh
   // at the rate the backend says it collects. Held in a ref because changing it
   // must not restart the effect (and re-fire the first request).
   const nextMs = useRef(DEFAULT_INTERVAL_S * 1000);
 
+  // A clock so the "last known" test and the age line move without a poll.
+  useEffect(() => {
+    const id = setInterval(() => setClock(Date.now()), CLOCK_TICK_MS);
+    return () => clearInterval(id);
+  }, []);
+
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let ctrl: AbortController | undefined;
+    let requestTimeout: ReturnType<typeof setTimeout> | undefined;
 
     const load = async () => {
-      ctrl = new AbortController();
+      const request = new AbortController();
+      ctrl = request;
+      // A half-open connection otherwise blocks the loop forever: the next
+      // poll is scheduled in `finally`, so a request that never settles stops
+      // every later one. The timeout aborts only this request.
+      requestTimeout = setTimeout(() => request.abort(), REQUEST_TIMEOUT_MS);
       try {
-        const s = await api.status(ctrl.signal);
+        const s = await api.status(request.signal);
         if (!alive) return;
         setStatus(s);
         setError(null);
+        setLastOk(Date.now());
         const secs = Number(s.collector?.interval_s);
         if (Number.isFinite(secs) && secs >= 5) nextMs.current = secs * 1000;
       } catch (e) {
-        if (!alive || (e as Error)?.name === "AbortError") return;
-        setError(e instanceof Error ? e.message : String(e));
+        if (!alive) return;
+        setError(
+          (e as Error)?.name === "AbortError"
+            ? `request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        );
       } finally {
+        clearTimeout(requestTimeout);
         if (alive) {
           setBusy(false);
           timer = setTimeout(load, nextMs.current);
@@ -102,6 +73,7 @@ export default function Overview() {
       alive = false;
       ctrl?.abort();
       clearTimeout(timer);
+      clearTimeout(requestTimeout);
     };
   }, []);
 
@@ -132,14 +104,34 @@ export default function Overview() {
   const c = status.collector;
   const hosts = Object.entries(status.hosts);
   const incidents = status.incidents.slice(0, INCIDENT_PREVIEW);
+  // The server said "fresh" when it built this document; that stops being true
+  // if the next two polls never arrive. Two intervals is the same grace the
+  // API itself gives before it calls a collector stale.
+  const intervalMs = nextMs.current;
+  const lastKnown =
+    Boolean(error) ||
+    (lastOk !== null && clock - lastOk > 2 * intervalMs);
+  const asOf = lastOk ? new Date(lastOk).toLocaleTimeString() : "unknown";
+  // The age ticks between polls by adding the client's elapsed time to the
+  // server's `last_age_s`, so this line never freezes at the value it had when
+  // the response was rendered.
+  const ageSeconds =
+    c.last_age_s == null
+      ? null
+      : c.last_age_s + (lastOk ? (clock - lastOk) / 1000 : 0);
 
   return (
     <>
-      {error && (
+      {lastKnown && (
         <div className="banner red" role="alert">
           <strong>Monitor unreachable — this is not a healthy fleet.</strong>{" "}
-          The last refresh failed ({error}), so everything below is the last
-          known state, not a live one.
+          {error
+            ? `The last refresh failed (${error}).`
+            : `No successful refresh in over ${span(
+                (2 * intervalMs) / 1000,
+              )}.`}{" "}
+          Everything below is the last known state (as of {asOf}), not a live
+          one.
         </div>
       )}
 
@@ -250,7 +242,7 @@ export default function Overview() {
       </p>
 
       <p className="sub footer">
-        Collected {c.last_age_s == null ? "never" : `${span(c.last_age_s)} ago`}
+        Collected {ageSeconds == null ? "never" : `${span(ageSeconds)} ago`}
         {c.epoch_seq != null && ` · epoch ${c.epoch_seq}`}
         {c.duration_ms != null && ` · ${c.duration_ms} ms`}
         {c.errors != null && ` · ${c.errors} errors`} · refreshing every{" "}

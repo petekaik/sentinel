@@ -4,7 +4,7 @@
    vocabularies the API uses are accepted -- check verdicts are
    ok/warn/fail/unknown, incident severity is red/amber. */
 
-const TONE: Record<string, { cls: string; word: string }> = {
+export const TONE: Record<string, { cls: string; word: string }> = {
   ok: { cls: "green", word: "OK" },
   warn: { cls: "amber", word: "WARN" },
   fail: { cls: "red", word: "FAIL" },
@@ -14,6 +14,10 @@ const TONE: Record<string, { cls: string; word: string }> = {
   red: { cls: "red", word: "RED" },
   grey: { cls: "grey", word: "GREY" },
 };
+
+export function tone(status: string | null | undefined): string {
+  return TONE[(status || "").toLowerCase()]?.cls ?? "grey";
+}
 
 export default function StatusPill({
   status,

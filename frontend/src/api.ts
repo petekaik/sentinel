@@ -37,6 +37,24 @@ export type Incident = {
   detail: string | null;
   remedy_attempts: number;
   remedy_latched: number;
+  resolved_at?: number | null;
+  dismissed_at?: number | null;
+  dismissed_reason?: string | null;
+};
+
+/* The freshness block `/api/v1/incidents` carries beside the rows. It is the
+   same shape the status page uses, so one banner serves both. */
+export type CollectorLiveness = {
+  staleness: string;
+  last_age_s: number | null;
+  interval_s: number;
+  stale_after_s?: number;
+};
+
+export type IncidentsPayload = {
+  live: Incident[];
+  history: Incident[];
+  collector: CollectorLiveness;
 };
 
 export type Status = {
@@ -56,8 +74,7 @@ export type Status = {
     checks_run: number | null;
     errors: number | null;
     note: string | null;
-  };
-  counts: Counts;
+  };  counts: Counts;
   modules: { id: string; title: string; order: number; enabled: boolean }[];
   disabled_modules: { id: string; title: string; order: number; enabled: boolean }[];
   hosts: Record<string, HostStatus>;
@@ -148,7 +165,7 @@ export const api = {
   modules: () => req<any[]>("GET", "/api/v1/modules"),
   settings: () => req<any>("GET", "/api/v1/settings"),
   incidents: (signal?: AbortSignal) =>
-    req<Incident[]>("GET", "/api/v1/incidents", undefined, signal),
+    req<IncidentsPayload>("GET", "/api/v1/incidents", undefined, signal),
   proposals: () => req<any[]>("GET", "/api/v1/proposals"),
   putSettings: (id: string, body: unknown) =>
     req<any>("PUT", `/api/v1/modules/${id}/settings`, body),

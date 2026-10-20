@@ -1,6 +1,11 @@
-import { useEffect, useState } from "react";
-import { api, type Incident } from "../api";
-import StatusPill from "../components/StatusPill";
+import { useEffect, useRef, useState } from "react";
+import { api, type IncidentsPayload } from "../api";
+import StaleBanner, { span } from "../components/StaleBanner";
+import StatusPill, { tone } from "../components/StatusPill";
+
+const DEFAULT_INTERVAL_S = 60;
+const REQUEST_TIMEOUT_MS = 15_000;
+const CLOCK_TICK_MS = 5_000;
 
 function when(ts: number | null | undefined): string {
   if (!ts) return "—";
@@ -14,36 +19,75 @@ function howLong(seconds: number): string {
   return `${(seconds / 3600).toFixed(1)} h`;
 }
 
-/* The incident board. `/api/v1/incidents` serves the CONFIRMED rows -- what is
-   on the board now -- and each row carries its own history counters (first
-   seen, last seen, observations). It does not serve resolved or dismissed rows;
-   see the task report, which records that mismatch rather than inventing
-   history the API never sent. */
+/* The incident board.
+
+   `/api/v1/incidents` serves BOTH halves -- `live` rows and terminal
+   `history` -- plus the collector's freshness. The freshness is not
+   decoration: "no live incident now" is only reassuring while the collector
+   is running, so the page polls on the collector's own interval and stops
+   trusting its last answer when two intervals pass without a successful
+   refresh. */
 export default function Incidents() {
-  const [incidents, setIncidents] = useState<Incident[] | null>(null);
+  const [data, setData] = useState<IncidentsPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [lastOk, setLastOk] = useState<number | null>(null);
+  const [clock, setClock] = useState(() => Date.now());
+  const nextMs = useRef(DEFAULT_INTERVAL_S * 1000);
 
   useEffect(() => {
-    const ctrl = new AbortController();
+    const id = setInterval(() => setClock(Date.now()), CLOCK_TICK_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
     let alive = true;
-    api
-      .incidents(ctrl.signal)
-      .then((rows) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let ctrl: AbortController | undefined;
+    let requestTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    const load = async () => {
+      const request = new AbortController();
+      ctrl = request;
+      requestTimeout = setTimeout(() => request.abort(), REQUEST_TIMEOUT_MS);
+      try {
+        const payload = await api.incidents(request.signal);
         if (!alive) return;
-        setIncidents(rows);
+        setData(payload);
         setError(null);
-      })
-      .catch((e: unknown) => {
-        if (!alive || (e as Error)?.name === "AbortError") return;
-        setError(e instanceof Error ? e.message : String(e));
-      });
+        setLastOk(Date.now());
+        const secs = Number(payload.collector?.interval_s);
+        if (Number.isFinite(secs) && secs >= 5) nextMs.current = secs * 1000;
+      } catch (e) {
+        if (!alive) return;
+        setError(
+          (e as Error)?.name === "AbortError"
+            ? `request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
+            : e instanceof Error
+              ? e.message
+              : String(e),
+        );
+      } finally {
+        clearTimeout(requestTimeout);
+        if (alive) timer = setTimeout(load, nextMs.current);
+      }
+    };
+
+    void load();
     return () => {
       alive = false;
-      ctrl.abort();
+      ctrl?.abort();
+      clearTimeout(timer);
+      clearTimeout(requestTimeout);
     };
   }, []);
 
-  if (error) {
+  if (!data && !error) {
+    return <p className="sub">Loading incidents…</p>;
+  }
+
+  // NO DATA IS NOT AN EMPTY BOARD. An unreachable list rendered as "no live
+  // incident" is exactly the false-clean the monitor exists to prevent.
+  if (!data) {
     return (
       <section className="unreachable" role="alert">
         <h2>Monitor unreachable — this is not a healthy fleet</h2>
@@ -51,29 +95,45 @@ export default function Incidents() {
           The incident list could not be read. An empty list would have meant
           “no confirmed condition”; this is no data at all.
         </p>
-        <p className="sub">{error}</p>
+        {error && <p className="sub">{error}</p>}
       </section>
     );
   }
 
-  if (incidents === null) {
-    return <p className="sub">Loading incidents…</p>;
-  }
-
-  const now = Date.now() / 1000;
+  const intervalMs = nextMs.current;
+  const lastKnown =
+    Boolean(error) ||
+    (lastOk !== null && clock - lastOk > 2 * intervalMs);
+  const asOf = lastOk ? new Date(lastOk).toLocaleTimeString() : "unknown";
+  const now = clock / 1000;
 
   return (
     <>
+      {lastKnown && (
+        <div className="banner red" role="alert">
+          <strong>Monitor unreachable — this is not a healthy fleet.</strong>{" "}
+          {error
+            ? `The last refresh failed (${error}).`
+            : `No successful refresh in over ${span(
+                (2 * intervalMs) / 1000,
+              )}.`}{" "}
+          Everything below is the last known state (as of {asOf}), not a live
+          one.
+        </div>
+      )}
+
+      <StaleBanner collector={data.collector} />
+
       <h2>Live incidents</h2>
-      {incidents.length === 0 ? (
+      {data.live.length === 0 ? (
         <p className="sub">
-          No live incident is on the board. That means no confirmed condition —
-          it does not by itself mean the fleet is healthy.
+          No live incident now. That means no confirmed condition — it does not
+          by itself mean the fleet is healthy.
         </p>
       ) : (
         <div className="grid">
-          {incidents.map((i) => (
-            <article key={i.key} className={`tile ${i.severity || "grey"}`}>
+          {data.live.map((i) => (
+            <article key={i.key} className={`tile ${tone(i.severity)}`}>
               <div className="tile-head">
                 <StatusPill status={i.severity} />
                 <span className="state">{i.state}</span>
@@ -101,45 +161,44 @@ export default function Incidents() {
       )}
 
       <h2>Recent history</h2>
-      <p className="sub">
-        When each live incident was first and last seen, and how much evidence
-        is behind it.
-      </p>
-      {incidents.length === 0 ? (
-        <p className="sub">Nothing to show.</p>
+      {data.history.length === 0 ? (
+        <p className="sub">
+          No history recorded. No incident has been resolved or dismissed yet —
+          that is a different statement from “no live incident now”.
+        </p>
       ) : (
         <div className="scroll">
           <table>
             <thead>
               <tr>
-                <th>Severity</th>
+                <th>Closed</th>
                 <th>State</th>
+                <th>Severity</th>
                 <th>Target</th>
                 <th>Check</th>
+                <th>Detail</th>
                 <th>First seen</th>
                 <th>Last seen</th>
-                <th>Observations</th>
               </tr>
             </thead>
             <tbody>
-              {[...incidents]
-                .sort((a, b) => b.last_seen - a.last_seen)
-                .map((i) => (
-                  <tr key={i.key}>
-                    <td>
-                      <StatusPill status={i.severity} />
-                    </td>
-                    <td>{i.state}</td>
-                    <td>
-                      {i.target}
-                      {i.subject ? ` / ${i.subject}` : ""}
-                    </td>
-                    <td>{i.check_id}</td>
-                    <td>{when(i.first_seen)}</td>
-                    <td>{when(i.last_seen)}</td>
-                    <td>{i.observed_count}</td>
-                  </tr>
-                ))}
+              {data.history.map((i) => (
+                <tr key={`${i.key}|${i.state}|${i.resolved_at ?? i.dismissed_at}`}>
+                  <td>{when(i.resolved_at ?? i.dismissed_at)}</td>
+                  <td>{i.state}</td>
+                  <td>
+                    <StatusPill status={i.severity} />
+                  </td>
+                  <td>
+                    {i.target}
+                    {i.subject ? ` / ${i.subject}` : ""}
+                  </td>
+                  <td>{i.check_id}</td>
+                  <td>{i.detail ?? "—"}</td>
+                  <td>{when(i.first_seen)}</td>
+                  <td>{when(i.last_seen)}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>

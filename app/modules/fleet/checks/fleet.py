@@ -744,17 +744,38 @@ class StateExportFresh(Check):
     def run(self, ctx):
         rows = []
         stale = []
+        in_flight = []
         for cid in ctx.fleet.cubox_ids:
             se = ctx.export(cid)
             if se is None or not se.ran or se.worker is None:
                 continue
-            age = se.log_age_min()
+            # THE BOX'S OWN CLOCK, NOT THE NAS'S. `export.pull` fills
+            # `server_now` from Backup-NAS, and grading a CuBox timestamp
+            # against it makes every age wrong by however much the two hosts
+            # differ -- the boxes have no RTC (item 23) and either host can be
+            # stepped. The boxfacts block already carries `epoch`, the same
+            # clock the log lines were written with, and `log_age_min(now=...)`
+            # exists for exactly this. No box clock means fall back to the
+            # NAS's, as before.
+            f = ctx.facts(cid)
+            age = se.log_age_min(now=f.int("epoch") if f.ok else None)
             rows.append("%s: last log line %s (%s)"
                         % (cid, se.worker.last_iso,
                            "age unknown" if age is None else "%.0f min ago" % age))
             if age is not None and age > 60:
+                # THE SILENCE MAY BE A JOB, NOT A BROKEN PATH. worker.sh logs at
+                # job boundaries; a 30 min source at 0.34x runs ~88 min, and the
+                # worker's own per-job cap is 11100 s, so a healthy box is quiet
+                # for far longer than this threshold. The box's per-pass lock is
+                # the discriminator, and it is the box's OWN read of /mnt/state
+                # -- so a stale mount makes the fact unreadable rather than
+                # `held`, and the warning below still fires.
+                lock = f.get("pass_lock").strip() if f.ok else ""
+                if lock == "held":
+                    in_flight.append("%s (%.0f min)" % (cid, age))
+                    continue
                 stale.append("%s (%.0f min)" % (cid, age))
-        ev = {"boxes": rows, "stale": stale}
+        ev = {"boxes": rows, "stale": stale, "in_flight": in_flight}
 
         if not rows:
             return unknown(self.id, self.target,
@@ -767,6 +788,16 @@ class StateExportFresh(Check):
                         "stale /mnt/state mount is invisible from here. Phase 2 "
                         "reads the box's own mount with the sentinel probe."
                         % ", ".join(stale), evidence=ev)
+        if in_flight:
+            return unknown(
+                self.id, self.target,
+                "log is quiet on %s, but a PASS IS IN FLIGHT there (the box's "
+                "own pass lock is held), so the silence is a job in progress, "
+                "not a stopped path. worker.sh writes between jobs; one "
+                "full-length job can run for three hours. This proxy cannot "
+                "grade liveness while a pass runs -- the box's own /mnt/state "
+                "check is what answers the stale-mount question."
+                % ", ".join(in_flight), evidence=ev)
         return ok(self.id, self.target,
                   "logs are advancing: %s" % "; ".join(rows), evidence=ev)
 

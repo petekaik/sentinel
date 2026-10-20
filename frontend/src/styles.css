@@ -54,6 +54,55 @@ th { text-align:left; color:var(--dim); font-weight:500; font-size:11px;
 td { padding:5px 7px; border-bottom:1px solid #1c212a; vertical-align:top;
      overflow-wrap:anywhere; }
 
+/* Banners are the page's "what you are looking at is not what you think"
+   surface. Red means the data is not live; amber means it is late. */
+.banner { border:1px solid var(--line); border-radius:5px; padding:9px 11px;
+          margin:7px 0 14px; font-size:12.5px; }
+.banner.red { background:#2a1416; border-color:#5c2326; color:#ffb4b0;
+              border-left:5px solid var(--fail); }
+.banner.amber { background:#2a2410; border-color:#5c4a1e; color:#f0d493;
+                border-left:5px solid var(--warn); }
+
+/* The verdict is the first thing under the header, and it is a sentence with a
+   colour -- never a colour on its own. */
+.verdict { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+           margin:0 0 12px; }
+.verdict p { margin:0; }
+
+.counts { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr));
+          gap:7px; margin:0 0 18px; }
+.counts div { border:1px solid var(--line); border-radius:5px;
+              padding:6px 9px; background:#171b21; }
+.counts dt { color:var(--dim); font-size:10.5px;
+             letter-spacing:.05em; }
+.counts dd { margin:1px 0 0; font-size:18px; font-weight:600; }
+
+/* Host cards: one column on a phone, wider once there is room. */
+.grid { display:grid; grid-template-columns:1fr; gap:10px; margin:0 0 18px; }
+@media (min-width: 640px) { .grid { grid-template-columns:1fr 1fr; } }
+.tile-head { display:flex; align-items:center; justify-content:space-between;
+             gap:8px; margin-bottom:4px; }
+.tile p { margin:4px 0; }
+.state { color:var(--dim); font-size:10.5px;
+         letter-spacing:.05em; }
+
+/* The four RAG counts beside a card, each with its initial. */
+.rags { display:flex; flex-wrap:wrap; gap:4px 10px; font-size:11px; }
+.rag { font-weight:600; }
+.rag.green { color:#7ee08f; }
+.rag.amber { color:#e8c46a; }
+.rag.red { color:#ff9d99; }
+.rag.grey { color:#a8b0bd; }
+
+/* NO DATA IS A STATE, NOT AN EMPTY PAGE. It gets the loudest surface the
+   stylesheet has, because a blank board reads as a clean fleet. */
+.unreachable { border:1px solid #5c2326; border-left:5px solid var(--fail);
+               background:#2a1416; border-radius:5px; padding:14px 16px; }
+.unreachable h2 { border-bottom-color:#5c2326; color:#ffb4b0; }
+.unreachable p { margin:7px 0; }
+
+.footer { margin-top:20px; border-top:1px solid var(--line); padding-top:9px; }
+
 @media (prefers-reduced-motion: reduce) {
   * { transition:none !important; animation:none !important;
       scroll-behavior:auto !important; }

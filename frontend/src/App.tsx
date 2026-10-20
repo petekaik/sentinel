@@ -11,7 +11,7 @@ export default function App() {
     <div className="wrap">
       <header><h1>Sentinel</h1></header>
       <nav>
-        <NavLink to="/">Overview</NavLink>
+        <NavLink to="/" end>Overview</NavLink>
         <NavLink to="/modules">Modules</NavLink>
         <NavLink to="/settings">Settings</NavLink>
         <NavLink to="/incidents">Incidents</NavLink>

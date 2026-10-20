@@ -125,9 +125,10 @@ def _specs_for(mod, specs, cfg=None):
     every configured device -- the detail page would show a module with no
     checks and no reason to think any were configured. The instances are built
     from a settings-only Context (the `context` hook does no I/O), and a module
-    whose settings do not parse contributes only its static rows: the page
-    already renders that failure as an UNKNOWN `check_instances` row, and it is
-    not this function's job to turn one module's bad `.env` into a 500.
+    whose settings do not parse contributes only its static rows: the failure
+    is carried to `/api/v1/status` as a module error and rendered as a banner,
+    and it is not this function's job to turn one module's bad `.env` into a
+    500.
     """
     per_box_targets = list(checks.expansion_targets([mod]))
     out = []

@@ -205,8 +205,9 @@ class Module:
             dashboard looks a reading up by `(target, metric, epoch)`, so two
             instances sharing a metric would each display the other's number.
           * Settings are operator input: a parse failure should raise, and both
-            readers isolate it -- the collector notes it and continues the epoch;
-            the page renders an UNKNOWN `check_instances` row for the module.
+            readers isolate it -- the collector notes it and continues the
+            epoch; the failure travels to `/api/v1/status` as a module error and
+            the SPA renders it as a banner naming the module and the reason.
         """
         if self._check_instances is not None:
             return list(self._check_instances(ctx))

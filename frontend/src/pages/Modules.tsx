@@ -15,12 +15,21 @@ export default function Modules() {
   const [modules, setModules] = useState<ModuleManifest[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [readOnly, setReadOnly] = useState(() => !hasToken());
+  const [writesEnabled, setWritesEnabled] = useState<boolean | null>(null);
   const [tokenOpen, setTokenOpen] = useState(false);
   const retry = useRef<(() => void) | null>(null);
 
   async function load() {
     try {
-      setModules(await api.modules());
+      // The status read is BEST-EFFORT, and it is what stops this page saying
+      // "writes unlocked" beside a toggle that can only come back 403: a token
+      // in this browser cannot make a token-less server writable.
+      const [mods, status] = await Promise.all([
+        api.modules(),
+        api.status().catch(() => null),
+      ]);
+      setModules(mods);
+      setWritesEnabled(status ? status.writes_enabled : null);
       setError(null);
     } catch (e) {
       setError(message(e));
@@ -54,7 +63,9 @@ export default function Modules() {
         collection; it stays configurable here.
       </p>
       <div className="setting-actions">
-        {readOnly ? (
+        {writesEnabled === false ? (
+          <span className="badge source">writes disabled on the server</span>
+        ) : readOnly ? (
           <button type="button" onClick={() => setTokenOpen(true)}>
             Unlock writes
           </button>
@@ -63,6 +74,12 @@ export default function Modules() {
         )}
         {error && <em role="alert">{error}</em>}
       </div>
+      {writesEnabled === false && (
+        <p className="notice">
+          Read-only: this monitor has no <code>SENTINEL_WRITE_TOKEN</code>{" "}
+          configured, so every enable/disable below will be refused.
+        </p>
+      )}
       <div className="grid">
         {ordered.map((mod) => (
           <article key={mod.id} className="module-card">

@@ -110,6 +110,25 @@ class Config:
                 "SENTINEL_ADVISOR_MAX_HISTORY_DAYS must be >= 0, got %d" % cap)
         self.advisor_max_history_days = cap
 
+        # CADENCE AND BUDGET. An advisor is a periodic analyst, not a
+        # per-epoch check: measured 2026-10-20, the reference advisor still
+        # took ~28 s after its statistics moved into SQL, and running it every
+        # 60 s stretched the collector. The default cadence is one run per
+        # five minutes, and the budget is a realistic 30 s rather than the
+        # original 5 s placeholder. Both remain operator knobs; zero or
+        # negative is refused because it would mean "never run" or "always
+        # over budget", neither of which is a threshold someone wrote.
+        interval = int(_env("SENTINEL_ADVISOR_INTERVAL_S", "300", e))
+        if interval <= 0:
+            raise ValueError(
+                "SENTINEL_ADVISOR_INTERVAL_S must be > 0, got %d" % interval)
+        self.advisor_interval_s = interval
+        budget = int(_env("SENTINEL_ADVISOR_BUDGET_MS", "30000", e))
+        if budget <= 0:
+            raise ValueError(
+                "SENTINEL_ADVISOR_BUDGET_MS must be > 0, got %d" % budget)
+        self.advisor_budget_ms = budget
+
         # How long an operator has to decide a proposal. EXPIRY IS A REAL
         # DEADLINE, not a display nicety: an approval is a statement about the
         # incident as it stands, and a proposal acted on three days later is an

@@ -1283,6 +1283,58 @@ def test_the_reference_advisor_is_on_by_default_and_none_switches_it_off(results
         _close(tmp, conn)
 
 
+def test_advisors_run_on_a_cadence(results):
+    """A periodic analyst, not a per-epoch check. The reference advisor still
+    took ~28 s after its statistics moved into SQL; running it every 60 s
+    stretches the collector. A skipped run writes no row."""
+    import collect
+    import config as config_mod
+
+    class Adv(_Good):
+        id = "cad"
+
+        def advise(self, ctx_, snapshot):
+            return []
+
+    tmp, conn = _store()
+    try:
+        cfg = config_mod.Config(env={"SENTINEL_ADVISORS": "cad",
+                                     "SENTINEL_ADVISOR_INTERVAL_S": "60"})
+        first = collect.run_advisors_for_epoch(
+            cfg, conn, _FakeCtx([_FakeModule("fleet", [Adv()])]),
+            enforce_cadence=True)
+        n1 = conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_run").fetchone()["n"]
+        second = collect.run_advisors_for_epoch(
+            cfg, conn, _FakeCtx([_FakeModule("fleet", [Adv()])]),
+            enforce_cadence=True)
+        n2 = conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_run").fetchone()["n"]
+        conn.execute("UPDATE advisor_run SET ts = ts - 120")
+        third = collect.run_advisors_for_epoch(
+            cfg, conn, _FakeCtx([_FakeModule("fleet", [Adv()])]),
+            enforce_cadence=True)
+        n3 = conn.execute(
+            "SELECT COUNT(*) AS n FROM advisor_run").fetchone()["n"]
+        results.check(
+            "an advisor runs once per cadence, not once per epoch",
+            len(first) == 1 and second == [] and len(third) == 1
+            and (n1, n2, n3) == (1, 1, 2),
+            "runs=%r rows=%r. The second call inside the interval must do "
+            "nothing and write nothing; the third, after the interval, must "
+            "run."
+            % ((len(first), len(second), len(third)), (n1, n2, n3)))
+        defaults = config_mod.Config(env={})
+        results.check(
+            "the advisor cadence and budget defaults are realistic",
+            defaults.advisor_interval_s == 300
+            and defaults.advisor_budget_ms == 30000,
+            "cadence=%r budget=%r" % (defaults.advisor_interval_s,
+                                      defaults.advisor_budget_ms))
+    finally:
+        _close(tmp, conn)
+
+
 def _add_series(conn, now, metric, values, span_days=7.0, target="cubox-1"):
     """Evenly spaced samples over `span_days`, newest at `now`."""
     n = len(values)
@@ -2901,6 +2953,7 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_every_read_is_bounded_by_the_row_cap,
          test_the_second_positional_is_a_limit_not_a_target,
          test_sample_stats_compute_the_window_in_sql,
+         test_advisors_run_on_a_cadence,
          test_the_snapshot_offers_no_write_path,
          test_thresholds_and_settings_are_copies,
          test_insight_defaults_match_the_spec,

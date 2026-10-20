@@ -551,7 +551,7 @@ def _propose_thresholds(cfg, conn, ctx, runs):
     return written
 
 
-def run_advisors_for_epoch(cfg, conn, ctx):
+def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
     """Run the selected advisors of the enabled modules. NEVER raises.
 
     CALLED AFTER `record_collector_run()`, per the spec's epoch order: persist
@@ -646,8 +646,25 @@ def run_advisors_for_epoch(cfg, conn, ctx):
                 conn, ctx, want, module,
                 "selector names no advisor: %r" % want)
 
+        # CADENCE. Every selected advisor is due only if its last run row is
+        # older than the interval. A skipped advisor writes NO row: the last
+        # row it wrote is the evidence of when it last ran, and a synthetic
+        # "skipped" row every epoch would be noise. This is what keeps a 28 s
+        # analyst from stretching every 60 s collector epoch.
+        if enforce_cadence:
+            interval = getattr(cfg, "advisor_interval_s", 300)
+            now = time.time()
+            due = []
+            for adv in picked:
+                last = store.last_advisor_run(conn, str(adv.id))
+                if last is not None and (now - last["ts"]) < interval:
+                    continue
+                due.append(adv)
+            picked = due
+
         runs = advisors.run_advisors(
             picked, conn, ctx,
+            budget_ms=getattr(cfg, "advisor_budget_ms", 30000),
             history_cap_days=getattr(cfg, "advisor_max_history_days", 30),
             specs=getattr(ctx, "specs", None))
         # AFTER the insights are durable. A proposal whose evidence was never
@@ -768,7 +785,7 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
         # durable, and this row is now the dashboard's proof the monitor is
         # alive -- an advisor that hangs or overruns cannot take it away. Never
         # on a dry run, whose contract is "claims nothing".
-        run_advisors_for_epoch(cfg, conn, ctx)
+        run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=True)
         if seq % PRUNE_EVERY == 0:
             store.prune(conn)
 

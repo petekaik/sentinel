@@ -4,12 +4,68 @@
 class Setting:
     """One env-backed setting a module owns."""
 
-    def __init__(self, key, default="", kind="str"):
-        if kind not in ("str", "int", "bool"):
+    def __init__(self, key, default="", kind="str", label=None, help="",
+                 secret=False, choices=None, required=False, group=None,
+                 item_fields=None):
+        if kind not in ("str", "int", "bool", "json", "list"):
             raise ValueError("unknown setting kind %r" % kind)
         self.key = key
         self.default = default
         self.kind = kind
+        self.label = label or key
+        self.help = help
+        self.secret = bool(secret)
+        self.choices = tuple(choices) if choices else None
+        self.required = bool(required)
+        self.group = group
+        self.item_fields = tuple(item_fields or ())
+
+    def parse(self, value):
+        """Validate one value. Raises ValueError with a field message."""
+        if self.kind == "int":
+            return int(value)
+        if self.kind == "bool":
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ("1", "true", "yes", "on")
+        if self.kind in ("json", "list"):
+            import json
+            parsed = value if not isinstance(value, str) else json.loads(value)
+            if self.kind == "list" and not isinstance(parsed, list):
+                raise ValueError("%s must be a list" % self.key)
+            return parsed
+        text = "" if value is None else str(value)
+        if self.choices and text not in self.choices:
+            raise ValueError("%s must be one of %r" % (self.key, self.choices))
+        if self.required and not text.strip():
+            raise ValueError("%s is required" % self.key)
+        return text
+
+    def parse_item(self, items):
+        """Validate a list of dicts against item_fields."""
+        if self.kind != "list":
+            return None, "%s is not a list setting" % self.key
+        out = []
+        for i, item in enumerate(items or []):
+            if not isinstance(item, dict):
+                return None, "%s[%d] is not an object" % (self.key, i)
+            row = {}
+            for field in self.item_fields:
+                value = item.get(field["key"])
+                if field.get("required") and (value is None or value == ""):
+                    return None, "%s[%d].%s is required" % (
+                        self.key, i, field["key"])
+                row[field["key"]] = value
+            out.append(row)
+        return out, ""
+
+    def schema(self):
+        return {"key": self.key, "label": self.label, "kind": self.kind,
+                "default": self.default, "help": self.help,
+                "secret": self.secret, "choices": list(self.choices or ()),
+                "required": self.required, "group": self.group,
+                "item_fields": [dict(f) for f in self.item_fields],
+                "set": False}
 
     def resolve(self, env):
         raw = env.get(self.key)
@@ -28,7 +84,8 @@ class Module:
     def __init__(self, id, title, order=100, settings=(), targets=(),
                  threshold_file="thresholds.conf", context=None, preload=None,
                  checks=(), commands=None, actions=None, advisors=None,
-                 after_epoch=None, extra_check_ids=()):
+                 after_epoch=None, extra_check_ids=(), check_instances=None,
+                 validate_settings=None):
         for value, want, name in ((id, str, "id"), (title, str, "title"),
                                   (order, int, "order")):
             if not isinstance(value, want):
@@ -48,6 +105,8 @@ class Module:
         self._actions = actions or (lambda: [])
         self._advisors = advisors or (lambda: [])
         self._after_epoch = after_epoch
+        self._check_instances = check_instances
+        self._validate_settings = validate_settings
 
         # CHECK IDS THE MODULE OWNS THAT ARE NOT Check CLASSES. The collector
         # emits a few incidents itself (`host_unreachable`, `journal_capture`),
@@ -69,6 +128,18 @@ class Module:
 
     def check_classes(self):
         return self._checks
+
+    def check_instances(self, ctx):
+        """Instances built from settings. Empty unless the module says otherwise."""
+        if self._check_instances is not None:
+            return list(self._check_instances(ctx))
+        return []
+
+    def validate_settings(self, values):
+        """Cross-field check on a settings write: an error string or None."""
+        if self._validate_settings is not None:
+            return self._validate_settings(values)
+        return None
 
     def commands(self):
         return list(self._commands())

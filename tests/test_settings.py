@@ -128,12 +128,55 @@ def test_init_is_idempotent_with_a_setting_present(results):
     conn.close()
 
 
+def test_config_overlay_precedence_and_types(results):
+    import config as config_mod
+    tmp = tempfile.mkdtemp()
+    conn = _fresh(tmp)
+    cfg = config_mod.Config(env={"SNMP_TIMEOUT_S": "9",
+                                 "MONITOR_HOST_CUBOX_1_ADDR": "203.0.113.1"})
+    store.put_setting(conn, "snmp", "SNMP_TIMEOUT_S", 5, "op")
+    cfg.reload_settings(conn)
+    results.check(
+        "UI > env > default, applied to the effective env",
+        cfg.env["SNMP_TIMEOUT_S"] == "5"
+        and cfg.env["MONITOR_HOST_CUBOX_1_ADDR"] == "203.0.113.1",
+        "env=%r" % (cfg.env,))
+    store.delete_setting(conn, "snmp", "SNMP_TIMEOUT_S", "op")
+    cfg.reload_settings(conn)
+    results.check(
+        "removing an override falls back to env",
+        cfg.env["SNMP_TIMEOUT_S"] == "9", "env=%r" % (cfg.env,))
+    conn.close()
+
+
+def test_setting_metadata_and_list_validation(results):
+    from module import Setting
+    s = Setting("SNMP_DEVICES", "[]", "list",
+                label="Devices", secret=True,
+                item_fields=[{"key": "name", "kind": "str", "required": True},
+                             {"key": "community", "kind": "str", "secret": True}])
+    schema = s.schema()
+    results.check(
+        "a list setting carries its item schema and secret flag",
+        schema["kind"] == "list" and schema["secret"] is True
+        and schema["item_fields"][0]["required"] is True,
+        "schema=%r" % (schema,))
+    ok, why = s.parse_item([{"name": "sw1", "community": "public"}])
+    bad, why2 = s.parse_item([{"community": "public"}])
+    results.check(
+        "list items validate required fields",
+        ok is not None and bad is None and "name" in why2,
+        "ok=%r bad=%r why2=%r" % (ok, bad, why2))
+
+
 TESTS = (test_settings_round_trip_and_env_mapping,
          test_a_secret_is_redacted_in_the_change_log,
          test_delete_removes_the_override_and_logs_it,
          test_a_secret_is_redacted_on_reset,
          test_a_secret_survives_a_non_secret_overwrite_in_the_log,
-         test_init_is_idempotent_with_a_setting_present)
+         test_init_is_idempotent_with_a_setting_present,
+         test_config_overlay_precedence_and_types,
+         test_setting_metadata_and_list_validation)
 
 
 def main():

@@ -16,6 +16,8 @@ an explicit known_hosts file, and every one of those is a variable.
 import os
 import re
 
+import store
+
 
 def _env(name, default, env):
     v = env.get(name)
@@ -36,7 +38,12 @@ class Config:
         e = env if env is not None else os.environ
         # Module settings resolve against this same env; keeping it on the
         # object is what lets a module read a value the platform was given.
-        self.env = e
+        # `_base_env` is the file's side of the precedence -- .env then DB
+        # overrides -- and survives `reload_settings`, which replaces only the
+        # effective `env`.
+        self._base_env = dict(e)
+        self.env = dict(e)
+        e = self.env
 
         # ssh material. One key for everything, one known_hosts file. Both are
         # mounted read-only into the container. The fleet module builds its
@@ -152,6 +159,17 @@ class Config:
         self.llm_endpoint = _env("SENTINEL_LLM_ENDPOINT", "", e)
         self.llm_key = _env("SENTINEL_LLM_KEY", "", e)
         self.llm_model = _env("SENTINEL_LLM_MODEL", "", e)
+
+    def reload_settings(self, conn):
+        """Rebuild the effective env: .env then DB overrides.
+
+        Platform fields computed in `__init__` are not UI-editable in this
+        scope, so they are NOT re-derived here -- but `module_enabled()` and
+        every module config read `self.env`, so they see the override live.
+        """
+        effective = dict(self._base_env)
+        effective.update(store.setting_env(conn))
+        self.env = effective
 
     def module_enabled(self, module_id):
         return _bool("%s_ENABLED" % module_id.upper(), True, self.env)

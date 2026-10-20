@@ -103,6 +103,72 @@ td { padding:5px 7px; border-bottom:1px solid #1c212a; vertical-align:top;
 
 .footer { margin-top:20px; border-top:1px solid var(--line); padding-top:9px; }
 
+/* ---------------------------------------------------------------------------
+   Settings and module surfaces.
+   The controls are plain native inputs on purpose: a settings page is a form,
+   and a form that needs a component library to look like one is a dependency
+   that has to be served by the thing whose outage it is describing.
+   --------------------------------------------------------------------------- */
+
+.module-card { border:1px solid var(--line); border-radius:5px;
+               background:#171b21; padding:10px 12px; margin:0 0 14px; }
+.module-card h2 { margin-top:0; }
+.module-card h3 { margin:0; font-size:14px; font-weight:600; }
+.module-card p { margin:6px 0; }
+
+.settings-form { margin:8px 0 0; }
+.setting { display:flex; flex-direction:column; gap:4px;
+           padding:9px 0; border-bottom:1px solid #1c212a; }
+.setting:last-of-type { border-bottom:0; }
+.setting-head { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+.setting-head label, .setting-head .label { font-size:12.5px; font-weight:600; }
+.setting small { color:var(--dim); font-size:11.5px; }
+.setting-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+
+input, select, textarea, button { font:inherit; color:var(--fg);
+                                  background:#10151a; border:1px solid var(--line);
+                                  border-radius:4px; padding:6px 8px; }
+input[type="checkbox"] { width:auto; padding:0; }
+textarea { width:100%; resize:vertical; }
+button { cursor:pointer; }
+button:hover:not(:disabled) { border-color:#3a4755; }
+button:disabled, input:disabled, select:disabled, textarea:disabled {
+  opacity:.55; cursor:default; }
+a:focus-visible, button:focus-visible, input:focus-visible,
+select:focus-visible, textarea:focus-visible {
+  outline:2px solid #6cb6ff; outline-offset:1px; }
+
+.badge { display:inline-block; border-radius:3px; padding:0 5px;
+         font-size:10px; font-weight:600; background:#12351d; color:#7ee08f; }
+.badge.source { background:#272c34; color:var(--dim); }
+
+.switch { min-width:84px; font-size:11.5px; font-weight:600; }
+.switch.on { background:#12351d; border-color:#245c33; color:#7ee08f; }
+.switch.off { background:#272c34; color:#a8b0bd; }
+.enable-toggle { display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+                 margin:6px 0; }
+
+.list-editor { margin-top:4px; }
+.list-editor table { margin:4px 0 7px; }
+.list-editor td { padding:4px 5px; }
+.list-editor td input, .list-editor td select { width:100%; min-width:80px; }
+
+/* The write-token dialog. It overlays the page instead of replacing it: reads
+   stay visible while writes are locked, which is the whole point of a token
+   that is only needed for writes. */
+.dialog-overlay { position:fixed; inset:0; z-index:10; display:flex;
+                  align-items:center; justify-content:center;
+                  background:rgba(0,0,0,.62);
+                  padding:calc(16px + env(safe-area-inset-top, 0px))
+                          calc(16px + env(safe-area-inset-right, 0px))
+                          calc(16px + env(safe-area-inset-bottom, 0px))
+                          calc(16px + env(safe-area-inset-left, 0px)); }
+.dialog { width:min(460px, 100%); max-height:100%; overflow:auto;
+          background:var(--panel); border:1px solid var(--line);
+          border-radius:6px; padding:14px 16px; }
+.dialog h2 { margin-top:0; }
+.dialog .setting { border-bottom:0; }
+
 @media (prefers-reduced-motion: reduce) {
   * { transition:none !important; animation:none !important;
       scroll-behavior:auto !important; }

@@ -105,6 +105,63 @@ export type Status = {
   };
 };
 
+/* The /api/v1 settings contract. `SettingField` is the MANIFEST schema -- it
+   describes a setting and never carries a value. The value lives in
+   `SettingsView`, keyed by module then setting key; a secret's value is always
+   null there and only `secret_set` says whether an override exists. */
+export type ItemField = {
+  key: string;
+  label?: string;
+  kind?: "str" | "int" | "bool" | string;
+  help?: string;
+  secret?: boolean;
+  required?: boolean;
+  choices?: string[];
+};
+
+export type SettingField = {
+  key: string;
+  label: string;
+  kind: "str" | "int" | "bool" | "json" | "list" | string;
+  default?: any;
+  help?: string;
+  secret?: boolean;
+  choices?: string[];
+  required?: boolean;
+  group?: string | null;
+  item_fields?: ItemField[];
+  set?: boolean;
+};
+
+export type CheckManifest = {
+  id: string;
+  title: string;
+  spec: string | null;
+  unit: string;
+  direction: string;
+};
+
+export type ModuleManifest = {
+  id: string;
+  title: string;
+  order: number;
+  enabled: boolean;
+  targets: string[];
+  checks: CheckManifest[];
+  settings: SettingField[];
+  commands: { id: string; title: string; danger?: string | null }[];
+  actions: { id: string; title: string; danger?: string | null }[];
+};
+
+export type SettingState = {
+  value: any;
+  source?: string;
+  secret_set?: boolean;
+};
+
+export type ModuleSettingsView = Record<string, SettingState>;
+export type SettingsView = Record<string, ModuleSettingsView>;
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -115,6 +172,12 @@ export class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/* True for the one error a write token fixes. A 403 `writes_disabled` is NOT
+   this: no token can help until the server itself is configured. */
+export function isUnauthorized(e: unknown): e is ApiError {
+  return e instanceof ApiError && e.status === 401;
 }
 
 const token = () => sessionStorage.getItem("sentinel.token") || "";
@@ -162,15 +225,22 @@ async function req<T>(
 export const api = {
   status: (signal?: AbortSignal) =>
     req<Status>("GET", "/api/v1/status", undefined, signal),
-  modules: () => req<any[]>("GET", "/api/v1/modules"),
-  settings: () => req<any>("GET", "/api/v1/settings"),
+  modules: () => req<ModuleManifest[]>("GET", "/api/v1/modules"),
+  settings: () => req<SettingsView>("GET", "/api/v1/settings"),
   incidents: (signal?: AbortSignal) =>
     req<IncidentsPayload>("GET", "/api/v1/incidents", undefined, signal),
   proposals: () => req<any[]>("GET", "/api/v1/proposals"),
   putSettings: (id: string, body: unknown) =>
-    req<any>("PUT", `/api/v1/modules/${id}/settings`, body),
+    req<ModuleSettingsView>("PUT", `/api/v1/modules/${id}/settings`, body),
   deleteSetting: (id: string, key: string) =>
-    req<any>("DELETE", `/api/v1/modules/${id}/settings/${key}`),
+    req<ModuleSettingsView>(
+      "DELETE",
+      `/api/v1/modules/${id}/settings/${encodeURIComponent(key)}`,
+    ),
   setEnabled: (id: string, enabled: boolean) =>
-    req<any>("PUT", `/api/v1/modules/${id}/enabled`, { enabled }),
+    req<{ module: string; enabled: boolean }>(
+      "PUT",
+      `/api/v1/modules/${id}/enabled`,
+      { enabled },
+    ),
 };

@@ -647,14 +647,18 @@ def _static_file(path):
     without it, a sibling directory named `static-secrets` would pass.
     """
     rel = path.lstrip("/")
-    full = os.path.realpath(os.path.join(STATIC, rel))
-    if not full.startswith(os.path.realpath(STATIC) + os.sep):
-        return None, None
     try:
+        # REALPATH IS INSIDE THE TRY because it, not open(), is what a NUL byte
+        # in the name makes raise ValueError -- and an uncaught one reaches the
+        # outer handler as a 500 with a traceback instead of a miss.
+        root = os.path.realpath(STATIC)
+        full = os.path.realpath(os.path.join(STATIC, rel))
+        if not full.startswith(root + os.sep):
+            return None, None
         with open(full, "rb") as fh:
             return (fh.read(),
                     mimetypes.guess_type(full)[0] or "application/octet-stream")
-    except OSError:
+    except (OSError, ValueError):
         return None, None
 
 
@@ -721,6 +725,53 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, body, ctype, cache=shell.CACHE_CONTROL)
             return
+        # HASHED ASSETS. The name carries the digest, so an immutable cache can
+        # never answer with bytes from a different build. Served BEFORE the
+        # store for the same reason as the shell: it is a constant of the image,
+        # and an outage must not stop an already-loaded page fetching its CSS.
+        #
+        # FLAT, ONE SEGMENT, DELIBERATELY. Vite writes
+        # `assets/<name>-<hash>.<ext>`; without this check,
+        # `/assets/../index.html` normalises out of the asset directory and
+        # serves the SHELL with the immutable cache header -- measured, 200
+        # `text/html` immutable. The shell is the pointer to the current bundle,
+        # so caching it forever is exactly the staleness the design refuses. A
+        # traversal elsewhere in static/ is already refused by `_static_file`;
+        # this refuses the one that stays inside it.
+        if path.startswith("/assets/"):
+            name = path[len("/assets/"):]
+            body, ctype = (_static_file(path)
+                           if name and "/" not in name else (None, None))
+            if body is None:
+                self._send(404, "no such asset\n", "text/plain; charset=utf-8")
+                return
+            self._send(200, body, ctype, cache=ASSET_CACHE)
+            return
+        # EVERY NON-API, NON-HEALTH PATH IS THE SPA, AND IT IS ANSWERED BEFORE
+        # THE STORE IS OPENED. The shell is a constant of the image, and during
+        # a database outage the app must still load so it can render "cannot
+        # reach the monitor" from the 503 on /api/*. A shell that 503s leaves
+        # the browser showing plaintext, which is a dead-man switch that cannot
+        # say what is wrong. A deep link (/modules/fleet) reloads through this
+        # branch, so the SPA owns the whole non-API URL space. It is served
+        # no-store because it is the pointer to whatever bundle this image
+        # carries; a cached old shell would point at deleted asset names.
+        if path != "/healthz" and path != "/api" and not path.startswith("/api/"):
+            body, ctype = _static_file("/index.html")
+            if body is None:
+                self._send(500,
+                           "THE SPA BUILD IS MISSING from the image: "
+                           "app/static/index.html\n\n"
+                           "That is not an empty dashboard -- it is an image "
+                           "built without its committed frontend. Run "
+                           "scripts/build-frontend.sh and commit app/static.\n",
+                           "text/plain; charset=utf-8")
+                return
+            self._send(200, body, ctype,
+                       extra={"Content-Security-Policy": SHELL_CSP})
+            return
+        # ONLY /healthz AND /api* GET HERE, so this is the one point that needs
+        # the store.
         try:
             conn = store.connect(cfg.db_path, read_only=True)
         except Exception as exc:                   # noqa: BLE001 - rendered
@@ -788,51 +839,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(state, default=str, indent=1),
                            "application/json")
                 return
-            # HASHED ASSETS. The name carries the digest, so an immutable cache
-            # can never answer with bytes from a different build.
-            #
-            # FLAT, ONE SEGMENT, DELIBERATELY. Vite writes
-            # `assets/<name>-<hash>.<ext>`; without this check,
-            # `/assets/../index.html` normalises out of the asset directory and
-            # serves the SHELL with the immutable cache header -- measured, 200
-            # `text/html` immutable. The shell is the pointer to the current
-            # bundle, so caching it forever is exactly the staleness the design
-            # refuses. A traversal elsewhere in static/ is already refused by
-            # `_static_file`; this refuses the one that stays inside it.
-            if path.startswith("/assets/"):
-                name = path[len("/assets/"):]
-                body, ctype = (_static_file(path)
-                               if name and "/" not in name else (None, None))
-                if body is None:
-                    self._send(404, "no such asset\n",
-                               "text/plain; charset=utf-8")
-                    return
-                self._send(200, body, ctype, cache=ASSET_CACHE)
-                return
-            # AN API PATH IS NEVER THE SPA. Without this branch, `/api/typo`
-            # would answer index.html with 200 and a fetch() would try to parse
-            # HTML as JSON.
-            if path == "/api" or path.startswith("/api/"):
-                self._send(404, "no such path\n", "text/plain; charset=utf-8")
-                return
-            # EVERY OTHER PATH IS A CLIENT ROUTE -> THE SHELL. A deep link
-            # (/modules/fleet) is reloaded by the browser as a fresh request, so
-            # the SPA has to own the whole non-API URL space. It is served
-            # no-store because it is the pointer to whatever bundle this image
-            # carries; a cached old shell would point at deleted asset names.
-            body, ctype = _static_file("/index.html")
-            if body is None:
-                self._send(500,
-                           "THE SPA BUILD IS MISSING from the image: "
-                           "app/static/index.html\n\n"
-                           "That is not an empty dashboard -- it is an image "
-                           "built without its committed frontend. Run "
-                           "scripts/build-frontend.sh and commit app/static.\n",
-                           "text/plain; charset=utf-8")
-                return
-            self._send(200, body, ctype,
-                       extra={"Content-Security-Policy": SHELL_CSP})
-            return
+            # ONLY /healthz AND /api* REACH THIS POINT, and every matched route
+            # has returned; anything left is a path those surfaces do not own.
+            # An API-shaped typo must not fall through to the SPA (a fetch()
+            # would parse HTML as JSON), and it never reaches this line anyway
+            # because the shell branch above excludes /api*.
+            self._send(404, "no such path\n", "text/plain; charset=utf-8")
         except Exception as exc:                   # noqa: BLE001 - rendered
             import traceback
             if path.startswith("/api/v1"):

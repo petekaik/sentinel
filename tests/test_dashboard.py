@@ -579,31 +579,55 @@ def test_nothing_is_cached(results):
             httpd.shutdown()
             httpd.server_close()
 
-        # A database that cannot be opened is 503 with the sentence that says
-        # what it is not, and it carries the same no-cache headers -- an error
-        # page cached by a proxy would outlive the outage. The path's PARENT is
-        # absent, so nothing here can accidentally create the file first.
+        # A DATABASE THAT CANNOT BE OPENED. The SPA is a constant of the image,
+        # so it STILL LOADS -- that is what lets the browser render the
+        # outage -- while every observation path is a loud 503 that says it is
+        # not "no problems". An error page cached by a proxy would outlive the
+        # outage, so the 503 carries no-store too. The path's PARENT is absent,
+        # so nothing here can accidentally create the file first.
         broken_cfg = make_cfg(os.path.join(tmpdir, "no-such-dir", "monitor.sqlite"))
         httpd, base = _serve(broken_cfg)
         try:
-            code, hdrs, body = _get(base + "/")
-            results.check(
-                "an unopenable database is 503 and says it is NOT 'no problems'",
-                code == 503 and "not 'no problems'" in body
-                and "no data at all" in body,
-                "code=%s body=%r" % (code, body[:200]))
-            results.check(
-                "the 503 carries no-store too",
-                hdrs.get("Cache-Control") == CACHE,
-                "Cache-Control=%r" % hdrs.get("Cache-Control"))
+            for path in ("/", "/modules/fleet"):
+                code, hdrs, body = _get(base + path)
+                results.check(
+                    "%s still serves the SPA during a database outage" % path,
+                    code == 200 and 'id="root"' in body
+                    and hdrs.get("Cache-Control") == CACHE
+                    and hdrs.get("Content-Security-Policy") == web.SHELL_CSP,
+                    "code=%s cache=%r csp=%r -- a shell that 503s leaves the "
+                    "browser showing plaintext, which is a dead-man switch that "
+                    "cannot say what is wrong"
+                    % (code, hdrs.get("Cache-Control"),
+                       hdrs.get("Content-Security-Policy")))
+            asset = _hashed_asset()
+            if asset:
+                code, hdrs, body = _get(base + asset)
+                results.check(
+                    "a hashed asset still serves during a database outage",
+                    code == 200 and hdrs.get("Cache-Control") == web.ASSET_CACHE,
+                    "code=%s cache=%r -- the bundle is a constant of the image "
+                    "and an outage must not stop a loaded page fetching its CSS"
+                    % (code, hdrs.get("Cache-Control")))
             code, hdrs, body = _get(base + "/api/status.json")
             results.check(
                 "an unopenable database is NOT a 200 on the status API",
-                code == 503 and "not 'no problems'" in body,
+                code == 503 and "not 'no problems'" in body
+                and "no data at all" in body,
                 "code=%s body=%r -- an API that answers 200 with a well-formed "
                 "document while it cannot read its own store is a false GREEN "
                 "delivered straight to whatever integrates with it"
                 % (code, body[:200]))
+            results.check(
+                "the 503 carries no-store too",
+                hdrs.get("Cache-Control") == CACHE,
+                "Cache-Control=%r" % hdrs.get("Cache-Control"))
+            code, hdrs, body = _get(base + "/healthz")
+            results.check(
+                "the health probe is 503 during an outage, not 200",
+                code == 503 and "not 'no problems'" in body,
+                "code=%s -- healthz asserting anything while the store cannot be "
+                "read is the false green one layer out" % code)
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -1632,7 +1656,18 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
                         "code=%s Cache-Control=%r -- the app shell is a constant "
                         "of the image, so an outage must not stop it being served"
                         % (code, hdrs.get("Cache-Control")))
+                # THE SHELL ANSWERS AND THE OBSERVATION PATH DOES NOT. Both
+                # halves are load-bearing: the shell answering alone would pass
+                # vacuously the day this config stops being unopenable, so the
+                # guard also asserts an observation path does NOT answer under
+                # it -- the same two-sided shape as the cache mutation.
                 code, _h, _b = _get(base2 + "/")
+                results.check(
+                    "the SPA shell is served while the store cannot be opened",
+                    code == 200,
+                    "code=%s -- the shell is a constant of the image, so an "
+                    "outage must not stop it loading" % code)
+                code, _h, _b = _get(base2 + "/api/status.json")
                 results.check(
                     "an observation path does NOT answer under the same config",
                     code != 200,
@@ -1660,6 +1695,18 @@ def test_the_app_shell_may_cache_and_nothing_else_may(results):
             "the shell is titled Sentinel",
             "<title>Sentinel</title>" in index,
             "the title is not the platform's name")
+        # THE MANIFEST DOES NOT SUBSTITUTE FOR THESE. iOS reads the apple-*
+        # meta tags when installing to the home screen; without the
+        # black-translucent status bar the safe-area insets above stay zero and
+        # the page stops clearing the Dynamic Island.
+        results.check(
+            "the shell carries the iOS home-screen tags",
+            'rel="apple-touch-icon"' in index
+            and 'name="apple-mobile-web-app-capable"' in index
+            and 'name="apple-mobile-web-app-title"' in index
+            and 'black-translucent' in index
+            and 'name="theme-color"' in index,
+            "the built head is missing an apple-* tag or the theme colour")
         results.check(
             "there is no service worker, deliberately",
             "serviceWorker" not in index and "sw.js" not in index,

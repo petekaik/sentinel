@@ -688,16 +688,28 @@ def test_the_committed_spa_is_served(results):
         "the built index has no #root -- the bundle would mount on null and the "
         "page would be blank with no error a server log can see")
 
-    # THE TRAVERSAL GUARD, from both spellings. The guard is a realpath prefix,
-    # not a '..' search, because a symlink escapes the same way a dotted segment
-    # does -- so the test asks the function, not a regex.
+    # THE TRAVERSAL GUARD, ASKED ABOUT A SIBLING THAT EXISTS. `/../etc/passwd`
+    # would return (None, None) from a function with NO guard at all -- the file
+    # does not exist, so open() fails and the assertion proves only that. The
+    # two paths below DO exist (app/web.py is beside app/static/), so a
+    # traversal without the realpath prefix would serve source code. The guard
+    # is a realpath prefix rather than a '..' search because a symlink escapes
+    # the same way a dotted segment does.
+    #
+    # NOTHING ENCODED IS ASSERTED HERE: the server never percent-decodes the
+    # path, so `%2e%2e` is an ordinary filename that happens not to exist --
+    # a check on it could not fail on a missing guard and is not evidence.
     results.check(
         "a path traversal cannot leave app/static",
-        web._static_file("/../etc/passwd") == (None, None)
-        and web._static_file("/assets/../../etc/passwd") == (None, None)
-        and web._static_file("/%2e%2e/etc/passwd") == (None, None),
+        web._static_file("/../web.py") == (None, None)
+        and web._static_file("/assets/../../web.py") == (None, None),
         "a traversal returned bytes -- realpath+prefix must reject a sibling "
-        "escape and an encoded one before open() is ever called")
+        "escape before open() is ever called")
+    results.check(
+        "a NUL byte in the name is a miss, not a 500",
+        web._static_file("/a\x00b") == (None, None),
+        "open() raises ValueError for a NUL byte; uncaught it reaches the outer "
+        "handler and becomes a 500 with a traceback")
 
     assets = os.path.join(web.STATIC, "assets")
     names = sorted(os.listdir(assets)) if os.path.isdir(assets) else []

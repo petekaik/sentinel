@@ -8,6 +8,7 @@ otherwise is the "measured nothing" failure this platform exists to prevent.
 """
 
 import copy
+import math
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -186,6 +187,37 @@ class Snapshot:
             self.truncated[key] = True
             rows = rows[:cap]
         return [dict(r) for r in reversed(rows)]
+
+    def sample_stats(self, since, target, metric, pct=95):
+        """Count, span and a nearest-rank percentile for one series, in SQL.
+
+        WHY THIS EXISTS BESIDE `sample_series`. Reading every row of every
+        series into Python to compute one p95 measured 43.5 s on the live
+        store (40-odd series of up to 20k rows each) against a 5 s advisor
+        budget. SQLite orders the same values in C and returns ONE row, so
+        the advisor gets the same statistic without the transfer.
+
+        `value IS NOT NULL` is part of the series: text-only samples are not
+        numbers and must not shift a percentile. Returns None when the series
+        is empty; the caller reports the window, never a value.
+        """
+        if self._conn is None:
+            return None
+        row = self._conn.execute(
+            "SELECT COUNT(*), MIN(ts), MAX(ts) FROM sample "
+            "WHERE ts >= ? AND target = ? AND metric = ? "
+            "AND value IS NOT NULL", (since, target, metric)).fetchone()
+        count, min_ts, max_ts = row[0], row[1], row[2]
+        if not count:
+            return None
+        pct = min(100.0, max(0.0, float(pct)))
+        offset = max(0, min(count - 1, math.ceil(pct / 100.0 * count) - 1))
+        prow = self._conn.execute(
+            "SELECT value FROM sample WHERE ts >= ? AND target = ? AND "
+            "metric = ? AND value IS NOT NULL ORDER BY value LIMIT 1 OFFSET ?",
+            (since, target, metric, offset)).fetchone()
+        return {"count": count, "min_ts": min_ts, "max_ts": max_ts,
+                "percentile": prow[0] if prow else None}
 
     def incidents(self, since, limit=None):
         rows = self._rows(

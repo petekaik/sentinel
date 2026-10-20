@@ -236,10 +236,43 @@ def test_the_second_positional_is_a_limit_not_a_target(results):
         _close(tmp, conn)
 
 
+def test_sample_stats_compute_the_window_in_sql(results):
+    """The reference advisor's 43.5 s came from fetching ~800k rows to get one
+    p95. The statistic must come back from SQL, with the same nearest-rank
+    definition the Python helper used, and NULL values must not shift it."""
+    tmp, conn = _store()
+    try:
+        now = 1_800_000_000
+        values = [600.0] * 28 + [700.0] * 2 + [100.0]
+        for i, value in enumerate(values):
+            conn.execute(
+                "INSERT INTO sample (ts, epoch_seq, target, metric, value) "
+                "VALUES (?,?,?,?,?)",
+                (now - 7 * 86400 + i * 3600, i, "local", "m", value))
+        conn.execute(
+            "INSERT INTO sample (ts, epoch_seq, target, metric, value) "
+            "VALUES (?,?,?,?,NULL)", (now, 99, "local", "m"))
+        s = advisors.Snapshot(conn, now)
+        stats = s.sample_stats(now - 8 * 86400, "local", "m", 95)
+        results.check(
+            "sample_stats returns count, span and the nearest-rank p95",
+            stats["count"] == 31 and stats["percentile"] == 700.0
+            and stats["min_ts"] < stats["max_ts"],
+            "stats=%r -- expected 31 samples (NULL ignored) and p95 700"
+            % (stats,))
+        results.check(
+            "an empty series has no stats at all",
+            s.sample_stats(now, "local", "absent", 95) is None,
+            "an empty series must return None, never a zero")
+    finally:
+        _close(tmp, conn)
+
+
 def test_the_snapshot_offers_no_write_path(results):
     s = advisors.Snapshot(_Conn(0), 0)
     public = {n for n in dir(s) if not n.startswith("_")}
     allowed = {"check_runs", "samples", "sample_keys", "sample_series",
+               "sample_stats",
                "incidents", "logs", "thresholds", "settings", "specs", "window",
                "requested_days", "available_days", "now", "caps", "truncated",
                "max_days"}
@@ -1473,16 +1506,20 @@ def test_a_truncated_series_never_supplies_a_percentile(results):
                                  specs={"mem_available_mb": spec})
         out = intelligence.ReferenceAdvisor().advise(None, snap)
         key = advisors.series_key("cubox-1", "mem_available_mb")
+        stats = snap.sample_stats(now - 8 * DAY, "cubox-1",
+                                  "mem_available_mb", 95)
         results.check(
-            "a capped series records its truncation and yields no suggestion",
+            "the statistic is computed over the WHOLE window, not a capped slice",
             out == []
-            and snap.truncated.get(key) is True
-            and intelligence._percentile([100.0] * 20 + [700.0] * 10, 95)
-            == 700.0,
-            "out=%r truncated=%r. The full-window p95 is 700 (inside "
-            "650..800); the capped newest slice says 100. Reporting 100 would "
-            "suggest a band change that the window does not support."
-            % (out, snap.truncated))
+            and stats["count"] == 30
+            and stats["percentile"] == 700.0
+            and snap.truncated.get(key) is None,
+            "out=%r stats=%r truncated=%r. The old reader fetched a newest-"
+            "first capped slice (all 100) and had to suppress the suggestion "
+            "when truncated; the SQL statistic sees all 30 samples and the "
+            "true p95 (700, inside 650..800), so there is nothing to suggest "
+            "and nothing to truncate."
+            % (out, stats, snap.truncated))
     finally:
         _close(tmp, conn)
 
@@ -2863,6 +2900,7 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_logs_are_bounded_by_bytes_and_rows,
          test_every_read_is_bounded_by_the_row_cap,
          test_the_second_positional_is_a_limit_not_a_target,
+         test_sample_stats_compute_the_window_in_sql,
          test_the_snapshot_offers_no_write_path,
          test_thresholds_and_settings_are_copies,
          test_insight_defaults_match_the_spec,

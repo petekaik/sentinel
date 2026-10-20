@@ -17,9 +17,12 @@ advisor) owns any change.
 WINDOW HONESTY. Every insight states `requested_days` (the ask) beside
 `available_days` (the history that exists), and carries the snapshot's
 truncation flag when a read hit the platform cap. Each sample series is read
-under its own cap (`Snapshot.sample_series`), so a busy metric cannot starve the
-window down to a few hours; a series that still hits its cap produces no
-suggestion at all rather than a confident wrong one.
+per (target, metric), so a busy metric cannot starve the window down to a few
+hours. The p95 and the span are computed in SQL
+(`Snapshot.sample_stats`) rather than by fetching every sample: the first
+implementation read ~800k rows per epoch and measured 43.5 s against a 5 s
+budget. A series too short to judge produces no suggestion at all rather than a
+confident wrong one.
 
 "Outside the band" means on the FAILING side of `amber`. A metric healthier
 than `green` needs no band change -- the band's job is to catch the bad end,
@@ -149,9 +152,9 @@ class ReferenceAdvisor(advisors.Advisor):
 
     def _suggestions(self, snapshot, since, window):
         read_keys = getattr(snapshot, "sample_keys", None)
-        read_series = getattr(snapshot, "sample_series", None)
+        read_stats = getattr(snapshot, "sample_stats", None)
         specs = getattr(snapshot, "specs", None) or {}
-        if not (callable(read_keys) and callable(read_series)) or not specs:
+        if not (callable(read_keys) and callable(read_stats)) or not specs:
             return []
 
         # One spec per metric name. Two specs sharing a metric are a
@@ -184,32 +187,26 @@ class ReferenceAdvisor(advisors.Advisor):
                 # fault"), not an over-tight number. No percentile improves it.
                 continue
 
-            # READ, then judge the truncation. Checking the flag before the
-            # read is dead code: the flag is set BY the read, so a pre-check
-            # reasons over the newest capped slice and calls it the window.
-            points = []
-            for row in read_series(since, target, metric) or ():
-                try:
-                    value = float(row.get("value"))
-                except (TypeError, ValueError):
-                    continue
-                points.append((float(row.get("ts") or 0), value))
-            series = advisors.series_key(target, metric)
-            if getattr(snapshot, "truncated", {}).get(series):
+            # THE STATISTIC IS COMPUTED IN SQL, NOT BY FETCHING ROWS. The
+            # first implementation read every sample of every series into
+            # Python; on the live store that was ~800k rows and 43.5 s against
+            # a 5 s budget. `sample_stats` returns count/span/percentile from
+            # SQLite and the advisor judges those numbers.
+            stats = read_stats(since, target, metric, self.percentile)
+            if not stats or stats.get("percentile") is None:
                 continue
-            values = [value for _ts, value in points]
-            if len(values) < self.min_samples:
+            if stats["count"] < self.min_samples:
                 continue
-            stamps = [ts for ts, _value in points]
-            span_days = (max(stamps) - min(stamps)) / DAY if len(stamps) > 1 \
-                else 0.0
+            if stats.get("min_ts") is None or stats.get("max_ts") is None:
+                continue
+            span_days = (stats["max_ts"] - stats["min_ts"]) / DAY
             # 90% of the minimum span: a full week of minute samples starts one
             # interval after `since`, and demanding the exact span would make
             # the advisor permanently silent on a healthy store.
             if span_days < self.min_history_days * 0.9:
                 continue
 
-            observed = _percentile(values, self.percentile)
+            observed = float(stats["percentile"])
             direction = getattr(spec, "direction", "")
             if direction == "high_is_good":
                 gap = spec.amber - observed
@@ -234,13 +231,13 @@ class ReferenceAdvisor(advisors.Advisor):
             proposed = {"green": spec.green, "amber": proposed_amber}
             unit = getattr(spec, "unit", "") or ""
 
-            evidence = _evidence(snapshot, window, only=series)
+            evidence = _evidence(snapshot, window)
             evidence.update({
                 "metric": metric,
                 "target": target,
                 "percentile": self.percentile,
                 "observed": observed,
-                "samples": len(values),
+                "samples": stats["count"],
                 "span_days": round(span_days, 2),
                 "direction": direction,
                 "unit": unit,
@@ -266,7 +263,7 @@ class ReferenceAdvisor(advisors.Advisor):
                       "(`--proposals`) owns any change, and the next epoch "
                       "still grades with the current band."
                       % (self.percentile, _fmt(window["available_days"]),
-                         len(values), span_days, _fmt(observed), unit,
+                         stats["count"], span_days, _fmt(observed), unit,
                          _fmt(spec.green), _fmt(spec.amber), direction,
                          _fmt(step), _fmt(proposed["green"]),
                          _fmt(proposed["amber"]))),

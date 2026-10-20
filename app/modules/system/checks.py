@@ -344,7 +344,8 @@ def _parse_mdstat(text):
 
     An array block starts at `mdN :` and runs until the next one. The member
     state is the `[UU]` / `[U_]` line; the rebuild marker is any `resync =`,
-    `recovery =`, `reshape =` or `check =` line inside the block.
+    `recovery =` or `reshape =` line inside the block. A `check =` line is a
+    scrub with redundancy intact, not a rebuild, and is not listed here.
     """
     arrays = {}
     order = []

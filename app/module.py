@@ -21,9 +21,24 @@ class Setting:
         self.item_fields = tuple(item_fields or ())
 
     def parse(self, value):
-        """Validate one value. Raises ValueError with a field message."""
+        """Validate one value. Raises ValueError with a field message.
+
+        `choices` and `required` apply to `kind == "str"` only.
+        """
         if self.kind == "int":
-            return int(value)
+            # STRICT: `int(True)` is 1 and `int(5.9)` is 5, so a bool or a
+            # fractional float would pass while meaning something else.
+            if isinstance(value, bool):
+                raise ValueError("%s must be an integer, got %r"
+                                 % (self.key, value))
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError("%s must be an integer, got %r"
+                                 % (self.key, value))
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                raise ValueError("%s must be an integer, got %r"
+                                 % (self.key, value))
         if self.kind == "bool":
             if isinstance(value, bool):
                 return value
@@ -42,7 +57,12 @@ class Setting:
         return text
 
     def parse_item(self, items):
-        """Validate a list of dicts against item_fields."""
+        """Validate a list of dicts against `item_fields`.
+
+        Rows are NORMALISED to the declared fields: an undeclared key is
+        dropped, and a declared optional field is present as `None` when the
+        input omits it. Returns `(rows, "")`, or `(None, why)`.
+        """
         if self.kind != "list":
             return None, "%s is not a list setting" % self.key
         out = []

@@ -159,14 +159,66 @@ def test_setting_metadata_and_list_validation(results):
     results.check(
         "a list setting carries its item schema and secret flag",
         schema["kind"] == "list" and schema["secret"] is True
-        and schema["item_fields"][0]["required"] is True,
+        and schema["item_fields"][0]["required"] is True
+        and "value" not in schema,
         "schema=%r" % (schema,))
-    ok, why = s.parse_item([{"name": "sw1", "community": "public"}])
+    ok, why = s.parse_item([{"name": "sw1", "community": "public",
+                             "undeclared": "dropped"}])
     bad, why2 = s.parse_item([{"community": "public"}])
     results.check(
-        "list items validate required fields",
-        ok is not None and bad is None and "name" in why2,
+        "list items validate required fields and normalise to declared ones",
+        ok == [{"name": "sw1", "community": "public"}]
+        and bad is None and "name" in why2,
         "ok=%r bad=%r why2=%r" % (ok, bad, why2))
+
+
+def test_setting_parse_validation(results):
+    from module import Setting
+
+    def refuses(setting, value):
+        try:
+            setting.parse(value)
+        except ValueError:
+            return True
+        return False
+
+    n = Setting("N", "0", "int")
+    results.check(
+        "int accepts digits and refuses bools and fractional floats",
+        n.parse(5) == 5 and n.parse("7") == 7
+        and refuses(n, True) and refuses(n, False) and refuses(n, 5.9),
+        "parse(5)=%r parse('7')=%r"
+        % (n.parse(5), n.parse("7")))
+    b = Setting("B", "0", "bool")
+    results.check(
+        "bool accepts the documented truthy spellings",
+        b.parse("yes") is True and b.parse("0") is False
+        and b.parse(True) is True,
+        "yes=%r 0=%r" % (b.parse("yes"), b.parse("0")))
+    j = Setting("J", "{}", "json")
+    l = Setting("L", "[]", "list")
+    results.check(
+        "json and list decode strings and keep parsed values",
+        j.parse('{"a": 1}') == {"a": 1} and j.parse({"a": 1}) == {"a": 1}
+        and l.parse("[1, 2]") == [1, 2] and refuses(l, {"a": 1}),
+        "j=%r l=%r" % (j.parse('{"a": 1}'), l.parse("[1, 2]")))
+    c = Setting("C", "a", "str", choices=("a", "b"))
+    r = Setting("R", "", "str", required=True)
+    results.check(
+        "str refuses an unlisted choice and a blank required value",
+        c.parse("a") == "a" and refuses(c, "c")
+        and r.parse("x") == "x" and refuses(r, "  "),
+        "c=%r r=%r" % (c.parse("a"), r.parse("x")))
+
+
+def test_module_hook_defaults(results):
+    from module import Module
+    m = Module(id="probe", title="Probe")
+    results.check(
+        "the default hooks return [] and None",
+        m.check_instances(None) == [] and m.validate_settings({}) is None,
+        "instances=%r why=%r" % (m.check_instances(None),
+                                 m.validate_settings({})))
 
 
 TESTS = (test_settings_round_trip_and_env_mapping,
@@ -176,7 +228,9 @@ TESTS = (test_settings_round_trip_and_env_mapping,
          test_a_secret_survives_a_non_secret_overwrite_in_the_log,
          test_init_is_idempotent_with_a_setting_present,
          test_config_overlay_precedence_and_types,
-         test_setting_metadata_and_list_validation)
+         test_setting_metadata_and_list_validation,
+         test_setting_parse_validation,
+         test_module_hook_defaults)
 
 
 def main():

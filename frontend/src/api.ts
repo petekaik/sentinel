@@ -148,6 +148,9 @@ export type ModuleManifest = {
   enabled: boolean;
   targets: string[];
   checks: CheckManifest[];
+  /* Check ids the module owns but no Check class declares (collector-emitted
+     rows such as host_unreachable). Ownership is by id, never by target. */
+  extra_check_ids: string[];
   settings: SettingField[];
   commands: { id: string; title: string; danger?: string | null }[];
   actions: { id: string; title: string; danger?: string | null }[];

@@ -90,6 +90,13 @@ def test_manifest_carries_the_schema_and_never_a_secret(results):
         any(s["key"] == "MONITOR_HOST_CUBOX_1_ADDR" for s in fleet["settings"])
         and all("value" not in s for m in manifests for s in m["settings"]),
         "manifest=%r" % (fleet,))
+    results.check(
+        "the manifest names the collector-owned check ids the module owns",
+        "host_unreachable" in fleet.get("extra_check_ids", [])
+        and all("extra_check_ids" in m for m in manifests),
+        "fleet extra_check_ids=%r -- a reader needs the ids, because two "
+        "modules can share a target and a target set cannot say whose row it "
+        "is" % (fleet.get("extra_check_ids"),))
 
     probe = _secret_module()
     settingsapi.write_settings(cfg, conn, probe, {"PROBE_TOKEN": "s3cret"},

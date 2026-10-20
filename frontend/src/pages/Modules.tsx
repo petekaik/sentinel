@@ -98,7 +98,12 @@ export default function Modules() {
       </div>
       <TokenDialog
         open={tokenOpen}
-        onClose={() => setTokenOpen(false)}
+        onClose={() => {
+          // A cancelled prompt must not leave a write armed to run later with
+          // a token the operator never supplied for it.
+          retry.current = null;
+          setTokenOpen(false);
+        }}
         onSaved={() => {
           setReadOnly(false);
           retry.current?.();

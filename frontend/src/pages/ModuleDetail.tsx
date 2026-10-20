@@ -93,10 +93,24 @@ export default function ModuleDetail() {
     );
   }
 
-  const checkIds = new Set(mod.checks.map((c) => c.id));
+  const owned = new Set([
+    ...mod.checks.map((c) => c.id),
+    ...(mod.extra_check_ids ?? []),
+  ]);
   const targets = new Set(mod.targets);
+  const otherOwned = new Set(
+    modules
+      .filter((m) => m.id !== mod.id)
+      .flatMap((m) => [
+        ...m.checks.map((c) => c.id),
+        ...(m.extra_check_ids ?? []),
+      ]),
+  );
+  // Ownership is by CHECK ID, never by target: two modules can share a target
+  // (`storage`, `fleet`). Target is only the fallback for a row no manifest can
+  // name -- a dynamic instance, which Task 9 will add to the manifest.
   const belongs = (target: string, checkId: string) =>
-    checkIds.has(checkId) || targets.has(target);
+    owned.has(checkId) || (!otherOwned.has(checkId) && targets.has(target));
   const flagged = (status?.worst ?? []).filter((r) =>
     belongs(r.target, r.check_id),
   );
@@ -199,6 +213,7 @@ export default function ModuleDetail() {
             <thead>
               <tr>
                 <th>Check</th>
+                <th>Target</th>
                 <th>Status now</th>
                 <th>Spec</th>
                 <th>Unit</th>
@@ -207,48 +222,57 @@ export default function ModuleDetail() {
               </tr>
             </thead>
             <tbody>
-              {mod.checks.map((check) => {
-                const bad = flagged.find((r) => r.check_id === check.id);
-                const info = informational.find((r) => r.check_id === check.id);
-                const incident = incidents.find(
-                  (r) => r.check_id === check.id,
-                );
-                const row = bad ?? info;
-                return (
-                  <tr key={check.id}>
-                    <td>
-                      <strong>{check.title}</strong>
-                      <br />
-                      <span className="sub">{check.id}</span>
-                    </td>
-                    <td>
-                      {row ? (
-                        <StatusPill status={row.status} />
-                      ) : incident ? (
-                        <StatusPill status={incident.severity} />
-                      ) : (
-                        <span className="sub">not flagged in this read</span>
-                      )}
-                    </td>
-                    <td>{check.spec ?? "—"}</td>
-                    <td>{check.unit || "—"}</td>
-                    <td>{check.direction || "—"}</td>
-                    <td>
-                      {row
-                        ? row.detail || value(row)
-                        : incident
-                          ? incident.detail ?? "—"
-                          : "—"}
-                    </td>
-                  </tr>
-                );
-              })}
+              {mod.targets.flatMap((target) =>
+                mod.checks.map((check) => {
+                  const bad = flagged.find(
+                    (r) => r.check_id === check.id && r.target === target,
+                  );
+                  const info = informational.find(
+                    (r) => r.check_id === check.id && r.target === target,
+                  );
+                  const incident = incidents.find(
+                    (r) => r.check_id === check.id && r.target === target,
+                  );
+                  const row = bad ?? info;
+                  return (
+                    <tr key={`${check.id}|${target}`}>
+                      <td>
+                        <strong>{check.title}</strong>
+                        <br />
+                        <span className="sub">{check.id}</span>
+                      </td>
+                      <td>{target}</td>
+                      <td>
+                        {row ? (
+                          <StatusPill status={row.status} />
+                        ) : incident ? (
+                          <StatusPill status={incident.severity} />
+                        ) : (
+                          <span className="sub">not flagged in this read</span>
+                        )}
+                      </td>
+                      <td>{check.spec ?? "—"}</td>
+                      <td>{check.unit || "—"}</td>
+                      <td>{check.direction || "—"}</td>
+                      <td>
+                        {row
+                          ? row.detail || value(row)
+                          : incident
+                            ? incident.detail ?? "—"
+                            : "—"}
+                      </td>
+                    </tr>
+                  );
+                }),
+              )}
             </tbody>
           </table>
           <p className="sub">
             This endpoint lists RED/AMBER checks and informational readings, so
-            “not flagged” is not the same as green. The Overview shows the whole
-            board{status?.worst_truncated ? "; its worst list is also truncated" : ""}.
+            “not flagged” is not the same as green.{" "}
+            <Link to="/">The Overview shows the whole board</Link>.
+            {status?.worst_truncated &&
+              " This read's worst list is truncated, so some flagged rows may be missing."}
           </p>
         </div>
       )}
@@ -378,7 +402,10 @@ export default function ModuleDetail() {
 
       <TokenDialog
         open={tokenOpen}
-        onClose={() => setTokenOpen(false)}
+        onClose={() => {
+          retry.current = null;
+          setTokenOpen(false);
+        }}
         onSaved={() => {
           setReadOnly(false);
           retry.current?.();

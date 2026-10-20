@@ -220,8 +220,35 @@ export default function SettingsForm({
     for (const field of settings) {
       if (!dirty.has(field.key)) continue;
       const value = draft[field.key];
-      // A blank secret is "unchanged", never "erase". Reset is the erase.
-      if (field.secret && (value === "" || value == null)) continue;
+      // A blank secret is "unchanged", never "erase". Reset is the erase. A
+      // whitespace-only secret is blank too; sending it would store a value the
+      // operator cannot see and did not mean.
+      if (field.secret) {
+        if (value == null) continue;
+        if (typeof value === "string" && value.trim() === "") continue;
+      }
+      // An empty number is not zero. Refuse it rather than let Number("") become
+      // a stored 0; Reset is how an override is removed.
+      if (field.kind === "int" && (value === "" || value == null)) {
+        local[field.key] =
+          "Enter an integer, or use Reset to fall back to the default.";
+        continue;
+      }
+      if (field.kind === "list") {
+        body[field.key] = (Array.isArray(value) ? value : []).map((row) => {
+          const out: Record<string, unknown> = {};
+          for (const item of field.item_fields ?? []) {
+            const v = (row as Record<string, unknown>)[item.key];
+            // An omitted optional field is normalised to null by the API;
+            // "" is a different stored value. A required blank stays in the
+            // body so the API can name the field in its error.
+            if (!item.required && (v === "" || v == null)) continue;
+            out[item.key] = v;
+          }
+          return out;
+        });
+        continue;
+      }
       if (field.kind === "json" && typeof value === "string") {
         if (!value.trim()) {
           local[field.key] =

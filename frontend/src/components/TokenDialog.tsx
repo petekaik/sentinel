@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { hasToken, setToken } from "../api";
 
 /* The write token lives in this tab's sessionStorage and nowhere else: not in
@@ -19,15 +19,26 @@ export default function TokenDialog({
 }) {
   const [value, setValue] = useState("");
 
+  // A half-typed token must not be waiting the next time the dialog opens,
+  // including when the parent closed it rather than a button here.
+  useEffect(() => {
+    if (!open) setValue("");
+  }, [open]);
+
   if (!open) return null;
 
   const stored = hasToken();
+
+  function close() {
+    setValue("");
+    onClose();
+  }
 
   return (
     <div
       className="dialog-overlay"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) close();
       }}
     >
       <div
@@ -36,7 +47,7 @@ export default function TokenDialog({
         aria-modal="true"
         aria-labelledby="token-title"
         onKeyDown={(e) => {
-          if (e.key === "Escape") onClose();
+          if (e.key === "Escape") close();
         }}
       >
         <h2 id="token-title">Unlock writes</h2>
@@ -67,7 +78,7 @@ export default function TokenDialog({
             setToken(token);
             setValue("");
             onSaved?.();
-            onClose();
+            close();
           }}
         >
           <div className="setting">
@@ -85,7 +96,7 @@ export default function TokenDialog({
             <button type="submit" disabled={!value.trim()}>
               Save token
             </button>
-            <button type="button" onClick={onClose}>
+            <button type="button" onClick={close}>
               Cancel
             </button>
           </div>

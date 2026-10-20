@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { SettingField } from "../api";
@@ -14,12 +20,14 @@ function respond(status: number, body: unknown): Response {
   } as unknown as Response;
 }
 
-function lastWrite(fetchMock: ReturnType<typeof vi.fn>) {
-  const call = fetchMock.mock.calls.find(
-    ([, init]) => (init as RequestInit | undefined)?.method === "PUT",
-  );
-  const [, init] = call as [string, RequestInit];
-  return JSON.parse(String(init.body)) as Record<string, unknown>;
+function writeBodies(fetchMock: ReturnType<typeof vi.fn>) {
+  return fetchMock.mock.calls
+    .filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === "PUT",
+    )
+    .map(([, init]) =>
+      JSON.parse(String((init as RequestInit).body)),
+    ) as Record<string, unknown>[];
 }
 
 afterEach(() => {
@@ -52,7 +60,7 @@ it("renders a secret blank with a set badge and omits it when unchanged", async 
       moduleId="probe"
       settings={settings}
       values={{
-        PROBE_TOKEN: { value: null, secret_set: true, source: "db" },
+        PROBE_TOKEN: { value: "leaked", secret_set: true, source: "db" },
         PROBE_NAME: { value: "old", source: "db" },
       }}
     />,
@@ -60,16 +68,36 @@ it("renders a secret blank with a set badge and omits it when unchanged", async 
 
   const secret = screen.getByLabelText("API token") as HTMLInputElement; // secretscan:ignore (variable name, not a credential)
   expect(secret.value).toBe("");
+  expect(screen.queryByDisplayValue("leaked")).toBeNull();
   expect(screen.getByText("set")).toBeInTheDocument();
 
+  // A non-blank secret must be WRITTEN, which proves the field is dirty and
+  // the omit branch below is actually reached rather than skipped because the
+  // field was never touched.
+  fireEvent.change(secret, { target: { value: "typed" } });
   fireEvent.change(screen.getByLabelText("Name"), {
     target: { value: "new" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-  const body = lastWrite(fetchMock);
-  expect(body).toEqual({ PROBE_NAME: "new" });
+  expect(writeBodies(fetchMock)[0]).toEqual({
+    PROBE_TOKEN: "typed",
+    PROBE_NAME: "new",
+  });
+
+  // Now blank it (whitespace-only) and save again: the key must be omitted.
+  fireEvent.change(screen.getByLabelText("API token"), {
+    target: { value: "   " },
+  });
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "newer" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  const body = writeBodies(fetchMock)[1];
+  expect(body).toEqual({ PROBE_NAME: "newer" });
   expect("PROBE_TOKEN" in body).toBe(false);
 });
 
@@ -82,6 +110,7 @@ it("adds and removes a list row and posts the edited array", async () => {
       item_fields: [
         { key: "name", label: "Name", kind: "str", required: true },
         { key: "port", label: "Port", kind: "int" },
+        { key: "community", label: "Community", kind: "str" },
       ],
     },
   ];
@@ -119,7 +148,9 @@ it("adds and removes a list row and posts the edited array", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-  expect(lastWrite(fetchMock)).toEqual({
+  // `community` was left blank. An omitted optional field is normalised to
+  // null by the API; "" would be a different stored value.
+  expect(writeBodies(fetchMock)[0]).toEqual({
     SNMP_DEVICES: [{ name: "sw2", port: 162 }],
   });
 });
@@ -197,6 +228,69 @@ it("renders a field-level API error inline", async () => {
   });
   fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-  const alert = await screen.findByRole("alert");
-  expect(alert).toHaveTextContent("PORT must be an integer, got 'x'");
+  // The message must belong to the field's block, not to the form-level
+  // alert -- the two share role="alert" and a whole-page query cannot tell
+  // them apart.
+  const block = screen.getByText("Port").closest(".setting") as HTMLElement;
+  expect(block).not.toBeNull();
+  await waitFor(() =>
+    expect(within(block).getByRole("alert")).toHaveTextContent(
+      "PORT must be an integer, got 'x'",
+    ),
+  );
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+});
+
+it("omits a whitespace-only secret", async () => {
+  const settings: SettingField[] = [
+    { key: "PROBE_TOKEN", label: "API token", kind: "str", secret: true },
+    { key: "PROBE_NAME", label: "Name", kind: "str" },
+  ];
+  const fetchMock = vi.fn(async () =>
+    respond(200, {
+      PROBE_TOKEN: { value: null, secret_set: false, source: "default" },
+      PROBE_NAME: { value: "new", source: "db" },
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+
+  render(
+    <SettingsForm
+      moduleId="probe"
+      settings={settings}
+      values={{ PROBE_NAME: { value: "old", source: "db" } }}
+    />,
+  );
+
+  fireEvent.change(screen.getByLabelText("API token"), {
+    target: { value: "   " },
+  });
+  fireEvent.change(screen.getByLabelText("Name"), {
+    target: { value: "new" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  expect(writeBodies(fetchMock)[0]).toEqual({ PROBE_NAME: "new" });
+});
+
+it("blocks an empty number instead of storing zero", async () => {
+  const fetchMock = vi.fn(async () => respond(200, {}));
+  vi.stubGlobal("fetch", fetchMock);
+
+  render(
+    <SettingsForm
+      moduleId="probe"
+      settings={[{ key: "PORT", label: "Port", kind: "int" }]}
+      values={{ PORT: { value: 161, source: "db" } }}
+    />,
+  );
+
+  fireEvent.change(screen.getByLabelText("Port"), {
+    target: { value: "" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("Enter an integer");
+  expect(fetchMock).not.toHaveBeenCalled();
 });

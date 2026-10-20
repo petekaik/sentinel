@@ -118,7 +118,10 @@ export default function Settings() {
       ))}
       <TokenDialog
         open={tokenOpen}
-        onClose={() => setTokenOpen(false)}
+        onClose={() => {
+          retry.current = null;
+          setTokenOpen(false);
+        }}
         onSaved={() => {
           setReadOnly(false);
           retry.current?.();

@@ -145,6 +145,12 @@ def module_manifests(cfg, conn, modules, specs):
             "enabled": cfg.module_enabled(mod.id),
             "targets": list(mod.targets),
             "checks": _specs_for(mod, specs),
+            # Check ids the module owns but no Check class declares -- the
+            # collector emits these (`host_unreachable`, `journal_capture`, ...)
+            # under the same module. The manifest names them so a reader can
+            # attribute a row by OWNERSHIP rather than by target, which two
+            # modules can share.
+            "extra_check_ids": list(mod.extra_check_ids),
             "settings": settings,
             "commands": [{"id": c.id, "title": c.title, "danger": c.danger}
                          for c in mod.commands()],

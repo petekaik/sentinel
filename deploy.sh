@@ -40,7 +40,8 @@
 #   --actor NAME                   # modifier for a ctl verb: attribute the run
 #                                  #   or approval to NAME (default: operator)
 #
-# Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER
+# Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER,
+#                        MONITOR_IP, CUBOX_1_IP, CUBOX_2_IP, BACKUP_IP
 #
 # WHY A SCRIPT AT ALL, when `docker compose up -d` would nearly do. Three things
 # travel with the image and are not in it: the ssh key, the known_hosts file and
@@ -240,10 +241,17 @@ dc()     { remote "cd '$MONITOR_DIR' && '$MONITOR_DOCKER' compose $*"; }
 nas_env_var() {   # $1=NAME -> the value, or empty
     remote "grep -E '^$1=' '$MONITOR_DIR/.env' 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r'" || true
 }
-CUBOX1_IP="$(nas_env_var MONITOR_HOST_CUBOX_1_ADDR)"
-CUBOX2_IP="$(nas_env_var MONITOR_HOST_CUBOX_2_ADDR)"
-CUBOX1_IP="${CUBOX1_IP:-198.51.100.31}"
-CUBOX2_IP="${CUBOX2_IP:-198.51.100.32}"
+# The addresses the container DIALS. They must match MONITOR_HOST_*_ADDR in the
+# deployed .env; the defaults are the sanitised placeholders, which answer
+# nothing, so a deploy without them refuses at the known_hosts build.
+#
+# A caller-provided CUBOX_1_IP/CUBOX_2_IP wins over the NAS's .env -- the repo's
+# usual precedence (caller > .env). The .env remains the authority when the
+# caller says nothing, and is still the copy the CONTAINER reads.
+CUBOX_1_IP="${CUBOX_1_IP:-$(nas_env_var MONITOR_HOST_CUBOX_1_ADDR)}"
+CUBOX_2_IP="${CUBOX_2_IP:-$(nas_env_var MONITOR_HOST_CUBOX_2_ADDR)}"
+CUBOX_1_IP="${CUBOX_1_IP:-198.51.100.31}"
+CUBOX_2_IP="${CUBOX_2_IP:-198.51.100.32}"
 
 # The backup host already had an override, but its DEFAULT is a placeholder like the two
 # above, so the .env is consulted for it too. Kept after `remote()` is defined, because it
@@ -651,7 +659,7 @@ known_host_line() {   # $1=address $2=alias -> "type key", or nothing
 TMP_KH="$(mktemp)"
 trap 'rm -f "$TMP_KH"' EXIT
 KH_FAIL=0
-for pair in "cubox-1:$CUBOX1_IP" "cubox-2:$CUBOX2_IP" "backup:$BACKUP_IP"; do
+for pair in "cubox-1:$CUBOX_1_IP" "cubox-2:$CUBOX_2_IP" "backup:$BACKUP_IP"; do
     hname="${pair%%:*}"
     ip="${pair##*:}"
     tline="$(known_host_line "$ip" "$hname")"

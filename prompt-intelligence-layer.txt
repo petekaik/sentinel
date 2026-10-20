@@ -1,0 +1,88 @@
+Working repo: ~/projects/sentinel (Sentinel — my fleet monitor on Storage-NAS).
+Start by reading CLAUDE.md, then docs/superpowers/specs/2026-10-19-sentinel-module-platform-design.md
+and 2026-10-20-settings-spa-snmp-design.md. Work in a git worktree, never on main.
+
+GOAL
+Turn Sentinel from a monitor into something that helps me run the ecosystem: analyse what
+it sees, suggest what to do, and remediate when I approve. In my words: I need an easy way
+to monitor the various components and systems in my ecosystem, an easy way to see that
+something is wrong, and a way to trigger or automate remediation. The technical design is
+yours to write and defend; I judge it on whether those three things get easier.
+
+ARCHITECTURE DIRECTION (my decision — design to this, and tell me if it is wrong)
+- ONE general intelligence layer, not an LLM per monitoring module. It is a platform
+  capability, NOT a Module (a Module has targets/checks/preload; intelligence has none).
+- It is enabled/disabled globally AND granted per monitoring module. A grant is per lane:
+    observe/advise  — may read that module's data and emit insights
+    author          — may propose changes to that module's settings/checks/thresholds
+    remediate       — may execute that module's actions, on the existing ladder
+                      off -> advisory -> propose -> scoped -> full (per-action overrides
+                      already exist and win over the module level)
+  Example of what I want: full remediation autonomy for fleet, insight-only for system,
+  authoring for snmp, nothing for anything I have not granted. Ungranted means the
+  intelligence does not even read that module.
+- TWO INVARIANTS, both above the grant matrix — no tier can override them:
+  1. THE INTELLIGENCE MAY NEVER SILENCE ITS OWN EVIDENCE. Removing a check, disabling a
+     device, or widening a band past a failing value requires human approval at EVERY tier.
+     Additions and new rows may be auto-applied at a high tier.
+  2. DESTRUCTIVE ACTIONS ARE HUMAN-APPROVED AT EVERY TIER. I have decided that the grant
+     matrix has no setting that changes this, so do not offer one.
+  These are correctness requirements, not preferences: every other failure is caught by one
+  poll, and these two hide the poll.
+- One model call per cycle across all granted modules, bounded and budgeted per module,
+  not one call per module. A failure must be visible (error row or banner), never a
+  silent green.
+
+WHAT ALREADY EXISTS (read before designing; do not rebuild)
+- Module platform: app/modules/<id>/ (fleet, system, snmp), dynamic checks from settings,
+  per-module thresholds; settings with a DB overlay (UI > .env > default) applied on the
+  next collection, token-gated /api/v1 writes, audit with secret redaction; React SPA with
+  Overview/Modules/Settings/Incidents/Proposals and the build committed in app/static/.
+- Advisors: app/advisors.py (contract + scoped Snapshot), app/intelligence.py (statistical
+  reference advisor, advisory-only, on by default), app/llm_advisor.py (real advisor,
+  INERT: needs provider+endpoint and RAISES rather than returning an empty list).
+- Remediation engine: proposals with approve/reject, the authority ladder above, dry-run,
+  cooldown, latch, verify-by-next-OK, per-action/incident/module locks, full audit. Off by
+  default. The gap is not more machinery — it is better proposals and an authoring lane.
+
+WHAT I WANT DESIGNED AND BUILT (phases, each deployable alone)
+1. The grant matrix itself: per module, per lane, declared by each module and granted by
+   me; enforced in the advisor, the proposal path and the executor; visible in the SPA;
+   with the two invariants enforced structurally rather than by message text.
+2. Deterministic discovery/authoring, first and WITHOUT a model. A module command that
+   walks a device (start with SNMP) and emits candidate check rows with the values it
+   observed and a band suggested from measurement. This is the substrate the authoring
+   lane will use, and it removes the manual loop we did by hand: walk -> read what answers
+   -> pick OIDs -> name them -> set a band from the observed value.
+3. The advisory/authoring lane on top: propose check sets, labels, band adjustments and
+   incident diagnoses as insights and pending proposals, every one falsifiable by a real
+   poll or measurement before it can be applied.
+4. Anomaly detection over stored history: statistics first (the reference advisor already
+   does window statistics in SQL); ML only if it beats that baseline.
+5. Remediation stays proposal-gated within the existing ladder, and destructive actions
+   stay human-approved no matter what the grants say.
+
+HARD CONSTRAINTS
+- Python stdlib only at runtime. No Node in the image. The collector epoch stays
+  deterministic, offline-capable and ~20s, 0 errors.
+- No model in the poll path or the execution path.
+- The API key is a credential: never in a log, insight, proposal, manifest, UI or traceback.
+- Nothing may regress ./test.sh (971 checks), the 96-row parity baseline, or the existing
+  module contracts. Every new guard needs a mutation proof it can fail — including both
+  invariants above, each tested by trying to violate it at the highest tier.
+
+PROCESS
+Brainstorming skill: questions one at a time, then approaches, then a spec in
+docs/superpowers/specs/. Wait for my approval of the spec, then write the plan, then wait
+again before implementing. Implement with subagent-driven development.
+
+FACTS FROM THE LAST TWO DAYS
+- Device reality: the UDR gateway gives MIB-II plus net-snmp's subtree (load, memory) and
+  nothing vendor-specific; APs give the Ubiquiti MIB (per-SSID up, channel utilisation);
+  switches give MIB-II only. Discovery must cope with "this device answers almost nothing".
+- Table indices (ifIndex, VAP index) are per-device and move on reconfiguration; a check
+  against a wrong index fails loudly. Prefer labels a human can verify.
+- A real bug shipped because its test stub was kinder than the hardware: the SNMP client
+  omitted the mandatory NULL varbind, every device silently dropped the request, and the
+  fake agent answered it. Assume our fakes lie until proven otherwise.
+- Adding three devices by hand took an hour. That is the loop phase 2 must delete.

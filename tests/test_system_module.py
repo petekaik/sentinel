@@ -502,8 +502,6 @@ def test_uptime_is_informational_and_uncounted(results):
         _tree(root)
         ctx, _ = _ctx(root)
         res = _run(system_checks.SystemUptime, ctx)
-        tally = web._tally({"tiles": [], "extra": [], "others": [],
-                            "informational": [{"status": res.status.value}]})
         results.check(
             "uptime reads OK and is declared informational",
             res.status is store.Status.OK
@@ -512,12 +510,12 @@ def test_uptime_is_informational_and_uncounted(results):
             "status=%r informational=%r subject=%r detail=%r"
             % (res.status, system_checks.SystemUptime.informational,
                res.subject, res.detail))
-        results.check(
-            "an informational OK row is not counted as a green verdict",
-            tally == {"green": 0, "amber": 0, "red": 0, "grey": 0,
-                      "informational": 1},
-            "tally=%r -- a thermometer reading is not a health statement"
-            % (tally,))
+        # THE EXCLUSION FROM THE COLOUR COUNTS is asserted in
+        # `test_uptime_lands_in_the_dashboard_informational_bucket`, against a
+        # real `build_state`/`build_status`. It used to be asserted here through
+        # `web._tally`, which went with the server-rendered page; counting a
+        # hand-built dict in this test would have proved only that the test can
+        # subtract.
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -561,6 +559,12 @@ def test_uptime_lands_in_the_dashboard_informational_bucket(results):
             "system_uptime" not in verdict,
             "verdict items=%r -- an uptime reading became a health statement"
             % (verdict,))
+        counts = web.build_status(cfg, conn)["counts"]
+        results.check(
+            "an informational OK row is not counted as a green verdict",
+            counts["green"] == 0 and counts["informational"] == 1,
+            "counts=%r -- a thermometer reading is not a health statement"
+            % (counts,))
         conn.close()
     finally:
         shutil.rmtree(root, ignore_errors=True)

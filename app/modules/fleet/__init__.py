@@ -20,7 +20,10 @@ MODULE = Module(
         Setting("MONITOR_LOCAL_HOST", "storage"),
         Setting("RECORDINGS_PATH", ""),
         Setting("TRANSCODED_PATH", ""),
-        Setting("MONITOR_REMEDIES", "0", "bool"),
+        # MONITOR_REMEDIES is deliberately NOT declared here: it is the
+        # process-level execution kill switch, read once at startup as
+        # `cfg.remedies_enabled`. It is deployment-only -- a UI write would
+        # return 200 and change nothing until a restart.
     ],
     threshold_file="thresholds.conf",
     context=context,

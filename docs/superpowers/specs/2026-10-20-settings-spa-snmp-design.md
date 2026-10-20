@@ -173,7 +173,7 @@ token, `403` when writes are disabled (`SENTINEL_WRITE_TOKEN` unset).
 | `GET /api/v1/settings` | Effective values per module: `{key: {value, source: db|env|default, secret_set}}`; secret values never included. |
 | `GET /api/v1/incidents` | Live confirmed incidents (the existing `store.live_incidents` shape) plus recent resolved history. |
 | `GET /api/v1/insights` | Newest insights (recommendations). |
-| `GET /api/v1/proposals` | Pending proposals (actions and threshold changes). |
+| `GET /api/v1/proposals` | `{pending, expired}`: proposals awaiting a decision (actions and threshold changes), and those whose decision window has lapsed. An expired row is shown but may not be decided. |
 
 `GET /api/v1/status` may reuse `build_status`; the legacy endpoints remain
 byte-compatible.
@@ -308,7 +308,7 @@ Nothing is written to a CuBox or a network device: SNMP is read-only.
 | `/modules/:id` | One module: checks/tiles, commands (if any), settings form |
 | `/settings` | Module enablement and all module settings; token unlock |
 | `/incidents` | Live and recent incidents with evidence |
-| `/proposals` | Pending remediation and threshold proposals; approve/reject |
+| `/proposals` | Pending and expired remediation/threshold proposals; approve/reject the pending ones |
 
 SPA fallback: any non-API, non-asset GET returns `index.html`.
 

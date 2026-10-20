@@ -22,15 +22,20 @@ from harness import Results                     # noqa: E402
 
 import test_checks_fixtures as fixture_tests    # noqa: E402
 import test_advisors as advisor_tests           # noqa: E402
+import test_api_v1 as api_tests                 # noqa: E402
 import test_collect_offline as collect_tests    # noqa: E402
 import test_commands as command_tests           # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
+import test_dynamic_checks as dynamic_tests     # noqa: E402
 import test_incident_lifecycle as incident_tests  # noqa: E402
 import test_modules as module_tests                # noqa: E402
 import test_proxy_config as proxy_tests         # noqa: E402
 import test_remediation as remediation_tests    # noqa: E402
 import test_serial_identity as serial_tests     # noqa: E402
+import test_settings as settings_tests          # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
+import test_snmp_codec as snmp_tests            # noqa: E402
+import test_snmp_module as snmp_module_tests    # noqa: E402
 import test_system_module as system_tests       # noqa: E402
 
 SUITES = (
@@ -50,10 +55,19 @@ SUITES = (
     ("store.py -- the incident lifecycle: what may close a row, and what must "
      "never be able to",
      incident_tests.TESTS),
+    ("store.py -- the settings overlay: typed values, their env form, and an "
+     "audit row a secret cannot leak through",
+     settings_tests.TESTS),
+    ("api/v1 -- manifests, effective views, strict writes, and a token-gated "
+     "surface that never reads back a secret",
+     api_tests.TESTS),
     ("web.py -- the dashboard contract (never green on no data, never cached)",
      dash_tests.TESTS),
     ("checks/* -- the real check classes against verbatim fleet captures",
      fixture_tests.TESTS),
+    ("checks/* -- settings-driven instances: they are evaluated, their specs "
+     "count as claimed, and the dashboard renders them",
+     dynamic_tests.TESTS),
     ("checks/* -- the shared dynamic layer (T2): converging vs stuck, the "
      "subjects incidents resolve by, and worker_drift's box-side authority",
      shared_tests.TESTS),
@@ -65,6 +79,12 @@ SUITES = (
      system_tests.TESTS),
     ("proxy/ -- the publishing stack's access rules (offline, text-level)",
      proxy_tests.TESTS),
+    ("snmp -- the BER codec and the v2c client against a loopback agent "
+     "(no device, no real network)",
+     snmp_tests.TESTS),
+    ("snmp -- the settings-driven module: reachability vs OID rows, save-time "
+     "validation, and the dynamic manifest (no device, no real network)",
+     snmp_module_tests.TESTS),
 )
 
 

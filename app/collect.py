@@ -181,16 +181,19 @@ def preload_modules(cfg, ctx, attempts):
 # ---------------------------------------------------------------------------
 
 
-def evaluate(classes, ctx, cubox_ids):
+def evaluate(instances, ctx):
     """Run every check. A check that throws is LOUD, never silently missing.
 
     The exception is caught here rather than allowed to kill the epoch, because
     one broken check must not cost the other thirty-nine -- but it is recorded as
     UNKNOWN carrying the traceback, not dropped. A check that vanishes from the
     dashboard reads exactly like a green one, which is item 72's shape.
+
+    Takes INSTANCES, not classes: a module's settings-driven instances have no
+    class in the registry, and expanding here would silently drop them.
     """
     results = []
-    for chk in checks.expand(classes, cubox_ids):
+    for chk in instances:
         t0 = _now()
         try:
             res = chk.timed(ctx)
@@ -200,7 +203,7 @@ def evaluate(classes, ctx, cubox_ids):
                 "THIS CHECK RAISED, so its verdict is unknown rather than "
                 "healthy. Traceback: %s"
                 % traceback.format_exc().strip().replace("\n", " | ")[-900:],
-                subject="check-error",
+                subject=getattr(chk, "subject", "check-error"),
                 evidence={"exception": True},
             )
             res.duration_ms = int((_now() - t0) * 1000)
@@ -422,7 +425,7 @@ def _fleet_view(ctx):
 # when collect.py runs as `__main__`.
 
 
-def freeze_disabled_modules(conn, seq, enabled, all_modules=None):
+def freeze_disabled_modules(conn, seq, enabled, all_modules=None, cfg=None):
     """Freeze every incident owned by a module that is not enabled.
 
     EVERY EPOCH, because a freeze is one UNKNOWN observation rather than a
@@ -432,13 +435,19 @@ def freeze_disabled_modules(conn, seq, enabled, all_modules=None):
 
     `all_modules` exists so the offline suite can drive two modules that share
     a reporting target; production always discovers.
+
+    `cfg` builds the settings-only Context a module may need to name the check
+    ids its settings declare (`check_instances`). Without it those ids are
+    unknowable and the module's incidents would stay open while it is off.
     """
     enabled_ids = {m.id for m in enabled}
+    ctx = checks.Context(cfg, {}, {}, modules=()) if cfg is not None else None
     for mod in (all_modules if all_modules is not None
                 else module_loader.discover()):
         if mod.id in enabled_ids:
             continue
-        for row in store.live_incidents_for_checks(conn, owned_check_ids(mod)):
+        for row in store.live_incidents_for_checks(
+                conn, owned_check_ids(mod, ctx)):
             store.freeze_incident(conn, seq, row,
                                   "module %r is disabled" % mod.id)
 
@@ -681,13 +690,17 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
 def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     """One epoch. Returns a summary dict for the CLI/self-test."""
     t0 = _now()
+    # THE DB OVERLAY APPLIES ON THE NEXT COLLECTION, and this is the collection.
+    # Only the web handlers used to reload, so a persisted override was inert in
+    # `--once` and after a restart until somebody opened the settings page.
+    cfg.reload_settings(conn)
     seq = store.next_epoch_seq(conn)
 
     enabled = module_loader.discover_enabled(cfg)
 
     # Skipped on a dry run, whose whole contract is "claims nothing".
     if not (dry_run or cfg.dry_run):
-        freeze_disabled_modules(conn, seq, enabled)
+        freeze_disabled_modules(conn, seq, enabled, cfg=cfg)
 
     # THRESHOLDS ARE DATA, INCLUDING A LIVE OVERRIDE. An approved band change
     # lives in the store, so the epoch must load the effective band rather than
@@ -714,7 +727,32 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     if hosts_only:
         wanted = set(hosts_only)
         targets = tuple(t for t in targets if t in wanted)
-    results = evaluate(classes, ctx, targets)
+    static = checks.expand(classes, targets)
+    # SETTINGS-DRIVEN INSTANCES. Built from the SAME preloaded ctx (so a module
+    # that builds one per configured device sees the settings the epoch is about
+    # to grade against). A dynamic instance is never per_box: its target is the
+    # module's reporting target (`snmp`) and its subject names the device, so
+    # the incident key stays (target, check_id, subject).
+    #
+    # ISOLATED PER MODULE, like `preload` and `after_epoch`. Settings are
+    # operator input: malformed JSON in `.env` makes `check_instances` raise,
+    # and an escaping exception here would kill the WHOLE epoch -- taking every
+    # other module's checks down with it. The module's own checks are absent
+    # this epoch and the reason is in the run note.
+    dynamic = []
+    for m in enabled:
+        try:
+            dynamic.extend(m.check_instances(ctx))
+        except Exception as exc:                   # noqa: BLE001 - isolated
+            ctx.module_errors[m.id + ":check_instances"] = \
+                traceback.format_exc()
+            first = (str(exc).strip().splitlines()
+                     or [type(exc).__name__])[0]
+            ctx.note("module %s failed to build its settings-driven checks: "
+                     "%s; they are absent from this epoch" % (m.id, first))
+            continue
+    ctx.merge_dynamic_specs()
+    results = evaluate(static + dynamic, ctx)
 
     # THIS ORDER MATTERS. The attempt rows are written BEFORE the escalation
     # reads them, so "3 consecutive failed attempts" counts the attempt that just

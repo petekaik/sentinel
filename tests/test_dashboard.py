@@ -1,28 +1,39 @@
-"""Dashboard contract tests. NO NETWORK to the fleet -- asserted by the server.
+"""Dashboard contract tests: the model, the API, and the served shell.
 
 The dashboard is the ONLY dead-man switch this design has (no push notification
 was chosen), so its contract is not "looks reasonable" but "is incapable of
 showing a clean fleet while measuring nothing". That is a property, and a
 property needs a test that can FAIL -- which is why several checks below assert
 the EXISTENCE of the healthy path as well as the loudness of the unhealthy one.
-A page that renders everything grey passes "UNKNOWN is never green" trivially,
-and a test suite that only asserted that would go green on a dashboard that had
-been reduced to a stub. So: `test_unknown_is_never_green` also proves that a
-stored OK renders green, and `test_no_result_renders_unknown` also proves that a
-stored result renders ITS OWN verdict. Item 26: a test that cannot fail is worse
-than no test.
+A board that renders everything grey passes "UNKNOWN is never green" trivially,
+and a suite that only asserted that would go green on an API that had been
+reduced to a stub. So: `test_unknown_is_never_green` also proves that a stored
+OK renders green, and `test_no_result_renders_unknown_with_a_reason` also proves
+that a stored result carries ITS OWN verdict. Item 26: a test that cannot fail
+is worse than no test.
 
-THE STORE IS WRITTEN BY DIFFERENT CODE THAN THE PAGE READS. These tests use
+THE SERVER-RENDERED PAGE IS GONE. `web.render_html`, its stylesheet and its
+refresh script were removed when `/` became the committed React build in
+`app/static/` (built by `scripts/build-frontend.sh`, committed, served by
+stdlib Python). What survives here is every property that lives in the MODEL or
+the HTTP headers: verdicts, colour counts, staleness, incidents, module
+disablement, the no-cache rule, and the shell's own headers. The rendered-markup
+assertions moved to the frontend's suite as its pages land, and the two
+behaviours that were only ever asserted through markup -- the shell's mobile
+safe-area contract and its refusal to fetch a webfont -- are asserted against
+the files that now own them (`frontend/src/styles.css`, `app/static/index.html`).
+
+THE STORE IS WRITTEN BY DIFFERENT CODE THAN THE API READS. These tests use
 `store.record_check` / `record_collector_run` directly rather than running
 `collect.py`, so an agreement between writer and reader here is not a
 restatement of one rule typed twice (item 45).
 
 THE ONE SERVER THAT BINDS A PORT BINDS LOOPBACK ONLY. `web.serve()` binds
-0.0.0.0; these tests must not, because the machine running them is on the fleet's
-own LAN and an exposed copy of a monitoring page is not something a test should
-be able to create by accident. Each server is a fresh `web.Handler` subclass
-bound to 127.0.0.1 on port 0, and the loopback address is ASSERTED rather than
-assumed -- the same class of check as everything else here.
+0.0.0.0; these tests must not, because the machine running them is on the
+fleet's own LAN and an exposed copy of a monitoring page is not something a test
+should be able to create by accident. Each server is a fresh `web.Handler`
+subclass bound to 127.0.0.1 on port 0, and the loopback address is ASSERTED
+rather than assumed -- the same class of check as everything else here.
 
 Fixtures: none. The dashboard's input is the incident/check tables, and those are
 constructed in-process; there is no captured artefact to drift from.
@@ -30,7 +41,6 @@ constructed in-process; there is no captured artefact to drift from.
 
 import json
 import os
-import re
 import shutil
 import struct
 import sys
@@ -53,6 +63,10 @@ import web                    # noqa: E402
 import shell                  # noqa: E402
 
 CACHE = "no-store, no-cache, must-revalidate, max-age=0"
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATIC = os.path.join(HERE, "..", "app", "static")
+STYLES = os.path.join(HERE, "..", "frontend", "src", "styles.css")
 
 
 def make_cfg(db_path, interval=60, **extra):
@@ -94,6 +108,9 @@ class Dash:
     def state(self):
         return web.build_state(self.cfg, self.conn)
 
+    def status(self, now=None):
+        return web.build_status(self.cfg, self.conn, now=now)
+
     def state_at(self, age_s):
         """build_state with an EXPLICIT `now`, `age_s` after the last collection.
 
@@ -106,35 +123,38 @@ class Dash:
         # THE NEWEST EPOCH, not MAX(ts). `build_state` reads the last collection
         # by `epoch_seq`, and a backdated history makes the two disagree: the
         # newest epoch carries the SMALLEST ts, so MAX(ts) picks an older row
-        # than the one the page renders. Then "age_s after the last collection"
-        # is a lie -- an age of 0 would render as the backdate of some earlier
-        # epoch, and the bar's arithmetic would measure the gap between two
-        # epochs instead of the age the caller asked for.
-        #
-        # `state["last"]` IS that row, so the selection is REUSED rather than
-        # re-typed here: a second copy of the query agrees with any bug in the
-        # first, and `MAX(ts)` was exactly that bug.
+        # than the one the API describes. Then "age_s after the last collection"
+        # is a lie. `state["last"]` IS that row, so the selection is REUSED
+        # rather than re-typed here.
         ts = self.state()["last"]["ts"]
         return web.build_state(self.cfg, self.conn, now=ts + age_s)
 
-    def html(self):
-        return web.render_html(self.state(), self.cfg)
-
 
 def registry_instances(cfg):
-    """Every check the DASHBOARD will render: all enabled modules, expanded.
+    """Every check the API will report: all enabled modules, expanded.
 
-    Derived from discovery rather than the fleet registry, because the page is
-    rendered from discovery too. With one module the two agreed by accident;
-    they diverge the moment a second module is discovered (the system module),
-    and a suite that drove only the fleet would leave the others unobserved and
-    then compare its own short list against the board's longer one.
+    Derived from discovery rather than the fleet registry, because the model is
+    built from discovery too. With one module the two agreed by accident; they
+    diverge the moment a second module is discovered (the system module), and a
+    suite that drove only the fleet would leave the others unobserved and then
+    compare its own short list against the model's longer one.
     """
     mods = module_loader.discover_enabled(cfg)
     classes = checks.registry(
         *([c for m in mods for c in m.check_classes()]
           + list(checks.platform_modules())))
-    return checks.expand(classes, checks.expansion_targets(mods))
+    # AND THE SETTINGS-DRIVEN INSTANCES, for the same reason: `build_state` now
+    # reports them, so a class-only list here would measure a different model
+    # than the one being served (and count it short).
+    ctx = checks.Context(cfg, {}, {}, modules=mods)
+    out = checks.expand(classes, checks.expansion_targets(mods))
+    for m in mods:
+        # The SAME order `build_state` uses: a module's settings-driven
+        # instances read state its `context` hook installs (the SNMP module's
+        # parsed device list), and `context` does no I/O.
+        m.context(ctx)
+        out.extend(m.check_instances(ctx))
+    return out
 
 
 class _Server(ThreadingHTTPServer):
@@ -183,6 +203,28 @@ def _get(url):
         return e.code, dict(e.headers), e.read().decode("utf-8", "replace")
 
 
+def _get_bytes(url):
+    """The body as BYTES. `_get` decodes utf-8 with "replace", which is right
+    for the HTML and the JSON and destroys a PNG -- comparing a decoded image
+    against its magic bytes would test the decoder, not the file.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def _hashed_asset():
+    """One real file from the committed build, by name."""
+    assets = os.path.join(STATIC, "assets")
+    names = sorted(os.listdir(assets)) if os.path.isdir(assets) else []
+    for name in names:
+        if not name.startswith("."):
+            return "/assets/" + name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 1. An empty store must be LOUD
 # ---------------------------------------------------------------------------
@@ -194,32 +236,34 @@ def test_empty_store_is_loud(results):
     try:
         d = Dash(tmpdir)
         state = d.state()
-        html = d.html()
+        st = d.status()
 
         results.check(
             "a store with no collector_run is 'none', not 'fresh'",
             state["staleness"] == "none" and state["last"] is None,
             "staleness=%r" % state["staleness"])
+        # THE SENTENCE IS THE API'S, and the SPA renders it. "no collection has
+        # ever been recorded" must not share a branch with "the last one is too
+        # old": the second asserts a collection that was never made.
         results.check(
             "the empty store says NO COLLECTION HAS EVER BEEN RECORDED",
-            "NO COLLECTION HAS EVER BEEN RECORDED" in html,
-            "the page did not say it. Every other surface on this page can be "
-            "empty and look calm; this sentence is the only thing standing "
-            "between 'the monitor is dead' and 'the fleet is fine'.")
+            st["verdict"] == "unknown"
+            and "no collection has ever been recorded" in st["verdict_reason"],
+            "verdict=%r reason=%r -- every other surface can be empty and look "
+            "calm; this sentence is the only thing standing between 'the "
+            "monitor is dead' and 'the fleet is fine'"
+            % (st["verdict"], st["verdict_reason"]))
         results.check(
-            "the empty store shows no green banner",
-            "banner ok" not in html,
-            "a green banner is rendered for a monitor that has never collected")
-        results.check(
-            "the empty store shows no green tile",
-            "tile green" not in html,
-            "a tile rendered green from an empty store")
+            "the empty store cannot report a green count",
+            st["counts"]["green"] == 0 and st["counts"]["checks_total"] > 0,
+            "counts=%s -- a green count here is a healthy board over no data"
+            % (st["counts"],))
 
         # The check list comes from the REGISTRY, not from the store, so an empty
-        # store still shows every check -- grey, with the reason.
+        # store still reports every check -- grey, with the reason.
         tiles = len(state["tiles"]) + len(state["others"]) + len(state["informational"])
         results.check(
-            "every registered check is on the page even with an empty store",
+            "every registered check is in the model even with an empty store",
             tiles >= 60 and len(state["missing"]) == tiles,
             "%d rows, %d missing -- expected the whole registry (64 checks) to be "
             "present and reported missing rather than absent"
@@ -227,19 +271,19 @@ def test_empty_store_is_loud(results):
         results.check(
             "'0 rows' is reported as a row count, not as no problems",
             state["counts"]["tables"]["collector_run"] == 0
-            and "collector_run" in html,
+            and state["counts"]["tables"]["check_run"] == 0,
             "row counts: %s" % state["counts"]["tables"])
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
-# 2. Staleness degrades the whole page
+# 2. Staleness degrades the whole document
 # ---------------------------------------------------------------------------
 
 
 def test_stale_says_so_and_cannot_also_be_ok(results):
-    """A stale store is RED, and the boundary is where the code says it is."""
+    """A stale store is UNKNOWN, and the boundary is where the code says it is."""
     tmpdir = tempfile.mkdtemp()
     try:
         interval = 60
@@ -259,31 +303,32 @@ def test_stale_says_so_and_cannot_also_be_ok(results):
                  "one second past %d intervals is stale" % web.STALE_INTERVALS)):
             got = d.state_at(age)["staleness"]
             results.check(
-                "at age %ds the page is %r (%s)" % (age, want, why),
+                "at age %ds the model is %r (%s)" % (age, want, why),
                 got == want, "staleness=%r, expected %r" % (got, want))
 
-        # The rendered page, at the state a stopped collector produces.
+        # The state a stopped collector produces, through the API the SPA reads.
         d.epoch(age_s=interval * web.STALE_INTERVALS + 1)
-        state, html = d.state(), d.html()
+        state, st = d.state(), d.status()
         results.check(
-            "past %d intervals the page is stale" % web.STALE_INTERVALS,
+            "past %d intervals the model is stale" % web.STALE_INTERVALS,
             state["staleness"] == "stale",
             "staleness=%r" % state["staleness"])
+        # THE BANNER'S BEHAVIOUR, re-expressed against the contract. There is
+        # one verdict field, so "stale cannot also be ok" is a property of the
+        # value, not of two banners that might both be drawn.
         results.check(
-            "the stale page says so in the red banner and says what it means",
-            "banner red" in html and "STALE" in html and "AS IT WAS" in html,
-            "the stale banner is missing or does not state that the rows below "
-            "describe the fleet as it was")
+            "a stale store's verdict is UNKNOWN and says the rows are historical",
+            st["verdict"] == "unknown" and "as it was" in st["verdict_reason"],
+            "verdict=%r reason=%r -- the rows below describe the fleet as it "
+            "WAS, and a verdict of ok on them is the false green this service "
+            "exists to prevent" % (st["verdict"], st["verdict_reason"]))
         results.check(
-            "a stale page cannot also carry the green banner",
-            "banner ok" not in html,
-            "both banners are on the page, so a reader skimming for colour sees "
-            "green on a monitor that has stopped")
-        results.check(
-            "the stale page names the number of intervals that count as current",
-            "past the %d poll intervals (180s)" % web.STALE_INTERVALS in html,
-            "the banner does not say what the threshold is, so the reader cannot "
-            "tell a stale page from a wrongly-stale one")
+            "the stale reason names the threshold that counts as current",
+            str(state["stale_after_s"]) in st["verdict_reason"]
+            and state["stale_after_s"] == interval * web.STALE_INTERVALS,
+            "reason=%r stale_after_s=%r -- without the number, a reader cannot "
+            "tell a stale board from a wrongly-stale one"
+            % (st["verdict_reason"], state["stale_after_s"]))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -308,39 +353,29 @@ def test_unknown_is_never_green(results):
             d.check(target, cid, store.Status.UNKNOWN,
                     "not observed this epoch (test)")
 
-        state, html = d.state(), d.html()
-        tally = web._tally(state)
+        counts = web.build_status(d.cfg, d.conn)["counts"]
         results.check(
             "an all-UNKNOWN store tallies ZERO green",
-            tally["green"] == 0 and tally["grey"] >= len(targets),
-            "tally=%s for %d UNKNOWN checks" % (tally, len(targets)))
+            counts["green"] == 0 and counts["grey"] >= len(targets),
+            "counts=%s for %d UNKNOWN checks" % (counts, len(targets)))
         results.check(
-            "no tile renders green while every check is UNKNOWN",
-            "tile green" not in html,
-            "a green tile exists on a page where nothing was observed")
-        results.check(
-            "the grey verdicts are rendered as grey",
-            "pill grey" in html and ">unknown<" in html,
-            "the UNKNOWN rows are not rendered as grey pills")
-        results.check(
-            "grey is not folded into red either",
-            tally["red"] == 0 and tally["amber"] == 0,
-            "tally=%s -- UNKNOWN must not share a branch with FAIL or WARN, in "
-            "either direction" % tally)
+            "grey is not folded into red or amber either",
+            counts["red"] == 0 and counts["amber"] == 0,
+            "counts=%s -- UNKNOWN must not share a branch with FAIL or WARN, in "
+            "either direction" % counts)
 
-        # The contrast, so this test can fail: a stored OK must render GREEN.
-        # Without this half, a dashboard that rendered everything grey would pass
+        # The contrast, so this test can fail: a stored OK must count GREEN.
+        # Without this half, an API that reported everything grey would pass
         # every assertion above.
         d.epoch()
         for target, cid in targets:
             d.check(target, cid, store.Status.OK, "measured within threshold (test)")
-        state, html = d.state(), d.html()
-        tally = web._tally(state)
+        counts = web.build_status(d.cfg, d.conn)["counts"]
         results.check(
-            "a stored OK DOES render green (so the test above can fail)",
-            tally["green"] == len(targets) and "tile green" in html,
-            "tally=%s for %d OK checks -- if this is zero, the grey assertions "
-            "above proved nothing" % (tally, len(targets)))
+            "a stored OK DOES count green (so the test above can fail)",
+            counts["green"] == len(targets),
+            "counts=%s for %d OK checks -- if this is zero, the grey assertions "
+            "above proved nothing" % (counts, len(targets)))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -370,15 +405,23 @@ def test_unrecognised_status_is_grey_not_green(results):
             and web._status(None) is store.Status.UNKNOWN,
             "_status folded an unreadable value onto something other than "
             "UNKNOWN -- and the only dangerous destination is OK")
-        html = d.html()
+        # The row keeps its RAW value in the model (so the SPA can show what the
+        # store actually says) and the COLOUR is unknown -- which is the RAG
+        # pill's contract, asserted where the colour is decided.
+        state = d.state()
+        by_key = {(t["target"], t["check_id"]): t for t in state["tiles"]}
+        corrupt = by_key[("storage", "media_volume_used_pct")]
         results.check(
-            "the row renders grey and shows the raw string, not a colour",
-            "pill grey" in html and ">green<" in html,
-            "the corrupt row is not rendered as grey with its raw value visible")
+            "the corrupt row is grey and keeps its raw string",
+            corrupt["status"] == "green"
+            and web._status(corrupt["status"]) is store.Status.UNKNOWN
+            and web._status(corrupt["status"]).rag == "grey",
+            "status=%r rag=%r" % (corrupt["status"],
+                                  web._status(corrupt["status"]).rag))
         results.check(
-            "no tile renders green off the corrupt status",
-            "tile green" not in html,
-            "a corrupt status produced a green tile")
+            "no row counts green off the corrupt status",
+            web.build_status(d.cfg, d.conn)["counts"]["green"] == 0,
+            "a corrupt status produced a green count")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -413,22 +456,21 @@ def test_no_result_renders_unknown_with_a_reason(results):
             and "no result is stored" in never["detail"],
             "cubox-2 mem_available_mb: has_result=%s status=%r detail=%r"
             % (never["has_result"], never["status"], never["detail"]))
-        html = d.html()
         results.check(
-            "the reason is on the page in words",
-            "no result is stored for the newest epoch" in html,
-            "the page shows the missing check without saying why it is grey")
+            "the reason travels with the row, in words the SPA can render",
+            "no result is stored for the newest epoch" in never["detail"],
+            "the missing check is grey with no explanation: %r" % never["detail"])
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
-# 6. Nothing is cached
+# 6. Nothing that carries a reading is cached
 # ---------------------------------------------------------------------------
 
 
 def test_nothing_is_cached(results):
-    """Every response carries no-store -- through a real server, real headers."""
+    """Every observation path carries no-store -- through a real server."""
     tmpdir = tempfile.mkdtemp()
     try:
         d = Dash(tmpdir)
@@ -444,7 +486,7 @@ def test_nothing_is_cached(results):
                                 ("/api/status.json", "application/json"),
                                 ("/api/state.json", "application/json"),
                                 ("/healthz", "text/plain"),
-                                ("/no/such/path", "text/plain")):
+                                ("/modules/fleet", "text/html")):
                 code, hdrs, body = _get(base + path)
                 results.check(
                     "%s carries Cache-Control: no-store" % path,
@@ -458,9 +500,59 @@ def test_nothing_is_cached(results):
                        hdrs.get("Expires")))
                 results.check(
                     "%s answered with the right shape" % path,
-                    hdrs.get("Content-Type", "").startswith(ctype)
-                    and (code == 200 or (path == "/no/such/path" and code == 404)),
+                    code == 200 and hdrs.get("Content-Type", "").startswith(ctype),
                     "code=%s content-type=%r" % (code, hdrs.get("Content-Type")))
+
+            # THE SHELL'S OWN HEADER. `default-src 'self'` is the SPA's whole
+            # third-party policy; without it a compromised dependency could load
+            # anything, and with inline script present it would need
+            # 'unsafe-inline', which this asserts it does not.
+            code, hdrs, body = _get(base + "/")
+            results.check(
+                "the shell is served with the no-inline, same-origin CSP",
+                hdrs.get("Content-Security-Policy") == web.SHELL_CSP
+                == "default-src 'self'",
+                "Content-Security-Policy=%r" % hdrs.get("Content-Security-Policy"))
+
+            # THE HASHED BUNDLE IS THE ONE CACHEABLE THING, because its name is
+            # its digest: a cached copy can never describe different bytes.
+            asset = _hashed_asset()
+            results.check(
+                "the committed build has a hashed asset to serve",
+                asset is not None, "no files under app/static/assets")
+            if asset:
+                code, hdrs, body = _get(base + asset)
+                results.check(
+                    "%s is served immutable" % asset,
+                    code == 200 and hdrs.get("Cache-Control") == web.ASSET_CACHE
+                    and "immutable" in hdrs.get("Cache-Control", ""),
+                    "code=%s Cache-Control=%r"
+                    % (code, hdrs.get("Cache-Control")))
+                results.check(
+                    "a hashed asset has no-store nowhere near it",
+                    hdrs.get("Cache-Control") != CACHE,
+                    "the bundle was served no-store -- caching it is safe and "
+                    "not caching it re-downloads 264 KB on every page view")
+
+            # AN API PATH NEVER FALLS THROUGH TO THE SHELL. Otherwise
+            # `/api/typo` answers HTML with 200 and a fetch() parses it.
+            code, hdrs, body = _get(base + "/api/typo")
+            results.check(
+                "an unknown API path is a 404, not the SPA",
+                code == 404 and "<div id=\"root\">" not in body,
+                "code=%s body=%r" % (code, body[:120]))
+
+            # A NORMALISED PATH MUST NOT BORROW THE ASSET CACHE. Measured:
+            # before the flat-name guard, `/assets/../index.html` served the
+            # SHELL with `immutable`, which caches the pointer to the current
+            # bundle forever -- the exact staleness the design refuses.
+            code, hdrs, body = _get(base + "/assets/../index.html")
+            results.check(
+                "an asset path that normalises out of assets/ is refused",
+                code == 404 and hdrs.get("Cache-Control") != web.ASSET_CACHE,
+                "code=%s Cache-Control=%r -- the shell was served as an "
+                "immutable asset"
+                % (code, hdrs.get("Cache-Control")))
 
             code, hdrs, body = _get(base + "/api/state.json")
             try:
@@ -468,7 +560,7 @@ def test_nothing_is_cached(results):
                 ok_json = parsed["staleness"] == "fresh"
             except Exception as exc:                      # noqa: BLE001
                 ok_json, parsed = False, {"error": str(exc)}
-            results.check("the API returns the same state model as the page",
+            results.check("the API returns the same state model as the shell",
                           ok_json, "staleness=%r" % parsed.get("staleness"))
 
             # The status API, through the same real socket and real headers. Its
@@ -491,35 +583,58 @@ def test_nothing_is_cached(results):
             httpd.shutdown()
             httpd.server_close()
 
-        # A database that cannot be opened is 503 with the sentence that says
-        # what it is not, and it carries the same no-cache headers -- an error
-        # page cached by a proxy would outlive the outage. The path's PARENT is
-        # absent, so nothing here can accidentally create the file first.
+        # A DATABASE THAT CANNOT BE OPENED. The SPA is a constant of the image,
+        # so it STILL LOADS -- that is what lets the browser render the
+        # outage -- while every observation path is a loud 503 that says it is
+        # not "no problems". An error page cached by a proxy would outlive the
+        # outage, so the 503 carries no-store too. The path's PARENT is absent,
+        # so nothing here can accidentally create the file first.
         broken_cfg = make_cfg(os.path.join(tmpdir, "no-such-dir", "monitor.sqlite"))
         httpd, base = _serve(broken_cfg)
         try:
-            code, hdrs, body = _get(base + "/")
-            results.check(
-                "an unopenable database is 503 and says it is NOT 'no problems'",
-                code == 503 and "not 'no problems'" in body
-                and "no data at all" in body,
-                "code=%s body=%r" % (code, body[:200]))
-            results.check(
-                "the 503 carries no-store too",
-                hdrs.get("Cache-Control") == CACHE,
-                "Cache-Control=%r" % hdrs.get("Cache-Control"))
+            for path in ("/", "/modules/fleet"):
+                code, hdrs, body = _get(base + path)
+                results.check(
+                    "%s still serves the SPA during a database outage" % path,
+                    code == 200 and 'id="root"' in body
+                    and hdrs.get("Cache-Control") == CACHE
+                    and hdrs.get("Content-Security-Policy") == web.SHELL_CSP,
+                    "code=%s cache=%r csp=%r -- a shell that 503s leaves the "
+                    "browser showing plaintext, which is a dead-man switch that "
+                    "cannot say what is wrong"
+                    % (code, hdrs.get("Cache-Control"),
+                       hdrs.get("Content-Security-Policy")))
+            asset = _hashed_asset()
+            if asset:
+                code, hdrs, body = _get(base + asset)
+                results.check(
+                    "a hashed asset still serves during a database outage",
+                    code == 200 and hdrs.get("Cache-Control") == web.ASSET_CACHE,
+                    "code=%s cache=%r -- the bundle is a constant of the image "
+                    "and an outage must not stop a loaded page fetching its CSS"
+                    % (code, hdrs.get("Cache-Control")))
             code, hdrs, body = _get(base + "/api/status.json")
             results.check(
                 "an unopenable database is NOT a 200 on the status API",
-                code == 503 and "not 'no problems'" in body,
+                code == 503 and "not 'no problems'" in body
+                and "no data at all" in body,
                 "code=%s body=%r -- an API that answers 200 with a well-formed "
                 "document while it cannot read its own store is a false GREEN "
                 "delivered straight to whatever integrates with it"
                 % (code, body[:200]))
+            results.check(
+                "the 503 carries no-store too",
+                hdrs.get("Cache-Control") == CACHE,
+                "Cache-Control=%r" % hdrs.get("Cache-Control"))
+            code, hdrs, body = _get(base + "/healthz")
+            results.check(
+                "the health probe is 503 during an outage, not 200",
+                code == 503 and "not 'no problems'" in body,
+                "code=%s -- healthz asserting anything while the store cannot be "
+                "read is the false green one layer out" % code)
         finally:
             httpd.shutdown()
             httpd.server_close()
-            shutil.rmtree(tmpdir + "-missing", ignore_errors=True)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -536,7 +651,7 @@ def test_collector_rows_are_visible(results):
         d = Dash(tmpdir)
         d.epoch()
         # EXACTLY what collect.py writes on a sustained outage: no Check class
-        # owns this id, so a renderer built only from the registry would lose the
+        # owns this id, so a model built only from the registry would lose the
         # single most important row on the fleet.
         d.check("cubox-1", "host_unreachable", store.Status.FAIL,
                 "cubox-1 could not be collected for 3 consecutive polls: no route "
@@ -555,14 +670,17 @@ def test_collector_rows_are_visible(results):
             extra.get(("cubox-1", "host_unreachable"), {}).get("status") == "fail",
             "status=%r" % extra.get(("cubox-1", "host_unreachable"), {})
             .get("status"))
-        html = d.html()
         results.check(
-            "the row and its provenance are both on the page",
-            "host_unreachable" in html and "(collector)" in html
-            and "journal_capture" in html,
-            "the collector's rows are not rendered -- this is the 'we cannot see "
+            "both collector rows are present with their provenance",
+            "journal_capture" in {e[1] for e in extra}
+            and all(e["from"] == "collector" for e in extra.values()),
+            "the collector's rows are missing -- this is the 'we cannot see "
             "cubox-1' row, and losing it is the failure this whole component "
             "exists to prevent")
+        results.check(
+            "the collector's FAIL drives the verdict",
+            web.build_status(d.cfg, d.conn)["verdict"] == "fail",
+            "a red collector row did not reach the verdict")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -588,7 +706,7 @@ def test_informational_rows_carry_no_colour(results):
             "implies an action that does not exist. If this is intentional, the "
             "ruling has changed and this test is the record of it.")
         # Deliberately recorded as OK: the exclusion must bite even on the
-        # verdict that would otherwise be the greenest number on the page. The
+        # verdict that would otherwise be the greenest number on the board. The
         # READING comes from `sample` and the VERDICT from `check_run` -- two
         # tables, which is the point of storing raw observations beside verdicts,
         # so a test that only wrote one of them would be testing half a row.
@@ -598,49 +716,50 @@ def test_informational_rows_carry_no_colour(results):
                                 None, text="48.2 C (test)")
 
         state = d.state()
-        tally = web._tally(state)
+        st = d.status()
         results.check(
             "an OK informational row is not counted as green",
-            tally["green"] == 0 and tally["informational"] == len(info),
-            "tally=%s with %d informational OK rows" % (tally, len(info)))
+            st["counts"]["green"] == 0
+            and st["counts"]["informational"] == len(info),
+            "counts=%s with %d informational OK rows -- a thermometer reading is "
+            "not a health statement" % (st["counts"], len(info)))
         results.check(
             "informational rows are not RAG tiles",
             all(not t["informational"] for t in state["tiles"])
             and len(state["informational"]) == len(info),
             "%d tiles, %d informational" % (len(state["tiles"]),
                                             len(state["informational"])))
-        html = d.html()
         results.check(
-            "the page says the count is excluded rather than leaving it to be added up",
-            "0 green" in html and "informational, no colour assigned" in html,
-            "the tally line does not name the excluded count")
-        results.check(
-            "the informational reading renders with no trailing space",
-            ">48.2<" in html,
-            "the reading cell is not exactly the value -- a unit-less reading "
-            "was rendered as '48.2 ' and every grep for it then misses")
+            "the reading and its unit are separate fields, never one string",
+            any(i["value"] == 48.2 for i in state["informational"])
+            and all(i["unit"] == i["unit"].strip()
+                    and (i["value"] is None
+                         or isinstance(i["value"], (int, float)))
+                    for i in state["informational"]),
+            "readings=%r -- a unit-less reading concatenated at the source is "
+            "'48.2 ' and every grep for it then misses"
+            % [(i["value"], i["unit"]) for i in state["informational"]])
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-
 # ---------------------------------------------------------------------------
-# 9b. Remedy attempts and the command audit are on the operator's page
+# 9. Remedy attempts and the command audit are in the model
 # ---------------------------------------------------------------------------
 
 
-def test_the_page_shows_remedy_attempts_and_command_history(results):
-    """A remedy attempt and an operator command must both be visible.
+def test_remedy_attempts_and_command_history_are_in_the_model(results):
+    """A remedy attempt and an operator command must both be reachable.
 
-    WHY BOTH HALVES ARE ASSERTED ON THE SUFFIX. An incident's `remedy_attempts`
-    is the only statement on the page that something was TRIED and did not
+    WHY BOTH HALVES ARE ASSERTED ON THE ATTEMPT COUNT. An incident's
+    `remedy_attempts` is the only statement that something was TRIED and did not
     clear it -- and the obvious renderer appends that sentence to every row, or
     to none. So one incident is given an attempt and one is not, and the
-    assertion is that the suffix is on exactly the one that earned it.
+    assertion is that the count is on exactly the one that earned it.
 
-    The command table is the other half: commands are the only part of the
+    The command audit is the other half: commands are the only part of the
     platform that changes the fleet, and an audit nobody can read from the
-    page's own surface is an audit that only answers a question asked with a
+    operator's own surface is an audit that only answers a question asked with a
     shell on the NAS.
     """
     tmpdir = tempfile.mkdtemp()
@@ -659,49 +778,38 @@ def test_the_page_shows_remedy_attempts_and_command_history(results):
                                  actor="operator", argv={}, dry_run=0,
                                  exit_status=0, output="ok", duration_ms=1)
         state = d.state()
-        html = web.render_html(state, d.cfg)
+        st = d.status()
         results.check(
-            "an incident with attempts and a command run are both visible",
+            "an incident with attempts and a command run are both present",
             any(i["remedy_attempts"] == 1 for i in state["incidents"])
-            and "serial_status" in html
-            and "attempt" in html.lower(),
-            "incidents=%r" % state["incidents"])
-        results.check(
-            "the command audit is in the page model, additively",
-            len(state["command_runs"]) == 1
-            and state["command_runs"][0]["command"] == "serial_status",
-            "command_runs=%r -- the page model carries no command history, so "
-            "the operator's own actions are only reachable over ssh"
-            % (state.get("command_runs"),))
+            and len(state["command_runs"]) == 1,
+            "incidents=%r command_runs=%r"
+            % (state["incidents"], state.get("command_runs")))
 
-        # THE INCIDENT SECTION, BOUNDED BY ITS OWN </details>. A page-wide
-        # search for the suffix would also find the command table (whose output
-        # carries arbitrary text), and a search for "cubox-1" alone finds the
-        # all-checks rows too -- so the rows are sliced out of the incident
-        # section and identified by the incident's own check id.
-        start = html.find("Live incidents")
-        section = html[start:html.find("</details>", start)]
-        rows = section.split("<tr class=")[1:]
-        with_attempts = [r for r in rows if "cubox-1" in r and "disk_free_gb" in r]
-        without = [r for r in rows if "cubox-2" in r and "disk_free_gb" in r]
+        by_target = {i["target"]: i for i in st["incidents"]}
         results.check(
-            "the remedy suffix appears on the incident that has attempts",
-            bool(with_attempts)
-            and all("remedy attempted 1 time(s)" in r for r in with_attempts),
-            "rows=%r" % (with_attempts,))
+            "the attempt count is on the incident that has it, and only there",
+            by_target["cubox-1"]["remedy_attempts"] == 1
+            and by_target["cubox-2"]["remedy_attempts"] == 0,
+            "attempts=%r -- a count on a row where no remedy ran says a remedy "
+            "was attempted when it was not"
+            % {t: i["remedy_attempts"] for t, i in by_target.items()})
         results.check(
-            "an incident with no attempt carries no remedy suffix",
-            bool(without) and not any("remedy attempted" in r for r in without),
-            "rows=%r -- a suffix on a row where no remedy ran says a remedy "
-            "was attempted when it was not" % (without,))
+            "the command audit is in the model, additively",
+            state["command_runs"][0]["command"] == "serial_status",
+            "command_runs=%r -- the operator's own actions are only reachable "
+            "over ssh" % (state.get("command_runs"),))
 
         store.latch_remedy(d.conn, key, "still full")
-        latched = web.render_html(d.state(), d.cfg)
+        latched = {i["target"]: i for i in
+                   web.build_status(d.cfg, d.conn)["incidents"]}
         results.check(
-            "a latched incident says so in the suffix",
-            "remedy attempted 2 time(s) (LATCHED)" in latched,
-            "the page does not distinguish a latched incident from one still "
-            "being retried, so a row waiting on a human reads as automatic")
+            "a latched incident says so, and is distinguishable from a retry",
+            latched["cubox-1"]["remedy_latched"]
+            and latched["cubox-1"]["remedy_attempts"] == 2
+            and not latched["cubox-2"]["remedy_latched"],
+            "cubox-1=%r -- a latched row waiting on a human must not read as "
+            "automatic" % (latched.get("cubox-1"),))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -717,18 +825,12 @@ def test_a_sample_from_an_older_epoch_is_not_shown_as_current(results):
     MEASURED 2026-10-06, on the live dashboard. `TvhLogSignals` grades the
     tuner-refusal age only when that age is BAD; when it is old it falls through
     to its pairing tests and returns a plain `ok` -- and a check that does not
-    grade writes no sample (nothing calls `res.metric`). The page asked for the
-    NEWEST sample for the metric regardless of epoch, so a green row read
-    `23.795 hours` from a sample ten days older than the verdict beside it, with
-    nothing on the page saying how old that number was.
-
-    That is the same failure as a green row over an empty one, wearing a number:
-    data-shaped, so nobody questions it. The reading and the verdict are two
-    tables -- the point of storing raw observations beside verdicts -- and they
-    are only meaningful together when they are the same epoch's.
+    grade writes no sample. The page asked for the NEWEST sample for the metric
+    regardless of epoch, so a green row read `23.795 hours` from a sample ten
+    days older than the verdict beside it.
 
     Both halves are asserted. A test that only checked "no stale number" would
-    pass on a page that had stopped showing numbers at all.
+    pass on a model that had stopped reporting numbers at all.
     """
     tmpdir = tempfile.mkdtemp()
     try:
@@ -747,7 +849,7 @@ def test_a_sample_from_an_older_epoch_is_not_shown_as_current(results):
             "a graded epoch shows the sample written in that same epoch",
             tile()["value"] == 23.795,
             "value=%r -- this half exists so the assertion below cannot pass "
-            "trivially on a page that shows no numbers at all"
+            "trivially on a model that shows no numbers at all"
             % (tile()["value"],))
 
         # Epoch 2: the same check returns OK WITHOUT grading -- the fall-through
@@ -759,18 +861,20 @@ def test_a_sample_from_an_older_epoch_is_not_shown_as_current(results):
         results.check(
             "an epoch that did not grade shows NO reading, not the last one",
             t["status"] == "ok" and t["value"] is None,
-            "status=%r value=%r unit=%r -- the tile is showing a sample from an "
+            "status=%r value=%r unit=%r -- the row is showing a sample from an "
             "older epoch beside this epoch's verdict"
             % (t["status"], t["value"], t["unit"]))
         results.check(
-            "the page prints the absent reading rather than the stale figure",
-            "23.795" not in d.html(),
-            "the ten-day-old number is still on the page beside a current verdict")
+            "the stale figure is nowhere in the served model",
+            "23.795" not in json.dumps(d.state(), default=str),
+            "the ten-day-old number is still in the document beside a current "
+            "verdict")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+
 # ---------------------------------------------------------------------------
-# 9. The status API -- three-valued, not a boolean
+# 11. The status API -- three-valued, not a boolean
 # ---------------------------------------------------------------------------
 
 
@@ -794,7 +898,7 @@ def test_status_api_is_three_valued(results):
             """A fresh epoch in which every verdict-bearing check says `status`.
 
             A NEW EPOCH PER STAGE, deliberately: two rows for the same
-            (target, check_id) inside one epoch would make the renderer's choice
+            (target, check_id) inside one epoch would make the reader's choice
             between them depend on row order, and this test would then be
             measuring SQLite's return order rather than the verdict logic.
             """
@@ -887,7 +991,7 @@ def test_status_api_is_three_valued(results):
             "as it was" in st["verdict_reason"],
             "verdict_reason=%r" % st["verdict_reason"])
 
-        # (g) The boundary is the page's own, so the two surfaces cannot drift:
+        # (g) The boundary is the model's own, so the two surfaces cannot drift:
         # at exactly 3 intervals the data is still current and the verdict is the
         # real one; one second later it is not.
         st = web.build_status(d.cfg, d.conn, now=ts + interval * web.STALE_INTERVALS)
@@ -903,7 +1007,7 @@ def test_status_api_is_three_valued(results):
 
 
 # ---------------------------------------------------------------------------
-# 10. The status API is a contract, and its caps are visible
+# 12. The status API is a contract, and its caps are visible
 # ---------------------------------------------------------------------------
 
 
@@ -963,8 +1067,8 @@ def test_status_api_is_a_stable_contract(results):
         # per-host rollup covers every verdict-bearing row on that host, which
         # includes the spec-less checks this test's `targets` selection
         # deliberately does not name. Asserting equality on `checks` here would
-        # be this test restating the renderer's row selection -- item 45's
-        # mistake -- instead of measuring the verdict.
+        # be this test restating the reader's row selection -- item 45's mistake
+        # -- instead of measuring the verdict.
         cube1 = [t for t, c in targets if t == "cubox-1"]
         results.check(
             "each CuBox has its own verdict, and its green count is exact",
@@ -1014,9 +1118,9 @@ def test_status_api_is_a_stable_contract(results):
             "statuses in worst: %s" % sorted({w["status"] for w in st["worst"]}))
 
         # INFORMATIONAL IS NOT A VERDICT, asserted through the API rather than
-        # the page. Only informational rows are recorded, and they are recorded
-        # OK: the verdict must still be `unknown`, because a thermometer reading
-        # is not a health statement about the fleet.
+        # the model's sections. Only informational rows are recorded, and they
+        # are recorded OK: the verdict must still be `unknown`, because a
+        # thermometer reading is not a health statement about the fleet.
         d.epoch()
         for target, cid in info:
             d.check(target, cid, store.Status.OK, "48.2 C (test)")
@@ -1053,124 +1157,18 @@ def test_status_api_is_a_stable_contract(results):
 
 
 # ---------------------------------------------------------------------------
-# 8. The freshness hero leads, and tracks the state it leads with
+# 13. The verdict, and the ways of having no colour
 # ---------------------------------------------------------------------------
 
 
-def test_the_freshness_hero_tracks_the_staleness_it_leads_with(results):
-    """Four states, four heroes, and the bar drawn in poll intervals."""
-    tmpdir = tempfile.mkdtemp()
-    try:
-        d = Dash(tmpdir, interval=60)          # stale_after_s == 180
-        d.epoch()
-        fresh = d.html()
-        d.epoch(age_s=60 * 2)
-        lagging = d.html()
-        d.epoch(age_s=60 * web.STALE_INTERVALS + 1)
-        stale = d.html()
-        # The brief's `Dash(os.path.join(tmpdir, "empty"))` needs the directory
-        # to exist first: sqlite will not create a database in a missing path,
-        # and the empty-store board is the whole point of this case.
-        os.makedirs(os.path.join(tmpdir, "empty"), exist_ok=True)
-        never = Dash(os.path.join(tmpdir, "empty")).html()
+def test_the_verdict_distinguishes_stale_from_never_collected(results):
+    """Staleness dominates, and "never collected" is not "too old".
 
-        for name, html in (("fresh", fresh), ("lagging", lagging),
-                           ("stale", stale), ("none", never)):
-            # THE RENDERED PAGE, NOT THE SCRIPT THAT SWAPS IT. `REFRESH_JS`
-            # carries `'hero none'` as a class string, so a document-wide search
-            # for "hero %s" now finds it on EVERY board -- measured: a fresh
-            # board counted ['fresh', 'none'], and this check went red the moment
-            # the failure branch started neutralising the hero. What this loop is
-            # about is the hero the renderer draws, so the scripts come out
-            # first -- and they are the ONLY thing it removes, because the
-            # document carries exactly one <script>. That the page then still
-            # finds exactly one state is what makes this a scoping change and not
-            # a weakening: a hero that stopped tracking staleness still reds it.
-            #
-            # AND THE SCRIPT'S OWN UNREACHABLE BRANCH IS ASSERTED NOWHERE. The
-            # reactive-layer test asserts the fetch literal, the catch, the
-            # disclosure restore and the scroll -- not the hero reset. A rename
-            # there is caught by READING this file, not by a check. That is the
-            # accepted ceiling for a suite that cannot execute JavaScript, and it
-            # is named here so nobody infers coverage this comment used to imply.
-            page = re.sub(r"<script.*?</script>", "", html, flags=re.S)
-            present = [s for s in ("fresh", "lagging", "stale", "none")
-                       if "hero %s" % s in page]
-            results.check(
-                "the %s board renders exactly one hero state, and it is %s"
-                % (name, name),
-                present == [name],
-                "hero states found on the %s page: %s -- the hero exists to lead "
-                "with the staleness, so a hero that does not track it is worse "
-                "than no hero" % (name, present))
-
-        # THE BAR IS DRAWN IN POLL INTERVALS, so these are exact: `state_at`
-        # pins `now` against the stored ts and the arithmetic is a division.
-        for age, want, why in (
-                (0, "width:0.0%", "an age of zero leaves the track empty"),
-                (90, "width:50.0%",
-                 "half of the 180s threshold fills exactly half the track"),
-                (181, "width:100.0%",
-                 "an age PAST the threshold clamps at 100% -- a bar that "
-                 "overflows its track is a bar that cannot be read")):
-            html = web.render_html(d.state_at(age), d.cfg)
-            results.check(
-                "at age %ds the bar is %s (%s)" % (age, want, why),
-                want in html,
-                "expected %r in the hero; the rendered hero was:\n%s"
-                % (want, html[html.find("class='hero"):][:300]))
-
-        results.check(
-            "a board with no collection ever draws NO bar and says 'never'",
-            # THE BAR'S CONTENT, not its attribute spelling. `class=hbar` alone
-            # is a check that can pass while a bar is on the page: re-quote the
-            # attribute (`class='hbar'`) in a later edit and the substring is
-            # absent while the element is not. The fill is what a drawn bar
-            # always has, so `"<i style='width:"` is asserted too. `class=hbar`,
-            # not `hbar`, for the other half: the hero's stylesheet rule
-            # (`.hero .hbar`) is inlined into every page, so a bare `hbar` is
-            # satisfied by the CSS that defines the bar this check exists to
-            # prove absent.
-            "class='hero none" in never and "class=hbar" not in never
-            and "<i style='width:" not in never,
-            "staleness=none drew a bar -- an empty track reads as '0s ago', "
-            "which is the one thing 'never collected' is not")
-
-        results.check(
-            "the hero states the age and the threshold it is measured against",
-            "stale at 3.0 min" in fresh and "class=hage" in fresh,
-            "the hero does not state the threshold the bar is drawn against, so "
-            "the bar has no scale and its length means nothing:\n%s"
-            % fresh[fresh.find("class='hero"):][:300])
-
-        # THE BAR IS AN IMAGE TO A SCREEN READER, which is the whole reason it
-        # is a `role=img` div rather than a plain element: the fill's length is
-        # the reading, and a length is not text. Delete the `aria-label` and the
-        # bar announces nothing, so the one thing the role exists for is gone.
-        results.check(
-            "the bar carries its reading as text for a screen reader",
-            "role=img" in fresh and "aria-label='last collection" in fresh,
-            "a role=img element with no accessible name is an image a screen "
-            "reader reads as nothing at all; the bar was:\n%s"
-            % fresh[fresh.find("class=hbar"):][:300])
-
-        # NON-VACUOUS HALF: the degradation sentences still exist, unchanged.
-        results.check(
-            "the hero did not replace the staleness banners it sits above",
-            "banner red" in stale and "AS IT WAS" in stale
-            and "NO COLLECTION HAS EVER BEEN RECORDED" in never,
-            "the hero displaced the sentences that degrade the whole document")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# 9. The band, and the three ways of having no colour
-# ---------------------------------------------------------------------------
-
-
-def test_the_band_never_says_ok_on_a_stale_or_colourless_page(results):
-    """Staleness dominates the band, and the three empty cases differ."""
+    Re-expressed from the rendered band. The band used to be a second reader of
+    the same rule, and having two readers was how a false green could survive on
+    one surface and not the other. There is one verdict field now; these are the
+    distinctions it must preserve.
+    """
     tmpdir = tempfile.mkdtemp()
     try:
         d = Dash(tmpdir, interval=60)
@@ -1179,825 +1177,94 @@ def test_the_band_never_says_ok_on_a_stale_or_colourless_page(results):
                    if c.spec and not getattr(c, "informational", False)]
         for target, cid in targets:
             d.check(target, cid, store.Status.OK, "fine (test)")
-        fresh = d.html()
+        st = d.status()
         results.check(
-            "a fresh all-green board bands OK",
-            "band ok" in fresh,
-            "the band did not read ok on a fresh board where every check is OK "
-            "-- if this is wrong the assertions below prove nothing")
+            "a fresh all-green board is ok",
+            st["verdict"] == "ok" and st["counts"]["green"] == len(targets),
+            "verdict=%r counts=%s -- if this is wrong the assertions below "
+            "prove nothing" % (st["verdict"], st["counts"]))
 
         # STALE, with every stored row still green. This is the dangerous one.
         d.epoch(age_s=60 * web.STALE_INTERVALS + 1)
         for target, cid in targets:
             d.check(target, cid, store.Status.OK, "fine (test)")
-        stale = d.html()
+        st = d.status()
         results.check(
-            "a stale page whose stored rows are green bands UNKNOWN, not OK",
-            "band unknown" in stale and "band ok" not in stale,
-            "the band read OK beside the red STALE banner -- the coloured rows "
-            "describe the fleet as it WAS, and a green band on them is the false "
-            "green this page exists to prevent")
+            "a stale board whose stored rows are green is UNKNOWN, not OK",
+            st["verdict"] == "unknown" and st["counts"]["green"] == len(targets),
+            "verdict=%r green=%s -- the coloured rows describe the fleet as it "
+            "WAS, and an ok verdict on them is the false green this service "
+            "exists to prevent" % (st["verdict"], st["counts"]["green"]))
+
+        # NEVER COLLECTED, WHICH IS NOT THE SAME FACT AS TOO OLD. Both are
+        # UNKNOWN, so a test asserting only the verdict could never catch the two
+        # collapsing into one sentence. The REASON is what has to differ.
+        os.makedirs(os.path.join(tmpdir, "never"), exist_ok=True)
+        v = Dash(os.path.join(tmpdir, "never"))
+        never = v.status()
+        results.check(
+            "a board that has never collected does not claim a collection went "
+            "stale",
+            never["verdict"] == "unknown"
+            and "ever been recorded" in never["verdict_reason"]
+            and "too old" not in never["verdict_reason"]
+            and never["verdict_reason"] != st["verdict_reason"],
+            "reason=%r -- it reaches the right verdict but gives the STALE "
+            "reason, asserting a collection that was never made"
+            % never["verdict_reason"])
 
         # NO COLOUR AT ALL: nothing graded, nothing green.
-        #
-        # THE SUBDIRECTORY BOARD NEEDS ITS DIRECTORY FIRST -- the same brief
-        # defect Task 1's hero test records one function above. `store.connect`
-        # opens the path with sqlite3, which will NOT create a database inside a
-        # directory that does not exist, so `Dash(<missing dir>)` dies with
-        # sqlite3.OperationalError and takes the whole run with it. All three
-        # subdirectory boards in this test (grey, mixed, red) are affected, and
-        # without the makedirs the three zero-colour cases could not exist.
         os.makedirs(os.path.join(tmpdir, "grey"), exist_ok=True)
         e = Dash(os.path.join(tmpdir, "grey"))
         e.epoch()
-        grey = e.html()
+        grey = e.status()
         results.check(
-            "a board with no coloured row bands UNKNOWN and says so in words",
-            "band unknown" in grey
-            and "nothing reported a colour" in grey,
-            "a page where no check reported a colour did not say so plainly")
+            "a board with no coloured row is UNKNOWN and says nothing is known",
+            grey["verdict"] == "unknown"
+            and "nothing is known" in grey["verdict_reason"],
+            "reason=%r" % grey["verdict_reason"])
 
-        # NEVER COLLECTED, WHICH IS NOT THE SAME FACT AS TOO OLD. Both cases
-        # band UNKNOWN -- that much they share -- so a test asserting only the
-        # class would pass either way and could never catch the two collapsing
-        # into one sentence. The REASON is what has to differ, and the reason
-        # lives in the band, so the band is what gets sliced.
-        #
-        # THE SLICE IS BOUNDED BY THE BAND'S OWN CLOSE and the assertion is
-        # scoped to it, because "ever been recorded" is ALSO said by the banner
-        # further down the page. A page-wide `in` here would be satisfied by the
-        # banner no matter what the band said -- the same vacuity the mixed
-        # board's slice above records, and the reason this one is written the
-        # long way.
-        os.makedirs(os.path.join(tmpdir, "never"), exist_ok=True)
-        v = Dash(os.path.join(tmpdir, "never"))
-        never = v.html()
-        vstart = never.find("class='band")
-        vband = never[vstart:never.find("</div></div>", vstart)]
-        results.check(
-            "a page that has never collected does not claim a collection went "
-            "stale",
-            "band unknown" in never and "ever been recorded" in vband
-            and "too old" not in vband,
-            "the never-collected band reads %r -- it bands UNKNOWN for the right "
-            "verdict but gives the STALE reason, asserting a collection that was "
-            "never made and contradicting the banner below it" % vband)
-
-        # SOME GREEN, SOME GREY. The verdict stays ok -- that is the platform's
-        # existing rule and not this design's business -- but the grey count
-        # must be stated at the top, never folded away behind the green one.
+        # SOME GREEN, SOME GREY. The verdict stays ok -- the platform's existing
+        # rule -- but the grey count must be carried, never folded away behind
+        # the green one. That is what the band's extra sentence used to say.
         os.makedirs(os.path.join(tmpdir, "mixed"), exist_ok=True)
         g = Dash(os.path.join(tmpdir, "mixed"))
         g.epoch()
         g.check(targets[0][0], targets[0][1], store.Status.OK, "fine (test)")
-        mixed = g.html()
-        # THE SLICE IS BOUNDED BY THE BAND'S OWN CLOSE, and it is not cosmetic.
-        # A fixed-width window past the band start runs off the end of the band
-        # and into the NEXT block's text: measured on this page the band is 109
-        # characters and a 220-character window reaches 111 characters past its
-        # close, straight into `_whats_wrong`'s note -- which contains the very
-        # same "reported nothing" sentence. The check then passes on text that
-        # is not the band's, and CANNOT FAIL on the property it names. Verified
-        # by mutation: with the band's ok-branch grey append removed the
-        # fixed-window form still reads True; the bounded form reads False.
-        bstart = mixed.find("class='band")
-        band = mixed[bstart:mixed.find("</div></div>", bstart)]
+        mixed = g.status()
         results.check(
-            "a partly-unknown board states the grey count in the band itself",
-            "band ok" in mixed and "reported nothing" in band,
-            "the band on a board with 1 green and %d unknown rows reads %r -- so "
-            "'we could not ask' is presented as if it were the same as 'it "
-            "answered green', which is the collapse this project is built "
-            "against" % (len(targets) - 1, band))
+            "a partly-unknown board carries the grey count beside the green one",
+            mixed["verdict"] == "ok" and mixed["counts"]["green"] == 1
+            and mixed["counts"]["grey"] == (
+                mixed["counts"]["checks_total"]
+                - mixed["counts"]["informational"] - 1),
+            "verdict=%r counts=%s -- 'we could not ask' presented as if it were "
+            "the same as 'it answered green' is the collapse this project is "
+            "built against" % (mixed["verdict"], mixed["counts"]))
 
-        # THE THIRD CASE: rows ARE red or amber, so they are listed and neither
-        # empty-case sentence appears. All three cases must be three strings.
+        # THE THIRD CASE: rows ARE red or amber, so the verdict is fail and the
+        # worst list names them.
         os.makedirs(os.path.join(tmpdir, "red"), exist_ok=True)
         r = Dash(os.path.join(tmpdir, "red"))
         r.epoch()
         r.check(targets[0][0], targets[0][1], store.Status.FAIL,
                 "38.2 hours, past the limit (test)")
         r.check(targets[1][0], targets[1][1], store.Status.WARN, "near (test)")
-        red = r.html()
+        red = r.status()
         results.check(
-            "a board with red and amber rows lists them and prints no empty note",
-            "No check reported a colour" not in red
-            and "reported nothing" not in red
-            and "38.2 hours, past the limit (test)" in red
-            and "band fail" in red,
-            "the red/amber case did not render as the list -- the three "
-            "zero-colour cases are three different documents and this one is "
-            "not an empty note")
+            "a board with red and amber rows is fail and lists them",
+            red["verdict"] == "fail" and red["counts"]["red"] == 1
+            and red["counts"]["amber"] == 1
+            and any("38.2 hours" in w["detail"] for w in red["worst"]),
+            "verdict=%r counts=%s worst=%r" % (red["verdict"], red["counts"],
+                                               red["worst"]))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
-# 10. The tally strip
+# 14. The newest epoch read uses an index
 # ---------------------------------------------------------------------------
-
-
-def test_the_strip_makes_all_grey_a_different_shape_from_all_green(results):
-    """Membership, informational exclusion, and the grey/green distinction."""
-    tmpdir = tempfile.mkdtemp()
-    try:
-        d = Dash(tmpdir)
-        d.epoch()
-        # EVERY NON-INFORMATIONAL REGISTRY CHECK -- not only the spec-having
-        # ones. `_verdict_items` is `tiles + extra + others`, and `others` are
-        # the spec-less logic-only checks (31 of them in this registry), which
-        # carry a colour and belong in the strip by §4.4. Driving only the
-        # spec-having 40 leaves those 31 with no stored result, so they render
-        # UNKNOWN: an "all-green" board would not be all green, the strip's
-        # label would read "31 unknown" rather than "0 unknown", and the counts
-        # asserted below could not agree with the strip they are counting.
-        targets = [(c.target, c.id) for c in registry_instances(d.cfg)
-                   if not getattr(c, "informational", False)]
-
-        for target, cid in targets:
-            d.check(target, cid, store.Status.UNKNOWN, "not observed (test)")
-        grey_strip = web._tally_strip(d.state())
-        # THE MEMBERSHIP SET `targets` MUST BE. If this ever disagrees with the
-        # strip, the counts below are measuring a different page than the strip
-        # is drawing, and a test that cannot fail is not evidence.
-        results.check(
-            "the driven set is exactly the verdict-bearing rows",
-            len(targets) == len(web._verdict_items(d.state())),
-            "targets=%d but _verdict_items=%d -- the test drives a different set "
-            "than the strip draws"
-            % (len(targets), len(web._verdict_items(d.state()))))
-        results.check(
-            "an all-UNKNOWN board's strip has a segment per check and none green",
-            grey_strip.count("class='seg ") == len(targets)
-            and "seg green" not in grey_strip and "seg grey" in grey_strip,
-            "segments=%d expected=%d green-present=%s"
-            % (grey_strip.count("class='seg "), len(targets),
-               "seg green" in grey_strip))
-
-        # NON-VACUOUS HALF: a stored OK must produce green segments.
-        d.epoch()
-        for target, cid in targets:
-            d.check(target, cid, store.Status.OK, "fine (test)")
-        state = d.state()
-        green_strip = web._tally_strip(state)
-        results.check(
-            "an all-OK board's strip is green, so the check above can fail",
-            "seg green" in green_strip and "seg grey" not in green_strip,
-            "the strip did not go green on a board where every check is OK")
-
-        # THE STRIP MUST ACTUALLY BE ON THE PAGE, AND IN §4.1's PLACE. Every
-        # check above calls `_tally_strip` DIRECTLY, so not one of them would
-        # notice the call site being deleted or moved -- measured: delete
-        # `a(_tally_strip(state))` from `render_html` and the suite stays green,
-        # and moving it below the wrong-rows stays green too. §4.1's wireframe is
-        # hero, band, strip, then the rows, and that ORDER is the requirement.
-        #
-        # THE FIRST `<h2>` IS THE WRONG-ROWS HEADING: it is the first heading
-        # after the hero, the band and the strip. Anchored on the tag rather than
-        # on its text, so the check does not depend on an apostrophe surviving
-        # `_esc`.
-        page = d.html()
-        results.check(
-            "the strip is rendered on the page, between the band and the rows",
-            "class=strip" in page
-            and page.find("class='band") < page.find("class=strip")
-            < page.find("<h2>"),
-            "band=%d strip=%d first h2=%d -- the strip is missing from the page, "
-            "or is out of §4.1's order, while every direct call to `_tally_strip` "
-            "in this test still passes"
-            % (page.find("class='band"), page.find("class=strip"),
-               page.find("<h2>")))
-
-        # A BOARD WITH RED AND AMBER ON IT. Both boards above are all-grey and
-        # all-green, so the label's amber and red counts were never exercised --
-        # measured: swapping the green and amber counts stays green, and forcing
-        # `0 red` stays green. The strip is `role=img`, which makes this label
-        # its ENTIRE accessible text, so a count that does not match the board is
-        # a false claim about the fleet -- the one class of defect this project
-        # exists to prevent.
-        os.makedirs(os.path.join(tmpdir, "coloured"), exist_ok=True)
-        r = Dash(os.path.join(tmpdir, "coloured"))
-        r.epoch()
-        for target, cid in targets:
-            r.check(target, cid, store.Status.OK, "fine (test)")
-        r.check(targets[0][0], targets[0][1], store.Status.FAIL,
-                "past the limit (test)")
-        r.check(targets[1][0], targets[1][1], store.Status.WARN, "near (test)")
-        coloured = web._tally_strip(r.state())
-        results.check(
-            "the label counts red and amber, and segments are drawn in them",
-            "1 red" in coloured and "1 amber" in coloured
-            and ("%d green" % (len(targets) - 2)) in coloured
-            and "seg red" in coloured and "seg amber" in coloured,
-            "the strip on a board with 1 red, 1 amber and %d green reads %r -- "
-            "its label is the whole of its accessible text, so a count that does "
-            "not match the board is a false statement about the fleet"
-            % (len(targets) - 2,
-               coloured.split("aria-label='")[1].split("'")[0]))
-
-        results.check(
-            "the strip's label states its own count, per colour",
-            ("%d graded:" % len(web._verdict_items(state))) in green_strip
-            and "0 unknown" in green_strip,
-            "the strip does not state what it is counting:\n%s"
-            % green_strip[:300])
-
-        # EACH GROUP WRAPPER HOLDS ONE TARGET'S SEGMENTS, AND THERE IS ONE
-        # WRAPPER PER TARGET. That is §4.4's grouping stated as a property of
-        # the output -- the wrappers and their contents -- rather than as a
-        # restatement of the sort that produces it.
-        #
-        # WHY THE WRAPPERS AND NOT THE SEGMENTS' ORDER. The grouping needs TWO
-        # pieces of code to be right: the SORT, which puts each target's segments
-        # next to each other, and the BOUNDARY, which wraps them. An earlier
-        # draft of this check counted the runs of target in the segment sequence,
-        # reading them off the aria-labels -- and that proves only the sort.
-        # Deleting the whole boundary block collapses five wrappers into one and
-        # changes not one character the runs-check can see, so it stayed GREEN
-        # (measured: wrappers 5 -> 1, runs still 5). Asserting on the wrappers
-        # catches both, because it also proves they are not misaligned.
-        #
-        # WHY NOT THE OBVIOUS FORM EITHER. The draft before that asserted the
-        # segment sequence equalled `_verdict_items(state)`'s rags. On this
-        # all-OK board every rag is "green", so ANY permutation satisfied it --
-        # it could only fail by losing segments outright -- and once the strip
-        # sorts by target, deriving the expected order here means RE-SORTING IT
-        # THE SAME WAY, which is a verification that re-types the code it checks
-        # and so agrees with any bug in that code.
-        groups = green_strip.split("<span class=seg-group>")[1:]
-        # `labelled` keeps each segment's whole aria-label (`<target> <check_id>:
-        # <status>`) so the within-group check below can read the check_id too;
-        # `per_group` is the target of each, which the check beneath needs.
-        labelled = [[s.split("aria-label='")[1].split("'")[0]
-                     for s in g.split("<span class='seg ")[1:]]
-                    for g in groups]
-        per_group = [[lbl.split(" ", 1)[0] for lbl in g] for g in labelled]
-        tseq = [t for g in per_group for t in g]
-        results.check(
-            "each group wrapper holds one target's segments, one wrapper per "
-            "target",
-            len(per_group) == len(set(tseq)) and len(set(tseq)) > 1
-            and all(len(set(g)) == 1 for g in per_group)
-            and len(tseq) == len(web._verdict_items(state)),
-            "the strip drew %d wrappers over %d targets, contents %r -- "
-            "interleaved or ungrouped, a red segment sits between two gaps and "
-            "nothing says which box it came from, which is §4.4's second reason "
-            "for the strip existing. (`len(set(tseq)) > 1` keeps this from "
-            "passing on a one-target board, where grouping and no grouping look "
-            "identical.)"
-            % (len(per_group), len(set(tseq)),
-               [sorted(set(g)) for g in per_group][:8]))
-
-        # WITHIN A GROUP, THE REGISTRY'S OWN ORDER SURVIVES -- the sort is meant
-        # to be STABLE, and the docstring says so, but nothing behind it held:
-        # measured, reversing each group's segments stays green.
-        #
-        # WHAT IS COMPARED IS THE STRIP'S INPUT, NOT ITS SORT. `ids_by_target` is
-        # `_verdict_items`' own relative order for that target -- the order the
-        # segments were handed to the grouping in -- so this asserts a property
-        # of the output against its source, and does not re-run the sort it
-        # checks.
-        ids_by_target = {}
-        for it in web._verdict_items(state):
-            ids_by_target.setdefault(it["target"], []).append(it["check_id"])
-
-        def _ids(labels):
-            """The check_ids in one group, in the order they were drawn."""
-            out = []
-            for lbl in labels:
-                _t, rest = lbl.split(" ", 1)
-                out.append(rest.rsplit(": ", 1)[0])
-            return out
-
-        results.check(
-            "within each group the registry's own order is kept",
-            all(_ids(g) == ids_by_target[g[0].split(" ", 1)[0]]
-                for g in labelled),
-            "a group's segments are not in the registry's order for that target, "
-            "so the sort is not stable and the boxes reshuffle between renders: "
-            "%r" % [_ids(g)[:3] for g in labelled][:3])
-
-        # AN UNRECOGNISED STATUS STRING. `_status` maps anything it does not
-        # know to UNKNOWN, so the strip must not draw it as a colour that
-        # carries a meaning it does not have.
-        os.makedirs(os.path.join(tmpdir, "bogus"), exist_ok=True)
-        u = Dash(os.path.join(tmpdir, "bogus"))
-        u.epoch()
-        u.check(targets[0][0], targets[0][1], "OK", "shouted (test)")
-        bogus = web._tally_strip(u.state())
-        results.check(
-            "a status string the build does not recognise is drawn unknown",
-            "class='seg grey" in bogus and "class='seg green" not in bogus,
-            "the status 'OK' produced: %s -- a status with no meaning here must "
-            "never be drawn as a colour that has one, and it must not be drawn "
-            "green on the strength of looking like green"
-            % bogus[bogus.find("class=strip"):][:240])
-
-        # THE LABEL IS NOT THE LIST'S COUNT. Informational rows are excluded,
-        # so the strip has fewer segments than the all-checks list has rows and
-        # the two numbers must each say what they count.
-        info = [c.id for c in registry_instances(d.cfg)
-                if getattr(c, "informational", False)]
-        if info:
-            results.check(
-                "no informational row is drawn as a segment",
-                all((" %s:" % cid) not in green_strip for cid in info),
-                "an informational row reached the strip -- drawing a colourless "
-                "row grey collapses 'no colour by ruling' into UNKNOWN, which is "
-                "the confusion the strip exists to remove")
-
-        # A ZERO-LENGTH SELECTION: no verdict-bearing rows at all.
-        #
-        # The label literal is `0 graded:` -- matching the format §4.4 specifies
-        # ("77 graded: 74 green, 2 amber, 1 red, 0 unknown") and the format the
-        # per-colour check above asserts. The plan originally wrote
-        # `0 graded checks`, which no branch of `_tally_strip` produces.
-        empty = web._tally_strip({"tiles": [], "extra": [], "others": [],
-                                  "informational": [], "incidents": []})
-        results.check(
-            "a board with no verdict-bearing row renders an empty strip, not a "
-            "broken one",
-            "class='seg " not in empty and "0 graded:" in empty
-            and "seg-group" not in empty,
-            "a zero-length selection produced: %r -- a stray group wrapper is "
-            "the `if group:` guard missing, and it renders an empty span on a "
-            "page with no rows at all" % empty[:200])
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-# ---------------------------------------------------------------------------
-# 11. Disclosure hides nothing
-# ---------------------------------------------------------------------------
-
-
-def test_a_closed_section_still_renders_every_row(results):
-    """Collapsed is a presentation state, not an omission."""
-    tmpdir = tempfile.mkdtemp()
-    try:
-        d = Dash(tmpdir)
-        d.epoch()
-        targets = [(c.target, c.id) for c in registry_instances(d.cfg)]
-        for target, cid in targets:
-            d.check(target, cid, store.Status.OK, "fine (test)")
-
-        state, html = d.state(), d.html()
-        results.check(
-            "every check in the registry appears in the HTML",
-            all(cid in html for _target, cid in targets),
-            "a check is missing from the document entirely -- collapsing must "
-            "hide presentation, never rows")
-        results.check(
-            "the page uses native <details>, so disclosure needs no script",
-            html.count("<details") == html.count("</details>")
-            and html.count("<details") >= 4,
-            "details open=%d close=%d -- expected at least four balanced "
-            "sections" % (html.count("<details"), html.count("</details>")))
-        # THE EXPECTED IDS ARE DERIVED, NOT TYPED. `informational` and
-        # `thresholds` render only when they have rows, so a typed list of all
-        # five would red on correct code the first time the data changes -- and
-        # it would be the same defect as the hardcoded row count one section up.
-        # The contract Step 3's docstring names is five ids; asserting three of
-        # them is a guard that covers a contract it does not fully name.
-        expected_ids = ["incidents", "checks", "evidence"]
-        if state["informational"]:
-            expected_ids.append("informational")
-        if state["deferred"] or state["unclaimed"]:
-            expected_ids.append("thresholds")
-        results.check(
-            "every section carries the id the refresh restores it by",
-            all(("id='sec-%s'" % s) in html for s in expected_ids),
-            "a section lost its id, so the refresh cannot restore whether it "
-            "was open -- and restoring by position instead would shift every "
-            "section after one that appears or disappears. Expected %r"
-            % expected_ids)
-        # §4.1's wireframe (:90-94) and §4.5's table (:174-175) both put
-        # `All N checks` above the incident section and agree with each other,
-        # so the order is the spec's. The brief originally emitted them the
-        # other way and nothing asserted either -- an order nobody checks is an
-        # order the next edit is free to reverse.
-        results.check(
-            "the sections follow the spec's order, counts before incidents",
-            -1 < html.find("id='sec-checks'") < html.find("id='sec-incidents'"),
-            "§4.1 and §4.5 both order the all-checks section above the incident "
-            "section: checks at %d, incidents at %d"
-            % (html.find("id='sec-checks'"), html.find("id='sec-incidents'")))
-
-        # The counts live in the SUMMARIES, so a shut section still says how
-        # much is behind it.
-        summary_texts = [html[m:m + 120] for m in
-                         [i for i in range(len(html))
-                          if html.startswith("<summary", i)]]
-        joined = " ".join(summary_texts)
-        want_all = (len(state["extra"]) + len(state["tiles"])
-                    + len(state["others"]) + len(state["informational"]))
-        results.check(
-            "the all-checks summary states its own count",
-            ("All %d checks" % want_all) in joined,
-            "summaries found: %r -- a collapsed list that does not say how many "
-            "rows it holds reads as an empty one" % joined[:300])
-        results.check(
-            "the evidence summary is present, so row counts are not lost",
-            "Evidence" in joined,
-            "the row-count section lost its summary: %r" % joined[:300])
-
-        # THE QUALITY FLOOR, and this task is where it is actually provided:
-        # §4.7 makes `prefers-reduced-motion` part of it, and Step 5's media
-        # query is the only thing on the page that honours it. The guard is
-        # asserted HERE, with the CSS that satisfies it -- asserted in Task 7 it
-        # would be satisfied by this stylesheet and say nothing about the script.
-        results.check(
-            "reduced motion is respected",
-            "prefers-reduced-motion" in html,
-            "the page animates for a reader who asked it not to")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# 12. Naming, and colour that is never the only channel
-# ---------------------------------------------------------------------------
-#
-# Needs `import re` added to the module's imports (:31-40); the token guard
-# below reads the stylesheet's var() uses and definitions.
-
-
-def test_the_page_names_the_platform_and_never_colours_alone(results):
-    """The title, the tokens, and four states all saying their own word."""
-    tmpdir = tempfile.mkdtemp()
-    try:
-        d = Dash(tmpdir)
-        d.epoch()
-        html = d.html()
-        results.check(
-            "the page is titled sentinel, not named after tenant #1",
-            "<h1>sentinel</h1>" in html and "CuBox fleet monitor" not in html,
-            "the <h1> still names the first adapter as if it were the platform, "
-            "which CLAUDE.md is explicit that it is not")
-
-        want_watched = ", ".join(sorted(
-            {r["target"] for r in d.state()["tiles"] + d.state()["extra"]
-             + d.state()["others"] + d.state()["informational"]}))
-        results.check(
-            "the subtitle names the targets the page is actually watching",
-            want_watched in html and "Watching" in html,
-            "the subtitle does not name the rows' own targets, so it is either "
-            "a stale literal or empty -- expected %r" % want_watched)
-
-        results.check(
-            "the old colour aliases are gone from the stylesheet",
-            "--green:" not in html.split("</style>")[0],
-            "the stylesheet still defines --green/--amber/--red/--grey as well "
-            "as the role tokens, so there are two names for one colour and they "
-            "will drift")
-
-        # THE GUARD THE ALIAS REMOVAL NEEDS. Deleting `--green` while some rule
-        # still says `var(--green)` raises nothing and logs nothing: the
-        # declaration becomes invalid and the element silently has no colour.
-        # The hero's bar would go invisible, and every other test on this page
-        # would still pass. Task 1's hero CSS uses the aliases, so this is the
-        # exact miss it would make.
-        css = html.split("</style>")[0]
-        defined = set(re.findall(r"(--[a-z-]+)\s*:", css))
-        used = set(re.findall(r"var\((--[a-z-]+)\)", css))
-        results.check(
-            "every colour token the stylesheet uses is one it defines",
-            used <= defined,
-            "the stylesheet uses %s but does not define %s -- a var() with no "
-            "definition is not an error anywhere, it is an element that "
-            "quietly has no colour"
-            % (sorted(used - defined), sorted(defined)))
-
-        # THE ONE GUARD THAT LOOKS AT A CSS VALUE, and it asserts a PROPERTY,
-        # not the value: a backslash that is not the start of a hex escape does
-        # NOT drop the declaration. CSS Syntax 4.3.7, "Consume an escaped code
-        # point": a backslash before a hex digit consumes a hex escape, and a
-        # backslash before ANYTHING ELSE returns that code point -- it escapes
-        # one character, which is then emitted literally. So the declaration
-        # parses and the value is silently not the one that was meant. Not
-        # hypothetical: write the disclosure marker as `\u25b8` and `u` is an
-        # ordinary character, so the marker renders as the visible text `u25b8`
-        # rather than as the glyph, and every check on the page stays green.
-        # This is the same failure Task 5's token guard above exists to catch,
-        # one level down: a var() with no definition and a mangled escape are
-        # both silent. It copies no value, so a restyle is free to change every
-        # colour -- and legitimate hex escapes (`\2014`) are not flagged,
-        # while a TRAILING backslash, which really is a parse error, is.
-        results.check(
-            "no CSS escape can silently drop a declaration",
-            not re.search(r"\\(?![0-9a-fA-F])", css),
-            "the stylesheet carries a backslash that is not a hex escape -- it "
-            "escapes the character after it, so the value is silently not the "
-            "one intended, which no assertion about structure can see")
-
-        results.check(
-            "no heading uppercases itself",
-            "uppercase" not in css,
-            "a heading still text-transforms to caps -- the tracked-out "
-            "ALL-CAPS eyebrow is the generated-page tell §4.6 removes")
-
-        results.check(
-            "no webfont is fetched for the one page that has to be trustworthy",
-            "@font-face" not in html and "fonts.googleapis" not in html
-            and "fonts.gstatic" not in html,
-            "the page pulls a font over the network -- a typography dependency "
-            "on the page whose whole job is to be believable when the network "
-            "is the thing that is broken")
-
-        # FOUR STATES, FOUR WORDS. Each state's own word is in the document, so
-        # a reader who cannot separate the colours loses nothing. The markers
-        # are the ACTUAL markup each state renders in -- a tile prints its word
-        # after the value; the coloured rows print it as the pill's text.
-        for (target, cid), status in zip(
-                [(c.target, c.id) for c in registry_instances(d.cfg)
-                 if c.spec and not getattr(c, "informational", False)][:4],
-                (store.Status.OK, store.Status.WARN, store.Status.FAIL,
-                 store.Status.UNKNOWN)):
-            d.check(target, cid, status, "state (test)")
-        html = d.html()
-        results.check(
-            "every coloured state also prints its status word",
-            all(marker in html for marker in (
-                "&middot; ok<", ">warn<", ">fail<", ">unknown<")),
-            "a state is conveyed by colour alone -- a reader who cannot "
-            "separate the greens from the reds loses that row's outcome "
-            "entirely")
-        results.check(
-            "the four states are drawn as four different colour classes",
-            all(c in html for c in ("tile green", "pill amber", "pill red",
-                                    "pill grey")),
-            "the states are not distinctly coloured, so the word assertions "
-            "above prove nothing about the colours")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# 13. The shell, and the ONE place a cache header is allowed
-# ---------------------------------------------------------------------------
-
-
-def _get_bytes(url):
-    """The body as BYTES. `_get` decodes utf-8 with "replace", which is right
-    for the HTML and the JSON and destroys a PNG -- comparing a decoded image
-    against its magic bytes would test the decoder, not the file.
-    """
-    try:
-        with urllib.request.urlopen(url, timeout=10) as r:
-            return r.status, dict(r.headers), r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read()
-
-
-def test_the_app_shell_may_cache_and_nothing_else_may(results):
-    """Manifest and icons cache; every observation path still does not."""
-    tmpdir = tempfile.mkdtemp()
-    try:
-        d = Dash(tmpdir)
-        d.epoch()
-        httpd, base = _serve(d.cfg)
-        try:
-            for path in web.shell.ASSETS:
-                code, hdrs, body = _get(base + path)
-                results.check(
-                    "%s is served, and cacheable" % path,
-                    code == 200 and hdrs.get("Cache-Control") == web.shell.CACHE_CONTROL,
-                    "code=%s Cache-Control=%r -- the app shell is a constant of "
-                    "the image, so caching it is not a claim about the fleet"
-                    % (code, hdrs.get("Cache-Control")))
-                # THE TYPE MUST AGREE WITH THE FORMAT, NOT MERELY WITH ITSELF.
-                # An earlier form of this check compared the header against
-                # `web.shell.ASSETS[path][1]` -- and that compares the table to
-                # the table, because the route reads that same entry
-                # (`shell.asset()` returns `ASSETS[relpath][1]` unchanged), so a
-                # declaration that is simply WRONG moves both sides and stays
-                # green. Measured: mutating the manifest's type to `text/plain`
-                # left the suite at 140 checks, 0 failed. A guard that cannot
-                # fail on the mislabelling it exists for is not evidence.
-                #
-                # The format is already established one check over -- the PNG
-                # magic bytes and the manifest's `json.loads` -- so the type is
-                # asserted to agree with THAT, which is a fact about the file
-                # rather than a value this test copies. A wrong type stops a
-                # phone installing the app with nothing in any log: the same
-                # silent class as a dropped CSS declaration.
-                #
-                # A PNG's type is a fact about PNGs, so it is asserted exactly; a
-                # manifest's is not settled (`application/manifest+json` and
-                # `application/json` both install), so it is asserted by family
-                # and a legitimate spelling is not red.
-                ctype = hdrs.get("Content-Type", "")
-                if path.endswith(".png"):
-                    kind_ok = ctype == "image/png"
-                else:
-                    kind_ok = "json" in ctype
-                results.check(
-                    "%s is served as the format it actually is" % path,
-                    code == 200 and kind_ok,
-                    "Content-Type=%r for %s -- a PNG must arrive as an image and "
-                    "the manifest as JSON, or the browser refuses the asset and "
-                    "nothing anywhere says so" % (ctype, path))
-
-            # THE GUARD THAT MATTERS: the exception must not grow.
-            for path in ("/", "/api/status.json", "/api/state.json", "/healthz"):
-                code, hdrs, body = _get(base + path)
-                results.check(
-                    "%s did NOT gain a cache header" % path,
-                    hdrs.get("Cache-Control") == CACHE
-                    and hdrs.get("Cache-Control") != web.shell.CACHE_CONTROL,
-                    "Cache-Control=%r -- an observation path became cacheable, "
-                    "and a cached 200 while the collector is dead is a false "
-                    "GREEN" % hdrs.get("Cache-Control"))
-
-            code, hdrs, body = _get(base + "/manifest.webmanifest")
-            try:
-                man = json.loads(body)
-                ok_man = (man["name"] == "sentinel" and man["display"] == "standalone"
-                          and len(man["icons"]) >= 2)
-            except Exception as exc:                     # noqa: BLE001
-                ok_man, man = False, {"error": str(exc)}
-            results.check(
-                "the manifest installs as a standalone app called sentinel",
-                ok_man, "manifest=%r" % man)
-
-            # PNG magic, so a truncated or wrong file is caught here rather than
-            # on the phone.
-            #
-            # THE IEND SLICE IS [-8:-4], NOT [-12:-8]. A PNG ends with the IEND
-            # chunk's 4-byte LENGTH, its 4-byte TYPE, then its 4-byte CRC -- so
-            # the last twelve bytes are `\0\0\0\0` `IEND` `<crc>` and the type
-            # is the middle quarter, not the first. Measured on a real 4x4 PNG:
-            # `raw[-12:-8]` is b'\x00\x00\x00\x00' and `raw[-8:-4]` is b'IEND'.
-            # The earlier form asserted a slice that can never hold it, so this
-            # check could only ever fail.
-            # DECLARED VS ACTUAL, and this is the residual instance of the class
-            # two neighbouring checks were fixed for. The manifest tells iOS the
-            # icon is 180x180; nothing compared that to the file. A mismatch is
-            # rescaled or ignored SILENTLY, which is the fallback that never says
-            # so. `man` is the parsed manifest from the check above, and on a
-            # parse failure it has no "icons" key -- so this fails CLOSED.
-            declared = ({i["src"]: i.get("sizes") for i in man.get("icons", [])}
-                        if isinstance(man, dict) else {})
-            for path in [p for p in web.shell.ASSETS if p.endswith(".png")]:
-                code, hdrs, raw = _get_bytes(base + path)
-                results.check(
-                    "%s is a real, complete PNG" % path,
-                    code == 200 and raw[:8] == b"\x89PNG\r\n\x1a\n"
-                    and raw[-8:-4] == b"IEND",
-                    "code=%s first8=%r last8=%r -- iOS will not accept an SVG "
-                    "here, and a truncated file falls back to a screenshot "
-                    "without saying so" % (code, raw[:8], raw[-8:]))
-                w, h = (struct.unpack(">II", raw[16:24]) if len(raw) >= 24
-                        else (0, 0))
-                results.check(
-                    "%s is the size the manifest declares" % path,
-                    code == 200 and w > 0
-                    and declared.get(path) == "%dx%d" % (w, h),
-                    "the manifest declares %r for this path and the file's own "
-                    "IHDR says %dx%d -- iOS trusts the declaration, so a "
-                    "mismatch is rescaled or ignored without saying so"
-                    % (declared.get(path), w, h))
-            # THE ORDERING THAT MAKES THE SHELL WORTH ANYTHING, and it was the
-            # one structural claim this task made with no guard behind it. The
-            # shell branch sits ahead of the store precisely so the installed app
-            # still looks like an app during an outage; move that branch one
-            # statement down and every check above still passes.
-            #
-            # BOTH HALVES ARE LOAD-BEARING. The shell answering 200 alone would
-            # pass vacuously the day this config stops being unopenable, so the
-            # guard also asserts an observation path does NOT answer under it --
-            # the same two-sided shape as the cache mutation.
-            broken = make_cfg(os.path.join(tmpdir, "no-such-dir", "monitor.sqlite"))
-            httpd2, base2 = _serve(broken)
-            try:
-                for path in web.shell.ASSETS:
-                    code, hdrs, body = _get(base2 + path)
-                    results.check(
-                        "%s is served while the store cannot be opened" % path,
-                        code == 200
-                        and hdrs.get("Cache-Control") == web.shell.CACHE_CONTROL,
-                        "code=%s Cache-Control=%r -- the app shell is a constant "
-                        "of the image, so an outage must not stop it being served"
-                        % (code, hdrs.get("Cache-Control")))
-                code, _h, _b = _get(base2 + "/")
-                results.check(
-                    "an observation path does NOT answer under the same config",
-                    code != 200,
-                    "code=%s -- if this answers 200 then the store was opened "
-                    "after all, and the check above proves nothing about ordering"
-                    % code)
-            finally:
-                httpd2.shutdown()
-                httpd2.server_close()
-
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-
-        html = d.html()
-        results.check(
-            "the page links the shell and the iOS home-screen tags",
-            "rel=manifest" in html and "apple-touch-icon" in html
-            and "apple-mobile-web-app-capable" in html,
-            "the head is missing one of the tags iOS needs to install it")
-        results.check(
-            "there is no service worker, deliberately",
-            "serviceWorker" not in html and "sw.js" not in html,
-            "a service worker appeared -- iOS installs without one, so it would "
-            "exist only to cache, which is the one thing no-store forbids")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# 14. The reactive layer, and the seam it depends on
-# ---------------------------------------------------------------------------
-
-
-def test_the_refresh_script_has_the_hooks_it_looks_for(results):
-    """The ids are an integration seam, and a rename would fail silently."""
-    tmpdir = tempfile.mkdtemp()
-    try:
-        d = Dash(tmpdir)
-        d.epoch()
-        html = d.html()
-        results.check(
-            "the page carries the container the script swaps",
-            "id=live" in html or 'id="live"' in html,
-            "the script replaces #live, and the renderer does not emit it -- "
-            "the page would simply stop updating, with no error anywhere")
-        results.check(
-            "the page carries the script",
-            "id=refresh" in html or 'id="refresh"' in html,
-            "no refresh script on the page")
-        results.check(
-            "the script re-fetches the SERVER's render, not a client-side one",
-            # `)` OR `,` AFTER THE QUOTE, and that is not pedantry. Step 3's own
-            # fence writes `fetch('/', {cache: 'no-store'})`, so the browser is
-            # told to bypass its cache as well as being served `no-store` -- two
-            # mechanisms for the one thing this script exists to prevent, a stale
-            # sample shown as current. A literal of `fetch('/')` REJECTS THAT CODE
-            # while differing from it by one token of freshness and none of
-            # meaning, which would make the check the thing that has to change.
-            #
-            # Widening to the comma does NOT weaken the discriminator, and that is
-            # measured rather than argued. A client-side renderer writing
-            # `fetch('/api/status.json')` contains NEITHER literal -- after
-            # `fetch('/` it has an `a`, not a quote -- so the widened check rejects
-            # it exactly as the narrow one did (measured: the renderer reds this
-            # check, 148/1, and nothing else). The widening therefore accepted
-            # exactly one more shape, `fetch('/',` followed by arguments, and that
-            # shape is the implementation's and never a renderer's. The narrow
-            # literal's only fault was rejecting the plan's own code -- a false
-            # negative, never a true one, which is the one direction a check may
-            # not fail in.
-            ("fetch('/')" in html or 'fetch("/")' in html
-             or "fetch('/'," in html or 'fetch("/",' in html),
-            "the script does not re-fetch the page -- a client-side renderer "
-            "would be a second render_html to keep identical forever")
-        # THE CALL IS ASSERTED, NOT ONLY THE COPY, and that is what makes Step
-        # 6's mutation evidence. The string alone is a literal in the
-        # `unreachable` function's BODY, so deleting the call -- which is
-        # exactly "the failure branch is gone" -- leaves the definition, the
-        # string and this check green. Measured on a scratch tree: with the
-        # copy asserted alone the mutation gives 0 failed. Naming the function
-        # is the same shape as the other hooks this test asserts (`d.open =
-        # true`, `scrollY`), and it is the brief's own fence's name.
-        results.check(
-            "a failed fetch is rendered as UNKNOWN, never as the stale page",
-            "cannot reach the monitor" in html and ".catch(unreachable)" in html,
-            "the script has no failure branch, so a page that can no longer "
-            "check would go on asserting health -- which is the false green "
-            "this whole design exists to prevent")
-        results.check(
-            "the poll period comes from the configured interval",
-            ("%d" % (d.cfg.interval * 1000)) in html,
-            "the script does not use the configured interval")
-        results.check(
-            "polling stops when the page is hidden",
-            "visibilitychange" in html,
-            "a phone in a pocket would poll all night")
-        # THE SEAM THAT WOULD FAIL SILENTLY. The script restores disclosure by
-        # id, so the renderer's ids and the script's lookup must agree; if
-        # either is renamed the page keeps working and quietly loses the state.
-        results.check(
-            "the script restores disclosure by the ids the renderer emits",
-            "d.id" in html and "id='sec-checks'" in html
-            and "st[d.id] = d.open" in html and "d.open = st[id]" in html,
-            "the script does not snapshot and restore disclosure by id, so an "
-            "open section snaps shut every interval -- or reopens the wrong one, "
-            "or comes back open after the reader closed it")
-        results.check(
-            "the scroll position survives the swap",
-            "scrollY" in html and "scrollTo" in html,
-            "the page jumps to the top every interval, so reading anything "
-            "below the fold is impossible")
-        # NOT HERE: a `prefers-reduced-motion` assertion would already be
-        # satisfied by Task 4's stylesheet media query, which is the thing that
-        # actually honours it. It is asserted in Task 4's test, beside that CSS.
-        # Asserting it here would be a check that cannot fail on this task's
-        # code -- and a test that cannot fail is not evidence.
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_the_newest_epoch_read_uses_an_index(results):
@@ -2008,9 +1275,7 @@ def test_the_newest_epoch_read_uses_an_index(results):
     symptom in any output this suite otherwise reads. Measured on the live store
     2026-10-07 at 807,263 `check_run` rows and 425 MB: 5.8 s for this one
     statement, build_state at 10-14 s -- slower than the container's own 5 s
-    healthcheck, so a monitor collecting perfectly reported as a dead one. That
-    is the confusion this whole platform exists to prevent, and it arrives with
-    no red anything.
+    healthcheck, so a monitor collecting perfectly reported as a dead one.
 
     THE PLAN, NOT A STOPWATCH, is what makes the assertion deterministic:
     `SCAN check_run` is what SQLite says when it has no usable index, on a table
@@ -2037,6 +1302,11 @@ def test_the_newest_epoch_read_uses_an_index(results):
         "table -- plan: %r. It stays correct and gets slower with every epoch, "
         "which is why nothing else notices: the page takes seconds to answer, "
         "and a live monitor then reads as a dead one" % (plan,))
+
+
+# ---------------------------------------------------------------------------
+# 15. A pending incident is not on the board
+# ---------------------------------------------------------------------------
 
 
 def test_a_pending_incident_is_not_on_the_board(results):
@@ -2073,83 +1343,12 @@ def test_a_pending_incident_is_not_on_the_board(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_the_page_fits_a_phone_without_being_asked(results):
-    """What the phone reported, and the mechanisms that fix it.
-
-    Measured on an iPhone 15 Pro with the app on the home screen, 2026-10-07:
-    the title and the target list sat BEHIND the Dynamic Island, and the live
-    incident table pushed the whole document wider than the screen so the page
-    scrolled sideways under the reader's thumb.
-
-    BOTH ARE CONSEQUENCES OF A DECISION ALREADY MADE, not of a missing one.
-    `viewport-fit=cover` plus a black-translucent status bar put the document
-    under the island deliberately, which obliges the page to inset itself with
-    `env()`; and a seven-column table with a free-text cell has no way to fit
-    393 pt unless something gives. The checks below assert the mechanism, since
-    neither has any output that would look wrong in a terminal.
-    """
-    tmpdir = tempfile.mkdtemp()
-    try:
-        d = Dash(tmpdir)
-        d.epoch()
-        # A LIVE INCIDENT, because the incident table is the one that overflowed
-        # and it only renders when there is one: asserting "every table has a
-        # scroll container" over a page that never draws that table would be a
-        # guard that cannot fail on the bug it was written for.
-        for _ in range(store.CONFIRM_POLLS):
-            d.seq += 1
-            store.sync_incident(d.conn, d.seq, "cubox-1", "disk_free_gb",
-                                "/mnt/recordings", store.Status.FAIL,
-                                "the recording volume is down to 0.4 GiB free "
-                                "and tvheadend is still writing to it")
-        html = d.html()
-        css = web.CSS
-
-        wrap = css.split(".wrap {", 1)[1].split("}", 1)[0]
-        insets = [i for i in ("top", "right", "bottom", "left")
-                  if "env(safe-area-inset-%s" % i in wrap]
-        results.check(
-            "the page insets itself clear of the iPhone's status bar and edges",
-            len(insets) == 4 and "calc(" in wrap,
-            "the .wrap rule does not carry all four env(safe-area-inset-*) "
-            "terms -- found %r. `viewport-fit=cover` and the black-translucent "
-            "status bar put the document UNDER the island on purpose, so a page "
-            "that does not inset itself hides its own title behind the camera "
-            "housing, which is what the phone reported" % (insets,))
-
-        tables = len(re.findall(r"<table", html))
-        wrapped = len(re.findall(r"<div class=scroll><table", html))
-        results.check(
-            "every table scrolls inside itself, never the page",
-            tables == wrapped and tables >= 1
-            and "overflow-x:auto" in css.split(".scroll {", 1)[1].split("}")[0],
-            "%d table(s) in the page, %d inside a .scroll container -- a table "
-            "that is not wrapped pushes the DOCUMENT wider than the screen, so "
-            "the whole page scrolls sideways instead of the one region that "
-            "cannot fit. The incident table is seven columns and carries free "
-            "text, which is what the phone reported." % (tables, wrapped))
-
-        script = html.split("<script id=refresh>", 1)[1]
-        results.check(
-            "the pull gesture reuses the one fetch path instead of adding a second",
-            "id=pull" in html and ".pull {" in css
-            and script.count("fetch(") == 1
-            and "touchmove" in script and "tick().then" in script,
-            "the pull-to-refresh gesture does not reuse tick(): a second "
-            "`fetch(` in the script (found %d) means a second copy of 'what to "
-            "show when the fetch dies', and the band would then be able to "
-            "disagree with the strip about whether the monitor answered"
-            % (script.count("fetch("),))
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
 # ---------------------------------------------------------------------------
-# 13. Modules: one section per enabled module, a loud note for a disabled one
+# 16. Modules: enabled, disabled, and the counts they own
 # ---------------------------------------------------------------------------
 
 
-def test_each_enabled_module_renders_its_own_section(results):
+def test_each_enabled_module_is_named_with_its_tiles(results):
     tmpdir = tempfile.mkdtemp()
     try:
         d = Dash(tmpdir)
@@ -2158,31 +1357,30 @@ def test_each_enabled_module_renders_its_own_section(results):
                    if c.spec and not getattr(c, "informational", False)]
         for target, cid in targets:
             d.check(target, cid, store.Status.OK, "fine (test)")
-        state, html = d.state(), d.html()
+        state = d.state()
 
         results.check(
             "the enabled modules are listed with their order and titles",
-            [m["id"] for m in state["modules"]] == ["fleet", "system"]
+            [m["id"] for m in state["modules"]] == ["fleet", "system", "snmp"]
             and state["modules"][0]["title"] == "CuBox fleet"
             and state["modules"][1]["title"] == "System resources"
+            and state["modules"][2]["title"] == "Network devices"
             and all(m["enabled"] for m in state["modules"]),
-            "modules=%r -- the page model must name what is on"
+            "modules=%r -- the model must name what is on"
             % (state["modules"],))
         fleet_tiles = [t for t in state["tiles"] if t["module"] == "fleet"]
         results.check(
-            "each enabled module renders its own titled section",
-            ("<h2>CuBox fleet (%d)</h2>" % len(fleet_tiles)) in html
-            and "<h2>System resources (" in html,
-            "the tile grid has no section headed by each module's title")
-        results.check(
-            "its tiles carry the module they came from",
-            bool(state["tiles"])
+            "each enabled module has tiles, and they carry their module id",
+            bool(fleet_tiles)
             and {t["module"] for t in state["tiles"]} == {"fleet", "system"},
-            "modules on tiles: %r" % sorted({t["module"] for t in state["tiles"]}))
+            "fleet tiles=%d, modules on tiles: %r"
+            % (len(fleet_tiles),
+               sorted({t["module"] for t in state["tiles"]})))
         results.check(
-            "no disabled note appears when nothing is disabled",
-            "DISABLED by configuration" not in html,
-            "a page with every module enabled claims one is disabled")
+            "no disabled module is reported when nothing is disabled",
+            state["disabled_modules"] == [],
+            "a board with every module enabled claims one is disabled: %r"
+            % (state["disabled_modules"],))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2191,65 +1389,74 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
     """A disabled module must be stated, and must not leave a green section."""
     tmpdir = tempfile.mkdtemp()
     try:
-        d = Dash(tmpdir, FLEET_ENABLED="0", SYSTEM_ENABLED="0")
+        d = Dash(tmpdir, FLEET_ENABLED="0", SYSTEM_ENABLED="0",
+                 SNMP_ENABLED="0")
         d.epoch()
-        state, html = d.state(), d.html()
-        st = web.build_status(d.cfg, d.conn)
+        state = d.state()
+        st = d.status()
 
         results.check(
-            "the page model separates enabled from disabled modules",
+            "the model separates enabled from disabled modules",
             state["modules"] == []
-            and [m["id"] for m in state["disabled_modules"]] == ["fleet", "system"],
+            and [m["id"] for m in state["disabled_modules"]]
+            == ["fleet", "system", "snmp"],
             "modules=%r disabled=%r -- a disabled module that simply vanishes "
             "reads exactly like one that never existed"
             % (state["modules"], state["disabled_modules"]))
+        # RE-EXPRESSED FROM THE DISABLED NOTE. The fact the note carried is in
+        # the model: the module is off (above) and its checks are absent, so a
+        # consumer can state both without a second source.
         results.check(
-            "the disabled module is stated in words, above the tiles",
-            "Module CuBox fleet is DISABLED by configuration" in html
-            and "frozen, not resolved" in html,
-            "the page does not say the module is disabled or what happened to "
-            "its incidents")
-        results.check(
-            "no tile, and no empty section, is rendered for the disabled module",
-            "mem_available_mb" not in html and "tile green" not in html
-            and "<h2>CuBox fleet" not in html,
-            "a check from a disabled module still renders, or a titled empty "
-            "section was drawn for a module that is not running -- an empty "
-            "section reads exactly like a healthy one")
+            "no tile is reported for a disabled module",
+            all(t["module"] not in ("fleet", "system") for t in state["tiles"])
+            and "mem_available_mb" not in {t["check_id"]
+                                           for t in state["tiles"]},
+            "a check from a disabled module still reports a tile: %r"
+            % (state["tiles"][:3],))
         results.check(
             "a wholly disabled fleet does not band green",
-            "band unknown" in html and "band ok" not in html,
-            "the band reads OK with no module enabled -- platform-only checks "
-            "are not a clean fleet (SpecCoverage alone returns OK on an empty "
-            "audit)")
+            st["verdict"] == "unknown",
+            "verdict=%r -- platform-only checks are not a clean fleet "
+            "(SpecCoverage alone returns OK on an empty audit)"
+            % (st["verdict"],))
+        rows = {r["check_id"]: r for r in
+                state["tiles"] + state["extra"] + state["others"]}
         results.check(
             "the platform's own rows still run and are grey, not absent",
-            "modules_enabled" in html and ">unknown<" in html,
+            "modules_enabled" in rows
+            and web._status(rows["modules_enabled"]["status"]).rag == "grey",
             "the platform's checks vanished with the module -- then nothing at "
-            "all would be measuring the disablement")
+            "all would be measuring the disablement (rows: %s)"
+            % sorted(rows)[:8])
         results.check(
             "the API payload carries the module lists, additively",
             st["modules"] == []
-            and [m["id"] for m in st["disabled_modules"]] == ["fleet", "system"],
+            and [m["id"] for m in st["disabled_modules"]]
+            == ["fleet", "system", "snmp"],
             "the status API dropped the module lists")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_insights_and_proposals_are_rendered_and_empty_safe(results):
-    """Recommendations and Approvals are additive, and empty is still a section.
+# ---------------------------------------------------------------------------
+# 17. Insights and proposals
+# ---------------------------------------------------------------------------
 
-    An absent section reads as a healthy one, so the EMPTY case must render
-    its own sentence and its id; the populated case must name the insight, the
-    rationale and the expiry. And an expired proposal is shown EXPIRED even
-    though the collector has not swept the row -- the page opens the store
-    read-only and cannot.
+
+def test_insights_and_proposals_are_additive_and_empty_safe(results):
+    """Recommendations and Approvals are additive, and empty is still a key.
+
+    An absent section reads as a healthy one, so the EMPTY case must carry its
+    own list and its count; the populated case must name the insight, the
+    rationale and the expiry. An expired proposal is annotated expired even
+    though the collector has not swept the row -- the dashboard opens the store
+    read-only and cannot run the sweep itself.
     """
     tmpdir = tempfile.mkdtemp()
     try:
         d = Dash(tmpdir)
         d.epoch()
-        state, html = d.state(), d.html()
+        state = d.state()
         results.check(
             "build_state exposes additive insight and proposal keys",
             state.get("insights") == [] and state.get("proposals") == []
@@ -2257,13 +1464,10 @@ def test_insights_and_proposals_are_rendered_and_empty_safe(results):
             "keys=%r -- additive means existing consumers are unaffected"
             % (sorted(state),))
         results.check(
-            "empty Recommendations and Approvals still render, with ids",
-            "Recommendations (0)" in html and "Approvals (0)" in html
-            and "id='sec-recommendations'" in html
-            and "id='sec-approvals'" in html
-            and "No pending proposal" in html,
-            "a section that vanishes when empty cannot be told from one whose "
-            "query broke")
+            "empty Recommendations and Approvals are still present and counted",
+            len(state["insights"]) == 0 and len(state["proposals"]) == 0
+            and state["remedies_enabled"] in (True, False),
+            "an empty list that vanishes cannot be told from a broken query")
 
         store.record_insight(
             d.conn, advisor="reference", module="platform",
@@ -2283,28 +1487,30 @@ def test_insights_and_proposals_are_rendered_and_empty_safe(results):
             rationale="this one lapsed",
             expires_at=time.time() - 5)
 
-        state, html = d.state(), d.html()
+        state = d.state()
         results.check(
             "insights and pending proposals appear in the model",
             len(state["insights"]) == 1 and len(state["proposals"]) == 2,
             "insights=%r proposals=%r"
             % (state["insights"], state["proposals"]))
         results.check(
-            "the Recommendations section names the insight",
-            "Recommendations (1)" in html
-            and "cubox-1 mem: p95 outside the band" in html,
-            "the advisor's claim is not on the page")
+            "the insight's title reaches the consumer",
+            state["insights"][0]["title"] == "cubox-1 mem: p95 outside the band",
+            "insights=%r" % (state["insights"],))
         results.check(
-            "the Approvals section names the rationale and the expiry",
-            "Approvals (2)" in html
-            and "worker stalled for six hours" in html
-            and "remaining" in html,
-            "a proposal without its rationale is an id nobody can decide")
+            "each proposal carries its rationale and an expiry",
+            all(p["rationale"] for p in state["proposals"])
+            and all(p["expires_at"] for p in state["proposals"]),
+            "proposals=%r -- a proposal without its rationale is an id nobody "
+            "can decide" % (state["proposals"],))
+        expired = {p["rationale"]: p["expired"] for p in state["proposals"]}
         results.check(
-            "an expired proposal is shown as EXPIRED, not pending",
-            "EXPIRED" in html and "this one lapsed" in html,
-            "the row is still pending in the store, and the page must not "
-            "present a lapsed authority as actionable")
+            "an expired proposal is annotated expired, not left actionable",
+            expired == {"worker stalled for six hours": False,
+                        "this one lapsed": True},
+            "expired flags=%r -- the row is still pending in the store, and the "
+            "surface must not present a lapsed authority as actionable"
+            % (expired,))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2320,11 +1526,11 @@ def test_the_empty_approvals_queue_names_the_engine_switch(results):
     try:
         off = Dash(tmpdir, MONITOR_REMEDIES="0")
         off.epoch()
-        off_state, off_html = off.state(), off.html()
+        off_state = off.state()
 
         on = Dash(tmpdir, MONITOR_REMEDIES="1")
         on.epoch()
-        on_state, on_html = on.state(), on.html()
+        on_state = on.state()
 
         results.check(
             "build_state exposes the execution switch",
@@ -2332,32 +1538,264 @@ def test_the_empty_approvals_queue_names_the_engine_switch(results):
             and on_state.get("remedies_enabled") is True,
             "off=%r on=%r" % (off_state.get("remedies_enabled"),
                               on_state.get("remedies_enabled")))
+        # THE SWITCH TRAVELS IN THE CONTRACT, so the SPA can say WHY the queue is
+        # empty without a second endpoint -- which is the whole point: the note
+        # it replaced was a server-side sentence the client could not vary.
         results.check(
             "the status API exposes it too, additively",
             web.build_status(off.cfg, off.conn)["remedies_enabled"] is False
             and web.build_status(on.cfg, on.conn)["remedies_enabled"] is True,
             "an integrator cannot tell an empty queue from a disabled engine")
         results.check(
-            "an empty queue with the engine off says so",
-            "No pending proposal" in off_html
-            and "MONITOR_REMEDIES=0" in off_html
-            and "DISABLED" in off_html,
-            "the off page does not name the switch")
-        results.check(
-            "an empty queue with the engine on reads as 'nothing to decide'",
-            "No pending proposal" in on_html
-            and "MONITOR_REMEDIES=0" not in on_html
-            and "nothing waiting for a human" in on_html,
-            "the on page reads as disabled or says nothing")
+            "both empty queues have no proposals to mis-sort",
+            off_state["proposals"] == [] and on_state["proposals"] == [],
+            "off=%r on=%r" % (off_state["proposals"], on_state["proposals"]))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-TESTS = (test_a_closed_section_still_renders_every_row,
-         test_each_enabled_module_renders_its_own_section,
-         test_a_disabled_module_is_loud_and_has_no_tiles,
-         test_empty_store_is_loud,
-         test_a_sample_from_an_older_epoch_is_not_shown_as_current,
+# ---------------------------------------------------------------------------
+# 18. The shell: cache, CSP, and the one place a cache header is allowed
+# ---------------------------------------------------------------------------
+
+
+def test_the_app_shell_may_cache_and_nothing_else_may(results):
+    """Manifest and icons cache; every observation path still does not."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        httpd, base = _serve(d.cfg)
+        try:
+            for path in web.shell.ASSETS:
+                code, hdrs, body = _get(base + path)
+                results.check(
+                    "%s is served, and cacheable" % path,
+                    code == 200 and hdrs.get("Cache-Control") == web.shell.CACHE_CONTROL,
+                    "code=%s Cache-Control=%r -- the app shell is a constant of "
+                    "the image, so caching it is not a claim about the fleet"
+                    % (code, hdrs.get("Cache-Control")))
+                # THE TYPE MUST AGREE WITH THE FORMAT, NOT MERELY WITH ITSELF.
+                # An earlier form compared the header against
+                # `web.shell.ASSETS[path][1]` -- and that compares the table to
+                # the table, because the route reads that same entry, so a
+                # declaration that is simply WRONG moved both sides and stayed
+                # green. Measured: mutating the manifest's type to `text/plain`
+                # left the suite green. The type is asserted against the FILE.
+                ctype = hdrs.get("Content-Type", "")
+                if path.endswith(".png"):
+                    kind_ok = ctype == "image/png"
+                else:
+                    kind_ok = "json" in ctype
+                results.check(
+                    "%s is served as the format it actually is" % path,
+                    code == 200 and kind_ok,
+                    "Content-Type=%r for %s -- a PNG must arrive as an image and "
+                    "the manifest as JSON, or the browser refuses the asset and "
+                    "nothing anywhere says so" % (ctype, path))
+
+            # THE GUARD THAT MATTERS: the exception must not grow.
+            for path in ("/", "/api/status.json", "/api/state.json", "/healthz",
+                         "/modules"):
+                code, hdrs, body = _get(base + path)
+                results.check(
+                    "%s did NOT gain a cache header" % path,
+                    hdrs.get("Cache-Control") == CACHE
+                    and hdrs.get("Cache-Control") != web.shell.CACHE_CONTROL,
+                    "Cache-Control=%r -- an observation path became cacheable, "
+                    "and a cached 200 while the collector is dead is a false "
+                    "GREEN" % hdrs.get("Cache-Control"))
+
+            code, hdrs, body = _get(base + "/manifest.webmanifest")
+            try:
+                man = json.loads(body)
+                ok_man = (man["name"] == "sentinel" and man["display"] == "standalone"
+                          and len(man["icons"]) >= 2)
+            except Exception as exc:                     # noqa: BLE001
+                ok_man, man = False, {"error": str(exc)}
+            results.check(
+                "the manifest installs as a standalone app called sentinel",
+                ok_man, "manifest=%r" % man)
+
+            # PNG magic, so a truncated or wrong file is caught here rather than
+            # on the phone. THE IEND SLICE IS [-8:-4], NOT [-12:-8]: a PNG ends
+            # with the IEND chunk's 4-byte LENGTH, its 4-byte TYPE, then its
+            # 4-byte CRC -- so the last twelve bytes are `\0\0\0\0` `IEND`
+            # `<crc>` and the type is the middle quarter.
+            declared = ({i["src"]: i.get("sizes") for i in man.get("icons", [])}
+                        if isinstance(man, dict) else {})
+            for path in [p for p in web.shell.ASSETS if p.endswith(".png")]:
+                code, hdrs, raw = _get_bytes(base + path)
+                results.check(
+                    "%s is a real, complete PNG" % path,
+                    code == 200 and raw[:8] == b"\x89PNG\r\n\x1a\n"
+                    and raw[-8:-4] == b"IEND",
+                    "code=%s first8=%r last8=%r -- iOS will not accept an SVG "
+                    "here, and a truncated file falls back to a screenshot "
+                    "without saying so" % (code, raw[:8], raw[-8:]))
+                w, h = (struct.unpack(">II", raw[16:24]) if len(raw) >= 24
+                        else (0, 0))
+                results.check(
+                    "%s is the size the manifest declares" % path,
+                    code == 200 and w > 0
+                    and declared.get(path) == "%dx%d" % (w, h),
+                    "the manifest declares %r for this path and the file's own "
+                    "IHDR says %dx%d -- iOS trusts the declaration, so a "
+                    "mismatch is rescaled or ignored without saying so"
+                    % (declared.get(path), w, h))
+
+            # THE ORDERING THAT MAKES THE SHELL WORTH ANYTHING. The shell branch
+            # sits ahead of the store precisely so the installed app still looks
+            # like an app during an outage; move that branch one statement down
+            # and every check above still passes.
+            #
+            # BOTH HALVES ARE LOAD-BEARING. The shell answering 200 alone would
+            # pass vacuously the day this config stops being unopenable, so the
+            # guard also asserts an observation path does NOT answer under it.
+            broken = make_cfg(os.path.join(tmpdir, "no-such-dir", "monitor.sqlite"))
+            httpd2, base2 = _serve(broken)
+            try:
+                for path in web.shell.ASSETS:
+                    code, hdrs, body = _get(base2 + path)
+                    results.check(
+                        "%s is served while the store cannot be opened" % path,
+                        code == 200
+                        and hdrs.get("Cache-Control") == web.shell.CACHE_CONTROL,
+                        "code=%s Cache-Control=%r -- the app shell is a constant "
+                        "of the image, so an outage must not stop it being served"
+                        % (code, hdrs.get("Cache-Control")))
+                # THE SHELL ANSWERS AND THE OBSERVATION PATH DOES NOT. Both
+                # halves are load-bearing: the shell answering alone would pass
+                # vacuously the day this config stops being unopenable, so the
+                # guard also asserts an observation path does NOT answer under
+                # it -- the same two-sided shape as the cache mutation.
+                code, _h, _b = _get(base2 + "/")
+                results.check(
+                    "the SPA shell is served while the store cannot be opened",
+                    code == 200,
+                    "code=%s -- the shell is a constant of the image, so an "
+                    "outage must not stop it loading" % code)
+                code, _h, _b = _get(base2 + "/api/status.json")
+                results.check(
+                    "an observation path does NOT answer under the same config",
+                    code != 200,
+                    "code=%s -- if this answers 200 then the store was opened "
+                    "after all, and the check above proves nothing about ordering"
+                    % code)
+            finally:
+                httpd2.shutdown()
+                httpd2.server_close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+        # THE SHELL ITSELF. Re-expressed from the rendered `<head>`: the file
+        # that ships is the one iOS installs, so the tags and the container the
+        # SPA mounts on are asserted where they now live.
+        with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
+            index = fh.read()
+        results.check(
+            "the shell links the manifest and mounts the SPA on #root",
+            'rel="manifest"' in index and 'href="/manifest.webmanifest"' in index
+            and 'id="root"' in index,
+            "the built shell is missing the manifest link or the mount point")
+        results.check(
+            "the shell is titled Sentinel",
+            "<title>Sentinel</title>" in index,
+            "the title is not the platform's name")
+        # THE MANIFEST DOES NOT SUBSTITUTE FOR THESE. iOS reads the apple-*
+        # meta tags when installing to the home screen; without the
+        # black-translucent status bar the safe-area insets above stay zero and
+        # the page stops clearing the Dynamic Island.
+        results.check(
+            "the shell carries the iOS home-screen tags",
+            'rel="apple-touch-icon"' in index
+            and 'name="apple-mobile-web-app-capable"' in index
+            and 'name="apple-mobile-web-app-title"' in index
+            and 'black-translucent' in index
+            and 'name="theme-color"' in index,
+            "the built head is missing an apple-* tag or the theme colour")
+        results.check(
+            "there is no service worker, deliberately",
+            "serviceWorker" not in index and "sw.js" not in index,
+            "a service worker appeared -- iOS installs without one, so it would "
+            "exist only to cache, which is the one thing no-store forbids")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 19. The mobile contract lives in the stylesheet now
+# ---------------------------------------------------------------------------
+
+
+def test_the_shell_keeps_the_mobile_contract(results):
+    """What the phone reported, asserted against the files that now own it.
+
+    Measured on an iPhone 15 Pro with the app on the home screen, 2026-10-07:
+    the title and the target list sat BEHIND the Dynamic Island, and a wide
+    table pushed the whole document wider than the screen so the page scrolled
+    sideways under the reader's thumb. Both were fixed in the server-rendered
+    page's CSS; the CSS moved to the SPA in Task 5, so the guard moves with it.
+
+    It reads the SOURCE, not the built bundle: the bundle is minified and its
+    file name changes by design, while `frontend/src/styles.css` is the file a
+    later edit actually touches.
+    """
+    try:
+        with open(STYLES, encoding="utf-8") as fh:
+            css = fh.read()
+        with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as fh:
+            index = fh.read()
+    except OSError as exc:
+        results.check("the shell's stylesheet and shell html are present", False,
+                      "could not read %s / the built index: %s" % (STYLES, exc))
+        return
+
+    wrap = css.split(".wrap {", 1)[1].split("}", 1)[0] if ".wrap {" in css else ""
+    insets = [i for i in ("top", "right", "bottom", "left")
+              if "env(safe-area-inset-%s" % i in wrap]
+    results.check(
+        "the page insets itself clear of the iPhone's status bar and edges",
+        len(insets) == 4 and "calc(" in wrap,
+        "the .wrap rule does not carry all four env(safe-area-inset-*) terms "
+        "-- found %r. `viewport-fit=cover` and the black-translucent status bar "
+        "put the document UNDER the island on purpose, so a page that does not "
+        "inset itself hides its own title behind the camera housing" % (insets,))
+    results.check(
+        "the viewport meta still asks for the safe-area treatment",
+        "viewport-fit=cover" in index,
+        "without viewport-fit=cover, env() is always zero and the insets above "
+        "are dead code")
+    results.check(
+        "tables can still scroll inside themselves",
+        ".scroll { overflow-x:auto; }" in css.replace("\n", " ").replace(
+            "  ", " ") or "overflow-x:auto" in css,
+        "a wide table pushes the DOCUMENT sideways; the wrapper must scroll "
+        "instead")
+    results.check(
+        "the four RAG tokens are defined",
+        all(("--%s:" % c) in css for c in ("ok", "warn", "fail", "unknown")),
+        "the stylesheet lost a RAG token -- a var() with no definition is an "
+        "element that quietly has no colour")
+    results.check(
+        "reduced motion is respected",
+        "prefers-reduced-motion" in css,
+        "the page animates for a reader who asked it not to")
+    results.check(
+        "no webfont is fetched for the page that has to be trustworthy",
+        "@font-face" not in css and "fonts.googleapis" not in index
+        and "fonts.gstatic" not in index,
+        "a typography dependency on the page whose whole job is to be "
+        "believable when the network is the thing that is broken")
+    results.check(
+        "no heading uppercases itself",
+        "uppercase" not in css,
+        "a heading still text-transforms to caps -- the tracked-out ALL-CAPS "
+        "eyebrow is the generated-page tell the design removed")
+
+
+TESTS = (test_empty_store_is_loud,
          test_stale_says_so_and_cannot_also_be_ok,
          test_unknown_is_never_green,
          test_unrecognised_status_is_grey_not_green,
@@ -2365,20 +1803,19 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_nothing_is_cached,
          test_collector_rows_are_visible,
          test_informational_rows_carry_no_colour,
-         test_the_page_shows_remedy_attempts_and_command_history,
+         test_remedy_attempts_and_command_history_are_in_the_model,
+         test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_status_api_is_three_valued,
          test_status_api_is_a_stable_contract,
-         test_the_freshness_hero_tracks_the_staleness_it_leads_with,
-         test_the_band_never_says_ok_on_a_stale_or_colourless_page,
-         test_the_strip_makes_all_grey_a_different_shape_from_all_green,
-         test_the_page_names_the_platform_and_never_colours_alone,
-         test_the_app_shell_may_cache_and_nothing_else_may,
-         test_the_refresh_script_has_the_hooks_it_looks_for,
+         test_the_verdict_distinguishes_stale_from_never_collected,
          test_the_newest_epoch_read_uses_an_index,
          test_a_pending_incident_is_not_on_the_board,
-         test_the_page_fits_a_phone_without_being_asked,
-         test_insights_and_proposals_are_rendered_and_empty_safe,
-         test_the_empty_approvals_queue_names_the_engine_switch)
+         test_each_enabled_module_is_named_with_its_tiles,
+         test_a_disabled_module_is_loud_and_has_no_tiles,
+         test_insights_and_proposals_are_additive_and_empty_safe,
+         test_the_empty_approvals_queue_names_the_engine_switch,
+         test_the_app_shell_may_cache_and_nothing_else_may,
+         test_the_shell_keeps_the_mobile_contract)
 
 
 def main():

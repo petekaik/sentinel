@@ -180,6 +180,10 @@ class Context:
         # distinct state from [] -- see SpecCoverage.run: it says "the audit
         # could not run" rather than "everything is claimed".
         self.check_classes = check_classes
+        # Thresholds declared by a module's `check_instances`, keyed by spec id.
+        # They live in no thresholds.conf, so the spec-coverage audit cannot see
+        # them in a check class and must be told they are claimed.
+        self.dynamic_specs = {}
         self.exports = {}
         self.box = {}
         self.worker = {}
@@ -207,12 +211,35 @@ class Context:
         return text
 
     def settings(self, module_id):
-        """A module's declared settings, env > default, typed (Setting.resolve)."""
+        """A module's declared settings, typed (Setting.resolve).
+
+        Read from `cfg.env`, which is already the effective view: DB override
+        > `.env` > default. This method applies no precedence of its own.
+        """
         mod = next((m for m in self.modules if m.id == module_id), None)
         if mod is None:
             raise KeyError("module %r is not loaded; settings are unavailable"
                            % module_id)
         return {s.key: s.resolve(self.cfg.env) for s in mod.settings}
+
+    def merge_dynamic_specs(self):
+        """Add the settings-declared bands to `self.specs`; A FILE SPEC WINS.
+
+        Dynamic ids are the module's, and a module that names one the same as a
+        declared threshold would otherwise replace the operator's file-declared
+        band with whatever the settings happened to say -- a silent override of
+        the file that every reader then grades against. The collision is noted
+        rather than resolved: the fix is a namespaced id, not a precedence rule
+        nobody can see.
+        """
+        for sid, spec in self.dynamic_specs.items():
+            if sid in self.specs:
+                self.note(
+                    "module-declared threshold %r collides with a declared "
+                    "spec; the declared spec is kept (namespace dynamic ids by "
+                    "module)" % sid)
+                continue
+            self.specs[sid] = spec
 
     def attempt(self, host):
         """The platform's per-host attempt record for this epoch."""
@@ -444,10 +471,18 @@ def expansion_targets(modules):
     This is the generic replacement for the old hand-maintained platform check
     list: the checks come from module discovery, and so do the ids they are
     instantiated for.
+
+    A MODULE WITH NO `per_box` CHECK CONTRIBUTES NOTHING. The collector expands
+    the MERGED class list over the MERGED target tuple, so a module's targets
+    would otherwise become bindings for another module's per-box check -- the
+    SNMP module's `snmp` reporting target turned every fleet per-box check into
+    a row on a target that is not a host.
     """
     out = []
     for mod in modules:
-        static = {c.target for c in registry(*mod.check_classes())
-                  if not c.per_box}
+        classes = registry(*mod.check_classes())
+        if not any(c.per_box for c in classes):
+            continue
+        static = {c.target for c in classes if not c.per_box}
         out.extend(t for t in mod.targets if t not in static)
     return tuple(out)

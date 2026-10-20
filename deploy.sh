@@ -544,9 +544,15 @@ remote "mkdir -p '$MONITOR_DIR'"
 #   proxy/ is the publishing stack, which is a separate concern with its own
 #          compose file: a sentinel deploy must not ship a second stack's config
 #          to the NAS.
+#   frontend/ is the SPA's SOURCE and its node_modules, neither of which the
+#          NAS builds or serves. The served artefact is app/static/, which is
+#          committed and therefore travels with app/. Excluding this before the
+#          first SPA deploy is also what keeps `--delete` honest: there is no
+#          frontend/ on the NAS to protect or remove.
 rsync -az --delete \
     --exclude 'data/' --exclude '.env' --exclude 'ssh/' --exclude '.git/' \
     --exclude 'docs/' --exclude 'tests/' --exclude 'proxy/' \
+    --exclude 'frontend/' \
     --exclude '__pycache__/' --exclude '*.pyc' \
     -e "ssh ${SSH_OPTS[*]}" \
     "$REPO_DIR/" "$STORAGE_USER@$STORAGE_IP:$MONITOR_DIR/"

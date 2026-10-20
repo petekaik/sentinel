@@ -22,6 +22,7 @@ Python 3 stdlib only, deliberately: no pip dependencies to rot in an appliance
 that is expected to run unattended for months.
 """
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -374,6 +375,44 @@ CREATE TABLE IF NOT EXISTS threshold_override (
     previous_json TEXT NOT NULL,
     proposal_id   INTEGER
 );
+
+-- THE SETTINGS OVERLAY, TYPED. The config files remain the defaults; a row
+-- here is an operator-approved override layered on top, exactly as
+-- threshold_override is for a band -- so a `reset` is a DELETE, because "no
+-- row" is what makes the file's value apply again.
+--
+-- `value_json` keeps the value's TYPE rather than flattening it to text on the
+-- way in; `setting_env` is the single place that flattens to an env string,
+-- because that is the one reader that cannot take a list.
+--
+-- `setting_change` is append-only and separate: `setting` says what is in
+-- force, `setting_change` says how it got that way. Both audit columns are
+-- named `_json` and hold either JSON or the literal redaction marker -- a
+-- secret's value is never written here, in either direction.
+--
+-- `secret` IS ON THE ROW, NOT ONLY ON THE CALL. The write that removes a value
+-- (a reset) and the write that replaces it are not the write that declared it
+-- secret, so a flag passed only to `put_setting` would log the old plaintext on
+-- both. The row is the authority, and it travels with the value.
+CREATE TABLE IF NOT EXISTS setting (
+    module     TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    actor      TEXT NOT NULL,
+    secret     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (module, key)
+);
+CREATE TABLE IF NOT EXISTS setting_change (
+    id       INTEGER PRIMARY KEY,
+    ts       REAL NOT NULL,
+    module   TEXT NOT NULL,
+    key      TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    old_json TEXT,
+    new_json TEXT,
+    actor    TEXT NOT NULL
+);
 """
 
 
@@ -442,6 +481,14 @@ def _migrate(conn):
     if "subject" not in have:
         conn.execute("ALTER TABLE check_run ADD COLUMN subject TEXT NOT NULL "
                      "DEFAULT ''")
+    # `setting.secret` arrived with the review of the first cut. A row written
+    # before it defaults to NOT secret, which is the only assumption available
+    # -- the flag is not derivable from the value -- and it is the honest one:
+    # nothing has declared that value secret.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(setting)")}
+    if "secret" not in have:
+        conn.execute("ALTER TABLE setting ADD COLUMN secret INTEGER NOT NULL "
+                     "DEFAULT 0")
 
 
 def _ensure_live_index(conn):
@@ -968,6 +1015,145 @@ def remove_threshold_override(conn, spec_id):
     return row
 
 
+REDACTED = "<redacted>"
+
+
+def setting_rows(conn):
+    """Every override, TYPED, keyed by `(module, key)`."""
+    return {(r["module"], r["key"]): json.loads(r["value_json"])
+            for r in conn.execute("SELECT * FROM setting").fetchall()}
+
+
+def _env_string(value):
+    """One typed value as the string an env reader expects.
+
+    A bool becomes 1/0 rather than "True"/"False", which is what every shell
+    and every `int(os.environ[...])` on this fleet already parses.
+    """
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def setting_env(conn):
+    """The overrides flattened for a config reader: bare key -> string.
+
+    The key without its module: the module is the row's namespace, not part of
+    the name the file's defaults are keyed by. Two modules declaring the same
+    key therefore collide here -- the config overlay is where that is a
+    question, and it has the module in hand.
+    """
+    return {key: _env_string(value)
+            for (_module, key), value in setting_rows(conn).items()}
+
+
+@contextlib.contextmanager
+def _txn(conn):
+    """One write transaction. `with conn:` is INERT here, not equivalent.
+
+    These connections are autocommit (`isolation_level=None`), so sqlite3 never
+    opens an implicit transaction and `with conn:` commits nothing -- a setting
+    and its audit row would be two independent commits, and a crash between
+    them leaves an override nobody can explain. `BEGIN IMMEDIATE` takes the
+    write lock up front, so two writers serialise here rather than at the first
+    INSERT. Not nestable, and nothing needs it to be.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def _setting_row(conn, module, key):
+    """One row as `(typed value, secret)`, or None. The write path's read.
+
+    Separate from `setting_rows` because that is the bulk read and the flag has
+    no business in its result -- but the write path MUST have it: whether an old
+    value may be written to the audit log depends on the row, not on the call.
+    """
+    row = conn.execute("SELECT value_json, secret FROM setting "
+                       "WHERE module = ? AND key = ?",
+                       (module, key)).fetchone()
+    return (json.loads(row["value_json"]), bool(row["secret"])) if row else None
+
+
+def _log_change(conn, module, key, action, old, new, actor,
+                old_secret=False, new_secret=False):
+    """Append one audit row. Each side is redacted INDEPENDENTLY.
+
+    `old_secret` is the flag the OLD ROW carried (see `_setting_row`), and the
+    caller ORs in the current write's flag: a secret write must not copy a
+    plaintext it is replacing into the log either, because secrecy is declared
+    at the write that marks it and everything before that was stored unmarked.
+
+    The marker is stored VERBATIM rather than JSON-encoded. `"<redacted>"` (a
+    JSON string) and `<redacted>` (the marker) reading differently is the point
+    -- a reader must not have to parse to tell a redaction from a value that
+    happens to spell one.
+    """
+    conn.execute(
+        "INSERT INTO setting_change (ts, module, key, action, old_json, "
+        "new_json, actor) VALUES (?,?,?,?,?,?,?)",
+        (time.time(), module, key, action,
+         REDACTED if old_secret else json.dumps(old),
+         REDACTED if new_secret else json.dumps(new), actor))
+
+
+def put_setting(conn, module, key, value, actor, secret=False):
+    """Write one override and its audit row, in ONE transaction.
+
+    `secret` is stored on the row as well as applied to this write's audit
+    entries, so the write that later replaces or deletes the value still knows
+    it must redact. It never affects `setting`'s value: the store keeps the
+    real one, and redaction is about the trail.
+    """
+    with _txn(conn):
+        old = _setting_row(conn, module, key)
+        conn.execute(
+            "INSERT INTO setting (module, key, value_json, updated_at, actor, "
+            "secret) VALUES (?,?,?,?,?,?) ON CONFLICT(module, key) DO UPDATE "
+            "SET value_json = excluded.value_json, updated_at = "
+            "excluded.updated_at, actor = excluded.actor, "
+            "secret = excluded.secret",  # secretscan:ignore -- a column copy
+            (module, key, json.dumps(value), time.time(), actor,
+             1 if secret else 0))
+        _log_change(conn, module, key, "set",
+                    old[0] if old else None, value, actor,
+                    old_secret=(old[1] if old else False) or secret,
+                    new_secret=secret)
+
+
+def delete_setting(conn, module, key, actor):
+    """Remove an override, so the file's value applies again. Audited as `reset`.
+
+    Redacts the old value when the ROW was secret -- the caller does not pass a
+    flag, and must not have to: a reset is not the write that declared secrecy.
+    """
+    with _txn(conn):
+        old = _setting_row(conn, module, key)
+        conn.execute("DELETE FROM setting WHERE module = ? AND key = ?",
+                     (module, key))
+        _log_change(conn, module, key, "reset",
+                    old[0] if old else None, None, actor,
+                    old_secret=old[1] if old else False)
+
+
+def setting_changes(conn, limit=50):
+    """Newest audit rows first, as stored -- `old_json`/`new_json` are text.
+
+    `limit` is CLAMPED at zero: SQLite reads `LIMIT -1` as "no limit", so a
+    negative limit from a caller would hand back the entire trail.
+    """
+    rows = conn.execute("SELECT * FROM setting_change ORDER BY id DESC "
+                        "LIMIT ?", (max(0, int(limit)),)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def record_journal(conn, host, cursor, ts, unit, priority, message):
     """Insert one journal line. Returns True if it was new.
 
@@ -1278,6 +1464,25 @@ def live_incidents(conn):
     return [dict(r) for r in rows]
 
 
+def recent_incidents(conn, limit=50):
+    """Terminal incidents, most recently closed first -- the board's history.
+
+    BOTH terminal states belong here: `resolved` (a positive observation) and
+    `dismissed` (a human's decision). They are not interchangeable, but each is
+    a row that has left the board and a reader is entitled to see it.
+
+    `dismiss()` deliberately leaves `resolved_at` NULL, so the sort key is
+    whichever close stamp the row actually has. Ordering on `resolved_at` alone
+    would silently drop every dismissed row to the bottom.
+    """
+    rows = conn.execute(
+        "SELECT * FROM incident WHERE state IN ('resolved', 'dismissed') "
+        "ORDER BY COALESCE(resolved_at, dismissed_at) DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def live_incidents_for_targets(conn, targets):
     """Confirmed incidents against any of `targets` -- the rows a layer owns.
 
@@ -1350,7 +1555,7 @@ def db_summary(conn):
     for table in ("sample", "check_run", "collection_attempt", "incident",
                   "journal", "remedy", "collector_run", "command_run",
                   "advisor_run", "insight", "proposal",
-                  "threshold_override"):
+                  "threshold_override", "setting", "setting_change"):
         try:
             out[table] = conn.execute(
                 "SELECT COUNT(*) AS n FROM %s" % table

@@ -31,6 +31,7 @@ import test_proxy_config as proxy_tests         # noqa: E402
 import test_remediation as remediation_tests    # noqa: E402
 import test_serial_identity as serial_tests     # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
+import test_system_module as system_tests       # noqa: E402
 
 SUITES = (
     ("serial -- the CuBox console identity: chip serial, not a /dev/ttyUSB number",
@@ -59,6 +60,9 @@ SUITES = (
     ("advisors -- the read-only snapshot (honest history windows, bounded "
      "reads, no write path) and the bounded, isolated runner",
      advisor_tests.TESTS),
+    ("system -- the local host's own resources: load, memory, disk, mdstat, "
+     "thermal and uptime, with absent figures UNKNOWN rather than green",
+     system_tests.TESTS),
     ("proxy/ -- the publishing stack's access rules (offline, text-level)",
      proxy_tests.TESTS),
 )

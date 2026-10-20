@@ -116,6 +116,11 @@ class Fleet:
             "TRANSCODED_PATH": os.path.join(tmpdir, "no-such-transcoded"),
             "MONITOR_SSH_TIMEOUT": "5",
             "MONITOR_INTERVAL": "60",
+            # THIS SUITE IS ABOUT THE FLEET. The system module has its own
+            # suite; left enabled here its local /proc reads fail on a
+            # non-Linux test host and its `local` attempt row joins the
+            # reachability assertions this suite makes about the boxes.
+            "SYSTEM_ENABLED": "0",
         }
         self.cfg = config_mod.Config(env=env)
         self.conn = store.connect(self.cfg.db_path)

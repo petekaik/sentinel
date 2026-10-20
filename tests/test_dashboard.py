@@ -42,11 +42,11 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
-                    fleet_config)
+from harness import CHECKS_CONF, Results                     # noqa: E402
 
 import checks                 # noqa: E402
 import config as config_mod   # noqa: E402
+import modules as module_loader  # noqa: E402
 import store                  # noqa: E402
 import thresholds             # noqa: E402
 import web                    # noqa: E402
@@ -122,7 +122,19 @@ class Dash:
 
 
 def registry_instances(cfg):
-    return checks.expand(check_classes(), fleet_config(cfg).cubox_ids)
+    """Every check the DASHBOARD will render: all enabled modules, expanded.
+
+    Derived from discovery rather than the fleet registry, because the page is
+    rendered from discovery too. With one module the two agreed by accident;
+    they diverge the moment a second module is discovered (the system module),
+    and a suite that drove only the fleet would leave the others unobserved and
+    then compare its own short list against the board's longer one.
+    """
+    mods = module_loader.discover_enabled(cfg)
+    classes = checks.registry(
+        *([c for m in mods for c in m.check_classes()]
+          + list(checks.platform_modules())))
+    return checks.expand(classes, checks.expansion_targets(mods))
 
 
 class _Server(ThreadingHTTPServer):
@@ -2149,20 +2161,23 @@ def test_each_enabled_module_renders_its_own_section(results):
         state, html = d.state(), d.html()
 
         results.check(
-            "the enabled module is listed with its order and title",
-            [m["id"] for m in state["modules"]] == ["fleet"]
+            "the enabled modules are listed with their order and titles",
+            [m["id"] for m in state["modules"]] == ["fleet", "system"]
             and state["modules"][0]["title"] == "CuBox fleet"
-            and state["modules"][0]["enabled"] is True,
+            and state["modules"][1]["title"] == "System resources"
+            and all(m["enabled"] for m in state["modules"]),
             "modules=%r -- the page model must name what is on"
             % (state["modules"],))
+        fleet_tiles = [t for t in state["tiles"] if t["module"] == "fleet"]
         results.check(
             "each enabled module renders its own titled section",
-            ("<h2>CuBox fleet (%d)</h2>" % len(state["tiles"])) in html,
-            "the tile grid has no section headed by the module's title")
+            ("<h2>CuBox fleet (%d)</h2>" % len(fleet_tiles)) in html
+            and "<h2>System resources (" in html,
+            "the tile grid has no section headed by each module's title")
         results.check(
             "its tiles carry the module they came from",
             bool(state["tiles"])
-            and all(t["module"] == "fleet" for t in state["tiles"]),
+            and {t["module"] for t in state["tiles"]} == {"fleet", "system"},
             "modules on tiles: %r" % sorted({t["module"] for t in state["tiles"]}))
         results.check(
             "no disabled note appears when nothing is disabled",
@@ -2176,7 +2191,7 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
     """A disabled module must be stated, and must not leave a green section."""
     tmpdir = tempfile.mkdtemp()
     try:
-        d = Dash(tmpdir, FLEET_ENABLED="0")
+        d = Dash(tmpdir, FLEET_ENABLED="0", SYSTEM_ENABLED="0")
         d.epoch()
         state, html = d.state(), d.html()
         st = web.build_status(d.cfg, d.conn)
@@ -2184,7 +2199,7 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
         results.check(
             "the page model separates enabled from disabled modules",
             state["modules"] == []
-            and [m["id"] for m in state["disabled_modules"]] == ["fleet"],
+            and [m["id"] for m in state["disabled_modules"]] == ["fleet", "system"],
             "modules=%r disabled=%r -- a disabled module that simply vanishes "
             "reads exactly like one that never existed"
             % (state["modules"], state["disabled_modules"]))
@@ -2215,7 +2230,7 @@ def test_a_disabled_module_is_loud_and_has_no_tiles(results):
         results.check(
             "the API payload carries the module lists, additively",
             st["modules"] == []
-            and [m["id"] for m in st["disabled_modules"]] == ["fleet"],
+            and [m["id"] for m in st["disabled_modules"]] == ["fleet", "system"],
             "the status API dropped the module lists")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

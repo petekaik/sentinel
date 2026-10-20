@@ -241,7 +241,7 @@
   "check_id": "vpu_present",
   "detail": "coda_vpu loaded, 13 video nodes, 5 v4l2m2m entry(ies), firmware vpu_fw_imx6q.bin",
   "status": "ok",
-  "subject": "vpu",
+  "subject": "v4l2m2m",
   "target": "cubox-1"
  },
  {
@@ -577,7 +577,7 @@
   "check_id": "vpu_present",
   "detail": "coda_vpu loaded, 13 video nodes, 5 v4l2m2m entry(ies), firmware vpu_fw_imx6q.bin",
   "status": "ok",
-  "subject": "vpu",
+  "subject": "v4l2m2m",
   "target": "cubox-2"
  },
  {

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import Proposals from "./Proposals";
 
@@ -96,7 +96,7 @@ it("opens the token dialog on 401 and keeps the proposal listed", async () => {
   expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(1);
 });
 
-it("shows a refusal and leaves the proposal pending", async () => {
+it("shows a refusal, keeps it visible, and reloads the queue", async () => {
   const calls = mockFetch(() =>
     respond(409, {
       error: {
@@ -115,6 +115,54 @@ it("shows a refusal and leaves the proposal pending", async () => {
     await screen.findByText(/is no longer live/),
   ).toBeInTheDocument();
   expect(screen.getByText("Restart the stalled worker")).toBeInTheDocument();
-  // A refused approval is not a refresh either -- nothing changed server-side.
-  expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(1);
+  // A 409 may mean the row MOVED (the engine expired it), so the queue is
+  // reloaded -- once more, not on every decision path. The refusal message must
+  // survive the reload: `load()` clears `error` on success.
+  expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(2);
+});
+
+it("moves a proposal out of Pending when a 409 says it is no longer pending", async () => {
+  // The whole-branch review's finding: an approval the engine expired answered
+  // 409, and the row stayed in Pending forever -- the queue was never re-read.
+  let reads = 0;
+  const expiredNow = { ...pending, state: "expired" };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      if (url === "/api/v1/proposals") {
+        reads += 1;
+        return respond(
+          200,
+          reads === 1
+            ? { pending: [pending], expired: [] }
+            : { pending: [], expired: [expiredNow] },
+        );
+      }
+      if (url.endsWith("/approve")) {
+        return respond(409, {
+          error: {
+            code: "refused",
+            message:
+              "proposal 1 is no longer pending -- another approval claimed it",
+          },
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+  render(<Proposals />);
+
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Approve" }),
+  );
+
+  expect(
+    await screen.findByText(/no longer pending/),
+  ).toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.getByText("Pending (0)")).toBeInTheDocument(),
+  );
+  expect(screen.getByText("Expired (1)")).toBeInTheDocument();
+  expect(screen.getByText("Restart the stalled worker")).toBeInTheDocument();
+  expect(reads).toBe(2);
 });

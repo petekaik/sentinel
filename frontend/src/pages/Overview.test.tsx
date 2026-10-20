@@ -124,6 +124,52 @@ it("says the monitor is unreachable when the status fetch fails", async () => {
   ).toBeInTheDocument();
 });
 
+it("warns when a module could not build its settings-driven checks", async () => {
+  // Zero checks from a malformed SNMP_DEVICES used to be indistinguishable
+  // from "nothing is configured": the failure lived in `others`/`note`, which
+  // no page rendered. The reason must be on the page, naming the module.
+  mockStatus({
+    ...STATUS,
+    module_errors: [
+      {
+        module: "snmp",
+        reason:
+          "module snmp could not build its settings-driven checks, so they " +
+          "are NOT being evaluated: SNMP_DEVICES is not valid JSON",
+      },
+    ],
+  });
+  render(
+    <MemoryRouter>
+      <Overview />
+    </MemoryRouter>,
+  );
+
+  expect(
+    await screen.findByText(/SNMP_DEVICES is not valid JSON/),
+  ).toBeInTheDocument();
+  expect(screen.getByText("snmp")).toBeInTheDocument();
+});
+
+it("renders the collector's run note as a warning", async () => {
+  mockStatus({
+    ...STATUS,
+    collector: {
+      ...STATUS.collector,
+      note: "module snmp failed to build its settings-driven checks: bad JSON",
+    },
+  });
+  render(
+    <MemoryRouter>
+      <Overview />
+    </MemoryRouter>,
+  );
+
+  expect(
+    await screen.findByText(/module snmp failed to build/),
+  ).toBeInTheDocument();
+});
+
 it("shows a stale banner that refuses to call the data live", async () => {
   mockStatus({
     ...STATUS,

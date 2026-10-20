@@ -155,6 +155,76 @@ it("adds and removes a list row and posts the edited array", async () => {
   });
 });
 
+it("fills a new list row from the item_fields' declared defaults", async () => {
+  // A NEW SNMP DEVICE WAS SAVED DISABLED: `blank()` hardcoded `false` for a
+  // bool and ignored the manifest's `default: true`, and the backend does not
+  // apply item defaults on write (`Setting.parse_item`). The device was stored
+  // enabled:false, skipped by preload/check_instances, and no check ever
+  // appeared -- with no error anywhere.
+  const settings: SettingField[] = [
+    {
+      key: "SNMP_DEVICES",
+      label: "Devices",
+      kind: "list",
+      item_fields: [
+        { key: "name", label: "Name", kind: "str", required: true },
+        { key: "address", label: "Address", kind: "str", required: true },
+        { key: "port", label: "Port", kind: "int", default: 161 },
+        {
+          key: "version",
+          label: "Version",
+          kind: "str",
+          choices: ["v2c"],
+          default: "v2c",
+        },
+        { key: "enabled", label: "Enabled", kind: "bool", default: true },
+      ],
+    },
+  ];
+  const fetchMock = vi.fn(async () =>
+    respond(200, {
+      SNMP_DEVICES: { value: [], source: "default" },
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+
+  render(
+    <SettingsForm
+      moduleId="snmp"
+      settings={settings}
+      values={{ SNMP_DEVICES: { value: [], source: "default" } }}
+    />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+
+  // The controls themselves carry the declared defaults, not only the body.
+  expect(screen.getByLabelText("Devices row 1 Enabled")).toBeChecked();
+  expect(screen.getByLabelText("Devices row 1 Port")).toHaveValue(161);
+  expect(screen.getByLabelText("Devices row 1 Version")).toHaveValue("v2c");
+
+  fireEvent.change(screen.getByLabelText("Devices row 1 Name"), {
+    target: { value: "sw1" },
+  });
+  fireEvent.change(screen.getByLabelText("Devices row 1 Address"), {
+    target: { value: "192.0.2.10" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  expect(writeBodies(fetchMock)[0]).toEqual({
+    SNMP_DEVICES: [
+      {
+        name: "sw1",
+        address: "192.0.2.10",
+        port: 161,
+        version: "v2c",
+        enabled: true,
+      },
+    ],
+  });
+});
+
 it("opens the token dialog on a 401 write and stores the token", async () => {
   function Harness() {
     const [open, setOpen] = useState(false);

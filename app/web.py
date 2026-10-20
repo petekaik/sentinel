@@ -210,6 +210,12 @@ def build_state(cfg, conn, now=None):
     ctx = checks.Context(cfg, specs, {}, modules=enabled)
     static = checks.expand(classes, checks.expansion_targets(enabled))
     dynamic = []
+    # A MODULE WHOSE SETTINGS DO NOT PARSE IS A FAULT IN THE CONFIGURATION, not
+    # an empty fleet. The placeholder row below is spec-less and lands in
+    # `others` (which the SPA does not render), so the failure also travels as a
+    # named list the Overview and ModuleDetail both show: "zero checks" must
+    # never be indistinguishable from "nothing configured".
+    module_errors = []
     for m in enabled:
         try:
             # The collector's preload calls these two in this order; a
@@ -226,6 +232,7 @@ def build_state(cfg, conn, now=None):
                       "so they are NOT being evaluated: %s"
                       % (m.id, first))
             ctx.note(detail)
+            module_errors.append({"module": m.id, "reason": detail})
             dynamic.append(_InstanceBuildFailure(m, detail))
             continue
         for inst in instances:
@@ -357,6 +364,10 @@ def build_state(cfg, conn, now=None):
         "others": others,
         "extra": extra,
         "missing": missing,
+        # Named module-level build failures, for a surface the SPA renders. The
+        # placeholder row in `others` is the board half; this is the warning
+        # that says WHICH module and WHY.
+        "module_errors": module_errors,
         "incidents": incidents,
         # Commands are the only part of the platform that changes the fleet, so
         # their audit belongs on the operator's page and not only behind ssh.
@@ -506,6 +517,7 @@ def build_status(cfg, conn, now=None):
                      key=lambda i: (0 if _status(i["status"]).rag == "red" else 1,
                                     i["target"], i["check_id"]))
     worst = [{"target": i["target"], "check_id": i["check_id"],
+              "subject": i["subject"],
               "status": i["status"], "detail": i["detail"], "spec": i["spec"],
               "value": i["value"], "unit": i["unit"],
               "claim": i["claim"]}
@@ -529,6 +541,13 @@ def build_status(cfg, conn, now=None):
         # prose. `MONITOR_REMEDIES` is the execution kill switch; advisory
         # insights are still produced while it is off.
         "remedies_enabled": state["remedies_enabled"],
+
+        # WHETHER ANY WRITE CAN SUCCEED AT ALL. Without this the SPA can only
+        # discover an unset `SENTINEL_WRITE_TOKEN` from a refused write, so a
+        # browser holding a token said "writes unlocked" on a read-only server
+        # until the operator tried to save. Additive: a reader that ignores the
+        # key is unaffected.
+        "writes_enabled": settingsapi.writes_enabled(cfg),
 
         # The fleet's own liveness, FIRST among the numbers, because everything
         # after it is only as current as this.
@@ -599,6 +618,7 @@ def build_status(cfg, conn, now=None):
         "informational": [{
             "target": i["target"],
             "check_id": i["check_id"],
+            "subject": i["subject"],
             "title": i["title"],
             "status": i["status"],
             "value": i["value"],
@@ -613,6 +633,16 @@ def build_status(cfg, conn, now=None):
             "unclaimed_thresholds": state["unclaimed"],
             "checks_without_result": len(state["missing"]),
         },
+
+        # A module whose settings-driven checks could not be built: the reason
+        # names the module and the failure, so the SPA can say "this module is
+        # not being evaluated" instead of showing a module with no checks.
+        "module_errors": state["module_errors"],
+
+        # The operator-command audit. Commands are the only part of the platform
+        # that changes the fleet, so their record belongs on the module's page
+        # and not only behind ssh. Additive: capped by COMMAND_RUNS_LIMIT.
+        "command_runs": state["command_runs"],
     }
 
 
@@ -705,6 +735,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", cache or OBSERVATION_CACHE)
         for name, value in (extra or {}).items():
             self.send_header(name, value)
+        # AN UNREAD REQUEST BODY IS POISON FOR A KEEP-ALIVE CONNECTION. An
+        # early return before `_body()` leaves `Content-Length` bytes in the
+        # socket, and the next request on that connection is parsed starting at
+        # the leftover body -- measured: a wrong-token PUT answered 401 and the
+        # following GET came back `400 Bad request syntax` as HTML, turning a
+        # token rotation into a false red on the Overview. Draining an
+        # attacker-sized body is not the answer; refusing to reuse the
+        # connection is. The check lives HERE, in the one response path, so a
+        # future early return cannot reintroduce the desync.
+        if self._body_unread():
+            self.close_connection = True
+            self.send_header("Connection", "close")
         if cache is None:
             # HTTP/1.0 belt-and-braces, for the observation rule only. With
             # Cache-Control present these are ignored (RFC 7234 s5.4), so
@@ -723,6 +765,9 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        # Per-request: a keep-alive handler instance serves many requests, and
+        # this flag must not survive from one to the next.
+        self._body_consumed = False
         path = self.path.split("?")[0]
         cfg = self.cfg
         # THE SHELL IS ANSWERED BEFORE THE STORE IS OPENED. It is a constant of
@@ -924,7 +969,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(n) or b"{}")
+        raw = self.rfile.read(n) if n > 0 else b""
+        # FLAG THE READ EVEN IF THE JSON IS BAD: the bytes are gone from the
+        # socket, so this connection is safe to reuse and `_send` must not close
+        # it. A read that raised leaves the flag false and the connection is
+        # closed, which is the safe side.
+        self._body_consumed = True
+        return json.loads(raw or b"{}")
+
+    def _body_unread(self):
+        """True iff this request declared a body that `_body()` did not read."""
+        if self.headers.get("Transfer-Encoding"):
+            # `_body()` cannot read chunked framing at all, so treat the bytes
+            # as unread rather than parse the next request out of them.
+            return True
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return True
+        return n > 0 and not getattr(self, "_body_consumed", False)
+
+    def _write_conn(self):
+        """The store for a write, or a JSON 503 and None.
+
+        `store.connect` used to be called OUTSIDE the handler's try: an
+        unopenable database raised out of the handler, logged a traceback
+        containing the DB path, and reset the connection instead of answering
+        the `{error:{code,message}}` document this API promises. The message
+        names the fault and not the path.
+        """
+        try:
+            return store.connect(self.cfg.db_path)
+        except Exception:                      # noqa: BLE001 - rendered
+            self._error(503, "unavailable",
+                        "the settings store cannot be opened, so this write was "
+                        "not attempted; this is not a validation failure")
+            return None
 
     def do_PUT(self):
         self._settings_write("PUT")
@@ -941,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
         it becomes the documented 403.
         """
         cfg = self.cfg
+        self._body_consumed = False
         try:
             if not settingsapi.authorized(cfg, self.headers):
                 self._error(401, "unauthorized", "missing or wrong write token")
@@ -949,7 +1030,9 @@ class Handler(BaseHTTPRequestHandler):
             self._error(403, exc.code, exc.message, exc.field)
             return
 
-        conn = store.connect(cfg.db_path)
+        conn = self._write_conn()
+        if conn is None:
+            return
         try:
             cfg.reload_settings(conn)
             parts = [p for p in self.path.split("?")[0].split("/") if p]
@@ -1011,6 +1094,7 @@ class Handler(BaseHTTPRequestHandler):
         leaves the row pending, because a failed approval is not a decision.
         """
         cfg = self.cfg
+        self._body_consumed = False
         try:
             if not settingsapi.authorized(cfg, self.headers):
                 self._error(401, "unauthorized", "missing or wrong write token")
@@ -1019,7 +1103,9 @@ class Handler(BaseHTTPRequestHandler):
             self._error(403, exc.code, exc.message, exc.field)
             return
 
-        conn = store.connect(cfg.db_path)
+        conn = self._write_conn()
+        if conn is None:
+            return
         try:
             cfg.reload_settings(conn)
             parts = [p for p in self.path.split("?")[0].split("/") if p]

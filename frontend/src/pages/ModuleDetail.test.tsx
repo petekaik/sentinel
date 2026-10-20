@@ -80,6 +80,34 @@ const status = {
   verdict: "fail",
   verdict_reason: "3 check(s) are RED",
   remedies_enabled: false,
+  writes_enabled: true,
+  module_errors: [],
+  command_runs: [
+    {
+      id: 2,
+      ts: 1760000000,
+      module: "fleet",
+      command: "serial_status",
+      actor: "operator",
+      argv_json: "{}",
+      dry_run: 0,
+      exit_status: 0,
+      output_head: "both adapters present",
+      duration_ms: 40,
+    },
+    {
+      id: 1,
+      ts: 1759999000,
+      module: "system",
+      command: "other_module_command",
+      actor: "operator",
+      argv_json: "{}",
+      dry_run: 1,
+      exit_status: 0,
+      output_head: "system output",
+      duration_ms: 10,
+    },
+  ],
   collector: {
     staleness: "fresh",
     last_age_s: 5,
@@ -214,6 +242,110 @@ it("renders one check row per target and attributes rows by check ownership", as
   // A collector-emitted check id named by `extra_check_ids` is owned even when
   // its target is not one of the module's reporting targets.
   expect(screen.getByText("extra-check detail")).toBeInTheDocument();
+});
+
+it("renders one row per (check, subject), not one per check id", async () => {
+  // SNMP uses ONE `snmp_reachable` id per device and the SUBJECT names the
+  // device. A checks table keyed by id alone showed a 12-device module as one
+  // reachability row.
+  const snmp = {
+    id: "snmp",
+    title: "Network devices",
+    order: 30,
+    enabled: true,
+    targets: ["snmp"],
+    checks: [
+      {
+        id: "snmp_reachable",
+        title: "SNMP reachable",
+        spec: null,
+        unit: "",
+        direction: "",
+        subject: "sw1",
+        targets: ["snmp"],
+      },
+      {
+        id: "snmp_reachable",
+        title: "SNMP reachable",
+        spec: null,
+        unit: "",
+        direction: "",
+        subject: "sw2",
+        targets: ["snmp"],
+      },
+    ],
+    extra_check_ids: ["snmp_reachable"],
+    settings: [],
+    commands: [],
+    actions: [],
+  };
+  const snmpStatus = {
+    ...status,
+    hosts: { snmp: host },
+    worst: [
+      {
+        target: "snmp",
+        check_id: "snmp_reachable",
+        subject: "sw1",
+        status: "red",
+        detail: "device sw1 did not answer",
+        spec: null,
+        value: null,
+        unit: "",
+        claim: null,
+      },
+    ],
+    informational: [],
+    incidents: [],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      if (url === "/api/v1/modules") return respond(200, [snmp]);
+      if (url === "/api/v1/status") return respond(200, snmpStatus);
+      if (url === "/api/v1/settings") return respond(200, {});
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+
+  render(
+    <MemoryRouter initialEntries={["/modules/snmp"]}>
+      <Routes>
+        <Route path="/modules/:id" element={<ModuleDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  const titles = await screen.findAllByText("SNMP reachable");
+  expect(titles).toHaveLength(2);
+  const rows = titles.map((t) => t.closest("tr") as HTMLElement);
+  const sw1 = rows.find(
+    (r) => within(r).queryAllByText(/sw1/).length > 0,
+  ) as HTMLElement;
+  const sw2 = rows.find(
+    (r) => within(r).queryAllByText(/sw2/).length > 0,
+  ) as HTMLElement;
+  expect(within(sw1).getByText("device sw1 did not answer")).toBeInTheDocument();
+  expect(within(sw2).getByText("not flagged in this read")).toBeInTheDocument();
+});
+
+it("renders this module's recent command audit", async () => {
+  mockFetch();
+  render(
+    <MemoryRouter initialEntries={["/modules/fleet"]}>
+      <Routes>
+        <Route path="/modules/:id" element={<ModuleDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  // The audit is part of the operator surface: a command that ran must be
+  // visible on the module's page, not only in the store behind ssh.
+  expect(await screen.findByText("serial_status")).toBeInTheDocument();
+  expect(screen.getByText("both adapters present")).toBeInTheDocument();
+  // Another module's run is not this module's history.
+  expect(screen.queryByText("other_module_command")).toBeNull();
+  expect(screen.queryByText("system output")).toBeNull();
 });
 
 it("renders a command's args form and gates only destructive commands", async () => {

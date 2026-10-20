@@ -271,6 +271,18 @@ export default function ModuleDetail() {
     );
   }
 
+  // A STORED TOKEN CANNOT MAKE A TOKEN-LESS SERVER WRITABLE. The status read
+  // carries the server's own fact, so the page never offers "writes unlocked"
+  // beside a save that can only be refused with 403 `writes_disabled`.
+  const writesDisabled = status ? status.writes_enabled === false : false;
+  const locked = readOnly || writesDisabled;
+  const moduleErrors = (status?.module_errors ?? []).filter(
+    (e) => e.module === mod.id,
+  );
+  const commandRuns = (status?.command_runs ?? []).filter(
+    (r) => r.module === mod.id,
+  );
+
   const owned = new Set([
     ...mod.checks.map((c) => c.id),
     ...(mod.extra_check_ids ?? []),
@@ -316,7 +328,9 @@ export default function ModuleDetail() {
         {mod.enabled ? "" : " · collection is stopped while disabled"}
       </p>
       <div className="setting-actions">
-        {readOnly ? (
+        {writesDisabled ? (
+          <span className="badge source">writes disabled on the server</span>
+        ) : readOnly ? (
           <button type="button" onClick={() => setTokenOpen(true)}>
             Unlock writes
           </button>
@@ -324,6 +338,24 @@ export default function ModuleDetail() {
           <span className="badge source">writes unlocked for this tab</span>
         )}
       </div>
+      {writesDisabled && (
+        <p className="notice">
+          Read-only: this monitor has no <code>SENTINEL_WRITE_TOKEN</code>{" "}
+          configured, so the server refuses every write. Set it in the monitor's{" "}
+          <code>.env</code> and restart the container; the checks and settings
+          below are still readable.
+        </p>
+      )}
+
+      {moduleErrors.map((e) => (
+        <div className="banner red" role="alert" key={e.module}>
+          <strong>
+            This module could not build its settings-driven checks, so they are
+            NOT being evaluated:
+          </strong>{" "}
+          {e.reason}
+        </div>
+      ))}
 
       {status && <StaleBanner collector={status.collector} />}
       {statusError && (
@@ -400,31 +432,37 @@ export default function ModuleDetail() {
               </tr>
             </thead>
             <tbody>
-              {/* One row per (check, target) from the manifest's own per-check
-                  target list -- not the module targets cross-product, which
-                  would invent rows for a check that never runs there. Task 9's
-                  dynamic instances arrive as manifest checks with their own
-                  `targets`, so they need no change here. */}
+              {/* ONE ROW PER (CHECK, TARGET, SUBJECT) from the manifest's own
+                  entries -- not the module targets cross-product, which would
+                  invent rows for a check that never runs there. The subject is
+                  part of the key: SNMP uses one `snmp_reachable` id per device,
+                  so an id-only key renders one row for a whole device list. */}
               {mod.checks.flatMap((check) =>
                 (check.targets ?? []).map((target) => {
-                  const bad = flagged.find(
-                    (r) => r.check_id === check.id && r.target === target,
-                  );
-                  const info = informational.find(
-                    (r) => r.check_id === check.id && r.target === target,
-                  );
-                  const incident = incidents.find(
-                    (r) => r.check_id === check.id && r.target === target,
-                  );
+                  const subject = check.subject ?? null;
+                  const same = (r: {
+                    target: string;
+                    check_id: string;
+                    subject?: string | null;
+                  }) =>
+                    r.check_id === check.id &&
+                    r.target === target &&
+                    (r.subject ?? null) === subject;
+                  const bad = flagged.find(same);
+                  const info = informational.find(same);
+                  const incident = incidents.find(same);
                   const row = bad ?? info;
                   return (
-                    <tr key={`${check.id}|${target}`}>
+                    <tr key={`${check.id}|${target}|${subject ?? ""}`}>
                       <td>
                         <strong>{check.title}</strong>
                         <br />
                         <span className="sub">{check.id}</span>
                       </td>
-                      <td>{target}</td>
+                      <td>
+                        {target}
+                        {subject ? ` / ${subject}` : ""}
+                      </td>
                       <td>
                         {row ? (
                           <StatusPill status={row.status} />
@@ -476,11 +514,14 @@ export default function ModuleDetail() {
               </thead>
               <tbody>
                 {flagged.map((row) => (
-                  <tr key={`${row.target}|${row.check_id}`}>
+                  <tr key={`${row.target}|${row.check_id}|${row.subject ?? ""}`}>
                     <td>
                       <StatusPill status={row.status} />
                     </td>
-                    <td>{row.target}</td>
+                    <td>
+                      {row.target}
+                      {row.subject ? ` / ${row.subject}` : ""}
+                    </td>
                     <td>{row.check_id}</td>
                     <td>{value(row)}</td>
                     <td>{row.detail ?? "—"}</td>
@@ -507,8 +548,11 @@ export default function ModuleDetail() {
               </thead>
               <tbody>
                 {informational.map((row) => (
-                  <tr key={`${row.target}|${row.check_id}`}>
-                    <td>{row.target}</td>
+                  <tr key={`${row.target}|${row.check_id}|${row.subject ?? ""}`}>
+                    <td>
+                      {row.target}
+                      {row.subject ? ` / ${row.subject}` : ""}
+                    </td>
                     <td>{row.title || row.check_id}</td>
                     <td>{value(row)}</td>
                     <td>{row.detail ?? "—"}</td>
@@ -575,6 +619,46 @@ export default function ModuleDetail() {
         </div>
       )}
 
+      <h2>Command runs</h2>
+      {commandRuns.length === 0 ? (
+        <p className="sub">No command has run for this module.</p>
+      ) : (
+        <div className="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Command</th>
+                <th>Actor</th>
+                <th>Dry run</th>
+                <th>Exit</th>
+                <th>Output</th>
+              </tr>
+            </thead>
+            <tbody>
+              {commandRuns.map((run) => (
+                <tr key={run.id}>
+                  <td>{new Date(run.ts * 1000).toLocaleString()}</td>
+                  <td>
+                    <code>{run.command}</code>
+                  </td>
+                  <td>{run.actor}</td>
+                  <td>{run.dry_run ? "yes" : "no"}</td>
+                  <td>{run.exit_status}</td>
+                  <td>
+                    {run.output_head ? (
+                      <pre>{run.output_head}</pre>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       <h2>Settings</h2>
       {settingsError ? (
         <div className="banner amber" role="alert">
@@ -586,7 +670,7 @@ export default function ModuleDetail() {
           moduleId={mod.id}
           settings={mod.settings}
           values={view?.[mod.id]}
-          readOnly={readOnly}
+          readOnly={locked}
           onSaved={() => void load()}
           onAuthRequired={(again) => {
             retry.current = again;

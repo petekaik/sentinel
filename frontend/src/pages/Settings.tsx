@@ -14,6 +14,9 @@ function message(e: unknown): string {
 export default function Settings() {
   const [modules, setModules] = useState<ModuleManifest[] | null>(null);
   const [view, setView] = useState<SettingsView | null>(null);
+  // null = the server has not told us (status read failed); keep the optimistic
+  // token gate rather than inventing an outage from a missing fact.
+  const [writesEnabled, setWritesEnabled] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [readOnly, setReadOnly] = useState(() => !hasToken());
   const [tokenOpen, setTokenOpen] = useState(false);
@@ -21,12 +24,16 @@ export default function Settings() {
 
   async function load() {
     try {
-      const [mods, settings] = await Promise.all([
+      // The status read is BEST-EFFORT: a settings page must still render when
+      // the status document cannot be built.
+      const [mods, settings, status] = await Promise.all([
         api.modules(),
         api.settings(),
+        api.status().catch(() => null),
       ]);
       setModules(mods);
       setView(settings);
+      setWritesEnabled(status ? status.writes_enabled : null);
       setError(null);
     } catch (e) {
       setError(message(e));
@@ -54,6 +61,11 @@ export default function Settings() {
   const ordered = [...modules].sort(
     (a, b) => a.order - b.order || a.title.localeCompare(b.title),
   );
+  // A TOKEN IN THIS BROWSER CANNOT MAKE A TOKEN-LESS SERVER WRITABLE. The
+  // server's own fact wins, so the page never says "writes unlocked" beside a
+  // save that can only come back 403 `writes_disabled`.
+  const writesDisabled = writesEnabled === false;
+  const locked = readOnly || writesDisabled;
 
   return (
     <>
@@ -63,7 +75,9 @@ export default function Settings() {
         fields you changed; a secret left blank keeps its stored value.
       </p>
       <div className="setting-actions">
-        {readOnly ? (
+        {writesDisabled ? (
+          <span className="badge source">writes disabled on the server</span>
+        ) : readOnly ? (
           <button type="button" onClick={() => setTokenOpen(true)}>
             Unlock writes
           </button>
@@ -72,6 +86,15 @@ export default function Settings() {
         )}
         {error && <em role="alert">{error}</em>}
       </div>
+      {writesDisabled && (
+        <p className="notice">
+          Read-only: this monitor has no <code>SENTINEL_WRITE_TOKEN</code>{" "}
+          configured, so the server refuses every write here. Set it in the
+          monitor's <code>.env</code> and restart the container. Values already
+          stored still apply to collection; this page is only where they are
+          edited.
+        </p>
+      )}
       {ordered.length === 0 && (
         <p className="sub">
           No module is discovered. That is a defect in the monitor, not an empty
@@ -93,7 +116,7 @@ export default function Settings() {
             moduleId={mod.id}
             title={mod.title}
             enabled={mod.enabled}
-            readOnly={readOnly}
+            readOnly={locked}
             onChanged={() => void load()}
             onAuthRequired={(again) => {
               retry.current = again;
@@ -106,7 +129,7 @@ export default function Settings() {
             moduleId={mod.id}
             settings={mod.settings}
             values={view?.[mod.id]}
-            readOnly={readOnly}
+            readOnly={locked}
             onSaved={() => void load()}
             onAuthRequired={(again) => {
               retry.current = again;

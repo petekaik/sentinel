@@ -442,12 +442,14 @@ that is not a decision. Every response carries `no-store`.
 | declaration default | the module's `Setting` | the module |
 
 `Config.reload_settings` builds the effective view — `os.environ` overlaid with
-every stored row in its env string form — at the **start of every epoch** and on
-**every page request**, so a saved value applies on the next collection with no
-restart. `GET /api/v1/settings` reports which layer won. Deleting a row
-restores the file/default. `<ID>_ENABLED` is written by the enable endpoint and
-obeyed by `module_enabled()`; `SENTINEL_MODULES` and the write token stay
-`.env`-only, and both are RESERVED keys no module may declare.
+every stored row in its env string form — at the **start of every collection**
+and in the **`GET /api/v1/modules` and `GET /api/v1/settings` handlers**, so a
+saved value applies on the next collection with no restart. Other reads
+(status, incidents, proposals) do not reload settings and may be at most one
+collection interval stale. `GET /api/v1/settings` reports which layer won.
+Deleting a row restores the file/default. `<ID>_ENABLED` is written by the
+enable endpoint and obeyed by `module_enabled()`; `SENTINEL_MODULES` and the
+write token stay `.env`-only, and both are RESERVED keys no module may declare.
 
 Validation happens in `app/settingsapi.py`, the **only** writer. The whole body
 is checked before any row is written; a key must be declared by the module; the

@@ -164,8 +164,10 @@ dropping an undeclared `community` from a device row answered 200 while the
 stored map kept authenticating with the old value.
 
 Precedence is **UI (DB override) > `.env` > declaration default**, rebuilt by
-`Config.reload_settings` at the start of every epoch and on every page request,
-so a save applies on the next collection with no restart.
+`Config.reload_settings` at the start of every collection and by the
+`GET /api/v1/modules` and `GET /api/v1/settings` handlers, so a save applies on
+the next collection with no restart. Other reads (status, incidents, proposals)
+are at most one collection interval stale — they do not reload settings.
 `GET /api/v1/settings` names the winning layer (`source: db|env|default`); a
 DELETE on the key restores the file/default. Secrets are accepted on write,
 never returned (`secret_set` only), and redacted in the audit log on both sides.

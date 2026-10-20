@@ -133,9 +133,11 @@ shapes.
 ### Settings, precedence and the write token
 
 Settings are typed overrides in the store: **UI (DB override) > `.env` > module
-default**. The effective view is rebuilt at the start of every epoch and on
-every page request, so a save applies on the **next collection** with no
-restart. A `list` setting is validated against its `item_fields` — every
+default**. The effective view is rebuilt at the start of every collection and,
+on the read side, by `GET /api/v1/modules` and `GET /api/v1/settings`; other
+reads (status, incidents, proposals) may be at most one collection interval
+stale. A save therefore applies on the **next collection** with no restart. A
+`list` setting is validated against its `item_fields` — every
 required field present and **no undeclared field**, so a device row carrying
 `community` is a 422 rather than a 200 that discards it. Secrets are write-only
 (a blank value on save means unchanged; DELETE removes the override), redacted

@@ -6,8 +6,13 @@ import type { ItemField, SettingField } from "../api";
    declare -- so the editor shows exactly what it will send. */
 
 function blank(field: ItemField): unknown {
+  // A DECLARED DEFAULT IS THE NEW ROW'S VALUE. Blanking every field ignored the
+  // manifest and made a new SNMP device arrive with `enabled: false`: the
+  // device was saved, skipped by the collector, and no check ever appeared.
+  // Bools, ints and choices all take their declaration's default when it has
+  // one; only an undeclared field falls back to the empty control.
+  if (field.default !== undefined && field.default !== null) return field.default;
   if (field.kind === "bool") return false;
-  if (field.kind === "int") return "";
   return "";
 }
 

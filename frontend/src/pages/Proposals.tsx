@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  ApiError,
   api,
   isUnauthorized,
   type Proposal,
@@ -18,8 +19,9 @@ function when(ts: number): string {
 
 /* The approvals queue. An approval is authority, not a bypass: it is sent to
    the engine, which re-resolves the action and the incident from what is live
-   now. A refusal is therefore a normal answer -- the row stays PENDING, and the
-   page says why rather than pretending the proposal went away. */
+   now. A refusal is therefore a normal answer, and it can mean the row MOVED
+   (the engine expired it) as well as that it stayed pending -- so a 409 reloads
+   the queue while the refusal message stays on the page. */
 export default function Proposals() {
   const [data, setData] = useState<ProposalsPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +60,14 @@ export default function Proposals() {
         setTokenOpen(true);
         setError("A write token is required to decide a proposal.");
       } else {
-        setError(message(e));
+        const text = message(e);
+        // A 409 IS OFTEN A STATE CHANGE, NOT A KEPT PENDING ROW: the engine
+        // expires a proposal whose incident is gone, or another approval claims
+        // it. Without the reload the row kept reading Pending forever. The
+        // message must survive the refresh -- `load()` clears `error` on
+        // success -- so it is set AFTER the reload.
+        if (e instanceof ApiError && e.status === 409) await load();
+        setError(text);
       }
     } finally {
       setBusy(null);
@@ -72,8 +81,9 @@ export default function Proposals() {
     <>
       <h2>Proposals</h2>
       <p className="sub">
-        An approval asks the engine to act on what is live now. A refusal leaves
-        the proposal pending.
+        An approval asks the engine to act on what is live now. A refusal is
+        shown, and the queue is reloaded because the engine may have expired the
+        proposal rather than left it pending.
       </p>
 
       {error && (

@@ -64,6 +64,9 @@ export type Status = {
   verdict: Verdict;
   verdict_reason: string;
   remedies_enabled: boolean;
+  /* Whether the SERVER has a write token at all. A token in this browser cannot
+     make a token-less server writable, and the page must say so before a save. */
+  writes_enabled: boolean;
   collector: {
     staleness: string;
     last_age_s: number | null;
@@ -81,6 +84,7 @@ export type Status = {
   worst: {
     target: string;
     check_id: string;
+    subject?: string | null;
     status: string;
     detail: string;
     spec: string | null;
@@ -93,16 +97,35 @@ export type Status = {
   informational: {
     target: string;
     check_id: string;
+    subject?: string | null;
     title: string;
     status: string;
     value: number | null;
     unit: string;
     detail: string;
   }[];
+  /* A module whose settings-driven checks could not be built. Rendered as a
+     warning: zero checks must never be mistaken for nothing configured. */
+  module_errors: { module: string; reason: string }[];
+  /* The operator-command audit, newest first and capped by the server. */
+  command_runs: CommandRun[];
   monitor_defects: {
     unclaimed_thresholds: string[];
     checks_without_result: number;
   };
+};
+
+export type CommandRun = {
+  id: number;
+  ts: number;
+  module: string;
+  command: string;
+  actor: string;
+  argv_json: string;
+  dry_run: number;
+  exit_status: number;
+  output_head: string | null;
+  duration_ms: number;
 };
 
 /* The /api/v1 settings contract. `SettingField` is the MANIFEST schema -- it
@@ -113,6 +136,10 @@ export type ItemField = {
   key: string;
   label?: string;
   kind?: "str" | "int" | "bool" | string;
+  /* The declared default for a NEW row. Without it the editor blanks every
+     field, so adding an SNMP device stored `enabled: false` -- the device was
+     skipped by the collector and no check ever appeared. */
+  default?: unknown;
   help?: string;
   secret?: boolean;
   required?: boolean;
@@ -139,6 +166,9 @@ export type CheckManifest = {
   spec: string | null;
   unit: string;
   direction: string;
+  /* The instance's discriminator. SNMP uses one `snmp_reachable` id per device
+     and the subject names the device, so a row is (check, subject). */
+  subject?: string | null;
   /* The targets this check actually runs on: one static target, or every
      expansion target for a per_box check. */
   targets: string[];

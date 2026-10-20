@@ -786,6 +786,46 @@ def test_the_manifest_lists_dynamic_checks_and_never_a_community(results):
         conn.close()
 
 
+def test_the_manifest_lists_one_reachability_row_per_device(results):
+    """Dedup by `(id, subject)`, because SNMP shares one id across devices.
+
+    `snmp_reachable` is ONE id per device and the SUBJECT is the discriminator
+    (the incident key is `(target, check_id, subject)`). An id-only dedup
+    collapsed three configured devices into one manifest row, so ModuleDetail
+    showed one reachability row for the whole device list.
+    """
+    conn = _store()
+    try:
+        devices = [_device(name="sw1"),
+                   _device(name="pdu1", address="192.0.2.11"),
+                   _device(name="nas1", address="192.0.2.12")]
+        cfg = _cfg(dict({"MONITOR_CHECKS": CHECKS_CONF},
+                        **_env(devices, [_check()])))
+        mods = module_loader.discover()
+        manifests = settingsapi.module_manifests(cfg, conn, mods, {})
+        snmp = next(m for m in manifests if m["id"] == "snmp")
+        reach = [c for c in snmp["checks"] if c["id"] == "snmp_reachable"]
+        oid = [c for c in snmp["checks"] if c["id"] == "snmp_sw1_cpu_load"]
+        results.check(
+            "one reachability row per configured device, plus the OID row",
+            len(reach) == 3
+            and {c["subject"] for c in reach} == {"sw1", "pdu1", "nas1"}
+            and len(oid) == 1 and len(snmp["checks"]) == 4,
+            "checks=%r -- deduping by id showed 3 devices as one reachability "
+            "row, and the others were invisible in the SPA" % (snmp["checks"],))
+        fields = {f["key"]: f for f in next(
+            s for s in snmp["settings"]
+            if s["key"] == "SNMP_DEVICES")["item_fields"]}
+        results.check(
+            "item_fields carry their declared defaults for a new row",
+            fields["enabled"].get("default") is True
+            and fields["port"].get("default") == 161,
+            "item_fields=%r -- a new device row that starts blank is saved "
+            "disabled and never polled" % (fields,))
+    finally:
+        conn.close()
+
+
 TESTS = (test_config_parses_devices_communities_and_defaults,
          test_malformed_json_is_refused_by_setting_name,
          test_config_refuses_invalid_devices,
@@ -806,4 +846,5 @@ TESTS = (test_config_parses_devices_communities_and_defaults,
          test_a_checks_only_write_is_validated_against_effective_values,
          test_env_supplied_lists_are_typed_in_the_view,
          test_disabling_the_module_freezes_its_dynamic_incidents,
-         test_the_manifest_lists_dynamic_checks_and_never_a_community)
+         test_the_manifest_lists_dynamic_checks_and_never_a_community,
+         test_the_manifest_lists_one_reachability_row_per_device)

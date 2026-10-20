@@ -137,6 +137,36 @@ export default function Overview() {
 
       <StaleBanner collector={c} />
 
+      {/* A MODULE WHOSE SETTINGS DO NOT PARSE IS NOT AN EMPTY MODULE. Without
+          this the only trace was a spec-less placeholder in `others`, which no
+          page rendered -- malformed SNMP_DEVICES showed zero checks and a page
+          that read like "nothing is configured". */}
+      {(status.module_errors ?? []).length > 0 && (
+        <div className="banner red" role="alert">
+          <strong>
+            Some modules could not build their settings-driven checks, so they
+            are NOT being evaluated:
+          </strong>
+          <ul>
+            {status.module_errors.map((e) => (
+              <li key={e.module}>
+                <code>{e.module}</code>: {e.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* The collector's own run note. It names module and platform failures
+          that happened during the epoch (preload, advisors, instance builds)
+          and was typed and returned but rendered nowhere. */}
+      {c.note && (
+        <div className="banner amber" role="alert">
+          <strong>The collector reported problems during the last epoch.</strong>
+          <pre>{c.note}</pre>
+        </div>
+      )}
+
       <section className="verdict" aria-label="Fleet verdict">
         <StatusPill status={status.verdict} />
         <p>{status.verdict_reason}</p>

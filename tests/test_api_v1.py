@@ -16,6 +16,7 @@ The HTTP checks run against a real loopback server, reusing the dashboard
 suite's `_serve`/`make_cfg` so there is one test server class, not two.
 """
 
+import http.client
 import json
 import os
 import sys
@@ -450,11 +451,149 @@ def _req(url, method="GET", body=None, token=None):
         return e.code, dict(e.headers), json.loads(e.read() or b"null")
 
 
+def test_a_write_with_an_unopenable_store_is_a_json_503(results):
+    """`store.connect` outside the try raised out of the handler.
+
+    The client saw a reset and the log a traceback with the DB path, instead of
+    the `{error:{code,message}}` document the /api/v1 contract promises -- and
+    the request body was never consumed, so the connection was poisoned too.
+    """
+    tmp = tempfile.mkdtemp()
+    # A DIRECTORY where the database file should be: sqlite cannot open it.
+    db_dir = os.path.join(tmp, "not-a-db")
+    os.makedirs(db_dir)
+    cfg = _cfg(tmp, MONITOR_DB=db_dir)
+    httpd, base = _serve(cfg)
+    try:
+        # A refused connection is a RESULT here, not an abort: the defect this
+        # test pins (store.connect outside the try) resets the socket, and a
+        # raised ConnectionResetError would take the suite down instead of
+        # reporting the FAIL.
+        try:
+            code, _, body = _req(base + "/api/v1/modules/fleet/settings", "PUT",
+                                 {"RECORDINGS_PATH": "/tmp/rec"}, token="tok")
+        except OSError as exc:
+            code, body = None, {"_transport": str(exc)}
+        text = json.dumps(body)
+        results.check(
+            "an unopenable store is a JSON 503 unavailable, never a dropped "
+            "connection or a traceback",
+            code == 503 and body.get("error", {}).get("code") == "unavailable"
+            and "Traceback" not in text and db_dir not in text,
+            "code=%s body=%r -- an exception out of the handler resets the "
+            "connection and logs the store path" % (code, body))
+
+        try:
+            code, _, body = _req(base + "/api/v1/commands/fleet/peek", "POST",
+                                 {"args": {}}, token="tok")
+        except OSError as exc:
+            code, body = None, {"_transport": str(exc)}
+        results.check(
+            "a command POST with an unopenable store is the same JSON 503",
+            code == 503 and body.get("error", {}).get("code") == "unavailable",
+            "code=%s body=%r -- both write handlers must use one store helper"
+            % (code, body))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_write_auth_refusal_does_not_poison_keep_alive(results):
+    """A 401 with an unread body must not be parsed as the next request.
+
+    Measured before the fix: a wrong-token PUT answered 401, then a GET on the
+    same pooled connection came back `400 Bad request syntax` as HTML -- so a
+    token rotation looked like a monitor outage on the Overview. The server
+    marks the connection non-reusable instead of draining an attacker-sized
+    body.
+    """
+    tmp = tempfile.mkdtemp()
+    cfg = _cfg(tmp)
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    conn.close()
+    httpd, base = _serve(cfg)
+    host, port = base.rsplit(":", 1)
+    host = host.replace("http://", "")
+    client = http.client.HTTPConnection(host, int(port), timeout=10)
+    try:
+        body = json.dumps({"RECORDINGS_PATH": "/tmp/rec"})
+        client.request("PUT", "/api/v1/modules/fleet/settings", body=body,
+                       headers={"Content-Type": "application/json",
+                                "Authorization": "Bearer wrong"})
+        first = client.getresponse()
+        first.read()
+        first_code = first.status
+        connection = first.getheader("Connection")
+
+        # The SAME client object: http.client reconnects when the server has
+        # closed the connection, so the GET is a real second request.
+        client.request("GET", "/api/v1/status")
+        second = client.getresponse()
+        second_code = second.status
+        raw = second.read() or b"null"
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            # A desynced GET answers HTML ("400 Bad request syntax"), and a test
+            # that raises here would abort the suite instead of reporting the
+            # FAIL this check exists to show.
+            payload = {"_body": raw[:80].decode("utf-8", "replace")}
+        results.check(
+            "a 401 write refuses keep-alive, so the next GET on that pool is "
+            "answered instead of parsed from the leftover body",
+            first_code == 401 and connection == "close" and second_code == 200
+            and payload.get("api_version") == web.API_VERSION,
+            "401=%r Connection=%r GET=%r payload=%r -- an unconsumed body is "
+            "read as the next request line and the GET answers 400 HTML"
+            % (first_code, connection, second_code, payload))
+    finally:
+        client.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_broken_module_setting_is_visible_in_status(results):
+    """A module whose `check_instances` raises must name itself on the page.
+
+    The failure used to be swallowed into a spec-less placeholder (`others`,
+    which no .tsx renders) plus the collector's run note (also rendered
+    nowhere). Malformed SNMP_DEVICES showed zero checks and a page that read
+    like "nothing is configured".
+    """
+    tmp = tempfile.mkdtemp()
+    cfg = _cfg(tmp, SENTINEL_MODULES="snmp", SNMP_DEVICES="{not json")
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    conn.close()
+    httpd, base = _serve(cfg)
+    try:
+        code, _, body = _req(base + "/api/v1/status")
+        errors = body.get("module_errors") or []
+        results.check(
+            "a module whose settings-driven checks cannot be built carries its "
+            "reason in /api/v1/status, naming the module",
+            code == 200 and any(
+                e.get("module") == "snmp"
+                and "SNMP_DEVICES" in e.get("reason", "")
+                for e in errors),
+            "code=%s module_errors=%r -- zero checks must never read as "
+            "\"nothing configured\"" % (code, errors))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_the_read_surface(results):
     tmp = tempfile.mkdtemp()
     cfg = _cfg(tmp)
     conn = store.connect(cfg.db_path)
     store.init(conn)
+    # The command audit is part of the operator surface; seed one row so the
+    # status document's `command_runs` is proven to reach the SPA rather than
+    # only the store.
+    store.record_command_run(conn, "fleet", "peek", "op", {}, False, 0,
+                             "audit output")
     conn.close()
     httpd, base = _serve(cfg)
     try:
@@ -483,6 +622,21 @@ def test_the_read_surface(results):
             code == 200 and body.get("api_version") == web.API_VERSION
             and body.get("verdict") in ("ok", "warn", "fail", "unknown"),
             "code=%s body=%r" % (code, body))
+        # The two facts a token-holding browser cannot infer for itself: whether
+        # the SERVER can write, and what the last commands did.
+        results.check(
+            "the status document says whether the server has a write token",
+            body.get("writes_enabled") is True,
+            "writes_enabled=%r -- a browser token cannot make a token-less "
+            "server writable, and the page must not claim it can"
+            % (body.get("writes_enabled"),))
+        runs = body.get("command_runs") or []
+        results.check(
+            "the status document carries the operator-command audit",
+            any(r.get("command") == "peek" and r.get("module") == "fleet"
+                and r.get("output_head") == "audit output" for r in runs),
+            "command_runs=%r -- the audit was rendered nowhere once the "
+            "server-rendered page went" % (runs,))
 
         # The incident board is an OBJECT, not a list: live rows, terminal
         # history and the freshness of the read are three facts, and an empty
@@ -782,6 +936,13 @@ def test_writes_disabled_without_a_token(results):
             "reads stay open when writes are disabled -- the write token may "
             "not be an outage",
             code == 200, "code=%s" % (code,))
+        code, _, body = _req(base + "/api/v1/status")
+        results.check(
+            "the status document says writes are disabled, without a write",
+            code == 200 and body.get("writes_enabled") is False,
+            "code=%s writes_enabled=%r -- a stored browser token otherwise "
+            "reads as writable until the first 403"
+            % (code, body.get("writes_enabled")))
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -1166,6 +1327,9 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_the_read_surface,
          test_api_errors_are_json,
          test_the_write_surface,
+         test_a_write_with_an_unopenable_store_is_a_json_503,
+         test_a_write_auth_refusal_does_not_poison_keep_alive,
+         test_a_broken_module_setting_is_visible_in_status,
          test_a_device_row_cannot_carry_a_community,
          test_writes_disabled_without_a_token,
          test_proposals_are_a_two_list_board,

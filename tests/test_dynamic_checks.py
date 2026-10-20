@@ -427,6 +427,40 @@ def test_a_subjectless_instance_still_finds_its_stored_row(results):
         "having no result" % (row,))
 
 
+def test_the_status_api_carries_the_subject_of_a_flagged_dynamic_row(results):
+    """The SPA keys rows by (target, check_id, subject), so `worst` must too.
+
+    Two devices share one check id and differ only in the subject. A worst row
+    without it hands every device the first one's verdict.
+    """
+    def build(ctx):
+        ctx.dynamic_specs["dyn_a"] = _spec()
+        return [Dynamic("a", spec="dyn_a")]
+
+    tmp = tempfile.mkdtemp()
+
+    def seed(conn):
+        seq = store.next_epoch_seq(conn)
+        store.record_check(conn, seq, "dynamic", "dyn", store.Status.FAIL,
+                           "device a is broken", subject="a")
+
+    cfg = _config(tmp)
+    conn = store.connect(cfg.db_path)
+    store.init(conn)
+    try:
+        seed(conn)
+        status = _with_module(_module(build, path=tmp),
+                              lambda: web.build_status(cfg, conn))
+    finally:
+        conn.close()
+    row = next((r for r in status["worst"] if r["check_id"] == "dyn"), None)
+    results.check(
+        "the status document carries the subject of a flagged dynamic row",
+        row is not None and row.get("subject") == "a",
+        "worst=%r -- a row keyed without its subject shows one device's verdict "
+        "for every device sharing the check id" % (status["worst"],))
+
+
 TESTS = (test_dynamic_instances_run_and_their_specs_are_claimed,
          test_collect_once_records_the_dynamic_result,
          test_a_raising_dynamic_instance_is_unknown,
@@ -438,5 +472,6 @@ TESTS = (test_dynamic_instances_run_and_their_specs_are_claimed,
          test_build_state_renders_the_dynamic_row,
          test_two_subjects_of_one_id_keep_their_own_verdict,
          test_bad_settings_render_a_visible_unknown_row,
+         test_the_status_api_carries_the_subject_of_a_flagged_dynamic_row,
          test_build_state_calls_the_module_context_hook,
          test_a_subjectless_instance_still_finds_its_stored_row)

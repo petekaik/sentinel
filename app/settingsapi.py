@@ -143,8 +143,13 @@ def _specs_for(mod, specs, cfg=None):
                     "spec": spec_id,
                     "unit": spec.unit if spec else "",
                     "direction": spec.direction if spec else "",
+                    # A static check has one row and no subject. The key is
+                    # carried anyway so every manifest entry has the same shape:
+                    # the SPA renders one row per (check, subject).
+                    "subject": None,
                     "targets": targets})
-    out.extend(_dynamic_specs_for(mod, specs, cfg, {r["id"] for r in out}))
+    out.extend(_dynamic_specs_for(mod, specs, cfg,
+                                  {(r["id"], r["subject"]) for r in out}))
     return out
 
 
@@ -154,6 +159,12 @@ def _dynamic_specs_for(mod, specs, cfg, seen):
     No `preload`: building these must never touch a device or a host. The band
     is the one the module just registered in `ctx.dynamic_specs`, because a
     dynamic spec is in no threshold file.
+
+    DEDUPED BY `(id, subject)`, NOT BY `id`. SNMP deliberately uses ONE
+    `snmp_reachable` id per device and makes the SUBJECT the discriminator (the
+    incident key is `(target, check_id, subject)`), so an id-only dedup collapses
+    three configured devices into one manifest row -- the detail page then shows
+    one reachability row and the other devices are invisible.
     """
     if cfg is None:
         return []
@@ -166,9 +177,10 @@ def _dynamic_specs_for(mod, specs, cfg, seen):
     out = []
     for inst in instances:
         ident = getattr(inst, "id", "")
-        if not ident or ident in seen:
+        subject = getattr(inst, "subject", None)
+        if not ident or (ident, subject) in seen:
             continue
-        seen.add(ident)
+        seen.add((ident, subject))
         spec_id = getattr(inst, "spec", None)
         spec = specs.get(spec_id) if spec_id else None
         if spec is None and spec_id:
@@ -179,6 +191,7 @@ def _dynamic_specs_for(mod, specs, cfg, seen):
                     "spec": spec_id,
                     "unit": spec.unit if spec else "",
                     "direction": spec.direction if spec else "",
+                    "subject": subject,
                     "targets": [target] if target else []})
     return out
 
@@ -303,6 +316,16 @@ def settings_view(cfg, conn, modules):
             view[setting.key] = {"value": value, "source": source}
         out[mod.id] = view
     return out
+
+
+def writes_enabled(cfg):
+    """True iff a write token is configured at all.
+
+    The read-only counterpart of `authorized`: the SPA needs this fact BEFORE a
+    write, or a stored browser token makes a token-less server look writable
+    until the first save comes back 403 `writes_disabled`.
+    """
+    return bool(cfg.env.get("SENTINEL_WRITE_TOKEN", ""))  # secretscan:ignore (env key name, not a value)
 
 
 def authorized(cfg, headers):

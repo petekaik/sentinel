@@ -30,6 +30,7 @@ import test_modules as module_tests                # noqa: E402
 import test_proxy_config as proxy_tests         # noqa: E402
 import test_remediation as remediation_tests    # noqa: E402
 import test_serial_identity as serial_tests     # noqa: E402
+import test_settings as settings_tests          # noqa: E402
 import test_shared_layer as shared_tests        # noqa: E402
 import test_system_module as system_tests       # noqa: E402
 
@@ -50,6 +51,9 @@ SUITES = (
     ("store.py -- the incident lifecycle: what may close a row, and what must "
      "never be able to",
      incident_tests.TESTS),
+    ("store.py -- the settings overlay: typed values, their env form, and an "
+     "audit row a secret cannot leak through",
+     settings_tests.TESTS),
     ("web.py -- the dashboard contract (never green on no data, never cached)",
      dash_tests.TESTS),
     ("checks/* -- the real check classes against verbatim fleet captures",

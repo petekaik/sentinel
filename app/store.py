@@ -374,6 +374,38 @@ CREATE TABLE IF NOT EXISTS threshold_override (
     previous_json TEXT NOT NULL,
     proposal_id   INTEGER
 );
+
+-- THE SETTINGS OVERLAY, TYPED. The config files remain the defaults; a row
+-- here is an operator-approved override layered on top, exactly as
+-- threshold_override is for a band -- so a `reset` is a DELETE, because "no
+-- row" is what makes the file's value apply again.
+--
+-- `value_json` keeps the value's TYPE rather than flattening it to text on the
+-- way in; `setting_env` is the single place that flattens to an env string,
+-- because that is the one reader that cannot take a list.
+--
+-- `setting_change` is append-only and separate: `setting` says what is in
+-- force, `setting_change` says how it got that way. Both audit columns are
+-- named `_json` and hold either JSON or the literal redaction marker -- a
+-- secret's value is never written here, in either direction.
+CREATE TABLE IF NOT EXISTS setting (
+    module     TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    actor      TEXT NOT NULL,
+    PRIMARY KEY (module, key)
+);
+CREATE TABLE IF NOT EXISTS setting_change (
+    id       INTEGER PRIMARY KEY,
+    ts       REAL NOT NULL,
+    module   TEXT NOT NULL,
+    key      TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    old_json TEXT,
+    new_json TEXT,
+    actor    TEXT NOT NULL
+);
 """
 
 
@@ -968,6 +1000,87 @@ def remove_threshold_override(conn, spec_id):
     return row
 
 
+REDACTED = "<redacted>"
+
+
+def setting_rows(conn):
+    """Every override, TYPED, keyed by `(module, key)`."""
+    return {(r["module"], r["key"]): json.loads(r["value_json"])
+            for r in conn.execute("SELECT * FROM setting").fetchall()}
+
+
+def _env_string(value):
+    """One typed value as the string an env reader expects.
+
+    A bool becomes 1/0 rather than "True"/"False", which is what every shell
+    and every `int(os.environ[...])` on this fleet already parses.
+    """
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def setting_env(conn):
+    """The overrides flattened for a config reader: bare key -> string.
+
+    The key without its module: the module is the row's namespace, not part of
+    the name the file's defaults are keyed by. Two modules declaring the same
+    key therefore collide here -- the config overlay is where that is a
+    question, and it has the module in hand.
+    """
+    return {key: _env_string(value)
+            for (_module, key), value in setting_rows(conn).items()}
+
+
+def _log_change(conn, module, key, action, old, new, actor, secret=False):
+    """Append one audit row. `secret` redacts BOTH sides.
+
+    The old side too, and not only for symmetry: a value's secrecy is declared
+    at the write that marks it secret, so anything written before that is in
+    the store unredacted and rewriting it must not copy it into the log.
+
+    The marker is stored VERBATIM rather than JSON-encoded. `"<redacted>"` (a
+    JSON string) and `<redacted>` (the marker) reading differently is the point
+    -- a reader must not have to parse to tell a redaction from a value that
+    happens to spell one.
+    """
+    conn.execute(
+        "INSERT INTO setting_change (ts, module, key, action, old_json, "
+        "new_json, actor) VALUES (?,?,?,?,?,?,?)",
+        (time.time(), module, key, action,
+         REDACTED if secret else json.dumps(old),
+         REDACTED if secret else json.dumps(new), actor))
+
+
+def put_setting(conn, module, key, value, actor, secret=False):
+    """Write one override and its audit row. `secret` affects ONLY the log."""
+    old = setting_rows(conn).get((module, key))
+    conn.execute(
+        "INSERT INTO setting (module, key, value_json, updated_at, actor) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(module, key) DO UPDATE SET "
+        "value_json = excluded.value_json, updated_at = excluded.updated_at, "
+        "actor = excluded.actor",
+        (module, key, json.dumps(value), time.time(), actor))
+    _log_change(conn, module, key, "set", old, value, actor, secret=secret)
+
+
+def delete_setting(conn, module, key, actor):
+    """Remove an override, so the file's value applies again. Audited as `reset`."""
+    old = setting_rows(conn).get((module, key))
+    conn.execute("DELETE FROM setting WHERE module = ? AND key = ?",
+                 (module, key))
+    _log_change(conn, module, key, "reset", old, None, actor)
+
+
+def setting_changes(conn, limit=50):
+    """Newest audit rows first, as stored -- `old_json`/`new_json` are text."""
+    rows = conn.execute("SELECT * FROM setting_change ORDER BY id DESC "
+                        "LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def record_journal(conn, host, cursor, ts, unit, priority, message):
     """Insert one journal line. Returns True if it was new.
 
@@ -1350,7 +1463,7 @@ def db_summary(conn):
     for table in ("sample", "check_run", "collection_attempt", "incident",
                   "journal", "remedy", "collector_run", "command_run",
                   "advisor_run", "insight", "proposal",
-                  "threshold_override"):
+                  "threshold_override", "setting", "setting_change"):
         try:
             out[table] = conn.execute(
                 "SELECT COUNT(*) AS n FROM %s" % table

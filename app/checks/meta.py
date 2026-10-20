@@ -90,7 +90,8 @@ class SpecCoverage(Check):
                 evidence={"declared": 0, "check_classes": len(classes)},
             )
 
-        claimed, deferred, unclaimed = _audit(ctx.specs, classes)
+        claimed, deferred, unclaimed = _audit(
+            ctx.specs, classes, set(getattr(ctx, "dynamic_specs", {})))
         n = len(ctx.specs)
         ev = {
             "declared": n,
@@ -176,7 +177,7 @@ class ModulesEnabled(Check):
         )
 
 
-def _audit(specs, classes):
+def _audit(specs, classes, extra_claimed=()):
     """Indirection so the offline suite can exercise this without thresholds."""
     import thresholds
-    return thresholds.audit(specs, classes)
+    return thresholds.audit(specs, classes, extra_claimed=extra_claimed)

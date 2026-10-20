@@ -142,7 +142,27 @@ def build_state(cfg, conn, now=None):
     classes = checks.registry(
         *([c for m in enabled for c in m.check_classes()]
           + list(checks.platform_modules())))
-    claimed, deferred, unclaimed = thresholds.audit(specs, classes)
+    # THE PAGE RENDERS THE SAME INSTANCES THE COLLECTOR EVALUATES. A module's
+    # `check_instances` are built from settings, so they exist on no registry and
+    # a class-only page would silently omit every device the operator configured.
+    # A settings-only Context: no preload hook is called, so building the page
+    # cannot touch the fleet.
+    ctx = checks.Context(cfg, specs, {}, modules=enabled)
+    static = checks.expand(classes, checks.expansion_targets(enabled))
+    dynamic = []
+    for m in enabled:
+        instances = m.check_instances(ctx)
+        for inst in instances:
+            # Attribute the row to its module for the same reason a class is:
+            # the page names who owns the check.
+            module_of.setdefault(inst.id, m)
+        dynamic.extend(instances)
+    # The band the page displays, not just the file's: a dynamic spec is
+    # declared by the module when it builds its instances, and it must render
+    # with its own unit/note like any file-declared one.
+    specs.update(ctx.dynamic_specs)
+    claimed, deferred, unclaimed = thresholds.audit(
+        specs, classes, extra_claimed=set(ctx.dynamic_specs))
 
     current, n_current = _rows(conn, NEWEST_EPOCH_SQL)
     by_key = {(r["target"], r["check_id"]): r for r in current}
@@ -159,7 +179,7 @@ def build_state(cfg, conn, now=None):
     n_incidents = len(incidents)
 
     tiles, informational, others, missing = [], [], [], []
-    for chk in checks.expand(classes, checks.expansion_targets(enabled)):
+    for chk in static + dynamic:
         row = by_key.pop((chk.target, chk.id), None)
         spec = specs.get(chk.spec) if chk.spec else None
         owner = module_of.get(chk.id)

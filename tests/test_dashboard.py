@@ -134,7 +134,14 @@ def registry_instances(cfg):
     classes = checks.registry(
         *([c for m in mods for c in m.check_classes()]
           + list(checks.platform_modules())))
-    return checks.expand(classes, checks.expansion_targets(mods))
+    # AND THE SETTINGS-DRIVEN INSTANCES, for the same reason: `build_state` now
+    # renders them, so a class-only list here would measure a different page
+    # than the one being rendered (and count it short).
+    ctx = checks.Context(cfg, {}, {}, modules=mods)
+    out = checks.expand(classes, checks.expansion_targets(mods))
+    for m in mods:
+        out.extend(m.check_instances(ctx))
+    return out
 
 
 class _Server(ThreadingHTTPServer):

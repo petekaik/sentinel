@@ -26,6 +26,7 @@ import test_api_v1 as api_tests                 # noqa: E402
 import test_collect_offline as collect_tests    # noqa: E402
 import test_commands as command_tests           # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
+import test_dynamic_checks as dynamic_tests     # noqa: E402
 import test_incident_lifecycle as incident_tests  # noqa: E402
 import test_modules as module_tests                # noqa: E402
 import test_proxy_config as proxy_tests         # noqa: E402
@@ -62,6 +63,9 @@ SUITES = (
      dash_tests.TESTS),
     ("checks/* -- the real check classes against verbatim fleet captures",
      fixture_tests.TESTS),
+    ("checks/* -- settings-driven instances: they are evaluated, their specs "
+     "count as claimed, and the dashboard renders them",
+     dynamic_tests.TESTS),
     ("checks/* -- the shared dynamic layer (T2): converging vs stuck, the "
      "subjects incidents resolve by, and worker_drift's box-side authority",
      shared_tests.TESTS),

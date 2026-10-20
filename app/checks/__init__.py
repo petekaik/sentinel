@@ -180,6 +180,10 @@ class Context:
         # distinct state from [] -- see SpecCoverage.run: it says "the audit
         # could not run" rather than "everything is claimed".
         self.check_classes = check_classes
+        # Thresholds declared by a module's `check_instances`, keyed by spec id.
+        # They live in no thresholds.conf, so the spec-coverage audit cannot see
+        # them in a check class and must be told they are claimed.
+        self.dynamic_specs = {}
         self.exports = {}
         self.box = {}
         self.worker = {}

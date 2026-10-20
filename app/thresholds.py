@@ -270,7 +270,7 @@ def load_effective(mapping, conn=None):
         specs, {r[0]: {"green": r[1], "amber": r[2]} for r in rows})
 
 
-def audit(specs, check_classes):
+def audit(specs, check_classes, extra_claimed=()):
     """Which declared specs does the registry actually claim?
 
     Returns (claimed, deferred, unclaimed) -- three dicts/sets, and the third is
@@ -279,6 +279,11 @@ def audit(specs, check_classes):
     `check_classes` is the list of Check CLASSES (not instances) that will run.
     A per_box check is one class regardless of how many boxes it binds to, and
     that is correct: the question is whether some code reads the spec at all.
+
+    `extra_claimed` is for specs claimed by something that has no Check class:
+    a module's `check_instances` builds instances from settings and declares
+    their bands in `ctx.dynamic_specs`. Those ids ARE claimed -- a class-only
+    audit would report every one of them as a threshold no code reads.
 
     A CLAIM IS NOT VERIFIED HERE, and that is a known limit worth stating: this
     compares spec ids against `cls.spec` strings. A check that declares
@@ -293,6 +298,7 @@ def audit(specs, check_classes):
         sid = getattr(cls, "spec", None)
         if sid:
             claimed.add(sid)
+    claimed.update(extra_claimed or ())
     deferred, unclaimed = {}, {}
     for sid, spec in specs.items():
         if sid in claimed:

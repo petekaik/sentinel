@@ -181,16 +181,19 @@ def preload_modules(cfg, ctx, attempts):
 # ---------------------------------------------------------------------------
 
 
-def evaluate(classes, ctx, cubox_ids):
+def evaluate(instances, ctx):
     """Run every check. A check that throws is LOUD, never silently missing.
 
     The exception is caught here rather than allowed to kill the epoch, because
     one broken check must not cost the other thirty-nine -- but it is recorded as
     UNKNOWN carrying the traceback, not dropped. A check that vanishes from the
     dashboard reads exactly like a green one, which is item 72's shape.
+
+    Takes INSTANCES, not classes: a module's settings-driven instances have no
+    class in the registry, and expanding here would silently drop them.
     """
     results = []
-    for chk in checks.expand(classes, cubox_ids):
+    for chk in instances:
         t0 = _now()
         try:
             res = chk.timed(ctx)
@@ -718,7 +721,16 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     if hosts_only:
         wanted = set(hosts_only)
         targets = tuple(t for t in targets if t in wanted)
-    results = evaluate(classes, ctx, targets)
+    static = checks.expand(classes, targets)
+    # SETTINGS-DRIVEN INSTANCES. Built from the SAME preloaded ctx (so a module
+    # that builds one per configured device sees the settings the epoch is about
+    # to grade against) and added to ctx.specs so `result_from_spec` can find
+    # the band they declare at run time. A dynamic instance is never per_box:
+    # its target is the module's reporting target (`snmp`) and its subject names
+    # the device, so the incident key stays (target, check_id, subject).
+    dynamic = [i for m in enabled for i in m.check_instances(ctx)]
+    ctx.specs.update(ctx.dynamic_specs)
+    results = evaluate(static + dynamic, ctx)
 
     # THIS ORDER MATTERS. The attempt rows are written BEFORE the escalation
     # reads them, so "3 consecutive failed attempts" counts the attempt that just

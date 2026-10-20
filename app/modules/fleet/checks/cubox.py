@@ -832,6 +832,15 @@ class VpuPresent(_BoxCheck):
     spec = None
     title = "VPU driver, nodes and encoder"
 
+    # ONE SUBJECT ON EVERY PATH (item 75). sync_incident resolves the row it
+    # looks up BY (target, check_id, subject), so a check that fails under one
+    # subject and passes under another opens a row no green observation can
+    # ever close. This check did exactly that until 2026-10-19: three failure
+    # subjects and subject="vpu" on success left two `v4l2m2m` rows open after
+    # the encoder was confirmed present. `v4l2m2m` is the subject kept because
+    # it is what the live incidents are keyed by.
+    SUBJECT = "v4l2m2m"
+
     def run(self, ctx):
         f, unk = self.facts_or_unknown(ctx)
         if unk:
@@ -852,26 +861,26 @@ class VpuPresent(_BoxCheck):
             return fail(self.id, self.box,
                         "the coda_vpu module is NOT loaded -- the VPU is not "
                         "bound, so every transcode falls back to CPU or fails",
-                        subject="coda_vpu", evidence=ev)
+                        subject=self.SUBJECT, evidence=ev)
         if nnodes == 0:
             return fail(self.id, self.box,
                         "no /dev/video* nodes -- the VPU is bound but exposed "
-                        "nothing", subject="video_nodes", evidence=ev)
+                        "nothing", subject=self.SUBJECT, evidence=ev)
         if enc is None:
             return unknown(self.id, self.box,
                            "coda_vpu is loaded and %d video nodes exist, but "
                            "the ffmpeg encoder list could not be read, so "
                            "'the VPU encoder works' is UNVERIFIED" % nnodes,
-                           subject="v4l2m2m", evidence=ev)
+                           subject=self.SUBJECT, evidence=ev)
         if enc == 0:
             return fail(self.id, self.box,
                         "ffmpeg reports NO v4l2m2m encoder -- the VPU FFmpeg is "
                         "missing or was built without --enable-v4l2-m2m",
-                        subject="v4l2m2m", evidence=ev)
+                        subject=self.SUBJECT, evidence=ev)
         return ok(self.id, self.box,
                   "coda_vpu loaded, %d video nodes, %d v4l2m2m entry(ies), "
                   "firmware %s" % (nnodes, enc, fw or "(none listed)"),
-                  subject="vpu", evidence=ev)
+                  subject=self.SUBJECT, evidence=ev)
 
 
 class StateDirOnTmpfs(_BoxCheck):
@@ -1072,8 +1081,8 @@ class WorkerPairParity(Check):
     title = "Both boxes run the same worker"
 
     def run(self, ctx):
-        import boxfacts
-        ids = list(ctx.cfg.cubox_ids)
+        import modules.fleet.boxfacts as boxfacts
+        ids = list(ctx.fleet.cubox_ids)
         if len(ids) < 2:
             return unknown(self.id, self.target,
                            "only %d box(es) configured -- nothing to compare"
@@ -1166,7 +1175,7 @@ def _drift_for(ctx, box_id, facts, ref_text):
     collector under the same deadline as everything else, and its lazy path is
     for tests and --once only.
     """
-    import boxfacts
+    import modules.fleet.boxfacts as boxfacts
     text = ctx.worker_text(box_id)
     if not text:
         return "unknown", ("the box's worker.sh could not be read through the "
@@ -1394,7 +1403,7 @@ class SharedLayerApplied(_BoxCheck):
             return fail(
                 self.id, self.box,
                 "the shared layer does not exist on Backup-NAS "
-                "(/share/HDA_DATA/cubpxe/shared is absent), so no box can "
+                "(/share/HDA_DATA/cubpxe/shared is absent), so no box can "  # secretscan:ignore (fleet-side design path, in settings.py)
                 "converge and every one is running its image snapshot. Re-seed it "
                 "with 02-prepare-pxe.sh.", subject=_SHARED_SUBJECT, evidence=ev)
         if bf.shared_dir is None:

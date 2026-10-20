@@ -1,8 +1,9 @@
 """RAG evaluation. Thresholds are DATA, deliberately.
 
 The operator's stated preference is that a routine tuning change is an edit and a
-restart, never a rebuild. So every boundary lives in `checks.conf`
-and nothing numeric is hard-coded in a check.
+restart, never a rebuild. So every boundary lives in a threshold file -- the
+platform's `checks.conf`, or a module's own `thresholds.conf` merged by
+`load_many()` -- and nothing numeric is hard-coded in a check.
 
 FORMAT: INI, parsed by the stdlib `configparser`, NOT YAML. The design said YAML
 and this substitutes INI for one reason: the whole application is stdlib-only by
@@ -23,6 +24,7 @@ which is item 72's shape exactly.
 """
 
 import configparser
+import copy
 import os
 
 from store import Status
@@ -81,7 +83,7 @@ class Spec:
     """One threshold definition."""
 
     __slots__ = ("id", "metric", "unit", "direction", "green", "amber", "target",
-                 "note", "unavailable_reason", "window_min", "claim")
+                 "note", "unavailable_reason", "window_min", "claim", "owner")
 
     def __init__(self, check_id, metric=None, unit=None, direction="high_is_good",
                  green=None, amber=None, target=None, note=None,
@@ -102,6 +104,9 @@ class Spec:
         # None means "a check MUST claim this". A string means "deliberately not
         # implemented yet, and here is why" -- see ALLOWED_KEYS above.
         self.claim = claim
+        # Which module's file declared this spec. Set by load_many(); None for a
+        # spec read straight out of the platform file with load().
+        self.owner = None
 
     def __repr__(self):
         return "<Spec %s %s green=%s amber=%s>" % (
@@ -178,6 +183,91 @@ def load(path):
                 % (path, name, spec.green, spec.amber))
         specs[name] = spec
     return specs
+
+
+def load_many(mapping):
+    """Merge module threshold files. Duplicate ids and bad files are fatal.
+
+    The duplicate check is the one thing a per-module split can break that a
+    single file could not: two modules declaring `disk_free_gb` would silently
+    grade one check against the other module's band.
+    """
+    specs = {}
+    for module_id, path in mapping.items():
+        if not path or not os.path.exists(path):
+            raise ConfigError("module %r: threshold file missing: %s"
+                              % (module_id, path))
+        for key, spec in load(path).items():
+            if key in specs:
+                raise ConfigError(
+                    "duplicate threshold spec %r (claimed by %r and %r)"
+                    % (key, specs[key].owner, module_id))
+            spec.owner = module_id
+            specs[key] = spec
+    return specs
+
+
+def spec_mapping(cfg, modules):
+    """Every threshold file that grades this fleet, in one mapping.
+
+    THE PLATFORM FILE IS NOT DECORATION. `MONITOR_CHECKS` (`cfg.checks_conf`)
+    used to be loaded by nothing after the module split, so a platform/meta spec
+    added there would silently never apply -- the declared-but-not-implemented
+    shape. It is merged here, under the owner id `config`, for every runtime
+    reader (collector, dashboard, approvals); `load_many()` refuses a spec id
+    that appears in more than one file, so the two sources cannot disagree.
+    """
+    mapping = {}
+    conf = getattr(cfg, "checks_conf", None)
+    if conf:
+        mapping["config"] = conf
+    for mod in modules:
+        mapping[mod.id] = os.path.join(mod._path, mod.threshold_file)
+    return mapping
+
+
+def apply_overrides(specs, overrides):
+    """Return a COPY of `specs` with each approved override's band applied.
+
+    `overrides` maps `spec_id` to `{"green": g, "amber": a}`. Only the two edges
+    are replaced; every other field (metric, direction, note, owner) still comes
+    from the module's file, because an approval is a band change and not a
+    rewrite of the spec.
+
+    An override naming a spec this mapping does not carry is IGNORED. A module
+    can be disabled, or a spec removed from its file, and a stale row in the
+    store must not stop the collector starting -- the file is still the
+    baseline, and `--thresholds` is where an orphaned override is visible.
+    """
+    out = dict(specs)
+    for spec_id, band in (overrides or {}).items():
+        spec = out.get(spec_id)
+        if spec is None:
+            continue
+        clone = copy.copy(spec)
+        clone.green = band["green"]
+        clone.amber = band["amber"]
+        out[spec_id] = clone
+    return out
+
+
+def load_effective(mapping, conn=None):
+    """Load module threshold files, then apply the store's live overrides.
+
+    ONE LOADER FOR EVERY READER. `collect_once`, `web.build_state`, the parity
+    tool and the offline tests all come through here, so an approved override
+    changes grading at the next epoch on every surface -- including the test
+    harness, which must grade against the same band the monitor does.
+
+    `conn=None` means "files only": parity pins a baseline and has no store.
+    """
+    specs = load_many(mapping)
+    if conn is None:
+        return specs
+    rows = conn.execute(
+        "SELECT spec_id, green, amber FROM threshold_override").fetchall()
+    return apply_overrides(
+        specs, {r[0]: {"green": r[1], "amber": r[2]} for r in rows})
 
 
 def audit(specs, check_classes):

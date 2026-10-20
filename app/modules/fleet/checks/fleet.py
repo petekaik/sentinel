@@ -26,7 +26,7 @@ THREE RULES THAT GOVERN EVERY CHECK IN THIS MODULE
 
 import os
 
-import parsers
+import modules.fleet.parsers as parsers
 from checks import Check, fail, ok, unknown, warn
 
 
@@ -54,7 +54,7 @@ def output_state(ctx, rel):
     permanent false FAIL; one that guesses "present" hides a genuinely failing
     file. So the caller must propagate None as UNKNOWN.
     """
-    root = ctx.cfg.transcoded_root
+    root = ctx.fleet.transcoded_root
     if not os.path.isdir(root):
         return None, ("the transcoded root %s is not a readable directory from "
                       "the monitor, so a strike cannot be matched against an "
@@ -686,7 +686,7 @@ class StateExportPresent(Check):
 
     def run(self, ctx):
         unreadable, gone, present = [], [], []
-        for cid in ctx.cfg.cubox_ids:
+        for cid in ctx.fleet.cubox_ids:
             se = ctx.export(cid)
             if se is None or not se.ran:
                 unreadable.append("%s: %s" % (cid, (se.why if se else "not attempted")))
@@ -714,7 +714,7 @@ class StateExportPresent(Check):
             return warn(self.id, self.target,
                         "%d of %d state exports readable; %s -- unreadable, so "
                         "whether those exist is UNKNOWN rather than absent"
-                        % (len(present), len(ctx.cfg.cubox_ids),
+                        % (len(present), len(ctx.fleet.cubox_ids),
                            "; ".join(unreadable)),
                         evidence=ev)
         return ok(self.id, self.target,
@@ -744,17 +744,38 @@ class StateExportFresh(Check):
     def run(self, ctx):
         rows = []
         stale = []
-        for cid in ctx.cfg.cubox_ids:
+        in_flight = []
+        for cid in ctx.fleet.cubox_ids:
             se = ctx.export(cid)
             if se is None or not se.ran or se.worker is None:
                 continue
-            age = se.log_age_min()
+            # THE BOX'S OWN CLOCK, NOT THE NAS'S. `export.pull` fills
+            # `server_now` from Backup-NAS, and grading a CuBox timestamp
+            # against it makes every age wrong by however much the two hosts
+            # differ -- the boxes have no RTC (item 23) and either host can be
+            # stepped. The boxfacts block already carries `epoch`, the same
+            # clock the log lines were written with, and `log_age_min(now=...)`
+            # exists for exactly this. No box clock means fall back to the
+            # NAS's, as before.
+            f = ctx.facts(cid)
+            age = se.log_age_min(now=f.int("epoch") if f.ok else None)
             rows.append("%s: last log line %s (%s)"
                         % (cid, se.worker.last_iso,
                            "age unknown" if age is None else "%.0f min ago" % age))
             if age is not None and age > 60:
+                # THE SILENCE MAY BE A JOB, NOT A BROKEN PATH. worker.sh logs at
+                # job boundaries; a 30 min source at 0.34x runs ~88 min, and the
+                # worker's own per-job cap is 11100 s, so a healthy box is quiet
+                # for far longer than this threshold. The box's per-pass lock is
+                # the discriminator, and it is the box's OWN read of /mnt/state
+                # -- so a stale mount makes the fact unreadable rather than
+                # `held`, and the warning below still fires.
+                lock = f.get("pass_lock").strip() if f.ok else ""
+                if lock == "held":
+                    in_flight.append("%s (%.0f min)" % (cid, age))
+                    continue
                 stale.append("%s (%.0f min)" % (cid, age))
-        ev = {"boxes": rows, "stale": stale}
+        ev = {"boxes": rows, "stale": stale, "in_flight": in_flight}
 
         if not rows:
             return unknown(self.id, self.target,
@@ -767,6 +788,16 @@ class StateExportFresh(Check):
                         "stale /mnt/state mount is invisible from here. Phase 2 "
                         "reads the box's own mount with the sentinel probe."
                         % ", ".join(stale), evidence=ev)
+        if in_flight:
+            return unknown(
+                self.id, self.target,
+                "log is quiet on %s, but a PASS IS IN FLIGHT there (the box's "
+                "own pass lock is held), so the silence is a job in progress, "
+                "not a stopped path. worker.sh writes between jobs; one "
+                "full-length job can run for three hours. This proxy cannot "
+                "grade liveness while a pass runs -- the box's own /mnt/state "
+                "check is what answers the stale-mount question."
+                % ", ".join(in_flight), evidence=ev)
         return ok(self.id, self.target,
                   "logs are advancing: %s" % "; ".join(rows), evidence=ev)
 
@@ -800,7 +831,7 @@ class SharedLayerParity(Check):
     title = "Both boxes applied the same generation"
 
     def run(self, ctx):
-        ids = list(ctx.cfg.cubox_ids)
+        ids = list(ctx.fleet.cubox_ids)
         if len(ids) < 2:
             return unknown(self.id, self.target,
                            "only %d box(es) configured -- nothing to compare"

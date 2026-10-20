@@ -120,7 +120,8 @@ class Check:
             # healthy check. Reported as unknown-with-a-reason.
             return unknown(
                 self.id, self.target,
-                "no threshold spec %r in checks.conf -- check not evaluated" % self.spec,
+                "no threshold spec %r in the module's thresholds.conf -- check "
+                "not evaluated" % self.spec,
                 subject=subject,
             )
         status, detail = _evaluate(value, spec)
@@ -149,16 +150,31 @@ def _evaluate(value, spec):
 class Context:
     """Everything a check needs, assembled once per collection.
 
-    `exports` caches the per-host state-export pull for the epoch, because the
-    CuBox checks and the fleet checks read the SAME few KB and a second ssh per
-    interval to Backup-NAS is both wasteful and a second thing that can time out.
+    THE PLATFORM DOES NOT FETCH FLEET DATA. Every remote read is done by the
+    module that owns the target (fleet's `preload.py`) and installed through the
+    `preload_*` methods below; a check can then never open a socket of its own.
+    An un-preloaded read is an UNAVAILABLE answer with the reason in words, never
+    an empty one -- which is the rule this project has paid for repeatedly
+    (items 28/46/62/72).
+
+    `exports` caches the per-host state-export pull for the epoch, because
+    several checks read the SAME few KB and a second ssh per interval is both
+    wasteful and a second thing that can time out.
     """
 
-    def __init__(self, cfg, specs, hosts, docker=None, check_classes=None):
+    def __init__(self, cfg, specs, hosts, docker=None, check_classes=None,
+                 modules=()):
         self.cfg = cfg
         self.specs = specs
         self.hosts = hosts
         self.docker = docker
+        # The loaded modules, so a check can ask for a module's declared
+        # settings and the collector can attribute a failure to its owner.
+        self.modules = tuple(modules)
+        self.module_errors = {}
+        # Whatever a module's `context` hook installs (fleet: FleetConfig under
+        # both "fleet" and ctx.fleet). Keyed by module id.
+        self.module_cfg = {}
         # The Check CLASSES the collector will run, so `checks/meta.py` can audit
         # spec coverage. None (the default, and what the offline suite gets) is a
         # distinct state from [] -- see SpecCoverage.run: it says "the audit
@@ -171,15 +187,44 @@ class Context:
         # separate from self.worker, which is the box's LIVE /etc copy: the drift
         # check is a comparison between the two, so they must not share a slot.
         self.gen_worker = {}
-        self._backup = None
+        # The sentinel is what separates "nothing was preloaded" (an
+        # unavailable answer with a reason) from a module explicitly saying
+        # "there is no such host" by preloading None.
+        self._backup = _UNSET
         self._tvh_log = None
         self.notes = []
+        # Set by the collector for `--host`; the module that owns the targets
+        # applies it while it builds its own view.
+        self.hosts_only = None
+        # The platform's per-host attempt registry. `attempt_factory` is the
+        # platform's Attempt type, installed by collect.py at epoch start; a
+        # module calls ctx.attempt(name) and notes success/failure per pull.
+        self.attempts = {}
+        self.attempt_factory = None
 
     def note(self, text):
         self.notes.append(text)
         return text
 
-    def tvh_log(self, tail=None):
+    def settings(self, module_id):
+        """A module's declared settings, env > default, typed (Setting.resolve)."""
+        mod = next((m for m in self.modules if m.id == module_id), None)
+        if mod is None:
+            raise KeyError("module %r is not loaded; settings are unavailable"
+                           % module_id)
+        return {s.key: s.resolve(self.cfg.env) for s in mod.settings}
+
+    def attempt(self, host):
+        """The platform's per-host attempt record for this epoch."""
+        if host not in self.attempts:
+            if self.attempt_factory is None:
+                raise RuntimeError(
+                    "ctx.attempt(%r) was called outside a collection: no "
+                    "attempt registry is installed" % host)
+            self.attempts[host] = self.attempt_factory(host)
+        return self.attempts[host]
+
+    def tvh_log(self):
         """The TVH container log, read ONCE per collection.
 
         Two checks read this log -- the log-signals check and EPG freshness --
@@ -190,23 +235,27 @@ class Context:
         literally the window the other parsed.
 
         Returns (text, why); `text` is None only when the read itself failed,
-        which stays a transport UNKNOWN and never becomes a clean log.
+        which stays a transport UNKNOWN and never becomes a clean log. The read
+        is performed by the module that owns the container runtime and installed
+        with `preload_tvh_log`; an un-preloaded read says so.
         """
         if self._tvh_log is None:
-            if self.docker is None:
-                self._tvh_log = (None, "no docker client configured")
-            else:
-                self._tvh_log = self.docker.logs(
-                    self.cfg.tvh_container,
-                    tail=tail or self.cfg.tvh_log_tail)
+            return (None, "not preloaded: no TVH log was fetched this epoch")
+        return self._tvh_log
+
+    def preload_tvh_log(self, text, why=""):
+        """Install an ALREADY-READ container log (or its failure)."""
+        self._tvh_log = (text, why)
         return self._tvh_log
 
     def export(self, cubox_id):
-        """Fetch (once per epoch) and return a StateExport, or None."""
-        if cubox_id not in self.exports:
-            import export
-            self.exports[cubox_id] = export.pull(self, cubox_id)
-        return self.exports[cubox_id]
+        """The state export preloaded for this box, or None if there is none."""
+        return self.exports.get(cubox_id)
+
+    def preload_export(self, cubox_id, se):
+        """Install an ALREADY-FETCHED state export."""
+        self.exports[cubox_id] = se
+        return se
 
     def preload_facts(self, cubox_id, facts):
         """Install an ALREADY-FETCHED fact block. Used by the collector.
@@ -227,20 +276,18 @@ class Context:
         return facts
 
     def backup_facts(self):
-        """Backup-NAS's fact block, fetched on first use if not preloaded.
+        """Backup-NAS's fact block as preloaded by the module that owns it.
 
-        Note this returns None -- not a failed block -- when no host is
-        configured, because "there is no such host" is a configuration defect
-        rather than a transport failure, and the check layer says so in words.
+        Three states stay distinct:
+          * NOT PRELOADED -> a transport-failed block with the reason
+            "not preloaded", so a check cannot read it as a clean NAS;
+          * preloaded None -> the module says there is genuinely no such host
+            (a configuration defect), which the checks word as such;
+          * a real block -> its own transport outcome decides.
         """
-        if self._backup is None:
-            import backupfacts
-            host = self.hosts.get("backup")
-            if host is None:
-                return None
-            self._backup = backupfacts.pull(
-                host, self.cfg.backupfacts_script, self.cfg,
-                timeout=self.cfg.ssh_timeout)
+        if self._backup is _UNSET:
+            return _NotPreloadedBackup(
+                "not preloaded: no Backup-NAS fact block was fetched this epoch")
         return self._backup
 
     def preload_worker(self, cubox_id, text):
@@ -257,18 +304,12 @@ class Context:
         return text
 
     def worker_text(self, cubox_id):
-        """The box's worker.sh, or None. Lazy path exists for tests and --once;
-        the collector's preload is the deployed path."""
-        if cubox_id not in self.worker:
-            import probes
-            host = self.hosts.get(cubox_id)
-            if host is None:
-                self.worker[cubox_id] = None
-            else:
-                r = probes.ssh(host, "cat /etc/cubox-transcode/worker.sh",
-                               timeout=self.cfg.ssh_timeout)
-                self.worker[cubox_id] = r.out if r.ran and r.out else None
-        return self.worker[cubox_id]
+        """The box's worker.sh, preloaded by the module that owns the box.
+
+        None means it was not obtained. A check renders that UNKNOWN and names
+        the question it could not answer -- never drift, and never a pass.
+        """
+        return self.worker.get(cubox_id)
 
     def preload_gen_worker(self, cubox_id, text):
         """Install an already-fetched APPLIED GENERATION worker.sh.
@@ -289,56 +330,62 @@ class Context:
         copying the file into the tmpfs /etc, so both sides of the comparison come
         from the same box and there is no snapshot left to go stale.
 
-        Fetched lazily and cached INCLUDING the failure. The collector calls this
-        once per box per epoch, under the same deadline as every other pull; the
-        check's own call then hits the cache. None means "could not read it" and
-        renders UNKNOWN -- never a pass.
-
-        `gen` COMES FROM THE BOX (the applied record, via boxfacts.sh) and is
-        interpolated into a remote shell command, so it is validated here rather
-        than trusted: the generation names cubox-app writes are digits, and
-        nothing outside these characters is one. A bad value is refused as None
-        rather than escaped, because the caller's job is to render UNKNOWN and say
-        the generation was unreadable.
+        The module that owns the box fetches this under the same deadline as
+        every other pull and installs it with `preload_gen_worker`, caching the
+        failure as None. None means "could not read it" and renders UNKNOWN --
+        never a pass. `gen` is validated before it is interpolated into a remote
+        command; that validation belongs with the fetch, not here.
         """
-        if not gen or not all(c.isalnum() or c in "._-" for c in gen):
-            return None
-        if cubox_id not in self.gen_worker:
-            import probes
-            host = self.hosts.get(cubox_id)
-            if host is None:
-                self.gen_worker[cubox_id] = None
-            else:
-                r = probes.ssh(
-                    host,
-                    "cat /mnt/shared/generations/%s/etc/cubox-transcode/worker.sh"  # secretscan:ignore (fleet-side path, documented in this file)
-                    % gen, timeout=self.cfg.ssh_timeout)
-                self.gen_worker[cubox_id] = r.out if r.ran and r.out else None
-        return self.gen_worker[cubox_id]
+        return self.gen_worker.get(cubox_id)
 
     def facts(self, cubox_id):
-        """The box's fact block, fetched on first use if not preloaded.
+        """The box's fact block, preloaded by the module that owns the box.
 
-        The lazy path exists for `--once` and for the offline tests, which call
-        checks directly. It is NOT the deployed path -- the collector always
-        preloads, so the deadline discipline above is what actually runs.
+        An UN-PRELOADED read is a transport failure with the reason in words,
+        never an empty fact block: "not preloaded" and "the box reported nothing"
+        must not share a branch (items 28/46/62/72). It also means a check cannot
+        reach the network on a path the collector did not bound.
         """
-        if cubox_id not in self.box:
-            import boxfacts
-            host = self.hosts.get(cubox_id)
-            if host is None:
-                import parsers
-                self.box[cubox_id] = parsers.parse_facts(
-                    "", transport_ok=False,
-                    why="no host entry for %r in the monitor config" % cubox_id)
-            else:
-                self.box[cubox_id] = boxfacts.pull(
-                    host, self.cfg.boxfacts_script,
-                    timeout=self.cfg.ssh_timeout)
-        return self.box[cubox_id]
+        f = self.box.get(cubox_id)
+        if f is None:
+            return _NotPreloaded(
+                "not preloaded: no fact block was fetched for %r this epoch"
+                % cubox_id)
+        return f
 
     def host(self, name):
         return self.hosts.get(name)
+
+
+class _NotPreloaded:
+    """An unavailable fact block, with only what the transport gate reads.
+
+    Deliberately not a lookalike for the fleet's BoxFacts: a check that skips
+    `if not f.ok` and reaches for a field should fail loudly with AttributeError
+    (the collector records that as UNKNOWN with the traceback), rather than read
+    a plausible default off an object that never saw the box.
+
+    `ok` is a BOOL here because BoxFacts exposes it as an attribute; the
+    BackupFacts-shaped subclass below exposes it as a METHOD, which is the real
+    asymmetry between the two probes (named in fleet/preload.py).
+    """
+
+    ok = False
+    transport_ok = False
+
+    def __init__(self, why):
+        self.why = why
+
+
+class _NotPreloadedBackup(_NotPreloaded):
+    """The Backup-NAS-shaped unavailable block: `ok()` is a method there."""
+
+    def ok(self):
+        return False
+
+
+# "Nothing was preloaded", as distinct from a module preloading None.
+_UNSET = object()
 
 
 def registry(*modules):
@@ -372,29 +419,35 @@ def expand(classes, cubox_ids):
     return out
 
 
-def all_modules():
-    """Every module the collector registers -- THE ONE HOME FOR THAT LIST.
+def platform_modules():
+    """The platform's own check modules, registered ONCE per collection.
 
-    Same defect shape as an unclaimed threshold spec, and worth closing the same
-    way: a new `checks/<name>.py` that nothing registers is a file full of checks
-    that never run, and the dashboard shows no row and reports no problem. There
-    is no error, because forgetting to add a name to a list is not an error.
-
-    So the collector must call `registry(*checks.all_modules())` rather than
-    naming modules itself, and the offline suite must call it too -- that way the
-    two cannot disagree about what exists. `SpecCoverage` (checks/meta.py) then
-    reports the consequence from the other direction: a spec claimed by a check
-    that never runs reads as claimed, which is why the registry this feeds has to
-    be the real one.
-
-    Imported LAZILY and not at the top of this file: `checks.cubox` and friends
-    do `from checks import Check`, so a module-level import here would be a cycle.
+    `checks.meta` audits every module's thresholds against the classes that will
+    run, so it belongs to the platform's registry rather than to any one
+    module: a second module must not duplicate `spec_coverage`, and disabling a
+    module must not remove the platform's coverage check. Imported lazily
+    because `checks.meta` does `from checks import ...` (a cycle at module
+    import time).
     """
-    import checks.backup
-    import checks.cubox
-    import checks.fleet
     import checks.meta
-    import checks.serial
-    import checks.storage
-    return (checks.backup, checks.cubox, checks.fleet, checks.meta,
-            checks.serial, checks.storage)
+    return (checks.meta,)
+
+
+def expansion_targets(modules):
+    """The concrete targets `per_box` checks expand against, per module.
+
+    A module's `targets` is its full reporting vocabulary (boxes, hosts and the
+    fleet-wide row). The subset a per-box check binds to is what remains after
+    removing the targets a NON-per-box check reports under -- which is a
+    property of the content, not a second list to keep in step.
+
+    This is the generic replacement for the old hand-maintained platform check
+    list: the checks come from module discovery, and so do the ids they are
+    instantiated for.
+    """
+    out = []
+    for mod in modules:
+        static = {c.target for c in registry(*mod.check_classes())
+                  if not c.per_box}
+        out.extend(t for t in mod.targets if t not in static)
+    return tuple(out)

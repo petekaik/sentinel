@@ -31,7 +31,7 @@ wedged, and is strictly better than throwing away the reachability evidence too.
 
 import re
 
-import parsers
+import modules.fleet.parsers as parsers
 import probes
 
 def pull(host, script_path, timeout=None, write_probe=False):

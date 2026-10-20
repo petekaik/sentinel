@@ -23,11 +23,12 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import CHECKS_CONF, Results          # noqa: E402
+from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
+                    fleet_config, load_specs)
 
 import checks                                    # noqa: E402
 import config as config_mod                      # noqa: E402
-import serial                                    # noqa: E402
+from modules.fleet import serial                 # noqa: E402
 import store                                     # noqa: E402
 import thresholds                                # noqa: E402
 
@@ -230,47 +231,55 @@ def test_config_maps_each_box_to_its_chip_serial(results):
     """The mapping uses config.py's existing box-name idiom, so cubox-1 -> the
     underscore form the host variables already use (MONITOR_HOST_CUBOX_1_ADDR)."""
     cfg = _cfg_for(tmpdir=None, env={"SERIAL_CUBOX_1_SERIAL": "SYNTH001"})
+    fleet = fleet_config(cfg)
     results.check(
         "SERIAL_<BOX>_SERIAL is read with '-' mapped to '_'",
-        cfg.serial_serials == {"cubox-1": "SYNTH001"},
+        fleet.serial_serials == {"cubox-1": "SYNTH001"},
         "got %r. If this is empty, every box falls through to UNCONFIGURED and the row "
-        "never grades anything." % (cfg.serial_serials,))
+        "never grades anything." % (fleet.serial_serials,))
     results.check(
         "a box with no serial configured is ABSENT from the mapping, not set to ''",
-        "cubox-2" not in cfg.serial_serials,
+        "cubox-2" not in fleet.serial_serials,
         "an empty string would be indistinguishable from a configured-but-blank value. "
-        "got %r" % (cfg.serial_serials,))
+        "got %r" % (fleet.serial_serials,))
 
 
 def test_config_defaults_are_the_measured_ones(results):
     cfg = _cfg_for(tmpdir=None, env={})
+    fleet = fleet_config(cfg)
     results.check(
         "baud defaults to the measured 115200 and the grace to 360 s",
-        cfg.serial_baud == 115200 and cfg.serial_watchdog_grace_s == 360,
+        fleet.serial_baud == 115200 and fleet.serial_watchdog_grace_s == 360,
         "the grace is 360 because the loader is a 5-minute cron; a shorter one reports "
         "FAIL on a NAS that rebooted a minute ago. got %r / %r"
-        % (cfg.serial_baud, cfg.serial_watchdog_grace_s))
+        % (fleet.serial_baud, fleet.serial_watchdog_grace_s))
     results.check(
         "SERIAL_REQUIRED defaults to False, because the adapter was an operator tool",
-        cfg.serial_required is False,
+        fleet.serial_required is False,
         "defaulting to True makes an unplugged cable a permanent FAIL on a healthy "
-        "fleet (item 72). got %r" % (cfg.serial_required,))
+        "fleet (item 72). got %r" % (fleet.serial_required,))
     results.check(
         "the sysfs and proc roots are overridable, which is what makes the suite offline",
-        cfg.serial_sysfs == "/sys" and cfg.serial_proc == "/proc",
-        "got %r / %r" % (cfg.serial_sysfs, cfg.serial_proc))
+        fleet.serial_sysfs == "/sys" and fleet.serial_proc == "/proc",
+        "got %r / %r" % (fleet.serial_sysfs, fleet.serial_proc))
 
 
 def _run_check(cfg, check_id="serial_adapter"):
     """The check, looked up through expand() -- so one that is not registered fails
-    here rather than passing (checks.all_modules is the one home for the list)."""
-    specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None, check_classes=classes)
-    for chk in checks.expand(classes, cfg.cubox_ids):
+    here rather than passing (the fleet module's check list is the one home)."""
+    specs = load_specs(cfg)
+    classes = check_classes()
+    fleet = fleet_config(cfg)
+    ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,
+                         check_classes=classes)
+    ctx.fleet = fleet
+    for chk in checks.expand(classes, fleet.cubox_ids):
         if chk.id == check_id:
             return chk.timed(ctx)
-    raise AssertionError("check %r is not registered for storage" % check_id)
+    raise AssertionError(
+        "check %r is not registered for storage -- a check that exists but is "
+        "not in the module's list never runs, and the dashboard shows no row "
+        "(modules/fleet/checks/__init__.py)" % check_id)
 
 
 def _proc_with_uptime(tmpdir, seconds):

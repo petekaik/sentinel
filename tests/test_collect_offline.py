@@ -42,20 +42,23 @@ restated, so the healthy-fleet half of these tests exercises the real probe
 output.
 """
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import CHECKS_CONF, FIXTURES, Results, read_fixture  # noqa: E402
 
-import backupfacts                   # noqa: E402
-import boxfacts                      # noqa: E402
-import export as export_mod          # noqa: E402
 import collect                       # noqa: E402
 import config as config_mod          # noqa: E402
-import journal as journal_mod        # noqa: E402
-import parsers                       # noqa: E402
+import modules.fleet.backupfacts as backupfacts    # noqa: E402
+import modules.fleet.boxfacts as boxfacts          # noqa: E402
+import modules.fleet.export as export_mod          # noqa: E402
+import modules.fleet.journal as journal_mod        # noqa: E402
+import modules.fleet.parsers as parsers            # noqa: E402
 import probes                        # noqa: E402
 import store                         # noqa: E402
 
@@ -167,9 +170,8 @@ class Fleet:
             return jp
 
         # EVERY NAME THAT CAN REACH A HOST, in one list, so a new stub cannot be
-        # added without a matching restore. `collect.boxfacts` IS the `boxfacts`
-        # module and `export_mod` IS `export`, so these are the same objects the
-        # checks import.
+        # added without a matching restore. These are the SAME module objects the
+        # fleet's preload imports, so patching here is what the epoch sees.
         self._patched = (
             (probes, "run", probes.run, _fake_run),
             (probes, "ssh", probes.ssh, _fake_ssh),
@@ -406,8 +408,147 @@ def test_transport_argv_is_the_measured_one(results):
                       "argv=%s" % argv)
 
 
+def test_a_raising_healer_cannot_lose_the_epoch_record(results):
+    """`consider` runs before `record_collector_run` and has no other try.
+
+    The engine catches its own handler calls, but a raise from module code or a
+    store read would otherwise escape and take the epoch record with it --
+    exactly the condition that makes the dashboard's staleness banner blame the
+    fleet for a monitor fault.
+    """
+    import shutil
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with Fleet(tmpdir) as f:
+            class Boom:
+                def consider(self, cfg, conn, seq, _results, ctx):
+                    raise RuntimeError("healer exploded")
+
+            out = collect.collect_once(f.cfg, f.conn, healer=Boom())
+            row = store.last_collection(f.conn)
+            results.check(
+                "a raising healer is reported in the epoch's notes, not raised",
+                any("healing failed" in n and "healer exploded" in n
+                    for n in out["notes"]),
+                "notes=%r -- an exception escaping here loses the epoch record"
+                % (out["notes"],))
+            results.check(
+                "the epoch record is still written after the healer failed",
+                row is not None and row["epoch_seq"] == out["seq"],
+                "row=%r seq=%r" % (row, out["seq"]))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_host_restricts_the_per_box_expansion(results):
+    """`--host` must narrow what is EVALUATED, not only what is fetched.
+
+    Before the filter, the preload contacted one box while the checker expanded
+    every per_box check for both -- so the other box produced a full set of
+    UNKNOWN rows and its incidents could be frozen/resolved by an epoch that
+    never observed it.
+    """
+    import shutil
+    tmpdir = tempfile.mkdtemp()
+    try:
+        with Fleet(tmpdir) as f:
+            f.down = False
+            for seq in range(1, store.CONFIRM_POLLS + 1):
+                store.sync_incident(f.conn, seq, "cubox-2", "mem_available_mb",
+                                    "host", store.Status.FAIL, "low")
+            before = f.conn.execute(
+                "SELECT state FROM incident WHERE target = 'cubox-2' "
+                "AND check_id = 'mem_available_mb'").fetchone()["state"]
+            summary = collect.collect_once(f.cfg, f.conn,
+                                           hosts_only=["cubox-1"])
+            seq = summary["seq"]
+            rows = f.conn.execute(
+                "SELECT target FROM check_run WHERE epoch_seq = ?", (seq,)
+            ).fetchall()
+            cubox2 = [r["target"] for r in rows if r["target"] == "cubox-2"]
+            cubox1 = [r["target"] for r in rows if r["target"] == "cubox-1"]
+            after = f.conn.execute(
+                "SELECT state FROM incident WHERE target = 'cubox-2' "
+                "AND check_id = 'mem_available_mb'").fetchone()["state"]
+            results.check(
+                "--host cubox-1 stores no cubox-2 check rows",
+                before == "open" and cubox2 == [],
+                "before=%r cubox-2 rows=%r -- expanding the other box "
+                "evaluates a host nobody fetched" % (before, cubox2))
+            results.check(
+                "and it does not freeze or resolve cubox-2's incident",
+                after == "open",
+                "state=%r -- an epoch that did not observe a box must not "
+                "decide anything about it" % (after,))
+            results.check(
+                "the control: cubox-1's own checks still ran",
+                bool(cubox1), "cubox-1 rows=%r" % (cubox1,))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_the_healer_loads_with_remedies_off(results):
+    """MONITOR_REMEDIES is the EXECUTION switch, not the advice switch.
+
+    An advisory-level authority surfaces recommendations through the healer;
+    with the healer absent because the execution switch is off, `advisory` on
+    every surface would look exactly like `off`.
+    """
+    cfg = config_mod.Config(env={"MONITOR_REMEDIES": "0",
+                                 "MONITOR_CHECKS": CHECKS_CONF})
+    healer = collect._load_healer(cfg)
+    results.check(
+        "the healer is loaded even when MONITOR_REMEDIES=0, so advisory advice "
+        "can still appear",
+        healer is not None and callable(getattr(healer, "consider", None)),
+        "healer=%r -- the engine reads the switch itself and executes nothing "
+        "while it is off" % (healer,))
+
+
+def test_showconf_lists_modules_including_disabled(results):
+    """`--showconf` must answer what was found, not only what runs.
+
+    A disabled module that vanishes from the report reads as a module that does
+    not exist, which is the opposite of what an operator checking their selector
+    needs to see.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        def showconf(extra):
+            env = {"MONITOR_DB": os.path.join(tmpdir, "none.sqlite"),
+                   "MONITOR_CHECKS": CHECKS_CONF}
+            env.update(extra)
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True):
+                with contextlib.redirect_stdout(buf):
+                    collect.main(["--showconf"])
+            return buf.getvalue()
+
+        out = showconf({"SENTINEL_MODULES": "fleet"})
+        fleet = [ln for ln in out.splitlines() if "fleet" in ln
+                 and "order=10" in ln]
+        results.check(
+            "--showconf prints the module summary, enabled state included",
+            "modules:" in out and fleet and "enabled" in fleet[0],
+            "out=%r" % (out,))
+        out = showconf({"FLEET_ENABLED": "0"})
+        fleet = [ln for ln in out.splitlines() if "fleet" in ln
+                 and "order=10" in ln]
+        results.check(
+            "--showconf names a disabled module as disabled",
+            fleet and "disabled" in fleet[0],
+            "fleet=%r -- an omitted module reads as a missing one" % (fleet,))
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_outage_keeps_its_history, test_blip_leaves_no_trace,
-         test_unknown_is_never_green, test_transport_argv_is_the_measured_one)
+         test_unknown_is_never_green, test_transport_argv_is_the_measured_one,
+         test_a_raising_healer_cannot_lose_the_epoch_record,
+         test_host_restricts_the_per_box_expansion,
+         test_the_healer_loads_with_remedies_off,
+         test_showconf_lists_modules_including_disabled)
 
 
 def main():

@@ -33,15 +33,16 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import CHECKS_CONF, Results, read_fixture   # noqa: E402
+from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
+                    fleet_config, load_specs, read_fixture)
 
-import backupfacts           # noqa: E402
-import boxfacts              # noqa: E402
 import checks                # noqa: E402
 import config as config_mod  # noqa: E402
-import export as export_mod  # noqa: E402
-import journal as journal_mod  # noqa: E402
-import parsers               # noqa: E402
+import modules.fleet.backupfacts as backupfacts    # noqa: E402
+import modules.fleet.boxfacts as boxfacts          # noqa: E402
+import modules.fleet.export as export_mod          # noqa: E402
+import modules.fleet.journal as journal_mod        # noqa: E402
+import modules.fleet.parsers as parsers            # noqa: E402
 import probes                # noqa: E402
 import store                 # noqa: E402
 import thresholds            # noqa: E402
@@ -101,17 +102,6 @@ class _Res:
         return ""
 
 
-class Ctx:
-    """The minimum a pull()/Check needs, so the REAL parse path runs."""
-
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.hosts = cfg.hosts
-
-    def host(self, name):
-        return self.hosts.get(name)
-
-
 def _cfg(tmpdir):
     return config_mod.Config(env={
         "CUBOX_IDS": "cubox-1,cubox-2",
@@ -143,16 +133,18 @@ def _export(cfg, box, transform=None):
     saved = export_mod._run_script
     export_mod._run_script = lambda host, script, payload: _Res(text)
     try:
-        return export_mod.pull(Ctx(cfg), box)
+        return export_mod.pull(fleet_config(cfg), box)
     finally:
         export_mod._run_script = saved
 
 
 def _context(cfg, box, se, with_facts=True):
-    specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
+    specs = load_specs(cfg)
+    classes = check_classes()
+    fleet = fleet_config(cfg)
+    ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,
                          check_classes=classes)
+    ctx.fleet = fleet
     if with_facts:
         ctx.preload_facts(box, parsers.parse_facts(
             read_fixture("boxfacts-%s-%s.txt" % (box, CAPTURE)),
@@ -181,8 +173,8 @@ def _context(cfg, box, se, with_facts=True):
 def _run_box_checks(cfg, box, ctx):
     """Every registered check for one box. Returns [(check_id, result)]."""
     out = []
-    for chk in checks.expand(checks.registry(*checks.all_modules()),
-                             cfg.cubox_ids):
+    for chk in checks.expand(check_classes(),
+                             fleet_config(cfg).cubox_ids):
         if chk.target != box:
             continue
         out.append((chk.id, chk.timed(ctx)))
@@ -218,7 +210,8 @@ def test_no_suite_leaked_a_transport_stub(results):
         "silently PASS while doing so" % leaked)
     results.check(
         "the import-time capture is of the real functions",
-        _REAL_PULL.__module__ == "export" and _REAL_PULL.__name__ == "pull",
+        _REAL_PULL.__module__ == "modules.fleet.export"
+        and _REAL_PULL.__name__ == "pull",
         "captured %r from %r -- capture must happen before any suite's patch"
         % (_REAL_PULL.__name__, _REAL_PULL.__module__))
 
@@ -380,7 +373,7 @@ def test_idle_gate_has_both_halves(results):
     try:
         cfg = _cfg(tmpdir)
         box = "cubox-1"
-        cls = [c for c in checks.registry(*checks.all_modules())
+        cls = [c for c in check_classes()
                if c.__name__ == "PassCadence"][0]
 
         def verdict(transform, facts_from=None):
@@ -443,7 +436,7 @@ def test_a_deliberate_stop_is_not_a_stall(results):
     try:
         cfg = _cfg(tmpdir)
         box = "cubox-1"
-        cls = [c for c in checks.registry(*checks.all_modules())
+        cls = [c for c in check_classes()
                if c.__name__ == "PassCadence"][0]
 
         raw = read_fixture("boxfacts-%s-%s.txt" % (box, CAPTURE))
@@ -584,8 +577,8 @@ def test_registry_and_thresholds_agree(results):
     tmpdir = tempfile.mkdtemp()
     try:
         cfg = _cfg(tmpdir)
-        specs = thresholds.load(cfg.checks_conf)
-        classes = checks.registry(*checks.all_modules())
+        specs = load_specs(cfg)
+        classes = check_classes()
         claimed, deferred, unclaimed = thresholds.audit(specs, classes)
         results.check(
             "every threshold is either claimed by a check or declared deferred",
@@ -959,12 +952,14 @@ def _save_result(cfg, box, facts_text):
     The whole of checks/* is exercised, not the class directly, so a check that
     stopped being registered for this box fails here rather than passing.
     """
-    specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
+    specs = load_specs(cfg)
+    classes = check_classes()
+    fleet = fleet_config(cfg)
+    ctx = checks.Context(cfg, specs, fleet.hosts, docker=None,
                          check_classes=classes)
+    ctx.fleet = fleet
     ctx.preload_facts(box, parsers.parse_facts(facts_text, transport_ok=True))
-    for chk in checks.expand(classes, cfg.cubox_ids):
+    for chk in checks.expand(classes, fleet_config(cfg).cubox_ids):
         if chk.id == "state_save_age_min" and chk.target == box:
             return chk.timed(ctx)
     raise AssertionError("StateSaveRunning is not registered for %r -- the "
@@ -1168,7 +1163,8 @@ def _facts_from(raw, **over):
                         % pattern)
 
     for key in ("pass_lock", "heartbeat_mnt", "heartbeat_tmp",
-                "unit_active_state", "epoch"):
+                "unit_active_state", "epoch",
+                "coda_vpu", "video_nodes", "v4l2m2m"):
         if key in over:
             one(r"(?m)^%s .*$" % key, "%s %s" % (key, over[key]))
     if "lock_mtime" in over:
@@ -1181,11 +1177,110 @@ def _facts_from(raw, **over):
 
 
 def _verdict_of(cls_name, cfg, box, raw):
-    cls = [c for c in checks.registry(*checks.all_modules())
+    cls = [c for c in check_classes()
            if c.__name__ == cls_name][0]
     ctx = _context(cfg, box, _export(cfg, box))
     ctx.preload_facts(box, parsers.parse_facts(raw, transport_ok=True))
     return cls().bind(box).timed(ctx)
+
+
+def test_a_quiet_log_during_a_pass_is_not_a_stale_mount(results):
+    """Measured 2026-10-19: cubox-2 ambered for 81 minutes while a healthy job
+    ran at 0.34x. worker.sh logs at job boundaries and its own per-job cap is
+    11100 s, so a full-length job is silent far longer than the 60-minute proxy
+    threshold. The box's per-pass lock is the discriminator; an unreadable lock
+    must still WARN rather than borrow the in-flight answer."""
+    import shutil
+    tmpdir = tempfile.mkdtemp()
+    try:
+        cfg = _cfg(tmpdir)
+        raw = read_fixture("boxfacts-cubox-1-%s.txt" % CAPTURE)
+        box_epoch = int(re.search(r"(?m)^epoch\s+(\d+)$", raw).group(1))
+        cls = [c for c in check_classes()
+               if c.__name__ == "StateExportFresh"][0]
+
+        def run(lock, box_age_s=0, nas_skew_s=0, facts_ok=True):
+            # `_hours_later` moves the EXPORT's own `now`, i.e. Backup-NAS's
+            # clock -- which the check must not use for the age.
+            base = _export(cfg, "cubox-1",
+                           transform=(lambda t: _hours_later(t, nas_skew_s))
+                           if nas_skew_s else None)
+            ctx = _context(cfg, "cubox-1", base)
+            ctx.exports["cubox-2"] = export_mod.StateExport(
+                cubox_id="cubox-2", transport=probes.Transport.ERROR.value,
+                why="simulated: this suite has one captured export")
+            ctx.preload_facts("cubox-1", parsers.parse_facts(
+                _facts_from(raw, pass_lock=lock,
+                            epoch=str(box_epoch + box_age_s)) if facts_ok else "",
+                transport_ok=facts_ok,
+                why="" if facts_ok else "simulated: the box did not answer"))
+            return cls().timed(ctx)
+
+        skew = run("free", nas_skew_s=6000)
+        old = run("free", box_age_s=6000)
+        held = run("held", box_age_s=6000)
+        blind = run("", box_age_s=6000, nas_skew_s=6000, facts_ok=False)
+        results.check(
+            "the age uses the BOX clock; a quiet log during a pass is UNKNOWN; "
+            "idle and unreadable stay AMBER",
+            skew.status is store.Status.OK
+            and old.status is store.Status.WARN
+            and held.status is store.Status.UNKNOWN
+            and blind.status is store.Status.WARN,
+            "NAS clock skew only -> %s, log genuinely old -> %s, old during a "
+            "pass -> %s, unreadable -> %s. Expected OK / WARN / UNKNOWN / WARN. "
+            "The export's `now` is BACKUP-NAS's clock, so a skew must not age a "
+            "CuBox line; the silence during a pass is explained only by a lock "
+            "we could actually READ; and 'could not ask' must not become "
+            "'fine'." % (skew.status, old.status, held.status, blind.status))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_vpu_present_reports_one_subject_on_every_path(results):
+    """Item 75's defect, second instance (measured 2026-10-19).
+
+    `VpuPresent` failed under `coda_vpu`, `video_nodes` and `v4l2m2m` but
+    passed under `vpu`, so the two `v4l2m2m` rows opened by the monitor's own
+    stale FFmpeg path could not resolve when the encoder was confirmed present:
+    sync_incident resolves BY KEY, and no green observation ever carried that
+    subject. Every path must report the same subject, and the healthy path must
+    be the one that closes what the failure opened.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        import shutil
+        cfg = _cfg(tmp)
+        raw = read_fixture("boxfacts-cubox-1-%s.txt" % CAPTURE)
+
+        cases = (
+            ("module not loaded", {"coda_vpu": ""}, store.Status.FAIL),
+            ("no video nodes", {"video_nodes": ""}, store.Status.FAIL),
+            ("ffmpeg answered, no encoder", {"v4l2m2m": "0"}, store.Status.FAIL),
+            ("ffmpeg could not be asked", {"v4l2m2m": ""}, store.Status.UNKNOWN),
+            ("healthy", {}, store.Status.OK),
+        )
+
+        seen, bad = [], []
+        for name, over, want in cases:
+            res = _verdict_of("VpuPresent", cfg, "cubox-1",
+                              _facts_from(raw, **over))
+            seen.append((name, res.subject, res.status))
+            if res.status is not want:
+                bad.append("%s produced %s, expected %s"
+                           % (name, res.status, want))
+
+        subjects = set(s for _, s, _ in seen)
+        results.check(
+            "every path of vpu_present reports the SAME subject",
+            len(subjects) == 1 and not bad,
+            "statuses: %s\nsubjects seen: %r\n"
+            "sync_incident resolves the row it looks up BY (target, check_id, "
+            "subject); a path with another subject files its outcome where there "
+            "is no incident to close."
+            % (bad or "all as expected", subjects))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_a_heartbeat_age_is_only_graded_inside_a_pass(results):
@@ -1365,7 +1460,9 @@ TESTS = (test_no_suite_leaked_a_transport_stub,
          test_state_save_never_evaluated_is_unknown_not_fail,
          test_state_save_evaluated_no_is_still_the_fault,
          test_state_save_incident_resolves_across_the_recovery,
-         test_state_save_reports_one_subject_on_every_path)
+         test_state_save_reports_one_subject_on_every_path,
+         test_vpu_present_reports_one_subject_on_every_path,
+         test_a_quiet_log_during_a_pass_is_not_a_stale_mount)
 
 
 def main():

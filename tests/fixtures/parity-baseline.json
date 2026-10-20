@@ -1,0 +1,674 @@
+[
+ {
+  "check_id": "backup_disk_free_gb",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the free space is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "disk",
+  "target": "backup"
+ },
+ {
+  "check_id": "backup_load1",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the load average is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "load",
+  "target": "backup"
+ },
+ {
+  "check_id": "backup_mem_available_mb",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the memory reading is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "mem",
+  "target": "backup"
+ },
+ {
+  "check_id": "backup_reachable",
+  "detail": "Backup-NAS did not answer the fact probe: parity: no NAS in this tool. ICMP hint unavailable (parity: ICMP disabled) -- this says nothing either way",
+  "status": "unknown",
+  "subject": "backup",
+  "target": "backup"
+ },
+ {
+  "check_id": "nfs_export_advertised",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the export table is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "exports",
+  "target": "backup"
+ },
+ {
+  "check_id": "nfsroot_tree",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the shared rootfs is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "nfsroot",
+  "target": "backup"
+ },
+ {
+  "check_id": "state_export_fresh",
+  "detail": "no box's log could be read, so nothing to compare",
+  "status": "unknown",
+  "subject": "",
+  "target": "backup"
+ },
+ {
+  "check_id": "state_export_present",
+  "detail": "NO state export could be READ, but nothing here says whether they exist: every pull failed before it looked. cubox-1: parity: no NAS in this tool; cubox-2: parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "",
+  "target": "backup"
+ },
+ {
+  "check_id": "state_exports",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the state exports is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "state",
+  "target": "backup"
+ },
+ {
+  "check_id": "tftp_boot_files",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the boot files is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "tftp",
+  "target": "backup"
+ },
+ {
+  "check_id": "cma_free_mb",
+  "detail": "250.5 >= 200 MB",
+  "status": "ok",
+  "subject": "cma",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "deadlock_kills",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "env_fail_lines",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "failed_dir",
+  "detail": "7 file(s) in failed/ -- presence alone is not a fault (item 65); the signal is whether this climbs with no job running",
+  "status": "ok",
+  "subject": "failed/",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "failed_units",
+  "detail": "0.0 <= 0 units",
+  "status": "ok",
+  "subject": "systemd",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "fstab_delivered",
+  "detail": "delivered and matches the export (1298131cb69a); both data mounts carry noauto,x-systemd.automount",
+  "status": "ok",
+  "subject": "/etc/fstab",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "heartbeat_age_min",
+  "detail": "a pass is in flight but its first job has not started yet: the probe reports no pass start and no encoder output exists, so this heartbeat belongs to the PREVIOUS pass and its age measures a job that already ended. That is the stale-heartbeat case the threshold's own note records (76 minutes of fictional age, measured), and grading it is a false red.",
+  "status": "unknown",
+  "subject": "job",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "job_failures",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "log_parse_failures",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "mem_available_mb",
+  "detail": "1912.9 >= 600 MB",
+  "status": "ok",
+  "subject": "mem",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "orphan_parts",
+  "detail": "0.0 <= 0 files",
+  "status": "ok",
+  "subject": "parts",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "pass_cadence_min",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "retired_files",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "shared_applied",
+  "detail": "the probe did not report whether cubox-shared-apply exists, so whether this box is on the layered image is UNKNOWN -- not a missing applier",
+  "status": "unknown",
+  "subject": "shared layer",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "shared_nonexec",
+  "detail": "the probe did not report whether the applier exists",
+  "status": "unknown",
+  "subject": "/etc",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "shared_promoted",
+  "detail": "the probe did not report whether the applier exists",
+  "status": "unknown",
+  "subject": "/mnt/state/etc",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "stall_watch",
+  "detail": "worker carries the deadlock watchdog (9 reference(s))",
+  "status": "ok",
+  "subject": "worker.sh",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "state_dir_tmpfs",
+  "detail": "heartbeat is in /mnt/state (persistent), not the tmpfs fallback",
+  "status": "ok",
+  "subject": "STATE_DIR",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "state_mount",
+  "detail": "/mnt/state mounted, readable, and its sentinel matches cubox-1",
+  "status": "ok",
+  "subject": "/mnt/state",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "state_on_tmpfs",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "state_save_age_min",
+  "detail": "1.8 <= 20 min",
+  "status": "ok",
+  "subject": "cubox-state-save.service",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "strikes",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-1",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "temperature",
+  "detail": "not available on this hardware -- the board has no thermal zone (no /sys/class/thermal, imx_thermal not built), so there is nothing to read. Stated explicitly rather than omitted, because an absent row reads as fine. [measured: 0 thermal zone(s), 3 cooling device(s)]",
+  "status": "unknown",
+  "subject": "thermal",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "tmpfs_used_pct",
+  "detail": "4.0 <= 60 percent (worst: /build 1%, /etc 4%, /tmp 4%, /var/log 1%, /var/tmp 0%)",
+  "status": "ok",
+  "subject": "tmpfs",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "vpu_present",
+  "detail": "coda_vpu loaded, 13 video nodes, 5 v4l2m2m entry(ies), firmware vpu_fw_imx6q.bin",
+  "status": "ok",
+  "subject": "v4l2m2m",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "worker_drift",
+  "detail": "this box records NO APPLIED GENERATION, so there is no manifest digest to compare its worker.sh against -- drift CANNOT be assessed, and this is not a pass. A box that has never applied the shared layer runs the image's build-time copy, which is a legitimate state; the digest only arrives once the applier has run.",
+  "status": "unknown",
+  "subject": "worker.sh",
+  "target": "cubox-1"
+ },
+ {
+  "check_id": "shared_layer_parity",
+  "detail": "cannot compare: cubox-1 did not report whether the applier exists",
+  "status": "unknown",
+  "subject": "shared layer",
+  "target": "fleet"
+ },
+ {
+  "check_id": "spec_coverage",
+  "detail": "1 of 28 thresholds are declared with no check behind them, each stating its own reason: gap_sources (PHASE 3 (plan's coverage-verification phase). This is explicitly the fold-in of scripts/11-transcode-verify.sh's logic. Writing it before that script's own gates were re-verified would repeat the project's most expensive mistake: item 72 was this exact check reporting \"Coverage is complete\" at exit 0 while measuring `done 0 / orphan 18`, with five independent faults each hiding the next. The dashboard must not inherit a coverage verdict that has not first been proven able to fail.). Nothing is wrong with the monitor -- these are known, deliberate gaps in coverage, and they are UNKNOWN rather than green so that an unmeasured metric is never mistaken for a healthy one.",
+  "status": "unknown",
+  "subject": "checks.conf",
+  "target": "fleet"
+ },
+ {
+  "check_id": "worker_pair_parity",
+  "detail": "both boxes run the same worker.sh (7211f889ebec)",
+  "status": "ok",
+  "subject": "worker.sh",
+  "target": "fleet"
+ },
+ {
+  "check_id": "dvb_adapter_count",
+  "detail": "/dev/dvb not readable ([Errno 2] No such file or directory: '/dev/dvb') -- the DVB subsystem is not exposed to this container, so adapter presence cannot be assessed here",
+  "status": "unknown",
+  "subject": "dvb",
+  "target": "storage"
+ },
+ {
+  "check_id": "epg_freshness_h",
+  "detail": "could not read the TVH log: no docker client configured",
+  "status": "unknown",
+  "subject": "epg",
+  "target": "storage"
+ },
+ {
+  "check_id": "media_volume_used_pct",
+  "detail": "cannot stat /nonexistent/parity/recordings or its parent ([Errno 2] No such file or directory: '/nonexistent/parity/recordings') -- the recordings share is not present on this host",
+  "status": "fail",
+  "subject": "/nonexistent/parity/recordings",
+  "target": "storage"
+ },
+ {
+  "check_id": "serial_adapter",
+  "detail": "cannot read /sys (/sys/class/tty is not readable ([Errno 2] No such file or directory: '/sys/class/tty')), so no console adapter can be identified here. This is NOT 'no adapter attached' -- it means this container cannot see the USB bus at all.",
+  "status": "unknown",
+  "subject": "serial",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_container",
+  "detail": "no docker client configured",
+  "status": "unknown",
+  "subject": "docker",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_log_signals",
+  "detail": "could not read the tvheadend log: no docker client configured",
+  "status": "unknown",
+  "subject": "tvh-log",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_mux_unreachable",
+  "detail": "could not read the TVH log: no docker client configured",
+  "status": "unknown",
+  "subject": "dvb",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_response_ms",
+  "detail": "TVH did not answer at http://198.51.100.12:9981/: parity: HTTP probe disabled (this tool never leaves the host)",
+  "status": "fail",
+  "subject": "tvh-http",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_tuner_silent_h",
+  "detail": "could not read the TVH log: no docker client configured",
+  "status": "unknown",
+  "subject": "dvb",
+  "target": "storage"
+ },
+ {
+  "check_id": "backup_disk_free_gb",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the free space is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "disk",
+  "target": "backup"
+ },
+ {
+  "check_id": "backup_load1",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the load average is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "load",
+  "target": "backup"
+ },
+ {
+  "check_id": "backup_mem_available_mb",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the memory reading is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "mem",
+  "target": "backup"
+ },
+ {
+  "check_id": "backup_reachable",
+  "detail": "Backup-NAS did not answer the fact probe: parity: no NAS in this tool. ICMP hint unavailable (parity: ICMP disabled) -- this says nothing either way",
+  "status": "unknown",
+  "subject": "backup",
+  "target": "backup"
+ },
+ {
+  "check_id": "nfs_export_advertised",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the export table is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "exports",
+  "target": "backup"
+ },
+ {
+  "check_id": "nfsroot_tree",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the shared rootfs is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "nfsroot",
+  "target": "backup"
+ },
+ {
+  "check_id": "state_export_fresh",
+  "detail": "no box's log could be read, so nothing to compare",
+  "status": "unknown",
+  "subject": "",
+  "target": "backup"
+ },
+ {
+  "check_id": "state_export_present",
+  "detail": "NO state export could be READ, but nothing here says whether they exist: every pull failed before it looked. cubox-1: parity: no NAS in this tool; cubox-2: parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "",
+  "target": "backup"
+ },
+ {
+  "check_id": "state_exports",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the state exports is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "state",
+  "target": "backup"
+ },
+ {
+  "check_id": "tftp_boot_files",
+  "detail": "could not read Backup-NAS: parity: no NAS in this tool -- the boot files is UNKNOWN, which is not the same as a fault on the NAS",
+  "status": "unknown",
+  "subject": "tftp",
+  "target": "backup"
+ },
+ {
+  "check_id": "cma_free_mb",
+  "detail": "253.9 >= 200 MB",
+  "status": "ok",
+  "subject": "cma",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "deadlock_kills",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "env_fail_lines",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "failed_dir",
+  "detail": "0 file(s) in failed/ -- presence alone is not a fault (item 65); the signal is whether this climbs with no job running",
+  "status": "ok",
+  "subject": "failed/",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "failed_units",
+  "detail": "0.0 <= 0 units",
+  "status": "ok",
+  "subject": "systemd",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "fstab_delivered",
+  "detail": "delivered and matches the export (1298131cb69a); both data mounts carry noauto,x-systemd.automount",
+  "status": "ok",
+  "subject": "/etc/fstab",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "heartbeat_age_min",
+  "detail": "a pass is in flight but its first job has not started yet: the probe reports no pass start and no encoder output exists, so this heartbeat belongs to the PREVIOUS pass and its age measures a job that already ended. That is the stale-heartbeat case the threshold's own note records (76 minutes of fictional age, measured), and grading it is a false red.",
+  "status": "unknown",
+  "subject": "job",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "job_failures",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "log_parse_failures",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "mem_available_mb",
+  "detail": "1917.0 >= 600 MB",
+  "status": "ok",
+  "subject": "mem",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "orphan_parts",
+  "detail": "0.0 <= 0 files",
+  "status": "ok",
+  "subject": "parts",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "pass_cadence_min",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "retired_files",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "shared_applied",
+  "detail": "the probe did not report whether cubox-shared-apply exists, so whether this box is on the layered image is UNKNOWN -- not a missing applier",
+  "status": "unknown",
+  "subject": "shared layer",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "shared_nonexec",
+  "detail": "the probe did not report whether the applier exists",
+  "status": "unknown",
+  "subject": "/etc",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "shared_promoted",
+  "detail": "the probe did not report whether the applier exists",
+  "status": "unknown",
+  "subject": "/mnt/state/etc",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "stall_watch",
+  "detail": "worker carries the deadlock watchdog (9 reference(s))",
+  "status": "ok",
+  "subject": "worker.sh",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "state_dir_tmpfs",
+  "detail": "heartbeat is in /mnt/state (persistent), not the tmpfs fallback",
+  "status": "ok",
+  "subject": "STATE_DIR",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "state_mount",
+  "detail": "/mnt/state mounted, readable, and its sentinel matches cubox-2",
+  "status": "ok",
+  "subject": "/mnt/state",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "state_on_tmpfs",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "state_save_age_min",
+  "detail": "13.6 <= 20 min",
+  "status": "ok",
+  "subject": "cubox-state-save.service",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "strikes",
+  "detail": "parity: no NAS in this tool",
+  "status": "unknown",
+  "subject": "cubox-2",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "temperature",
+  "detail": "not available on this hardware -- the board has no thermal zone (no /sys/class/thermal, imx_thermal not built), so there is nothing to read. Stated explicitly rather than omitted, because an absent row reads as fine. [measured: 0 thermal zone(s), 3 cooling device(s)]",
+  "status": "unknown",
+  "subject": "thermal",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "tmpfs_used_pct",
+  "detail": "4.0 <= 60 percent (worst: /build 1%, /etc 4%, /tmp 2%, /var/log 1%, /var/tmp 0%)",
+  "status": "ok",
+  "subject": "tmpfs",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "vpu_present",
+  "detail": "coda_vpu loaded, 13 video nodes, 5 v4l2m2m entry(ies), firmware vpu_fw_imx6q.bin",
+  "status": "ok",
+  "subject": "v4l2m2m",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "worker_drift",
+  "detail": "this box records NO APPLIED GENERATION, so there is no manifest digest to compare its worker.sh against -- drift CANNOT be assessed, and this is not a pass. A box that has never applied the shared layer runs the image's build-time copy, which is a legitimate state; the digest only arrives once the applier has run.",
+  "status": "unknown",
+  "subject": "worker.sh",
+  "target": "cubox-2"
+ },
+ {
+  "check_id": "shared_layer_parity",
+  "detail": "cannot compare: cubox-1 did not report whether the applier exists",
+  "status": "unknown",
+  "subject": "shared layer",
+  "target": "fleet"
+ },
+ {
+  "check_id": "spec_coverage",
+  "detail": "1 of 28 thresholds are declared with no check behind them, each stating its own reason: gap_sources (PHASE 3 (plan's coverage-verification phase). This is explicitly the fold-in of scripts/11-transcode-verify.sh's logic. Writing it before that script's own gates were re-verified would repeat the project's most expensive mistake: item 72 was this exact check reporting \"Coverage is complete\" at exit 0 while measuring `done 0 / orphan 18`, with five independent faults each hiding the next. The dashboard must not inherit a coverage verdict that has not first been proven able to fail.). Nothing is wrong with the monitor -- these are known, deliberate gaps in coverage, and they are UNKNOWN rather than green so that an unmeasured metric is never mistaken for a healthy one.",
+  "status": "unknown",
+  "subject": "checks.conf",
+  "target": "fleet"
+ },
+ {
+  "check_id": "worker_pair_parity",
+  "detail": "both boxes run the same worker.sh (7211f889ebec)",
+  "status": "ok",
+  "subject": "worker.sh",
+  "target": "fleet"
+ },
+ {
+  "check_id": "dvb_adapter_count",
+  "detail": "/dev/dvb not readable ([Errno 2] No such file or directory: '/dev/dvb') -- the DVB subsystem is not exposed to this container, so adapter presence cannot be assessed here",
+  "status": "unknown",
+  "subject": "dvb",
+  "target": "storage"
+ },
+ {
+  "check_id": "epg_freshness_h",
+  "detail": "could not read the TVH log: no docker client configured",
+  "status": "unknown",
+  "subject": "epg",
+  "target": "storage"
+ },
+ {
+  "check_id": "media_volume_used_pct",
+  "detail": "cannot stat /nonexistent/parity/recordings or its parent ([Errno 2] No such file or directory: '/nonexistent/parity/recordings') -- the recordings share is not present on this host",
+  "status": "fail",
+  "subject": "/nonexistent/parity/recordings",
+  "target": "storage"
+ },
+ {
+  "check_id": "serial_adapter",
+  "detail": "cannot read /sys (/sys/class/tty is not readable ([Errno 2] No such file or directory: '/sys/class/tty')), so no console adapter can be identified here. This is NOT 'no adapter attached' -- it means this container cannot see the USB bus at all.",
+  "status": "unknown",
+  "subject": "serial",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_container",
+  "detail": "no docker client configured",
+  "status": "unknown",
+  "subject": "docker",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_log_signals",
+  "detail": "could not read the tvheadend log: no docker client configured",
+  "status": "unknown",
+  "subject": "tvh-log",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_mux_unreachable",
+  "detail": "could not read the TVH log: no docker client configured",
+  "status": "unknown",
+  "subject": "dvb",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_response_ms",
+  "detail": "TVH did not answer at http://198.51.100.12:9981/: parity: HTTP probe disabled (this tool never leaves the host)",
+  "status": "fail",
+  "subject": "tvh-http",
+  "target": "storage"
+ },
+ {
+  "check_id": "tvh_tuner_silent_h",
+  "detail": "could not read the TVH log: no docker client configured",
+  "status": "unknown",
+  "subject": "dvb",
+  "target": "storage"
+ }
+]

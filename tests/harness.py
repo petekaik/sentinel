@@ -16,7 +16,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MONITOR = os.path.dirname(HERE)
 APP = os.path.join(MONITOR, "app")
 FIXTURES = os.path.join(HERE, "fixtures")
+# The two threshold sources, kept separate because the RUNTIME now merges them:
+# `CHECKS_CONF` is the platform file (`MONITOR_CHECKS`, comment-only today), and
+# `FLEET_THRESHOLDS` is the fleet module's own file. A suite that pointed
+# MONITOR_CHECKS at the fleet file would make the runtime load the same specs
+# twice and fail on duplicate ids; `load_specs` reads the fleet file directly so
+# a check fixture still grades against its own bands.
 CHECKS_CONF = os.path.join(MONITOR, "checks.conf")
+FLEET_THRESHOLDS = os.path.join(APP, "modules", "fleet", "thresholds.conf")
 
 if APP not in sys.path:
     sys.path.insert(0, APP)
@@ -78,3 +85,43 @@ class Results:
 def read_fixture(name):
     with open(os.path.join(FIXTURES, name)) as fh:
         return fh.read()
+
+
+def fleet_module():
+    """The discovered fleet module -- the ONE home for its check list."""
+    import modules as loader
+    for mod in loader.discover():
+        if mod.id == "fleet":
+            return mod
+    raise AssertionError("the fleet module was not discovered; its checks are "
+                         "not registered anywhere and the dashboard shows no row")
+
+
+def check_classes():
+    """Every check class the discovered modules provide, through the registry."""
+    import checks
+    return checks.registry(*(tuple(fleet_module().check_classes())
+                             + tuple(checks.platform_modules())))
+
+
+def load_specs(cfg, conn=None):
+    """Threshold specs through the loader the RUNTIME uses.
+
+    The suites must grade against the same band the monitor does, overrides
+    included, or a check that passes here could fail on the deployment at the
+    next epoch. `conn` is optional: most suites build no store, so they get the
+    file's band; a test that applies an override passes its connection.
+    """
+    import thresholds
+    return thresholds.load_effective({"fleet": FLEET_THRESHOLDS}, conn)
+
+
+def fleet_config(cfg):
+    """The fleet's settings view over the SAME env the Config was built from.
+
+    Passing `cfg.env` is what keeps a suite hermetic: `FleetConfig(cfg)` alone
+    reads os.environ, so a test's overrides would be silently ignored and the
+    real deployment's .env could leak in.
+    """
+    from modules.fleet.settings import FleetConfig
+    return FleetConfig(cfg, cfg.env)

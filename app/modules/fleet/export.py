@@ -27,7 +27,7 @@ than parsed as a short log.
 import time
 from dataclasses import dataclass, field
 
-import parsers
+import modules.fleet.parsers as parsers
 import probes
 
 SECTION_RE = parsers.SECTION_RE
@@ -121,14 +121,19 @@ def build_script(log_tail=LOG_TAIL):
     return SCRIPT_TEMPLATE.replace("LOGTAIL", str(int(log_tail)))
 
 
-def pull(ctx, cubox_id):
-    """Fetch one CuBox's state export. Never raises; a failure is the transport."""
-    host = ctx.host("backup")
+def pull(fleet, cubox_id):
+    """Fetch one CuBox's state export. Never raises; a failure is the transport.
+
+    `fleet` is the fleet module's FleetConfig view: `host()` and
+    `state_export_base` are the only two things this needs, and keeping them on
+    that object is what lets the platform call this without knowing the fleet.
+    """
+    host = fleet.host("backup")
     if host is None:
         return StateExport(cubox_id=cubox_id, transport="error",
                            why="no backup host configured")
 
-    base = "%s/%s/transcode" % (ctx.cfg.state_export_base.rstrip("/"), cubox_id)
+    base = "%s/%s/transcode" % (fleet.state_export_base.rstrip("/"), cubox_id)
     script = "sh -s -- %s %s" % (probes.shq(base), probes.shq(cubox_id))
     payload = build_script().lstrip("\n")
 

@@ -22,6 +22,7 @@ Python 3 stdlib only, deliberately: no pip dependencies to rot in an appliance
 that is expected to run unattended for months.
 """
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -158,6 +159,11 @@ CREATE TABLE IF NOT EXISTS check_run (
     epoch_seq   INTEGER NOT NULL,
     target      TEXT    NOT NULL,
     check_id    TEXT    NOT NULL,
+    -- The incident key is (target, check_id, subject), so an approval's
+    -- freshness test needs the subject too. It was absent from this table
+    -- (only check_run's in-memory results carried it), which made the store's
+    -- freshness question weaker than the one `heal.consider` asks.
+    subject     TEXT    NOT NULL DEFAULT '',
     status      TEXT    NOT NULL,
     detail      TEXT,
     duration_ms INTEGER
@@ -276,6 +282,98 @@ CREATE TABLE IF NOT EXISTS collector_run (
     errors      INTEGER,
     note        TEXT
 );
+
+-- OPERATOR-COMMAND AUDIT. Commands are the only part of the platform that can
+-- change the fleet, so every invocation -- including a dry run and a handler
+-- that failed -- leaves a row saying who ran what, with which arguments, and
+-- what came back. `output_head` is bounded (2048 chars) because a command can
+-- print a lot; `output_sha` covers the FULL output, so two runs whose heads
+-- agree are still distinguishable.
+CREATE TABLE IF NOT EXISTS command_run (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,
+    module      TEXT NOT NULL,
+    command     TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    argv_json   TEXT NOT NULL,
+    dry_run     INTEGER NOT NULL,
+    exit_status INTEGER NOT NULL,
+    output_head TEXT,
+    output_sha  TEXT,
+    duration_ms INTEGER NOT NULL
+);
+
+-- ONE ROW PER ADVISOR PER EPOCH, ALWAYS -- the run that raised and the run
+-- that overran its budget included. A run with no row reads exactly like an
+-- advisor that was never configured, so the failures are the rows that matter.
+CREATE TABLE IF NOT EXISTS advisor_run (
+    id                    INTEGER PRIMARY KEY,
+    ts                    REAL    NOT NULL,
+    advisor               TEXT    NOT NULL,
+    module                TEXT    NOT NULL DEFAULT '',
+    status                TEXT    NOT NULL,
+    duration_ms           INTEGER NOT NULL,
+    window_requested_days INTEGER NOT NULL DEFAULT 0,
+    window_available_days REAL    NOT NULL DEFAULT 0.0,
+    detail                TEXT
+);
+CREATE INDEX IF NOT EXISTS advisor_run_advisor ON advisor_run (advisor, ts);
+
+-- ADVISOR OUTPUT IS ADDITIVE. An insight is a claim an advisor makes about the
+-- fleet; a proposal asks for a change. Neither is an incident (an insight has no
+-- state machine and no check can resolve it) and neither is a command (a
+-- proposal cannot act until a human decides it). Keeping them out of those
+-- tables is what keeps their semantics untouched.
+CREATE TABLE IF NOT EXISTS insight (
+    id            INTEGER PRIMARY KEY,
+    ts            REAL    NOT NULL,
+    advisor       TEXT    NOT NULL DEFAULT '',
+    module        TEXT    NOT NULL,
+    target        TEXT    NOT NULL DEFAULT '',
+    check_id      TEXT    NOT NULL DEFAULT '',
+    subject       TEXT    NOT NULL DEFAULT '',
+    kind          TEXT    NOT NULL,
+    severity      TEXT    NOT NULL DEFAULT 'info',
+    confidence    REAL    NOT NULL DEFAULT 0.0,
+    title         TEXT    NOT NULL,
+    body          TEXT    NOT NULL,
+    evidence_json TEXT,
+    expires_at    REAL    NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS insight_module ON insight (module, ts);
+
+CREATE TABLE IF NOT EXISTS proposal (
+    id           INTEGER PRIMARY KEY,
+    ts           REAL    NOT NULL,
+    module       TEXT    NOT NULL,
+    kind         TEXT    NOT NULL,
+    payload_json TEXT    NOT NULL,
+    rationale    TEXT    NOT NULL,
+    state        TEXT    NOT NULL DEFAULT 'pending',
+    expires_at   REAL    NOT NULL DEFAULT 0,
+    decided_at   REAL,
+    actor        TEXT,
+    executed_at  REAL
+);
+CREATE INDEX IF NOT EXISTS proposal_module ON proposal (module, ts);
+CREATE INDEX IF NOT EXISTS proposal_state ON proposal (state, expires_at);
+
+-- A LIVE THRESHOLD BAND, WITHOUT A REBUILD. The threshold files are still the
+-- baseline -- an override is an operator-approved adjustment layered on top --
+-- so the store holds only the specs that differ from their file. `previous_json`
+-- is the band the file declared when the override was applied, which is what
+-- `--revert-threshold` restores and what makes the change auditable after the
+-- file is edited again. `proposal_id` is the approval that wrote the row.
+CREATE TABLE IF NOT EXISTS threshold_override (
+    spec_id       TEXT PRIMARY KEY,
+    module        TEXT NOT NULL,
+    green         REAL NOT NULL,
+    amber         REAL NOT NULL,
+    actor         TEXT NOT NULL,
+    applied_at    REAL NOT NULL,
+    previous_json TEXT NOT NULL,
+    proposal_id   INTEGER
+);
 """
 
 
@@ -336,6 +434,14 @@ def _migrate(conn):
     for name, decl in _ADDED_COLUMNS:
         if name not in have:
             conn.execute("ALTER TABLE incident ADD COLUMN %s %s" % (name, decl))
+    # `check_run.subject` arrived with the approval freshness gate. An older
+    # row gets the empty default: it is evidence recorded before the subject
+    # was stored, and the approval gate then treats it as not fresh, which is
+    # the safe direction.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(check_run)")}
+    if "subject" not in have:
+        conn.execute("ALTER TABLE check_run ADD COLUMN subject TEXT NOT NULL "
+                     "DEFAULT ''")
 
 
 def _ensure_live_index(conn):
@@ -389,16 +495,18 @@ def record_sample(conn, seq, target, metric, value=None, unit=None, text=None):
     )
 
 
-def record_check(conn, seq, target, check_id, status, detail, duration_ms=None):
+def record_check(conn, seq, target, check_id, status, detail, duration_ms=None,
+                 subject=""):
     conn.execute(
         "INSERT INTO check_run "
-        "(ts, epoch_seq, target, check_id, status, detail, duration_ms) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(ts, epoch_seq, target, check_id, subject, status, detail, "
+        "duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             time.time(),
             seq,
             target,
             check_id,
+            subject or "",
             status.value if isinstance(status, Status) else str(status),
             detail,
             duration_ms,
@@ -424,6 +532,35 @@ def record_collector_run(conn, seq, duration_ms, checks_run, errors, note=None):
     )
 
 
+# The head kept in the row. Long enough to see what a command said, short
+# enough that an operator command cannot make the store the biggest thing on
+# the NAS; the SHA-256 covers what was cut, so truncation is lossy on the text
+# and not on the identity of the output.
+COMMAND_OUTPUT_HEAD = 2048
+
+
+def record_command_run(conn, module, command, actor, argv, dry_run,
+                       exit_status, output="", duration_ms=0):
+    """One audit row per dispatch. `output` is the FULL text; the head is cut."""
+    output = output or ""
+    conn.execute(
+        "INSERT INTO command_run (ts, module, command, actor, argv_json, "
+        "dry_run, exit_status, output_head, output_sha, duration_ms) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (time.time(), module, command, actor,
+         json.dumps(argv, sort_keys=True, default=str),
+         1 if dry_run else 0, int(exit_status), output[:COMMAND_OUTPUT_HEAD],
+         hashlib.sha256(output.encode("utf-8", "replace")).hexdigest(),
+         duration_ms),
+    )
+
+
+def list_command_runs(conn, limit=50):
+    rows = conn.execute(
+        "SELECT * FROM command_run ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def record_remedy(conn, key, remedy, evidence, dry_run, exit_status,
                   post_check_result=None, post_check_evidence=None):
     conn.execute(
@@ -441,6 +578,394 @@ def record_remedy(conn, key, remedy, evidence, dry_run, exit_status,
             post_check_evidence,
         ),
     )
+
+
+def list_remedies(conn, limit=20):
+    """The newest remedy audit rows, for the operator surfaces.
+
+    Newest first, for the same reason `list_command_runs` is: the attempt an
+    operator is looking for is the one that just failed, not the first one ever
+    made.
+    """
+    rows = conn.execute(
+        "SELECT * FROM remedy ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+ADVISOR_RUN_STATUSES = ("ok", "error", "budget")
+
+
+def record_advisor_run(conn, advisor, module, status, duration_ms,
+                       window_requested_days, window_available_days,
+                       detail=""):
+    """Store one advisor run, whatever its outcome.
+
+    An unknown status is REFUSED: a typo would otherwise be a row nobody can
+    query, and the dashboard would count the run under a status that does not
+    exist. `detail` carries the traceback on error and the overrun on budget.
+    """
+    if status not in ADVISOR_RUN_STATUSES:
+        raise ValueError("invalid advisor run status %r; expected one of %s"
+                         % (status, ", ".join(ADVISOR_RUN_STATUSES)))
+    cur = conn.execute(
+        "INSERT INTO advisor_run (ts, advisor, module, status, duration_ms, "
+        "window_requested_days, window_available_days, detail) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (time.time(), advisor, module, status, int(duration_ms),
+         int(window_requested_days), float(window_available_days), detail),
+    )
+    return cur.lastrowid
+
+
+def last_advisor_run(conn, advisor):
+    """The newest run row for one advisor id, or None if it never ran.
+
+    "Never ran" is a different fact from "ran and failed", and the operator
+    surface must be able to say which -- an advisor with no row is one the
+    selector did not reach, and that is a configuration question.
+    """
+    row = conn.execute(
+        "SELECT * FROM advisor_run WHERE advisor = ? ORDER BY id DESC LIMIT 1",
+        (advisor,)).fetchone()
+    return dict(row) if row else None
+
+
+# The insight columns this store can persist, named ONCE. `advisors.Insight`'s
+# fields plus `advisor`. An unknown keyword is REFUSED rather than dropped: a
+# renamed or newly added Insight field would otherwise be stored as the column
+# default while the caller believed it was recorded -- silent data loss in the
+# one table that is meant to be durable history.
+INSIGHT_FIELDS = (
+    "advisor", "module", "target", "check_id", "subject", "kind",
+    "severity", "confidence", "title", "body", "evidence", "expires_at",
+)
+INSIGHT_REQUIRED = ("module", "kind", "title", "body")
+
+
+def record_insight(conn, **fields):
+    """Store one advisor insight.
+
+    `fields` are `advisors.Insight`'s own fields plus `advisor` (the advisor's
+    id); everything optional defaults so a caller that uses the dataclass as-is
+    needs no translation layer. `evidence` is JSON-encoded here, once, rather
+    than at every call site.
+    """
+    unknown = sorted(set(fields) - set(INSIGHT_FIELDS))
+    if unknown:
+        raise TypeError("unexpected insight field(s): %s" % ", ".join(unknown))
+    missing = [name for name in INSIGHT_REQUIRED if name not in fields]
+    if missing:
+        raise TypeError("missing required insight field(s): %s"
+                        % ", ".join(missing))
+    cur = conn.execute(
+        "INSERT INTO insight (ts, advisor, module, target, check_id, subject, "
+        "kind, severity, confidence, title, body, evidence_json, expires_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (time.time(), fields.get("advisor", ""), fields["module"],
+         fields.get("target", ""), fields.get("check_id", ""),
+         fields.get("subject", ""), fields["kind"],
+         fields.get("severity", "info"), fields.get("confidence", 0.0),
+         fields["title"], fields["body"],
+         json.dumps(fields.get("evidence", {})), fields.get("expires_at", 0)),
+    )
+    return cur.lastrowid
+
+
+def list_insights(conn, module=None, limit=100):
+    """Newest first, for the operator surface."""
+    sql = "SELECT * FROM insight"
+    params = []
+    if module:
+        sql += " WHERE module = ?"
+        params.append(module)
+    rows = conn.execute(sql + " ORDER BY id DESC LIMIT ?",
+                        tuple(params) + (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def newest_insight(conn, advisor, kind, target="", check_id="", subject="",
+                   since=None):
+    """The newest insight for one identity, optionally no older than `since`.
+
+    The identity is `(advisor, kind, target, check_id, subject)` -- the same
+    four-part selection the runner uses to decide whether an epoch's advice is
+    new or a repeat. `since` is what turns that into a dedupe window: an advisor
+    that runs every minute must not write a row every minute.
+    """
+    sql = ("SELECT * FROM insight WHERE advisor = ? AND kind = ? AND target = ? "
+           "AND check_id = ? AND subject = ?")
+    params = [advisor or "", kind or "", target or "", check_id or "",
+              subject or ""]
+    if since is not None:
+        sql += " AND ts >= ?"
+        params.append(since)
+    row = conn.execute(sql + " ORDER BY id DESC LIMIT 1",
+                       tuple(params)).fetchone()
+    return dict(row) if row else None
+
+
+def recent_insights(conn, kind, module=None, target=None, check_id=None,
+                    subject=None, since=None, limit=50):
+    """Newest insights of one kind, with whatever filters are given.
+
+    Used by the advisory engine to answer, from the store, whether it has
+    already written the recommendation this incident/action pair deserves.
+    """
+    sql = "SELECT * FROM insight WHERE kind = ?"
+    params = [kind]
+    for column, value in (("module", module), ("target", target),
+                          ("check_id", check_id), ("subject", subject)):
+        if value is not None:
+            sql += " AND %s = ?" % column
+            params.append(value)
+    if since is not None:
+        sql += " AND ts >= ?"
+        params.append(since)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+
+def update_insight(conn, insight_id, **fields):
+    """Replace an insight row's content in place, keeping its id and identity.
+
+    Same field whitelist as `record_insight` (with `evidence` JSON-encoded here,
+    once). `ts` moves to now, so a deduped row reads as current advice rather
+    than as a stale one that happens to still be the newest.
+    """
+    unknown = sorted(set(fields) - set(INSIGHT_FIELDS))
+    if unknown:
+        raise TypeError("unexpected insight field(s): %s" % ", ".join(unknown))
+    values = {}
+    for name, value in fields.items():
+        values["evidence_json" if name == "evidence" else name] = (
+            json.dumps(value) if name == "evidence" else value)
+    if not values:
+        return 0
+    values["ts"] = time.time()
+    cur = conn.execute(
+        "UPDATE insight SET %s WHERE id = ?"
+        % ", ".join("%s = ?" % name for name in values),
+        tuple(values.values()) + (insight_id,))
+    return cur.rowcount
+
+
+def record_proposal(conn, module, kind, payload, rationale, expires_at=0):
+    """A proposal starts `pending`; only `decide_proposal` moves it."""
+    cur = conn.execute(
+        "INSERT INTO proposal (ts, module, kind, payload_json, rationale, state, "
+        "expires_at) VALUES (?,?,?,?,?,'pending',?)",
+        (time.time(), module, kind, json.dumps(payload), rationale, expires_at),
+    )
+    return cur.lastrowid
+
+
+def get_proposal(conn, proposal_id):
+    row = conn.execute("SELECT * FROM proposal WHERE id = ?",
+                       (proposal_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def proposal_expired(row, now=None):
+    """A pending row past its expiry is EXPIRED, whatever the state column says.
+
+    The collector rewrites expired rows with `expire_proposals()`, but the
+    dashboard reads a store that may not have been collected since the deadline
+    (that is exactly the stale-collector case), so the display cannot depend on
+    that rewrite having happened.
+    """
+    expires_at = row.get("expires_at") if hasattr(row, "get") else row["expires_at"]
+    if not expires_at:
+        return False
+    return float(expires_at) <= (time.time() if now is None else now)
+
+
+def expire_proposals(conn, now=None):
+    """Move every pending proposal past its deadline to `expired`.
+
+    Called by the healer once per epoch and by the ctl verbs that decide one, so
+    the stored state converges without a second timer. `decided_at` records when
+    the deadline lapsed, not a human decision; `actor` stays NULL for that reason.
+    """
+    now = time.time() if now is None else now
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'expired', decided_at = ? "
+        "WHERE state = 'pending' AND expires_at > 0 AND expires_at <= ?",
+        (now, now))
+    return cur.rowcount
+
+
+def _proposal_payload(row):
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def last_action_proposal(conn, incident_key, action_id):
+    """The newest proposal for one `(incident, action)`, whatever its state.
+
+    The healer needs the DECIDED history as well as the pending set: an
+    approved proposal that executed leaves the incident open, and without this
+    the next epoch would write a fresh proposal immediately -- a queue that
+    cycles and later approvals that refuse on an exhausted attempt budget.
+    """
+    rows = conn.execute(
+        "SELECT * FROM proposal WHERE kind = 'action' ORDER BY id DESC"
+    ).fetchall()
+    for row in rows:
+        payload = _proposal_payload(row)
+        if (payload.get("incident_key") == incident_key
+                and payload.get("action_id") == action_id):
+            return dict(row)
+    return None
+
+
+def last_threshold_proposal(conn, spec_id):
+    """The NEWEST `threshold_change` proposal for one spec, whatever its state.
+
+    The producer needs the decided history, not only the pending set: a
+    rejected or just-executed proposal must not regenerate on the next epoch
+    (60 s later), or `--reject` is inert. Expiry is handled by the caller --
+    a lapsed row is absent, not a decision.
+    """
+    rows = conn.execute(
+        "SELECT * FROM proposal WHERE kind = 'threshold_change' "
+        "ORDER BY id DESC").fetchall()
+    for row in rows:
+        if _proposal_payload(row).get("spec_id") == spec_id:
+            return dict(row)
+    return None
+
+
+def list_proposals(conn, state=None, limit=100):
+    sql = "SELECT * FROM proposal"
+    params = []
+    if state:
+        sql += " WHERE state = ?"
+        params.append(state)
+    rows = conn.execute(sql + " ORDER BY id DESC LIMIT ?",
+                        tuple(params) + (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+DECISION_STATES = ("approved", "rejected", "expired")
+
+
+def decide_proposal(conn, proposal_id, state, actor):
+    """Record the human decision. `actor` and `decided_at` are the evidence that
+    this was decided rather than defaulted.
+
+    Only a PENDING row can be decided, and the rowcount says whether anything
+    happened -- 0 means the id was unknown or already decided. An unconditional
+    UPDATE would let a second decision rewrite `actor`/`decided_at` on a row
+    whose history is meant to be final.
+    """
+    if state not in DECISION_STATES:
+        raise ValueError("invalid proposal state %r; expected one of %s"
+                         % (state, ", ".join(DECISION_STATES)))
+    cur = conn.execute(
+        "UPDATE proposal SET state = ?, decided_at = ?, actor = ? "
+        "WHERE id = ? AND state = 'pending'",
+        (state, time.time(), actor, proposal_id),
+    )
+    return cur.rowcount
+
+
+def claim_proposal(conn, proposal_id, actor):
+    """Atomically take a PENDING proposal for execution.
+
+    Returns the rowcount: 1 when THIS caller won the claim, 0 when the row was
+    not pending. The conditional UPDATE is the whole mechanism -- two operator
+    processes that both read `pending` must not both execute the action, and a
+    check-then-execute sequence cannot promise that. The winner is recorded as
+    the decider here (the human said yes); `mark_proposal_executed` later adds
+    the execution stamp without rewriting this one.
+    """
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'approved', decided_at = ?, actor = ? "
+        "WHERE id = ? AND state = 'pending'",
+        (time.time(), actor, proposal_id),
+    )
+    return cur.rowcount
+
+
+def release_proposal(conn, proposal_id):
+    """Undo a claim whose execution was REFUSED, restoring `pending`.
+
+    Only ever touches a row still in `approved`, so a proposal that executed (or
+    was decided in the meantime) cannot be dragged back. A refusal is not a
+    decision about the proposal: the operator can retry the approval once the
+    refusal's cause is gone.
+    """
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'pending', decided_at = NULL, actor = NULL, "
+        "executed_at = NULL WHERE id = ? AND state = 'approved'",
+        (proposal_id,),
+    )
+    return cur.rowcount
+
+
+def mark_proposal_executed(conn, proposal_id):
+    """Record that an approved proposal ran. The decision metadata is preserved.
+
+    Deliberately not routed through `decide_proposal`: execution is a later
+    fact about the same row, and rewriting `decided_at`/`actor` would destroy
+    the evidence of who approved it. STATE-GUARDED to `approved`: only a claimed
+    proposal can become `executed`, so an unclaimed pending row cannot skip the
+    claim. Returns the rowcount.
+    """
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'executed', executed_at = ? "
+        "WHERE id = ? AND state = 'approved'",
+        (time.time(), proposal_id),
+    )
+    return cur.rowcount
+
+
+THRESHOLD_OVERRIDE_COLUMNS = (
+    "spec_id", "module", "green", "amber", "actor", "applied_at",
+    "previous_json", "proposal_id",
+)
+
+
+def set_threshold_override(conn, spec_id, module, green, amber, actor,
+                           previous, proposal_id=None):
+    """Apply one live band. `previous` is the band it is replacing, as a dict.
+
+    INSERT OR REPLACE because `spec_id` is the key: a second approved change to
+    the same spec supersedes the first, and the first's `previous_json` is the
+    band this one is measured against -- not the file's, which is why the bound
+    check runs against the EFFECTIVE band.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO threshold_override "
+        "(spec_id, module, green, amber, actor, applied_at, previous_json, "
+        "proposal_id) VALUES (?,?,?,?,?,?,?,?)",
+        (spec_id, module, green, amber, actor, time.time(),
+         json.dumps(previous), proposal_id))
+
+
+def get_threshold_override(conn, spec_id):
+    row = conn.execute("SELECT * FROM threshold_override WHERE spec_id = ?",
+                       (spec_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_threshold_overrides(conn):
+    rows = conn.execute(
+        "SELECT * FROM threshold_override ORDER BY spec_id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def remove_threshold_override(conn, spec_id):
+    """Delete one override, returning the row it removed (None if absent)."""
+    row = get_threshold_override(conn, spec_id)
+    if row is None:
+        return None
+    conn.execute("DELETE FROM threshold_override WHERE spec_id = ?", (spec_id,))
+    return row
 
 
 def record_journal(conn, host, cursor, ts, unit, priority, message):
@@ -495,6 +1020,32 @@ def _live_incident(conn, key):
         "SELECT * FROM incident WHERE key = ? AND state IN (%s)" % LIVE_SQL,
         (key,),
     ).fetchone()
+
+
+def get_live_incident(conn, key):
+    """The one live row for a key, as a dict -- the healer's approval gate."""
+    row = _live_incident(conn, key)
+    return dict(row) if row else None
+
+
+def evidence_in_newest_epoch(conn, target, check_id, subject=""):
+    """True if the NEWEST epoch observed exactly this incident.
+
+    Approving a proposal acts on an incident, and an incident row can outlive
+    the observation that produced it (a frozen `unknown` row, or one selected
+    by a check id that did not run this epoch). An approval must therefore
+    confirm that the EVIDENCE it is acting on was produced by the latest
+    collection -- for the same `(target, check_id, subject)` triple the incident
+    key is built from, not merely the same check somewhere.
+    """
+    row = conn.execute("SELECT MAX(epoch_seq) AS s FROM check_run").fetchone()
+    seq = row["s"] if row else None
+    if seq is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM check_run WHERE epoch_seq = ? AND target = ? "
+        "AND check_id = ? AND subject = ? LIMIT 1",
+        (seq, target, check_id, subject or "")).fetchone() is not None
 
 
 def sync_incident(conn, seq, target, check_id, subject, status, detail,
@@ -727,6 +1278,58 @@ def live_incidents(conn):
     return [dict(r) for r in rows]
 
 
+def live_incidents_for_targets(conn, targets):
+    """Confirmed incidents against any of `targets` -- the rows a layer owns.
+
+    Deliberately CONFIRMED_STATES, like `live_incidents`: a `pending` row was
+    never an incident.
+
+    NOT AN OWNERSHIP SELECTOR. Modules share reporting targets, so freezing by
+    target would claim another module's rows -- use `live_incidents_for_checks`
+    with the ids the module declares.
+    """
+    if not targets:
+        return []
+    marks = ", ".join("?" for _ in targets)
+    rows = conn.execute(
+        "SELECT * FROM incident WHERE state IN (%s) AND target IN (%s)"
+        % (CONFIRMED_SQL, marks), tuple(targets)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def live_incidents_for_checks(conn, check_ids):
+    """Confirmed incidents for any of `check_ids` -- rows a MODULE owns.
+
+    OWNERSHIP IS BY CHECK ID, NOT BY TARGET. Two modules can share a reporting
+    target (`storage`, `fleet`), so selecting rows by target would let one
+    module's disablement freeze another module's incidents and stamp the wrong
+    reason into them. The module declares the ids it owns (its Check classes
+    plus `extra_check_ids`); this selects exactly those.
+    """
+    if not check_ids:
+        return []
+    marks = ", ".join("?" for _ in check_ids)
+    rows = conn.execute(
+        "SELECT * FROM incident WHERE state IN (%s) AND check_id IN (%s)"
+        % (CONFIRMED_SQL, marks), tuple(check_ids)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def freeze_incident(conn, seq, row, reason):
+    """Fold an UNKNOWN observation into the row that owns it.
+
+    A disabled module runs no checks, so no observation can ever resolve its
+    incidents -- freezing is the honest state, and it is done through the same
+    state machine (and so the same severity cap) as a genuinely unobservable
+    check. It NEVER resolves: UNKNOWN is not the answer "fine". A `latched` row
+    is left alone by that state machine -- it is waiting on a human, not on a
+    poll -- and the dashboard's disabled note says so rather than implying the
+    freeze covered it.
+    """
+    return sync_incident(conn, seq, row["target"], row["check_id"],
+                         row["subject"], Status.UNKNOWN, reason, None)
+
+
 def last_collection(conn):
     row = conn.execute(
         "SELECT ts, epoch_seq, duration_ms, checks_run, errors FROM collector_run "
@@ -745,7 +1348,9 @@ def db_summary(conn):
     """
     out = {}
     for table in ("sample", "check_run", "collection_attempt", "incident",
-                  "journal", "remedy", "collector_run"):
+                  "journal", "remedy", "collector_run", "command_run",
+                  "advisor_run", "insight", "proposal",
+                  "threshold_override"):
         try:
             out[table] = conn.execute(
                 "SELECT COUNT(*) AS n FROM %s" % table

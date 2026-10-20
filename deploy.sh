@@ -7,7 +7,8 @@
 #   ./deploy.sh --status           # what is running, what it sees
 #   ./deploy.sh --once             # one collection, print it, exit
 #   ./deploy.sh --once --dry-run   # ... and write NOTHING to the store
-#   ./deploy.sh --showconf         # config + threshold coverage
+#   ./deploy.sh --showconf         # config + modules + threshold coverage
+#   ./deploy.sh --modules          # discovered modules: state, order, targets, checks
 #   ./deploy.sh --authorise-backup # let the monitor ssh to Backup-NAS
 #   ./deploy.sh --logs             # follow the container log
 #   ./deploy.sh --dismiss          # list the live incidents
@@ -18,8 +19,29 @@
 #                                                     #   no check can ever
 #                                                     #   close, and it is not
 #                                                     #   a way to hide a fault.
+#   ./deploy.sh --list-commands    # module commands, their arguments and danger
+#   ./deploy.sh --run MODULE.COMMAND [--arg k=v ...] [--dry-run]
+#                                                     # run one module command.
+#                                                     #   --arg repeats. A
+#                                                     #   --dry-run anywhere
+#                                                     #   alongside a command
+#                                                     #   verb is the COMMAND's
+#                                                     #   dry run.
+#   ./deploy.sh --list-runs        # the command audit
+#   ./deploy.sh --proposals        # the proposal queue (expired shown as expired)
+#   ./deploy.sh --approve ID       # approve one; it still passes every gate
+#   ./deploy.sh --reject ID        # reject one; it can never execute
+#   ./deploy.sh --insights         # advisor insights, newest first
+#   ./deploy.sh --advisors         # configured advisors and their last run
+#   ./deploy.sh --remedies         # the remedy audit (newest 20)
+#   ./deploy.sh --thresholds       # active threshold overrides
+#   ./deploy.sh --revert-threshold SPEC_ID
+#                                  # drop one override, restoring the file band
+#   --actor NAME                   # modifier for a ctl verb: attribute the run
+#                                  #   or approval to NAME (default: operator)
 #
-# Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER
+# Environment overrides: STORAGE_IP, STORAGE_USER, MONITOR_DIR, MONITOR_DOCKER,
+#                        MONITOR_IP, CUBOX_1_IP, CUBOX_2_IP, BACKUP_IP
 #
 # WHY A SCRIPT AT ALL, when `docker compose up -d` would nearly do. Three things
 # travel with the image and are not in it: the ssh key, the known_hosts file and
@@ -62,15 +84,103 @@ BACKUP_USER="${BACKUP_USER:-admin}"
 
 MODE=deploy
 PASSTHRU=()
+# Whether any ctl verb has been seen. STICKY: once it is set, --dry-run always
+# belongs to ctl.py and never changes MODE. That is what makes
+# `--dry-run --run X` and `--run X --dry-run` the same invocation, and what
+# stops `--list-commands --dry-run` from silently becoming a collection.
+SAW_CTL=0
 TRUST_NEW_HOST_KEYS=0
+
+# One home for the usage block: --help and the missing-value guards print it.
+# Anchored range, never a line count (docs/08 item 57's family).
+usage() { sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --status)           MODE=status ;;
         --logs)             MODE=logs ;;
         --once)             MODE=once; PASSTHRU+=(--once) ;;
-        --dry-run)          MODE=once; PASSTHRU+=(--dry-run) ;;
+        --dry-run)
+            # CONTEXT-SENSITIVE, and the two meanings are DIFFERENT FACTS.
+            # Before any ctl verb this is deploy.sh's own dry run: --once plus
+            # the flag, i.e. one collection that writes NOTHING. After one it
+            # belongs to ctl.py: changing MODE here would turn a command's dry
+            # run into an epoch that never invokes the command at all, and
+            # `--list-commands --dry-run` into an argparse error.
+            # Neither branch may swallow the flag: --once WITHOUT --dry-run is
+            # a WRITE.
+            if [ "$SAW_CTL" -eq 1 ]; then
+                PASSTHRU+=(--dry-run)
+            else
+                MODE=once
+                PASSTHRU+=(--dry-run)
+            fi ;;
         --showconf)         MODE=showconf ;;
+        # The module command surface. Each VALUE is consumed here and passed as
+        # its own argv element, so the remote shell never re-splits it (item 81's
+        # family -- argv is joined and re-split, so re-joining is already wrong).
+        --modules)          MODE=ctl; SAW_CTL=1; PASSTHRU+=(--modules) ;;
+        --list-commands)    MODE=ctl; SAW_CTL=1; PASSTHRU+=(--list-commands) ;;
+        --actor)
+            [ $# -ge 2 ] || { echo "unknown argument: --actor needs a name" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --actor needs a name, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--actor "$2"); shift ;;
+        --run)
+            [ $# -ge 2 ] || { echo "unknown argument: --run needs MODULE.COMMAND" >&2
+                              usage >&2; exit 2; }
+            # A FLAG-SHAPED VALUE IS A MISTAKE, NOT A COMMAND. Without this,
+            # `--run --dry-run` consumes --dry-run as the command name and the
+            # run is no longer dry.
+            case "$2" in
+                -*) echo "unknown argument: --run needs MODULE.COMMAND, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--run "$2"); shift ;;
+        --arg)
+            [ $# -ge 2 ] || { echo "unknown argument: --arg needs k=v" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --arg needs k=v, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--arg "$2"); shift ;;
+        --list-runs)        MODE=ctl; SAW_CTL=1; PASSTHRU+=(--list-runs) ;;
+        # The proposal and advisor surface. Each VALUE is consumed here and
+        # passed as its own argv element, exactly like --run's: the remote shell
+        # joins and re-splits argv, so a value never travels as a string.
+        --proposals)        MODE=ctl; SAW_CTL=1; PASSTHRU+=(--proposals) ;;
+        --insights)         MODE=ctl; SAW_CTL=1; PASSTHRU+=(--insights) ;;
+        --advisors)         MODE=ctl; SAW_CTL=1; PASSTHRU+=(--advisors) ;;
+        --thresholds)       MODE=ctl; SAW_CTL=1; PASSTHRU+=(--thresholds) ;;
+        --remedies)         MODE=ctl; SAW_CTL=1; PASSTHRU+=(--remedies) ;;
+        --approve)
+            [ $# -ge 2 ] || { echo "unknown argument: --approve needs a proposal id" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --approve needs a proposal id, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--approve "$2"); shift ;;
+        --reject)
+            [ $# -ge 2 ] || { echo "unknown argument: --reject needs a proposal id" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --reject needs a proposal id, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--reject "$2"); shift ;;
+        --revert-threshold)
+            [ $# -ge 2 ] || { echo "unknown argument: --revert-threshold needs a spec id" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --revert-threshold needs a spec id, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--revert-threshold "$2"); shift ;;
         --dismiss)          MODE=dismiss
                             # Everything after --dismiss belongs to dismiss.py,
                             # including a --reason whose text contains anything
@@ -90,8 +200,7 @@ while [ $# -gt 0 ]; do
         # The terminator is a BARE `#`, not an empty line: every line of this
         # header starts with `#`, so /^$/ never matches until the comment block
         # ends -- and the first attempt at this printed the entire header.
-        -h|--help)          sed -n '/^# Usage:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//'
-                            exit 0 ;;
+        -h|--help)          usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -132,10 +241,17 @@ dc()     { remote "cd '$MONITOR_DIR' && '$MONITOR_DOCKER' compose $*"; }
 nas_env_var() {   # $1=NAME -> the value, or empty
     remote "grep -E '^$1=' '$MONITOR_DIR/.env' 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r'" || true
 }
-CUBOX1_IP="$(nas_env_var MONITOR_HOST_CUBOX_1_ADDR)"
-CUBOX2_IP="$(nas_env_var MONITOR_HOST_CUBOX_2_ADDR)"
-CUBOX1_IP="${CUBOX1_IP:-198.51.100.31}"
-CUBOX2_IP="${CUBOX2_IP:-198.51.100.32}"
+# The addresses the container DIALS. They must match MONITOR_HOST_*_ADDR in the
+# deployed .env; the defaults are the sanitised placeholders, which answer
+# nothing, so a deploy without them refuses at the known_hosts build.
+#
+# A caller-provided CUBOX_1_IP/CUBOX_2_IP wins over the NAS's .env -- the repo's
+# usual precedence (caller > .env). The .env remains the authority when the
+# caller says nothing, and is still the copy the CONTAINER reads.
+CUBOX_1_IP="${CUBOX_1_IP:-$(nas_env_var MONITOR_HOST_CUBOX_1_ADDR)}"
+CUBOX_2_IP="${CUBOX_2_IP:-$(nas_env_var MONITOR_HOST_CUBOX_2_ADDR)}"
+CUBOX_1_IP="${CUBOX_1_IP:-198.51.100.31}"
+CUBOX_2_IP="${CUBOX_2_IP:-198.51.100.32}"
 
 # The backup host already had an override, but its DEFAULT is a placeholder like the two
 # above, so the .env is consulted for it too. Kept after `remote()` is defined, because it
@@ -207,6 +323,7 @@ _oneoff() {
 
 dc_oneoff()  { _oneoff /app/collect.py "$@"; }
 dc_dismiss() { _oneoff /app/dismiss.py "$@"; }
+dc_ctl()     { _oneoff /app/ctl.py "$@"; }
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -356,6 +473,17 @@ case "$MODE" in
         # The sync above is idempotent and cheap, so agreement is guaranteed
         # rather than assumed.
         dc_dismiss ${PASSTHRU[@]+"${PASSTHRU[@]}"}
+        exit $? ;;
+    ctl)
+        # COMMANDS ACT ON WHAT IS DEPLOYED, exactly like --dismiss: the enabled
+        # modules and their handlers are read from the running container's own
+        # app/, so invoking one against a stale copy would apply this revision's
+        # arguments to the previous revision's code (or fail with an ImportError
+        # for a handler the old tree never had).
+        #
+        # The array is passed, never a joined string -- see the note below. An
+        # --arg value containing a space must arrive as ONE argv element.
+        dc_ctl ${PASSTHRU[@]+"${PASSTHRU[@]}"}
         exit $? ;;
     # PASS THE ARRAY, NEVER A JOINED STRING. This branch used to build
     # `ARGS="$ARGS $a"` from an empty ARGS and then call `dc_oneoff "$ARGS"`,
@@ -531,7 +659,7 @@ known_host_line() {   # $1=address $2=alias -> "type key", or nothing
 TMP_KH="$(mktemp)"
 trap 'rm -f "$TMP_KH"' EXIT
 KH_FAIL=0
-for pair in "cubox-1:$CUBOX1_IP" "cubox-2:$CUBOX2_IP" "backup:$BACKUP_IP"; do
+for pair in "cubox-1:$CUBOX_1_IP" "cubox-2:$CUBOX_2_IP" "backup:$BACKUP_IP"; do
     hname="${pair%%:*}"
     ip="${pair##*:}"
     tline="$(known_host_line "$ip" "$hname")"

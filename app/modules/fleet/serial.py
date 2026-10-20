@@ -22,10 +22,9 @@ THE RULE THIS MODULE ENFORCES: NEVER GUESS. `resolve` returns None rather than a
 guess, and callers must refuse rather than fall back to a device number. An absent
 answer is recoverable; a rebooted wrong box is not.
 
-A NOTE ON THE MODULE NAME. It shadows any installed `pyserial`, which is deliberate and
-safe here: `app/` is first on sys.path both when `main.py` runs (/app/main.py) and in the
-tests (tests/harness.py inserts it). The image installs no pip packages, so there is
-nothing to shadow in the container anyway.
+A NOTE ON THE MODULE NAME. It used to live at `app/serial.py`, where it shadowed any
+installed `pyserial`; it now lives inside the fleet package, so that shadowing is gone
+entirely. Nothing else changed -- this is the same resolver, moved with its callers.
 """
 
 import os

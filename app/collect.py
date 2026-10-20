@@ -44,13 +44,12 @@ import sys
 import time
 import traceback
 
-import backupfacts
-import boxfacts
+import advisors
 import checks
 import config as config_mod
-import journal as journal_mod
-import parsers
-import probes
+import intelligence
+from module import owned_check_ids
+import modules as module_loader
 import store
 import thresholds
 
@@ -89,11 +88,6 @@ UNREACHABLE_ID = "host_unreachable"     # it does not answer
 AUTH_ID = "host_auth_failed"            # it answered and refused us
 LOCAL_ID = "monitor_local_access"       # the monitor cannot read its own runtime
 CONFIG_ID = "monitor_config"            # the host is not in the monitor's config
-
-# The one host the monitor RUNS ON. Its access path is entirely local (the docker
-# socket), so "unreachable" is not a thing that can happen to it and its failures
-# are classified as LOCAL_ID.
-LOCAL_HOST = "storage"
 
 # Prune samples every N epochs (about a week at 60 s).
 PRUNE_EVERY = 10080
@@ -151,135 +145,35 @@ def _attempt(attempts, host):
 # ---------------------------------------------------------------------------
 
 
-def preload(cfg, ctx, conn, attempts):
-    """Fetch every remote fact ONCE, under its own timeout, before any check runs.
+def preload_modules(cfg, ctx, attempts):
+    """Let each enabled module fetch its own facts, under its own guard.
 
-    Nothing in this function raises for an expected condition: a failed pull
-    installs a transport-failed fact block, which the check layer already knows
-    how to render as UNKNOWN with the reason in words. That is the whole point of
-    the fact-block types carrying `transport_ok`/`why` instead of being plain
-    dicts.
+    THE PLATFORM DOES NOT KNOW WHAT A CUBOX IS. Each module's `preload(ctx)`
+    performs every remote read it owns -- once, with its own timeout -- and
+    installs the results through the platform's `preload_*` methods. The check
+    layer then reads finished data and cannot open a socket of its own.
+
+    A module that raises is ISOLATED: its checks report UNKNOWN from the
+    not-preloaded facts and the rest of the epoch proceeds. NO Attempt row is
+    written or modified for a preload failure. `Attempt` answers "can we see
+    this HOST at all?"; a module's `targets` also contain reporting-only
+    targets (`fleet`), and a host the module already contacted successfully
+    must not be re-marked failed because a later pull in the same module threw
+    -- either would open a `host_unreachable` incident no positive observation
+    could resolve. The run note names the cause, and the full traceback stays
+    in `module_errors`.
     """
-    # The Docker client is local (a unix socket) and cheap. Its absence is a
-    # configuration fact, not a transport failure, so it is noted rather than
-    # escalated -- and the checks that need it say so themselves.
-    ctx.docker = _docker_client(cfg, ctx)
-
-    # -- the CuBoxes -------------------------------------------------------
-    for cid in cfg.cubox_ids:
-        a = _attempt(attempts, cid)
-        host = cfg.cubox_host(cid)
-        if host is None:
-            ctx.preload_facts(cid, parsers.parse_facts(
-                "", transport_ok=False,
-                why="no host entry for %r in the monitor config" % cid))
-            a.note(False, "no host entry in config")
-            continue
-        f = boxfacts.pull(host, cfg.boxfacts_script, timeout=cfg.ssh_timeout)
-        ctx.preload_facts(cid, f)
-        a.note(f.ok, f.why)
-
-    # -- the worker.sh drift follow-up ------------------------------------
-    # Only pulled when the box's digest differs from the reference, because it is
-    # a 78 KB transfer per box per minute for a question that changes only when
-    # someone deploys. It is pulled HERE, not lazily inside the check, so the
-    # check phase stays socket-free.
-    _preload_worker_text(cfg, ctx)
-
-    # -- Backup-NAS --------------------------------------------------------
-    bhost = cfg.hosts.get("backup")
-    if bhost is None:
-        ctx.note("no backup host configured -- its checks will be UNKNOWN")
-    else:
-        a = _attempt(attempts, "backup")
-        bf = backupfacts.pull(bhost, cfg.backupfacts_script, cfg,
-                             timeout=cfg.ssh_timeout)
-        ctx.preload_backup_facts(bf)
-        # BackupFacts exposes `transport_ok`; BoxFacts exposes `ok`. The two
-        # probes were written at different times and the asymmetry is real, so it
-        # is named here rather than glossed with a getattr chain that would hide
-        # the day one of them is renamed.
-        a.note(bf.transport_ok, bf.why)
-
-        # The state exports ride the same host. Fetched here so the fleet checks
-        # that read the worker logs find them already installed.
-        for cid in cfg.cubox_ids:
-            se = ctx.export(cid)          # cached; the ssh happens on first use
-            a.note(_export_ok(se), getattr(se, "why", ""))
-
-    # -- the local host: TVH's container log -------------------------------
-    # No ssh: the monitor runs ON Storage-NAS, so this is the docker socket. A
-    # failed read stays a transport UNKNOWN via Context.tvh_log's (None, why).
-    #
-    # The attempt is created even when there is no docker client at all, so a
-    # monitor that is structurally blind to its own container runtime escalates
-    # to a visible FAIL rather than only to a note. "All 16 containers are
-    # unmonitored" must not be quiet.
-    la = _attempt(attempts, LOCAL_HOST)
-    text, why = ctx.tvh_log()
-    la.note(text is not None, why)
-
-    return attempts
-
-
-def _docker_client(cfg, ctx):
-    if not os.path.exists(cfg.docker_socket):
-        ctx.note("no docker socket at %s -- container checks will be UNKNOWN"
-                 % cfg.docker_socket)
-        return None
-    try:
-        return probes.DockerAPI(cfg.docker_socket)
-    except Exception as exc:                       # noqa: BLE001 - reported
-        ctx.note("cannot open the docker socket: %s" % exc)
-        return None
-
-
-def _export_ok(se):
-    """A state export counts as read only if its transport ran.
-
-    StateExport.ran exists for this and compares `transport` against the
-    probes.Transport VALUE -- the field is a string, not the enum member, so a
-    caller comparing against `probes.Transport.RAN` directly would be silently
-    False forever. That is the shape of every bug this project keeps finding, so
-    it is done in one place and this is a call to it rather than a second copy.
-    """
-    return bool(se is not None and se.ran)
-
-
-def _preload_worker_text(cfg, ctx):
-    """Pull worker.sh for boxes whose digest differs from their generation's.
-
-    BOTH texts the drift check compares live on the box (item 90): the live /etc
-    copy, pulled here, and the applied generation's copy, pulled through
-    ctx.gen_worker_text. Neither is pulled unconditionally -- the two are 78 KB
-    apiece and the question they answer changes only when a generation is applied,
-    so the MANIFEST digest is the cheap detector and these are the follow-up.
-    """
-    for cid in cfg.cubox_ids:
-        f = ctx.box.get(cid)
-        host = cfg.cubox_host(cid)
-        if f is None or host is None or not getattr(f, "ok", False):
-            continue
-        gen = f.get("shared_applied_gen").strip()
-        ref_md5 = f.get("worker_manifest_md5").strip()
-        box_md5 = f.get("worker_etc").strip()
-        # Having nothing to detect against is not a reason to pull: the check
-        # renders UNKNOWN from the same empty facts, and a pull would not change
-        # that -- it would only cost a transfer per box per epoch.
-        if not ref_md5 or not box_md5 or box_md5 == ref_md5:
-            continue
-        r = probes.ssh(host, "cat /etc/cubox-transcode/worker.sh",
-                       timeout=cfg.ssh_timeout)
-        # A pull that did not run leaves the entry absent, so the check's own
-        # ctx.worker_text falls back to its lazy path -- which returns None for a
-        # failed read and is rendered UNKNOWN. Deliberately not cached as "" here:
-        # an empty string means "the box has a worker.sh and it is empty", which
-        # is a DIFFERENT and much louder finding than "I could not read it".
-        if r.ran and r.out:
-            ctx.preload_worker(cid, r.out)
-        # Caches its own failure as None; the check renders that UNKNOWN and names
-        # the generation, rather than calling it drift.
-        ctx.gen_worker_text(cid, gen)
+    ctx.attempt_factory = Attempt
+    ctx.attempts = attempts
+    for mod in ctx.modules:
+        try:
+            mod.preload(ctx)
+        except Exception as exc:                   # noqa: BLE001 - isolated
+            ctx.module_errors[mod.id] = traceback.format_exc()
+            first = (str(exc).strip().splitlines()
+                     or [type(exc).__name__])[0]
+            ctx.note("module %s failed to preload: %s; its checks are UNKNOWN"
+                     % (mod.id, first))
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +221,8 @@ def record(conn, seq, results):
             store.record_sample(conn, seq, res.target, metric, value, unit, text)
         try:
             store.record_check(conn, seq, res.target, res.check_id,
-                               res.status, res.detail, res.duration_ms)
+                               res.status, res.detail, res.duration_ms,
+                               subject=res.subject or "")
             store.sync_incident(conn, seq, res.target, res.check_id,
                                 res.subject or "", res.status, res.detail,
                                 res.evidence)
@@ -348,7 +243,7 @@ def record_attempts(conn, seq, attempts):
 # ---------------------------------------------------------------------------
 
 
-def class_ids(host):
+def class_ids(host, local_host=None):
     """Every incident class `host` can open, PRIMARY FIRST.
 
     The first element is the host's reachability row -- the one the dashboard
@@ -356,12 +251,12 @@ def class_ids(host):
     The rest are listed so that a stranded incident in another class can still be
     resolved by the same positive observation; see escalate().
     """
-    if host == LOCAL_HOST:
+    if local_host is not None and host == local_host:
         return (LOCAL_ID,)
     return (UNREACHABLE_ID, AUTH_ID, CONFIG_ID)
 
 
-def classify_failure(host, why):
+def classify_failure(host, why, local_host=None):
     """Which KIND of failure is this? The answer must not be "it is down" by
     default, because three of the four classes are not that.
 
@@ -381,7 +276,7 @@ def classify_failure(host, why):
         answer. Everything left over lands here, which is correct: it is the only
         class that means what its name says without further evidence.
     """
-    if host == LOCAL_HOST:
+    if local_host is not None and host == local_host:
         return LOCAL_ID
     low = (why or "").lower()
     if "no host entry" in low:
@@ -445,7 +340,7 @@ def _class_message(cid, host, why, cfg, pulls, n=1):
            why or "unknown"))
 
 
-def escalate(conn, seq, attempts, cfg):
+def escalate(conn, seq, attempts, cfg, local_host=None):
     """Turn a host's sustained silence into a visible verdict -- and back again.
 
     THE HALF THAT IS EASY TO FORGET: a recovered host must be reported OK, or the
@@ -464,7 +359,7 @@ def escalate(conn, seq, attempts, cfg):
     results = []
     for host in attempts:
         a = attempts[host]
-        ids = class_ids(host)
+        ids = class_ids(host, local_host)
 
         if a.ok:
             detail = ("collection from this host succeeded (%d pull(s) in %d ms)"
@@ -479,7 +374,7 @@ def escalate(conn, seq, attempts, cfg):
                                              evidence={"pulls": a.pulls}))
             continue
 
-        cid = classify_failure(host, a.why)
+        cid = classify_failure(host, a.why, local_host)
         n = _recent_fail_count(conn, host) or 1
         results.append(checks.fail(
             cid, host, _class_message(cid, host, a.why, cfg, a.pulls, n),
@@ -505,99 +400,304 @@ def _recent_fail_count(conn, host):
 
 
 # ---------------------------------------------------------------------------
-# Journal capture
-# ---------------------------------------------------------------------------
-
-
-def capture_journals(cfg, conn, seq):
-    """Pull every CuBox's journal and store it. Returns [(host, summary, gap)].
-
-    Only the CuBoxes: their journald is volatile RAM, so this table is the only
-    copy that will ever exist. The NAS boxes keep no journald, and QTS logs to its
-    own volume -- pulling there would collect a different thing under the same
-    name, which is worse than not collecting it.
-
-    A GAP IS ITS OWN FINDING and is surfaced separately from a failed pull,
-    because the two call for different responses: a failed pull means we are
-    blind NOW (and the escalation above already handles the host), while a gap
-    means the history we already hold has a hole in it and no amount of future
-    reachability fills it.
-    """
-    out = []
-    for cid in cfg.cubox_ids:
-        host = cfg.cubox_host(cid)
-        if host is None:
-            continue
-        jp = journal_mod.pull(host, conn, cfg.interval,
-                              timeout=cfg.ssh_timeout)
-        for cursor, ts, unit, prio, msg in jp.lines:
-            store.record_journal(conn, cid, cursor, ts, unit, prio, msg)
-        if jp.new_cursor:
-            journal_mod.set_cursor(conn, cid, jp.new_cursor)
-
-        if jp.gap:
-            res = checks.unknown(
-                "journal_gap", cid,
-                "THE JOURNAL RECORD FOR THIS BOX HAS A HOLE IN IT. %s"
-                % jp.gap,
-                subject="journal-gap",
-                evidence={"prev_last_ts": jp.prev_last_ts,
-                          "first_ts": jp.first_ts, "captured": len(jp.lines)})
-        elif not jp.ok:
-            res = checks.unknown(
-                "journal_capture", cid,
-                "the journal could not be captured: %s" % (jp.why or jp.transport),
-                subject="journal", evidence={"transport": jp.transport})
-        elif jp.gap_unassessable:
-            res = checks.unknown(
-                "journal_capture", cid,
-                "journal captured (%d line(s)) but contiguity could not be "
-                "assessed: %s" % (len(jp.lines), jp.gap_unassessable),
-                subject="journal")
-        else:
-            res = checks.ok(
-                "journal_capture", cid,
-                "captured %d line(s), contiguous with the stored history%s"
-                % (len(jp.lines),
-                   "" if not jp.bad_lines
-                   else " (%d unparseable line(s) skipped)" % jp.bad_lines),
-                subject="journal")
-            res.metric("journal_lines", len(jp.lines), "lines")
-        out.append((cid, jp.summary(), bool(jp.gap)))
-        store.record_check(conn, seq, cid, res.check_id, res.status, res.detail,
-                           jp.duration_ms)
-        store.sync_incident(conn, seq, cid, res.check_id, res.subject,
-                            res.status, res.detail, res.evidence)
-    return out
-
-
-# ---------------------------------------------------------------------------
 # The epoch
 # ---------------------------------------------------------------------------
+
+
+def _fleet_view(ctx):
+    """The fleet module's installed view, if it is loaded (else None).
+
+    The collector keeps the fleet's reachability escalation -- that is platform
+    behaviour -- and it needs the fleet's host list and the name of the host the
+    monitor runs on. Both are DATA the module installed; this function is the one
+    place the platform reads them.
+    """
+    return ctx.module_cfg.get("fleet")
+
+
+# `owned_check_ids` is imported from `module.py`: it is the module contract's
+# own rule (its Check classes plus the ids the collector emits for it), and the
+# remedy engine reads the same rule. Keeping the one definition there means
+# `heal.py` never has to import this file -- which would duplicate the module
+# when collect.py runs as `__main__`.
+
+
+def freeze_disabled_modules(conn, seq, enabled, all_modules=None):
+    """Freeze every incident owned by a module that is not enabled.
+
+    EVERY EPOCH, because a freeze is one UNKNOWN observation rather than a
+    terminal transition, and a row left alone is not re-asserted. NEVER resolves:
+    disabling a module is a decision about the monitor, not a positive
+    observation about the fleet.
+
+    `all_modules` exists so the offline suite can drive two modules that share
+    a reporting target; production always discovers.
+    """
+    enabled_ids = {m.id for m in enabled}
+    for mod in (all_modules if all_modules is not None
+                else module_loader.discover()):
+        if mod.id in enabled_ids:
+            continue
+        for row in store.live_incidents_for_checks(conn, owned_check_ids(mod)):
+            store.freeze_incident(conn, seq, row,
+                                  "module %r is disabled" % mod.id)
+
+
+def _note_advisor_problem(conn, ctx, advisor, module, detail):
+    """Record a selection failure as loudly as a run failure.
+
+    A selector that names nothing, or an advisor object that cannot be called,
+    would otherwise be a green no-op -- the platform's oldest failure shape. It
+    gets the same `advisor_run` row an exception gets, so a count of runs is a
+    count of what was CONFIGURED as well as what executed.
+    """
+    ctx.note(detail)
+    if conn is None:
+        return
+    try:
+        store.record_advisor_run(
+            conn, advisor=advisor, module=module, status="error",
+            duration_ms=0, window_requested_days=0,
+            window_available_days=0.0, detail=detail)
+    except Exception:                              # noqa: BLE001 - reported
+        line = traceback.format_exc().strip().splitlines()
+        ctx.note("could not record an advisor problem for %r: %s"
+                 % (advisor, line[-1] if line else "unknown"))
+
+
+def _propose_thresholds(cfg, conn, ctx, runs):
+    """Translate threshold suggestions into proposals a human can approve.
+
+    THE ADVISOR STAYS WRITE-FREE. It returned data; the collector is the writer,
+    exactly as it is for incident rows. Without this the threshold-approval path
+    in `ctl.py` is unreachable -- an insight that says "tighten amber" with no
+    route to a proposal is a recommendation nobody can act on.
+
+    ONE PENDING PROPOSAL PER SPEC. The reference advisor runs every epoch, so a
+    row per suggestion would fill the queue with copies of one idea. An existing
+    pending row (or one still inside its TTL) means the human has not decided
+    yet; writing another changes nothing except the queue length.
+    """
+    if conn is None:
+        return []
+    specs = getattr(ctx, "specs", None) or {}
+    ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
+    now = time.time()
+
+    # A LAPSED PROPOSAL IS ABSENT, NOT A DECISION. The healer's sweep does not
+    # run when MONITOR_REMEDIES=0, so without this a dead pending row would
+    # block its spec's new proposals for as long as the collector runs.
+    try:
+        store.expire_proposals(conn, now)
+    except Exception as exc:                       # noqa: BLE001 - isolated
+        line = str(exc).splitlines()
+        ctx.note("could not expire lapsed proposals: %s"
+                 % (line[0] if line else type(exc).__name__))
+
+    written = []
+    for run in runs or ():
+        # AN ERROR/BUDGET RUN'S INSIGHT MAY NOT BE DURABLE. The runner carries
+        # the insight objects back on that path too, and proposing from one
+        # would cite evidence the store rejected.
+        if run.get("status") != "ok":
+            continue
+        for insight in run.get("insights") or ():
+            if getattr(insight, "kind", "") != "threshold_suggestion":
+                continue
+            try:
+                evidence = insight.evidence or {}
+                proposed = evidence.get("proposed") or {}
+                green = proposed.get("green")
+                amber = proposed.get("amber")
+                spec = specs.get(getattr(insight, "check_id", ""))
+                if spec is None or green is None or amber is None:
+                    continue
+                module = getattr(spec, "owner", None)
+                if not module:
+                    # A spec with no owning module cannot be approved: the
+                    # approval path resolves it through that module's file.
+                    continue
+                # THE NEWEST PROPOSAL SPEAKS, NOT JUST THE PENDING ONE. A row
+                # rejected (or executed) seconds ago must not regenerate on the
+                # next epoch, or `--reject` is decoration and an approved band
+                # is re-proposed before anyone can see whether it helped. The
+                # suppression lasts one TTL; after that a still-outside band is
+                # new evidence and may be proposed again.
+                last = store.last_threshold_proposal(conn, spec.id)
+                if last is not None:
+                    if (last["state"] == "pending"
+                            and not store.proposal_expired(last, now)):
+                        continue
+                    if last["state"] in ("rejected", "executed"):
+                        stamp = (last.get("decided_at")
+                                 if last["state"] == "rejected"
+                                 else last.get("executed_at"))
+                        stamp = stamp or last["ts"]
+                        if float(stamp) + ttl_s > now:
+                            continue
+                pid = store.record_proposal(
+                    conn, module=module, kind="threshold_change",
+                    payload={"spec_id": spec.id, "module": module,
+                             "green": green, "amber": amber},
+                    rationale="%s: %s" % (run.get("advisor", "advisor"),
+                                          insight.title),
+                    expires_at=time.time() + ttl_s)
+                written.append(pid)
+            except Exception as exc:               # noqa: BLE001 - isolated
+                line = str(exc).splitlines()
+                ctx.note("could not record a threshold proposal from %r: %s"
+                         % (run.get("advisor", "advisor"),
+                            line[0] if line else type(exc).__name__))
+    return written
+
+
+def run_advisors_for_epoch(cfg, conn, ctx):
+    """Run the selected advisors of the enabled modules. NEVER raises.
+
+    CALLED AFTER `record_collector_run()`, per the spec's epoch order: persist
+    the epoch, then enqueue advisor runs. The epoch's liveness proof therefore
+    exists before any advisor runs, so an advisor that hangs or overruns cannot
+    disappear it. Advisor time is consequently not part of the epoch's
+    `duration_ms`; each advisor's own row records its duration and overrun.
+
+    AN EMPTY SELECTION RUNS NOTHING. `SENTINEL_ADVISORS` defaults to the
+    reference advisor; `none` is the explicit off switch and parses to no ids,
+    which is the only way to reach this early return.
+
+    Selection is isolated per module AND per advisor: module code may raise,
+    and an advisor object may be malformed (no readable id, a frozen dataclass
+    that refuses attribution). Either is recorded as an error row and skipped;
+    the rest still run. A selector that matches nothing is recorded too -- a
+    typo must never read as "ran fine and found nothing".
+    """
+    ids = tuple(getattr(cfg, "advisor_ids", ()))
+    if not ids:
+        return []
+    try:
+        picked, matched = [], set()
+
+        # PLATFORM ADVISORS FIRST. The reference advisor belongs to no module
+        # (`module = "platform"`), so it cannot be discovered through
+        # `ctx.modules`; and it is the DEFAULT selection, so if the selector
+        # could not see it every default epoch would record "selector names no
+        # advisor". A malformed platform object is isolated like any other.
+        for adv in intelligence.platform_advisors(cfg):
+            try:
+                adv_id = str(adv.id)
+            except Exception:                  # noqa: BLE001 - isolated
+                name = type(adv).__name__
+                ctx.module_errors["platform:advisors:%s" % name] = \
+                    traceback.format_exc()
+                _note_advisor_problem(
+                    conn, ctx, name, "platform",
+                    "advisor object %s has no readable id; skipped" % name)
+                continue
+            qualified = "platform.%s" % adv_id
+            if adv_id not in ids and qualified not in ids:
+                continue
+            matched.update((adv_id, qualified))
+            picked.append(adv)
+
+        for mod in ctx.modules:
+            try:
+                declared = mod.advisors()
+            except Exception:                      # noqa: BLE001 - isolated
+                ctx.module_errors[mod.id + ":advisors"] = \
+                    traceback.format_exc()
+                ctx.note("module %s failed to list advisors; none from it ran"
+                         % mod.id)
+                continue
+            for adv in declared:
+                try:
+                    adv_id = str(adv.id)
+                except Exception:                  # noqa: BLE001 - isolated
+                    name = type(adv).__name__
+                    ctx.module_errors["%s:advisors:%s" % (mod.id, name)] = \
+                        traceback.format_exc()
+                    _note_advisor_problem(
+                        conn, ctx, name, mod.id,
+                        "advisor object %s has no readable id; skipped"
+                        % name)
+                    continue
+                qualified = "%s.%s" % (mod.id, adv_id)
+                if adv_id not in ids and qualified not in ids:
+                    continue
+                matched.update((adv_id, qualified))
+                try:
+                    if not getattr(adv, "module", ""):
+                        adv.module = mod.id
+                except Exception:                  # noqa: BLE001 - isolated
+                    ctx.module_errors["%s:advisors:%s" % (mod.id, adv_id)] = \
+                        traceback.format_exc()
+                    _note_advisor_problem(
+                        conn, ctx, adv_id, mod.id,
+                        "advisor %r could not be attributed to module %r; "
+                        "skipped" % (adv_id, mod.id))
+                    continue
+                picked.append(adv)
+
+        # Every selector entry that named no advisor is a configuration defect,
+        # not an empty result. Report it once per entry.
+        for want in ids:
+            if want in matched:
+                continue
+            module = want.rsplit(".", 1)[0] if "." in want else ""
+            _note_advisor_problem(
+                conn, ctx, want, module,
+                "selector names no advisor: %r" % want)
+
+        runs = advisors.run_advisors(
+            picked, conn, ctx,
+            history_cap_days=getattr(cfg, "advisor_max_history_days", 30),
+            specs=getattr(ctx, "specs", None))
+        # AFTER the insights are durable. A proposal whose evidence was never
+        # stored is a decision nobody can audit.
+        _propose_thresholds(cfg, conn, ctx, runs)
+        return runs
+    except Exception as exc:                       # noqa: BLE001 - isolated
+        lines = str(exc).splitlines()
+        ctx.note("advisors could not run: %s"
+                 % (lines[0] if lines else type(exc).__name__))
+        return []
 
 
 def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     """One epoch. Returns a summary dict for the CLI/self-test."""
     t0 = _now()
     seq = store.next_epoch_seq(conn)
-    specs = thresholds.load(cfg.checks_conf)
 
-    classes = checks.registry(*checks.all_modules())
-    ctx = checks.Context(cfg, specs, cfg.hosts, docker=None,
-                         check_classes=classes)
+    enabled = module_loader.discover_enabled(cfg)
+
+    # Skipped on a dry run, whose whole contract is "claims nothing".
+    if not (dry_run or cfg.dry_run):
+        freeze_disabled_modules(conn, seq, enabled)
+
+    # THRESHOLDS ARE DATA, INCLUDING A LIVE OVERRIDE. An approved band change
+    # lives in the store, so the epoch must load the effective band rather than
+    # the file's -- otherwise an approval would not change grading until the
+    # next rebuild, which is the thing this mechanism exists to avoid.
+    specs = thresholds.load_effective(
+        thresholds.spec_mapping(cfg, enabled), conn)
+    classes = checks.registry(
+        *([c for m in enabled for c in m.check_classes()]
+          + list(checks.platform_modules())))
+    ctx = checks.Context(cfg, specs, {}, docker=None, check_classes=classes,
+                         modules=enabled)
+    ctx.hosts_only = hosts_only
 
     attempts = {}
-    if hosts_only:
-        saved = cfg.cubox_ids
-        cfg.cubox_ids = tuple(x for x in saved if x in hosts_only)
-        try:
-            preload(cfg, ctx, conn, attempts)
-        finally:
-            cfg.cubox_ids = saved
-    else:
-        preload(cfg, ctx, conn, attempts)
+    preload_modules(cfg, ctx, attempts)
 
-    results = evaluate(classes, ctx, cfg.cubox_ids)
+    # `--host` RESTRICTS THE PER-BOX EXPANSION, not just the preload. The
+    # preload already narrows the boxes it contacts; expanding every per_box
+    # check for BOTH boxes anyway then evaluates a box nobody fetched (all
+    # UNKNOWN rows) and lets the escalation record rows for it. Non-box targets
+    # are unaffected -- they are static checks, not expansion targets.
+    targets = checks.expansion_targets(enabled)
+    if hosts_only:
+        wanted = set(hosts_only)
+        targets = tuple(t for t in targets if t in wanted)
+    results = evaluate(classes, ctx, targets)
 
     # THIS ORDER MATTERS. The attempt rows are written BEFORE the escalation
     # reads them, so "3 consecutive failed attempts" counts the attempt that just
@@ -608,16 +708,31 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     if not (dry_run or cfg.dry_run):
         record_attempts(conn, seq, attempts)
 
-    results += escalate(conn, seq, attempts, cfg)
+    fleet = _fleet_view(ctx)
+    results += escalate(conn, seq, attempts, cfg,
+                        getattr(fleet, "local_host", None))
 
     if not (dry_run or cfg.dry_run):
         errors = record(conn, seq, results)
     else:
         errors = 0
 
+    # The modules' post-record hooks run AFTER the evidence is durable. Each
+    # returns its own summary rows (fleet's is the journal capture), which the
+    # caller prints; a hook that raises is isolated like a preload failure.
     journals = []
     if not (dry_run or cfg.dry_run):
-        journals = capture_journals(cfg, conn, seq)
+        for mod in enabled:
+            try:
+                out = mod.after_epoch(ctx, conn, seq, dry_run)
+            except Exception:                      # noqa: BLE001 - isolated
+                ctx.module_errors[mod.id + ":after_epoch"] = \
+                    traceback.format_exc()
+                ctx.note("module %s failed after the epoch; its post-record "
+                         "work did not complete" % mod.id)
+                continue
+            if out:
+                journals.extend(out)
 
     # REMEDIES LAST, AND ONLY EVER AFTER THE EVIDENCE IS DURABLE. Both halves of
     # that are deliberate. The trigger evidence must be in the store before
@@ -628,14 +743,32 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     #
     # SKIPPED ENTIRELY ON A DRY RUN. Item 55: the mode whose whole contract is
     # "claims nothing" must not be able to take an action.
+    #
+    # AND IT IS ISOLATED. Every handler call inside `consider` is already
+    # bounded and caught by the engine, but the seam can still raise from
+    # module code or a store read -- and this call sits BEFORE
+    # `record_collector_run` with no other try, so an escaping exception would
+    # lose the epoch record (the dashboard's stale banner and `--once`'s
+    # traceback). The epoch proceeds and the failure is named in its notes.
     if healer is not None and not (dry_run or cfg.dry_run):
-        healer.consider(cfg, conn, seq, results, ctx)
+        try:
+            healer.consider(cfg, conn, seq, results, ctx)
+        except Exception as exc:                   # noqa: BLE001 - isolated
+            lines = str(exc).splitlines()
+            ctx.note("healing failed: %s"
+                     % (lines[0] if lines else type(exc).__name__))
 
     duration_ms = int((_now() - t0) * 1000)
     if not (dry_run or cfg.dry_run):
         store.record_collector_run(
             conn, seq, duration_ms, len(results), errors,
             note="; ".join(ctx.notes) or None)
+        # ADVISORS AFTER THE EPOCH ROW, per the spec's order: persist the epoch,
+        # then enqueue advisor runs. `record()` above already made the evidence
+        # durable, and this row is now the dashboard's proof the monitor is
+        # alive -- an advisor that hangs or overruns cannot take it away. Never
+        # on a dry run, whose contract is "claims nothing".
+        run_advisors_for_epoch(cfg, conn, ctx)
         if seq % PRUNE_EVERY == 0:
             store.prune(conn)
 
@@ -654,6 +787,12 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
 def _load_healer(cfg):
     """heal.py or a LOUD refusal -- never a silently disabled remedy engine.
 
+    THE HEALER IS LOADED EVEN WHEN `MONITOR_REMEDIES=0`. That switch is the
+    EXECUTION kill switch; an `advisory`-level authority is advice rather than
+    execution, and with the healer absent the dashboard would show nothing for
+    it -- an advisory module indistinguishable from `off`. The engine itself
+    reads the switch (`heal.consider`) and executes nothing while it is off.
+
     `MONITOR_REMEDIES=1` with no healer would leave an operator believing
     automated healing is on when nothing runs, which is the "declared but not
     implemented" shape this project has now hit twice (the unclaimed threshold
@@ -667,21 +806,19 @@ def _load_healer(cfg):
     prevent, one level further in. So the seam is named here, once, and a
     healer that cannot be called refuses to start.
     """
-    if not cfg.remedies_enabled:
-        return None
     try:
         import heal
     except ImportError:
         raise SystemExit(
-            "MONITOR_REMEDIES is enabled but app/heal.py does not exist, so NO "
-            "remedy would ever run. Refusing to start rather than appearing to "
-            "heal: an operator who believes automated healing is on will not go "
-            "and look. Unset MONITOR_REMEDIES to collect and alert without it."
+            "app/heal.py does not exist, so neither automated remedies nor "
+            "advisory-level recommendations could ever surface. Refusing to "
+            "start rather than appearing to heal: an operator who believes "
+            "remedies are on will not go and look."
         )
     if not callable(getattr(heal, "consider", None)):
         raise SystemExit(
-            "MONITOR_REMEDIES is enabled and app/heal.py imports, but it has no "
-            "callable consider(cfg, conn, seq, results, ctx) -- the one seam "
+            "app/heal.py imports, but it has no callable "
+            "consider(cfg, conn, seq, results, ctx) -- the one seam "
             "collect_once calls. Nothing would ever run, and the process would "
             "still print 'remedies ENABLED'. Refusing to start."
         )
@@ -722,7 +859,7 @@ def run_forever(cfg, conn, hosts_only=None, should_stop=None):
 
     Two loops is two places for the "a failing epoch must not kill the collector"
     rule to be forgotten, and this repo has already paid for that shape twice
-    (item 7: one home for the provisioning definition; `checks.all_modules`: one
+    (item 7: one home for the provisioning definition; module discovery: one
     home for the check list). So the loop lives here and the container entry
     point calls it rather than re-implementing it.
 
@@ -741,9 +878,14 @@ def run_forever(cfg, conn, hosts_only=None, should_stop=None):
     use is the only version of this that cannot be forgotten.
     """
     healer = _load_healer(cfg)
-    if healer is not None:
+    if cfg.remedies_enabled:
         sys.stderr.write("remedies ENABLED: every action is recorded with its "
-                         "trigger evidence and its post-check\n")
+                         "trigger evidence and its exit status; success is the "
+                         "next OK observation\n")
+    else:
+        sys.stderr.write("remedies DISABLED (MONITOR_REMEDIES=0): no action "
+                         "executes and no proposal is written; advisory-level "
+                         "recommendations are still surfaced as insights\n")
     while True:
         try:
             summary = collect_once(cfg, conn, hosts_only=hosts_only,
@@ -778,8 +920,37 @@ def main(argv=None):
 
     if args.showconf:
         print(cfg.describe())
-        specs = thresholds.load(cfg.checks_conf)
-        classes = checks.registry(*checks.all_modules())
+        # DISCOVERY IS PART OF THE CONFIGURATION. A disabled module is named as
+        # disabled rather than vanishing: `--modules`/`--showconf` answer "what
+        # was found and what state is each in", which is not the same question
+        # as "what runs this epoch".
+        print("\nmodules:")
+        for line in module_loader.format_summary(module_loader.summary(cfg)):
+            print("  " + line)
+        enabled = module_loader.discover_enabled(cfg)
+        # The effective band, overrides included, so the coverage report
+        # describes what the NEXT epoch will grade with rather than what the
+        # files alone say. READ-ONLY, AND BEST-EFFORT: --showconf is a
+        # diagnostic, so it must not create or migrate the store, and a locked
+        # or absent database falls back to the file-declared bands rather than
+        # failing the command that is supposed to explain the configuration.
+        mapping = thresholds.spec_mapping(cfg, enabled)
+        specs = thresholds.load_many(mapping)
+        if os.path.exists(cfg.db_path):
+            try:
+                show_conn = store.connect(cfg.db_path, read_only=True)
+                try:
+                    specs = thresholds.load_effective(mapping, show_conn)
+                finally:
+                    show_conn.close()
+            except Exception as exc:              # noqa: BLE001 - diagnostic
+                line = str(exc).splitlines()
+                print("\nthreshold overrides not read (%s); the coverage below "
+                      "is the file-declared bands"
+                      % (line[0] if line else type(exc).__name__))
+        classes = checks.registry(
+            *([c for m in enabled for c in m.check_classes()]
+              + list(checks.platform_modules())))
         claimed, deferred, unclaimed = thresholds.audit(specs, classes)
         print("\nthresholds: %d declared, %d claimed, %d deferred, %d UNCLAIMED"
               % (len(specs), len(claimed), len(deferred), len(unclaimed)))

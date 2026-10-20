@@ -26,10 +26,10 @@ READ-ONLY. The script creates nothing, mounts nothing, and its only writes are t
 stdout. This runs every 60 seconds forever against the tightest box in the fleet.
 """
 
-import parsers
+import modules.fleet.parsers as parsers
 import probes
 
-def build_command(cfg):
+def build_command(fleet):
     """The remote command line: the fixed paths as argv, then the two lists.
 
     PATHS ARE SEPARATE ARGV WORDS; LISTS ARE COMMA-JOINED. That asymmetry is
@@ -43,19 +43,19 @@ def build_command(cfg):
     q = probes.shq
 
     argv = [
-        q(cfg.cubpxe_root),
-        q(cfg.tftp_root),
-        q(cfg.exports_file),
-        q(cfg.export_name),
-        q(cfg.nfsroot),
-        q(cfg.state_export_base),
-        q(",".join(cfg.cubox_ids)),
-        q(",".join(cfg.tftp_files)),
+        q(fleet.cubpxe_root),
+        q(fleet.tftp_root),
+        q(fleet.exports_file),
+        q(fleet.export_name),
+        q(fleet.nfsroot),
+        q(fleet.state_export_base),
+        q(",".join(fleet.cubox_ids)),
+        q(",".join(fleet.tftp_files)),
     ]
     return "sh -s -- " + " ".join(argv)
 
 
-def pull(host, script_path, cfg, timeout=None):
+def pull(host, script_path, fleet, timeout=None):
     """Run the probe on `host` and return a parsers.BackupFacts.
 
     A missing or unreadable script is a CONFIGURATION defect and comes back as a
@@ -70,7 +70,7 @@ def pull(host, script_path, cfg, timeout=None):
                 % (script_path, probes.script_error(script_path)),
         )
 
-    res = probes.run(host.base_args() + [build_command(cfg)],
+    res = probes.run(host.base_args() + [build_command(fleet)],
                      timeout=timeout or host.timeout,
                      stdin=text.encode())
 

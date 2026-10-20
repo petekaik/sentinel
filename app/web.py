@@ -43,6 +43,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import checks
+import modules as module_loader
 import shell
 import store
 import thresholds
@@ -51,6 +52,10 @@ import thresholds
 # the same count the incident machine uses to confirm a condition, for the same
 # reason: one missed poll is a hiccup, three is a condition.
 STALE_INTERVALS = 3
+
+# How many operator commands the page shows. ONE constant because the query and
+# the heading that says "last N" must not be two spellings of the same number.
+COMMAND_RUNS_LIMIT = 20
 
 
 # ---------------------------------------------------------------------------
@@ -116,27 +121,51 @@ def build_state(cfg, conn, now=None):
     else:
         staleness = "fresh"
 
-    specs = thresholds.load(cfg.checks_conf)
-    classes = checks.registry(*checks.all_modules())
+    enabled = module_loader.discover_enabled(cfg)
+    # WHAT IS OFF IS PART OF THE PAGE. A disabled module that simply vanishes
+    # from the dashboard is indistinguishable from one that never existed, and
+    # the user has no way to learn that its incidents are frozen rather than
+    # resolved. So discovery is asked for the full set and the difference named.
+    enabled_ids = {m.id for m in enabled}
+    disabled = [m for m in module_loader.discover() if m.id not in enabled_ids]
+    module_of = {}
+    for m in enabled:
+        # `check_classes()` returns the module's check MODULES; the registry
+        # enumerates their classes, which are what carry an id.
+        for cls in checks.registry(*m.check_classes()):
+            module_of[cls.id] = m
+    # THE BAND THE COLLECTOR GRADES WITH, not the file's band: an approved
+    # override is live, and the page must not describe the old one.
+    specs = thresholds.load_effective(
+        thresholds.spec_mapping(cfg, enabled), conn)
+    classes = checks.registry(
+        *([c for m in enabled for c in m.check_classes()]
+          + list(checks.platform_modules())))
     claimed, deferred, unclaimed = thresholds.audit(specs, classes)
 
     current, n_current = _rows(conn, NEWEST_EPOCH_SQL)
     by_key = {(r["target"], r["check_id"]): r for r in current}
 
-    incidents, n_incidents = _rows(
-        conn, "SELECT key, target, check_id, subject, state, severity, first_seen, "
-              "last_seen, observed_count, confirm_streak, first_evidence_json, "
-              "last_detail, remedy_attempts, remedy_latched FROM incident "
-              "WHERE state IN (%s) "
-              "ORDER BY severity = 'red' DESC, first_seen ASC" % store.LIVE_SQL)
+    # CONFIRMED ONLY, and taken from the store's own definition rather than a
+    # second copy of the rule (item 84). This query used LIVE_SQL, which
+    # includes `pending` -- rows awaiting their confirmation streak. Measured
+    # 2026-10-19: a one-observation `pending` row from 9.4 days earlier was
+    # still painted RED in this section, while `store.live_incidents`, the
+    # verdict and every count excluded it, and `--dismiss` could not even name
+    # it. A pending row is not an incident; "still live" and "on the board" are
+    # two questions (see CONFIRMED_STATES).
+    incidents = store.live_incidents(conn)
+    n_incidents = len(incidents)
 
     tiles, informational, others, missing = [], [], [], []
-    for chk in checks.expand(classes, cfg.cubox_ids):
+    for chk in checks.expand(classes, checks.expansion_targets(enabled)):
         row = by_key.pop((chk.target, chk.id), None)
         spec = specs.get(chk.spec) if chk.spec else None
+        owner = module_of.get(chk.id)
         item = {
             "target": chk.target,
             "check_id": chk.id,
+            "module": owner.id if owner else None,
             "title": chk.title or chk.id,
             "spec": chk.spec,
             "informational": bool(getattr(chk, "informational", False)),
@@ -185,7 +214,7 @@ def build_state(cfg, conn, now=None):
     # class -- and "we cannot see cubox-1" is exactly the row an operator must
     # never lose because the renderer was built from the wrong list.
     extra = [{"target": t, "check_id": c, "title": c, "status": r["status"],
-              "detail": r["detail"], "from": "collector",
+              "detail": r["detail"], "from": "collector", "module": None,
               "spec": None, "value": None, "unit": "", "has_result": True,
               "informational": False, "spec_note": None,
               "unavailable_reason": None, "claim": None}
@@ -193,19 +222,47 @@ def build_state(cfg, conn, now=None):
 
     summary = store.db_summary(conn)
 
+    # ADVISOR OUTPUT AND THE OPERATOR'S QUEUE. Additive keys: a consumer that
+    # ignores them is unaffected. A pending proposal past its deadline is
+    # annotated `expired` here because the dashboard opens the store READ-ONLY
+    # and cannot run `expire_proposals()` -- the display must not depend on a
+    # collector epoch having happened since the deadline lapsed.
+    insights = store.list_insights(conn, limit=50)
+    proposals = store.list_proposals(conn, state="pending")
+    for proposal in proposals:
+        proposal["expired"] = store.proposal_expired(proposal, now)
+
     return {
         "now": now,
         "last": last,
+        # The PROCESS kill switch, so the approvals inbox can say WHY it is
+        # empty: "nothing pending" and "nothing could execute anyway" are
+        # different facts, and an empty queue that is empty because the engine
+        # is off looks identical to a fleet with nothing to decide.
+        "remedies_enabled": bool(getattr(cfg, "remedies_enabled", False)),
         "last_age_s": age,
         "staleness": staleness,
         "stale_after_s": cfg.interval * STALE_INTERVALS,
         "interval": cfg.interval,
         "tiles": tiles,
+        "modules": [{"id": m.id, "title": m.title, "order": m.order,
+                     "enabled": True} for m in enabled],
+        "disabled_modules": [{"id": m.id, "title": m.title, "order": m.order,
+                              "enabled": False} for m in disabled],
         "informational": informational,
         "others": others,
         "extra": extra,
         "missing": missing,
         "incidents": incidents,
+        # Commands are the only part of the platform that changes the fleet, so
+        # their audit belongs on the operator's page and not only behind ssh.
+        # Additive: a consumer of this model that ignores the key is unaffected.
+        "command_runs": store.list_command_runs(conn, limit=COMMAND_RUNS_LIMIT),
+        # The advisor surface: platform-level insights are included because
+        # `list_insights` is unfiltered, which is the point -- a threshold
+        # suggestion belongs to no module and must not vanish for that reason.
+        "insights": insights,
+        "proposals": proposals,
         "deferred": [{"id": k, "reason": v.claim} for k, v in sorted(deferred.items())],
         "unclaimed": sorted(unclaimed),
         "counts": {
@@ -564,6 +621,12 @@ def build_status(cfg, conn, now=None):
         "verdict": verdict,
         "verdict_reason": why,
 
+        # Whether an approval could execute at all. Additive: an integrator can
+        # distinguish an empty queue from a disabled engine without parsing
+        # prose. `MONITOR_REMEDIES` is the execution kill switch; advisory
+        # insights are still produced while it is off.
+        "remedies_enabled": state["remedies_enabled"],
+
         # The fleet's own liveness, FIRST among the numbers, because everything
         # after it is only as current as this.
         "collector": {
@@ -588,6 +651,12 @@ def build_status(cfg, conn, now=None):
                        checks_without_result=len(state["missing"]),
                        worst_total=len(flagged),
                        worst_truncated=len(flagged) > WORST_LIMIT),
+
+        # What is observing the fleet, and what is switched off. Additive: a
+        # consumer that only reads `verdict` is unaffected, and one that sees a
+        # thin board can find out why without a second endpoint.
+        "modules": state["modules"],
+        "disabled_modules": state["disabled_modules"],
 
         # Per-host, so "which box" does not require filtering the flat list. The
         # keys are the targets the collector itself uses, so `backup` and
@@ -1123,42 +1192,182 @@ def render_html(state, cfg):
     _inc = incidents.append
     _inc("<h2>Live incidents (%d)</h2>" % len(state["incidents"]))
     if not state["incidents"]:
-        _inc("<div class=note>No live incident. A condition that is still being "
-             "confirmed, or one that can no longer be observed, would appear here "
-             "too -- so an empty list means no check is currently reporting a "
-             "problem <em>and</em> none is frozen.</div>")
+        _inc("<div class=note>No live incident. One that can no longer be "
+             "observed would appear here too -- so an empty list means no check "
+             "is currently reporting a problem <em>and</em> none is frozen. A "
+             "condition still being confirmed after a single poll is not yet an "
+             "incident and is not shown.</div>")
     else:
         _inc("<div class=scroll><table><tr><th>Sev</th><th>Target</th><th>Check</th>"
              "<th>State</th><th>Since</th><th>Obs</th><th>Detail</th></tr>")
         for i in state["incidents"]:
             sev = i["severity"] or "grey"
+            # THE SUFFIX IS THE INCIDENT'S OWN FACT, so it is appended to the
+            # detail cell rather than stated anywhere page-wide: an operator
+            # reading a row needs to know whether a remedy has already been
+            # tried on THIS condition, and a sentence rendered for every row
+            # would say a remedy ran where none did.
+            detail = i["last_detail"] or ""
+            if i.get("remedy_attempts"):
+                detail += " · remedy attempted %d time(s)%s" % (
+                    i["remedy_attempts"],
+                    " (LATCHED)" if i.get("remedy_latched") else "")
             _inc("<tr class=%s><td><span class='pill %s'>%s</span></td>"
                  "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
                  "<td class=detail>%s</td></tr>"
                  % (sev, sev, _esc(sev.upper()), _esc(i["target"]),
                     _esc(i["check_id"]), _esc(i["state"]),
                     _esc(_age(state["now"] - i["first_seen"])),
-                    i["observed_count"], _esc(i["last_detail"] or "")))
+                    i["observed_count"], _esc(detail)))
         _inc("</table></div>")
     incidents_html = "\n".join(incidents)
+
+    # ---- operator commands: what was run against the fleet, and its rc -----
+    #
+    # BELOW THE INCIDENTS, because the two answer the same question in order:
+    # what is wrong, and what has already been done about it. The remedy audit
+    # is the healer's, the command audit is the operator's, and both belong on
+    # the page that exists to be the only surface nobody has to ssh to read.
+    cacc = []
+    _cm = cacc.append
+    _cm("<h2>Operator commands (last %d)</h2>" % COMMAND_RUNS_LIMIT)
+    if not state["command_runs"]:
+        # AN EMPTY LIST SAYS WHICH EMPTY IT IS. "No commands" and "the audit
+        # query failed" are two facts; the row count in the evidence section
+        # below is what distinguishes them, so the sentence points at it rather
+        # than reading as a clean slate.
+        _cm("<div class=note>No operator command is recorded. That means none "
+            "was run in this store, not that the audit is missing -- the "
+            "<code>command_run</code> row count is in the evidence section.")
+    else:
+        _cm("<div class=scroll><table><tr><th>When</th><th>Command</th>"
+            "<th>Actor</th><th>RC</th></tr>")
+        for r in state["command_runs"]:
+            _cm("<tr><td>%s</td><td>%s.%s%s</td><td>%s</td><td>%s</td></tr>"
+                % (_esc(_age(state["now"] - r["ts"])), _esc(r["module"]),
+                   _esc(r["command"]),
+                   " <span class=sub>(dry run)</span>" if r["dry_run"] else "",
+                   _esc(r["actor"]), _esc(r["exit_status"])))
+        _cm("</table></div>")
+    commands_html = "\n".join(cacc)
+
+    # ---- recommendations: what the advisors claim --------------------------
+    #
+    # ADDITIVE OUTPUT, NOT AN INCIDENT. An insight has no state machine and no
+    # check can resolve it, so it is presented as advice and never as a
+    # verdict. Platform-level insights (the reference advisor's incident report
+    # and threshold suggestions) are included: filtering by module would hide
+    # the only advisor the default deployment runs.
+    racc = []
+    _rec = racc.append
+    insights = state.get("insights", [])
+    _rec("<h2>Recommendations (%d)</h2>" % len(insights))
+    if not insights:
+        _rec("<div class=note>No advisor insight is stored. That means no "
+             "advisor produced one, not that the fleet has nothing worth "
+             "recommending &mdash; the <code>insight</code> row count is in the "
+             "evidence section.</div>")
+    else:
+        _rec("<div class=scroll><table><tr><th>When</th><th>Kind</th>"
+             "<th>Source</th><th>Title</th></tr>")
+        for row in insights:
+            source = row["module"]
+            if row.get("target"):
+                source += " &middot; " + row["target"]
+            _rec("<tr><td>%s</td><td>%s</td><td>%s</td><td class=detail>%s"
+                 "</td></tr>"
+                 % (_esc(_age(state["now"] - row["ts"])), _esc(row["kind"]),
+                    _esc(source), _esc(row["title"])))
+        _rec("</table></div>")
+    recommendations_html = "\n".join(racc)
+
+    # ---- approvals: the pending proposal queue -----------------------------
+    #
+    # AN EXPIRED PROPOSAL IS SHOWN AS EXPIRED, not as pending. The row is still
+    # `pending` in a store the collector has not swept since the deadline, and
+    # presenting it as actionable is exactly the kind of stale-but-data-shaped
+    # claim this page exists not to make.
+    pacc = []
+    _app = pacc.append
+    proposals = state.get("proposals", [])
+    _app("<h2>Approvals (%d)</h2>" % len(proposals))
+    if not proposals:
+        # TWO EMPTY QUEUES. `MONITOR_REMEDIES=0` stops execution at the process
+        # level, so nothing could run even if something were queued. Saying only
+        # "nothing pending" would read as "the fleet needs no decision", which
+        # is the opposite of "the engine is switched off".
+        if state.get("remedies_enabled"):
+            _app("<div class=note>No pending proposal. A "
+                 "<code>propose</code>-level remedy writes one here rather than "
+                 "acting; an empty queue means the engine has nothing waiting "
+                 "for a human.</div>")
+        else:
+            _app("<div class=note>No pending proposal, and automated remedies "
+                 "are DISABLED (<code>MONITOR_REMEDIES=0</code>): an approval "
+                 "could not execute even if one were queued. Set "
+                 "<code>MONITOR_REMEDIES=1</code> to enable execution; "
+                 "advisory-level recommendations are still surfaced above."
+                 "</div>")
+    else:
+        _app("<div class=scroll><table><tr><th>Key</th><th>Kind</th>"
+             "<th>Module</th><th>Rationale</th><th>Expiry</th></tr>")
+        for row in proposals:
+            if not row["expires_at"]:
+                expiry = "never"
+            elif row.get("expired"):
+                expiry = "EXPIRED %s ago" % _span(state["now"] - row["expires_at"])
+            else:
+                expiry = "%s remaining" % _span(row["expires_at"] - state["now"])
+            _app("<tr><td>%s</td><td>%s</td><td>%s</td><td class=detail>%s"
+                 "</td><td>%s</td></tr>"
+                 % (_esc(row["id"]), _esc(row["kind"]), _esc(row["module"]),
+                    _esc(row["rationale"]), _esc(expiry)))
+        _app("</table></div>")
+    approvals_html = "\n".join(pacc)
 
     # ---- the RAG tiles, then every check the registry does not own ----------
     tacc = []
     _tc = tacc.append
-    _tc("<h2>Critical metrics (%d)</h2>" % len(state["tiles"]))
-    _tc("<div class=grid>")
+
+    # A DISABLED MODULE IS LOUD, ABOVE THE TILES. Its checks are absent by
+    # construction, and an absent section reads exactly like a healthy one --
+    # so the reason it is absent is stated rather than inferred.
+    for m in state.get("disabled_modules", []):
+        _tc("<div class=note>Module %s is DISABLED by configuration. Its "
+            "checks are not running; its incidents are frozen, not resolved "
+            "(a latched incident still waits for a human).</div>"
+            % _esc(m["title"]))
+
+    def _grid(items):
+        _tc("<div class=grid>")
+        for t in items:
+            colour = _status(t["status"]).rag
+            if t["value"] is None:
+                val = "--"
+            else:
+                val = ("%g%s" % (t["value"],
+                                 (" " + t["unit"]) if t["unit"] else ""))
+            _tc("<div class='tile %s'><span class=badge>%s</span>"
+                "<div class=t>%s &middot; %s</div><div class=v>%s</div>"
+                "<div class=d>%s</div></div>"
+                % (colour, _esc(t["target"]), _esc(t["title"]),
+                   _esc(t["status"]), _esc(val), _esc(t["detail"])))
+        _tc("</div>")
+
+    # ONE SECTION PER ENABLED MODULE, in discovery order (module `order`, then
+    # id). A tile whose check belongs to no enabled module is rendered under a
+    # fallback heading rather than dropped -- a vanishing row reads as green.
+    grouped = {}
     for t in state["tiles"]:
-        colour = _status(t["status"]).rag
-        if t["value"] is None:
-            val = "--"
-        else:
-            val = ("%g%s" % (t["value"], (" " + t["unit"]) if t["unit"] else ""))
-        _tc("<div class='tile %s'><span class=badge>%s</span>"
-            "<div class=t>%s &middot; %s</div><div class=v>%s</div>"
-            "<div class=d>%s</div></div>"
-            % (colour, _esc(t["target"]), _esc(t["title"]), _esc(t["status"]),
-               _esc(val), _esc(t["detail"])))
-    _tc("</div>")
+        grouped.setdefault(t.get("module"), []).append(t)
+    for m in state.get("modules", []):
+        items = grouped.pop(m["id"], [])
+        _tc("<h2>%s (%d)</h2>" % (_esc(m["title"]), len(items)))
+        _grid(items)
+    for mid, items in grouped.items():
+        _tc("<h2>%s (%d)</h2>"
+            % (_esc("Critical metrics" if mid is None else mid), len(items)))
+        _grid(items)
     rows = state["extra"] + state["tiles"] + state["others"] + state["informational"]
     by_target = {}
     for r in rows:
@@ -1261,6 +1470,20 @@ def render_html(state, cfg):
                    incidents_html, open_=True))
     else:
         a(_details("incidents", "No live incident", incidents_html))
+
+    a(_details("commands",
+               ("Operator commands (last %d)" % COMMAND_RUNS_LIMIT)
+               if state["command_runs"] else "No operator command recorded",
+               commands_html))
+
+    # Both are always rendered, empty-safe: a section that vanishes when the
+    # queue empties is indistinguishable from one whose query broke.
+    a(_details("recommendations",
+               "Recommendations (%d)" % len(state.get("insights", [])),
+               recommendations_html))
+    a(_details("approvals",
+               "Approvals (%d)" % len(state.get("proposals", [])),
+               approvals_html))
 
     if state["informational"]:
         a(_details("informational",

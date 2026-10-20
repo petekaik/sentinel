@@ -28,7 +28,7 @@ Re-capture any of these with the commands in each row.
 |---|---|---|
 | `boxfacts-cubox-{1,2}-2026-09-26.txt` | **probe output**, one ssh per box | `app/boxfacts.sh` run live, in the deployment's own argument order (cubpxe root, tftp root, exports file, export name, nfsroot, state base, cubox ids, tftp filenames) |
 | `facts-backup-nas-2026-09-26.txt` | **probe output** over ssh to `.60` | `app/backupfacts.sh` run live — the same eight arguments, against QTS armv5 BusyBox |
-| `state-export-cubox-1-2026-09-26.txt` | Backup-NAS `cubpxe/state/cubox-1/transcode/` | the monitor's own combined ssh script (`app/export.py`), run by hand |
+| `state-export-cubox-1-2026-09-26.txt` | Backup-NAS `cubpxe/state/cubox-1/transcode/` | the monitor's own combined ssh script (`modules/fleet/export.py`), run by hand |
 | `tvh-log-sample-2026-09-26.txt` | `docker logs tvheadend` on Storage-NAS | `docker logs` via the absolute-path CLI |
 | `worker.box-cubox-{1,2}-2026-09-26.sh` | the live `/etc/cubox-transcode/worker.sh` on each box | pulled off each box |
 | `config-cubox-{1,2}.txt` | `/mnt/state/transcode/config` on each box (via the state export) | `cat` over the export script |

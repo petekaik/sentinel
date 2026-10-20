@@ -349,8 +349,14 @@ done
 # ---------------------------------------------------------------------------
 f coda_vpu "$(lsmod 2>/dev/null | awk '$1=="coda_vpu"{print $1}')"
 f video_nodes "$(ls /dev/video* 2>/dev/null | tr '\n' ' ')"
-f ffmpeg "$(tmo 10 /usr/lib/jellyfin-ffmpeg-v4l2/bin/ffmpeg -version 2>/dev/null | head -1)"
-f v4l2m2m "$(tmo 10 /usr/lib/jellyfin-ffmpeg-v4l2/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -c v4l2m2m)"
+f ffmpeg "$(tmo 10 /usr/bin/ffmpeg -version 2>/dev/null | head -1)"
+# The count is emitted ONLY if ffmpeg could be asked. A missing binary or a
+# timed-out -encoders leaves `grep -c` printing 0, which is indistinguishable
+# from "built without v4l2m2m" -- exactly the collapse the check's UNKNOWN
+# branch exists to prevent.
+if _enc=$(tmo 10 /usr/bin/ffmpeg -hide_banner -encoders 2>/dev/null); then
+  f v4l2m2m "$(printf '%s\n' "$_enc" | grep -c v4l2m2m)"
+fi
 f vpu_firmware "$(ls /lib/firmware/vpu 2>/dev/null | tr '\n' ' ')"
 
 # ---------------------------------------------------------------------------

@@ -42,7 +42,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import CHECKS_CONF, Results  # noqa: E402
+from harness import (CHECKS_CONF, Results, check_classes,  # noqa: E402
+                    fleet_config)
 
 import checks                 # noqa: E402
 import config as config_mod   # noqa: E402
@@ -54,20 +55,23 @@ import shell                  # noqa: E402
 CACHE = "no-store, no-cache, must-revalidate, max-age=0"
 
 
-def make_cfg(db_path, interval=60):
-    return config_mod.Config(env={
+def make_cfg(db_path, interval=60, **extra):
+    env = {
         "CUBOX_IDS": "cubox-1,cubox-2",
         "MONITOR_DB": db_path,
         "MONITOR_CHECKS": CHECKS_CONF,
         "MONITOR_INTERVAL": str(interval),
-    })
+    }
+    env.update(extra)
+    return config_mod.Config(env=env)
 
 
 class Dash:
     """A store and a config, with no collector in the loop."""
 
-    def __init__(self, tmpdir, interval=60):
-        self.cfg = make_cfg(os.path.join(tmpdir, "monitor.sqlite"), interval)
+    def __init__(self, tmpdir, interval=60, **extra):
+        self.cfg = make_cfg(os.path.join(tmpdir, "monitor.sqlite"), interval,
+                            **extra)
         self.conn = store.connect(self.cfg.db_path)
         store.init(self.conn)
         self.seq = 0
@@ -118,7 +122,7 @@ class Dash:
 
 
 def registry_instances(cfg):
-    return checks.expand(checks.registry(*checks.all_modules()), cfg.cubox_ids)
+    return checks.expand(check_classes(), fleet_config(cfg).cubox_ids)
 
 
 class _Server(ThreadingHTTPServer):
@@ -606,6 +610,88 @@ def test_informational_rows_carry_no_colour(results):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+
+
+# ---------------------------------------------------------------------------
+# 9b. Remedy attempts and the command audit are on the operator's page
+# ---------------------------------------------------------------------------
+
+
+def test_the_page_shows_remedy_attempts_and_command_history(results):
+    """A remedy attempt and an operator command must both be visible.
+
+    WHY BOTH HALVES ARE ASSERTED ON THE SUFFIX. An incident's `remedy_attempts`
+    is the only statement on the page that something was TRIED and did not
+    clear it -- and the obvious renderer appends that sentence to every row, or
+    to none. So one incident is given an attempt and one is not, and the
+    assertion is that the suffix is on exactly the one that earned it.
+
+    The command table is the other half: commands are the only part of the
+    platform that changes the fleet, and an audit nobody can read from the
+    page's own surface is an audit that only answers a question asked with a
+    shell on the NAS.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        key = store.incident_key("cubox-1", "disk_free_gb", "mnt")
+        for _ in range(store.CONFIRM_POLLS):
+            d.seq += 1
+            store.sync_incident(d.conn, d.seq, "cubox-1", "disk_free_gb",
+                                "mnt", store.Status.FAIL, "full")
+            store.sync_incident(d.conn, d.seq, "cubox-2", "disk_free_gb",
+                                "mnt", store.Status.FAIL, "full on cubox-2")
+        store.note_remedy_attempt(d.conn, key, "restart did not clear it")
+        store.record_command_run(d.conn, module="fleet", command="serial_status",
+                                 actor="operator", argv={}, dry_run=0,
+                                 exit_status=0, output="ok", duration_ms=1)
+        state = d.state()
+        html = web.render_html(state, d.cfg)
+        results.check(
+            "an incident with attempts and a command run are both visible",
+            any(i["remedy_attempts"] == 1 for i in state["incidents"])
+            and "serial_status" in html
+            and "attempt" in html.lower(),
+            "incidents=%r" % state["incidents"])
+        results.check(
+            "the command audit is in the page model, additively",
+            len(state["command_runs"]) == 1
+            and state["command_runs"][0]["command"] == "serial_status",
+            "command_runs=%r -- the page model carries no command history, so "
+            "the operator's own actions are only reachable over ssh"
+            % (state.get("command_runs"),))
+
+        # THE INCIDENT SECTION, BOUNDED BY ITS OWN </details>. A page-wide
+        # search for the suffix would also find the command table (whose output
+        # carries arbitrary text), and a search for "cubox-1" alone finds the
+        # all-checks rows too -- so the rows are sliced out of the incident
+        # section and identified by the incident's own check id.
+        start = html.find("Live incidents")
+        section = html[start:html.find("</details>", start)]
+        rows = section.split("<tr class=")[1:]
+        with_attempts = [r for r in rows if "cubox-1" in r and "disk_free_gb" in r]
+        without = [r for r in rows if "cubox-2" in r and "disk_free_gb" in r]
+        results.check(
+            "the remedy suffix appears on the incident that has attempts",
+            bool(with_attempts)
+            and all("remedy attempted 1 time(s)" in r for r in with_attempts),
+            "rows=%r" % (with_attempts,))
+        results.check(
+            "an incident with no attempt carries no remedy suffix",
+            bool(without) and not any("remedy attempted" in r for r in without),
+            "rows=%r -- a suffix on a row where no remedy ran says a remedy "
+            "was attempted when it was not" % (without,))
+
+        store.latch_remedy(d.conn, key, "still full")
+        latched = web.render_html(d.state(), d.cfg)
+        results.check(
+            "a latched incident says so in the suffix",
+            "remedy attempted 2 time(s) (LATCHED)" in latched,
+            "the page does not distinguish a latched incident from one still "
+            "being retried, so a row waiting on a human reads as automatic")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1941,6 +2027,40 @@ def test_the_newest_epoch_read_uses_an_index(results):
         "and a live monitor then reads as a dead one" % (plan,))
 
 
+def test_a_pending_incident_is_not_on_the_board(results):
+    """`pending` owns its key but is not an incident (measured 2026-10-19).
+
+    The dashboard selected incidents with LIVE_SQL, so a row with ONE bad poll
+    9.4 days earlier was rendered as a RED live incident while the verdict, the
+    colour counts and `store.live_incidents` all excluded it -- and `--dismiss`
+    could not even name it. Two questions, two lists (CONFIRMED_STATES); the
+    board asks the second one.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        seen = []
+        for _ in range(store.CONFIRM_POLLS):
+            d.seq += 1
+            state = store.sync_incident(d.conn, d.seq, "storage",
+                                        "tvh_response_ms", "tvh-http",
+                                        store.Status.FAIL, "one failed probe")
+            seen.append((state, len(d.state()["incidents"])))
+
+        results.check(
+            "pending is off the board; only a confirmed row is on it",
+            seen[:-1] == [("pending", 0)] * (store.CONFIRM_POLLS - 1)
+            and seen[-1] == ("open", 1),
+            "state and board count per poll: %r. A `pending` row has not "
+            "reached CONFIRM_POLLS, is deleted outright if the condition "
+            "clears, and is not an incident -- showing it as a RED one makes "
+            "the page disagree with its own verdict and puts a row on the "
+            "board that no operator surface can close." % (seen,))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_the_page_fits_a_phone_without_being_asked(results):
     """What the phone reported, and the mechanisms that fix it.
 
@@ -2012,7 +2132,215 @@ def test_the_page_fits_a_phone_without_being_asked(results):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# 13. Modules: one section per enabled module, a loud note for a disabled one
+# ---------------------------------------------------------------------------
+
+
+def test_each_enabled_module_renders_its_own_section(results):
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        targets = [(c.target, c.id) for c in registry_instances(d.cfg)
+                   if c.spec and not getattr(c, "informational", False)]
+        for target, cid in targets:
+            d.check(target, cid, store.Status.OK, "fine (test)")
+        state, html = d.state(), d.html()
+
+        results.check(
+            "the enabled module is listed with its order and title",
+            [m["id"] for m in state["modules"]] == ["fleet"]
+            and state["modules"][0]["title"] == "CuBox fleet"
+            and state["modules"][0]["enabled"] is True,
+            "modules=%r -- the page model must name what is on"
+            % (state["modules"],))
+        results.check(
+            "each enabled module renders its own titled section",
+            ("<h2>CuBox fleet (%d)</h2>" % len(state["tiles"])) in html,
+            "the tile grid has no section headed by the module's title")
+        results.check(
+            "its tiles carry the module they came from",
+            bool(state["tiles"])
+            and all(t["module"] == "fleet" for t in state["tiles"]),
+            "modules on tiles: %r" % sorted({t["module"] for t in state["tiles"]}))
+        results.check(
+            "no disabled note appears when nothing is disabled",
+            "DISABLED by configuration" not in html,
+            "a page with every module enabled claims one is disabled")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_a_disabled_module_is_loud_and_has_no_tiles(results):
+    """A disabled module must be stated, and must not leave a green section."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir, FLEET_ENABLED="0")
+        d.epoch()
+        state, html = d.state(), d.html()
+        st = web.build_status(d.cfg, d.conn)
+
+        results.check(
+            "the page model separates enabled from disabled modules",
+            state["modules"] == []
+            and [m["id"] for m in state["disabled_modules"]] == ["fleet"],
+            "modules=%r disabled=%r -- a disabled module that simply vanishes "
+            "reads exactly like one that never existed"
+            % (state["modules"], state["disabled_modules"]))
+        results.check(
+            "the disabled module is stated in words, above the tiles",
+            "Module CuBox fleet is DISABLED by configuration" in html
+            and "frozen, not resolved" in html,
+            "the page does not say the module is disabled or what happened to "
+            "its incidents")
+        results.check(
+            "no tile, and no empty section, is rendered for the disabled module",
+            "mem_available_mb" not in html and "tile green" not in html
+            and "<h2>CuBox fleet" not in html,
+            "a check from a disabled module still renders, or a titled empty "
+            "section was drawn for a module that is not running -- an empty "
+            "section reads exactly like a healthy one")
+        results.check(
+            "a wholly disabled fleet does not band green",
+            "band unknown" in html and "band ok" not in html,
+            "the band reads OK with no module enabled -- platform-only checks "
+            "are not a clean fleet (SpecCoverage alone returns OK on an empty "
+            "audit)")
+        results.check(
+            "the platform's own rows still run and are grey, not absent",
+            "modules_enabled" in html and ">unknown<" in html,
+            "the platform's checks vanished with the module -- then nothing at "
+            "all would be measuring the disablement")
+        results.check(
+            "the API payload carries the module lists, additively",
+            st["modules"] == []
+            and [m["id"] for m in st["disabled_modules"]] == ["fleet"],
+            "the status API dropped the module lists")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_insights_and_proposals_are_rendered_and_empty_safe(results):
+    """Recommendations and Approvals are additive, and empty is still a section.
+
+    An absent section reads as a healthy one, so the EMPTY case must render
+    its own sentence and its id; the populated case must name the insight, the
+    rationale and the expiry. And an expired proposal is shown EXPIRED even
+    though the collector has not swept the row -- the page opens the store
+    read-only and cannot.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        d = Dash(tmpdir)
+        d.epoch()
+        state, html = d.state(), d.html()
+        results.check(
+            "build_state exposes additive insight and proposal keys",
+            state.get("insights") == [] and state.get("proposals") == []
+            and "tiles" in state and "incidents" in state,
+            "keys=%r -- additive means existing consumers are unaffected"
+            % (sorted(state),))
+        results.check(
+            "empty Recommendations and Approvals still render, with ids",
+            "Recommendations (0)" in html and "Approvals (0)" in html
+            and "id='sec-recommendations'" in html
+            and "id='sec-approvals'" in html
+            and "No pending proposal" in html,
+            "a section that vanishes when empty cannot be told from one whose "
+            "query broke")
+
+        store.record_insight(
+            d.conn, advisor="reference", module="platform",
+            kind="threshold_suggestion", severity="notable",
+            title="cubox-1 mem: p95 outside the band",
+            body="Proposed band moved by at most 10.")
+        store.record_proposal(
+            d.conn, module="fleet", kind="action",
+            payload={"action_id": "transcode_restart",
+                     "incident_key": "cubox-1|c|s"},
+            rationale="worker stalled for six hours",
+            expires_at=time.time() + 3600)
+        store.record_proposal(
+            d.conn, module="fleet", kind="action",
+            payload={"action_id": "transcode_restart",
+                     "incident_key": "cubox-2|c|s"},
+            rationale="this one lapsed",
+            expires_at=time.time() - 5)
+
+        state, html = d.state(), d.html()
+        results.check(
+            "insights and pending proposals appear in the model",
+            len(state["insights"]) == 1 and len(state["proposals"]) == 2,
+            "insights=%r proposals=%r"
+            % (state["insights"], state["proposals"]))
+        results.check(
+            "the Recommendations section names the insight",
+            "Recommendations (1)" in html
+            and "cubox-1 mem: p95 outside the band" in html,
+            "the advisor's claim is not on the page")
+        results.check(
+            "the Approvals section names the rationale and the expiry",
+            "Approvals (2)" in html
+            and "worker stalled for six hours" in html
+            and "remaining" in html,
+            "a proposal without its rationale is an id nobody can decide")
+        results.check(
+            "an expired proposal is shown as EXPIRED, not pending",
+            "EXPIRED" in html and "this one lapsed" in html,
+            "the row is still pending in the store, and the page must not "
+            "present a lapsed authority as actionable")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_the_empty_approvals_queue_names_the_engine_switch(results):
+    """"Nothing pending" and "nothing could execute" are different facts.
+
+    The inbox was identical with MONITOR_REMEDIES on and off, so an operator
+    looking at an empty queue could not tell whether the fleet needed no
+    decision or the execution engine was simply switched off.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        off = Dash(tmpdir, MONITOR_REMEDIES="0")
+        off.epoch()
+        off_state, off_html = off.state(), off.html()
+
+        on = Dash(tmpdir, MONITOR_REMEDIES="1")
+        on.epoch()
+        on_state, on_html = on.state(), on.html()
+
+        results.check(
+            "build_state exposes the execution switch",
+            off_state.get("remedies_enabled") is False
+            and on_state.get("remedies_enabled") is True,
+            "off=%r on=%r" % (off_state.get("remedies_enabled"),
+                              on_state.get("remedies_enabled")))
+        results.check(
+            "the status API exposes it too, additively",
+            web.build_status(off.cfg, off.conn)["remedies_enabled"] is False
+            and web.build_status(on.cfg, on.conn)["remedies_enabled"] is True,
+            "an integrator cannot tell an empty queue from a disabled engine")
+        results.check(
+            "an empty queue with the engine off says so",
+            "No pending proposal" in off_html
+            and "MONITOR_REMEDIES=0" in off_html
+            and "DISABLED" in off_html,
+            "the off page does not name the switch")
+        results.check(
+            "an empty queue with the engine on reads as 'nothing to decide'",
+            "No pending proposal" in on_html
+            and "MONITOR_REMEDIES=0" not in on_html
+            and "nothing waiting for a human" in on_html,
+            "the on page reads as disabled or says nothing")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 TESTS = (test_a_closed_section_still_renders_every_row,
+         test_each_enabled_module_renders_its_own_section,
+         test_a_disabled_module_is_loud_and_has_no_tiles,
          test_empty_store_is_loud,
          test_a_sample_from_an_older_epoch_is_not_shown_as_current,
          test_stale_says_so_and_cannot_also_be_ok,
@@ -2022,6 +2350,7 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_nothing_is_cached,
          test_collector_rows_are_visible,
          test_informational_rows_carry_no_colour,
+         test_the_page_shows_remedy_attempts_and_command_history,
          test_status_api_is_three_valued,
          test_status_api_is_a_stable_contract,
          test_the_freshness_hero_tracks_the_staleness_it_leads_with,
@@ -2031,7 +2360,10 @@ TESTS = (test_a_closed_section_still_renders_every_row,
          test_the_app_shell_may_cache_and_nothing_else_may,
          test_the_refresh_script_has_the_hooks_it_looks_for,
          test_the_newest_epoch_read_uses_an_index,
-         test_the_page_fits_a_phone_without_being_asked)
+         test_a_pending_incident_is_not_on_the_board,
+         test_the_page_fits_a_phone_without_being_asked,
+         test_insights_and_proposals_are_rendered_and_empty_safe,
+         test_the_empty_approvals_queue_names_the_engine_switch)
 
 
 def main():

@@ -14,20 +14,24 @@ reader must be able to tell which half of it exists today.
 
 | Component | State |
 |---|---|
-| `app/store.py` — SQLite schema, incidents, attempts, journal, remedies | **built** |
-| `app/probes.py`, `app/boxfacts.*`, `app/backupfacts.*` — read-only host probing | **built** |
-| `app/parsers.py`, `app/export.py`, `app/journal.py` — log/state/cursor parsing | **built** |
-| `app/checks/` — 71 check instances across 4 hosts | **built** |
-| `app/collect.py` — the epoch loop, preload-then-evaluate | **built** |
+| `app/store.py` — SQLite schema, incidents, attempts, journal, remedies, commands, advisors, insights, proposals, threshold overrides | **built** |
+| `app/module.py`, `app/modules/` — the module contract, discovery and validation | **built** |
+| `app/probes.py`, `app/modules/fleet/{boxfacts,backupfacts}.*` — read-only host probing | **built** |
+| `app/parsers.py` (generic helpers) and `app/modules/fleet/parsers.py`, `export.py`, `journal.py` — log/state/cursor parsing | **built** |
+| checks — 75 instances across 4 hosts, behind `app/modules/fleet/` | **built** |
+| `app/collect.py` — the epoch loop, preload-then-evaluate, remedies, advisors | **built** |
+| `app/commands.py`, `app/ctl.py` — operator commands, cross-process locks, audit | **built** |
+| `app/actions.py`, `app/heal.py` — action declarations, authority ladder and the remedy engine | **built; no live remedy has executed** |
+| `app/advisors.py`, `app/intelligence.py` — the snapshot, runner and reference advisor | **built; reference advisor on by default** |
+| `app/llm_advisor.py` — the LLM seam | **registered only when configured; transport NOT implemented** |
 | `app/dismiss.py` — the operator's exit for an incident no check can close | **built** 2026-10-04 |
-| `app/web.py` — dashboard, `/api/status.json`, `/api/state.json`, `/healthz` | **built** |
+| `app/web.py` — dashboard, `/api/status.json`, `/api/state.json`, `/healthz`, recommendations and approvals | **built** |
 | `app/main.py` — container entry point, signal handling, dashboard-death exit | **built** |
-| `checks.conf` — 27 threshold specs, claimed or declared deferred | **built** |
+| `checks.conf` + `app/modules/fleet/thresholds.conf` — per-module threshold specs, claimed or declared deferred | **built** |
 | `Dockerfile`, `compose.yml`, `.env.example`, `.dockerignore` | **built** |
-| `test.sh` — the offline suite | **built** |
-| `deploy.sh` — sync, build on the NAS, start, `--status` | **built** |
+| `test.sh` — the offline suite; `tools/parity.py` — the check-result baseline | **built** |
+| `deploy.sh` — sync, build on the NAS, start, `--status`, and every operator verb | **built** |
 | **baking `monitor_id.pub` into the rootfs** | **CODE DONE, not yet deployed** — see below |
-| **`app/heal.py` — the remedy engine** | **NOT WRITTEN.** See *Remedies* below |
 | `gap_sources` check | **DEFERRED**, with the reason recorded in `checks.conf` |
 
 Three consequences of that table, stated plainly rather than left to be inferred.
@@ -47,11 +51,17 @@ is quoted in each correction:
   box*.~~ — **STALE.** The rebuild landed and both boxes authenticate; the
   `host_auth_failed` class exists and is correctly classified, but it is not
   firing.
-- **No remedy has ever executed**, because `heal.py` does not exist. Remedies are
-  off by default (`MONITOR_REMEDIES=0`) and enabling them without `heal.py` makes
-  the process refuse to start rather than pretend. **Still true**, and the one
-  remaining functional gap on this page. `dismiss` (below) is not a remedy: it is
-  an operator verb, and it changes nothing about the fleet.
+- **No remedy has executed on the live fleet.** That is no longer because the
+  engine is missing — `heal.py` is built and every gate is tested. It is because
+  both switches are off by default: `MONITOR_REMEDIES=0` (process kill switch) and
+  the fleet module at authority `off`. Enabling remedies without a callable
+  engine still makes the process refuse to start rather than pretend. `dismiss`
+  (below) is not a remedy: it is an operator verb, and it changes nothing about
+  the fleet.
+- **The LLM advisor's transport is absent on purpose.** Configuring a provider and
+  endpoint makes it *selectable*; selecting it records an explicit "not
+  implemented" error row and makes no network call. Configuration alone never
+  puts it on the default path.
 
 ### The monitor's ssh credential — what was decided, and why not the alternatives
 
@@ -144,15 +154,33 @@ the design:
 
 ## Architecture
 
-One container on Storage-NAS, three concerns, one image, **Python 3 standard
+One container on Storage-NAS, four concerns, one image, **Python 3 standard
 library only** — `sqlite3`, `http.server`, `subprocess`, `urllib`. There is no
 `requirements.txt` to rot and no dependency to pin.
 
 | Process | Role |
 |---|---|
 | collector | a loop on `MONITOR_INTERVAL` (default 60 s). Probes every host once, evaluates every check, writes samples + verdicts + incidents |
-| dashboard | a read-only HTTP server on 8787, serving the RAG page and the two JSON endpoints |
-| healer | called by the collector **after** the epoch's evidence is durable. Not yet written |
+| dashboard | a read-only HTTP server on 8787, serving the RAG page, the two JSON endpoints, Recommendations and Approvals |
+| healer | called by the collector **after** the epoch's evidence is durable and **before** the epoch row is written; executes an action only through the authority ladder |
+| advisors | called **after** `record_collector_run`, one fresh bounded snapshot each; may emit insights and proposed changes only |
+
+The epoch order is the contract:
+
+1. discover the enabled modules and load the effective thresholds — the platform's
+   `checks.conf` merged with each module's `thresholds.conf` (duplicate ids are a
+   startup error);
+2. `preload()` every module (all remote/local I/O, once), then evaluate the union of
+   checks;
+3. write the evidence (`record`), then run each module's `after_epoch` hook;
+4. run the healer for confirmed incidents — **after** evidence is durable, so the
+   next epoch's observation that decides success is explainable, and **before** the
+   epoch row, because that row is not a licence to act;
+5. write `collector_run` (the dashboard's liveness proof), then run the selected
+   advisors. An advisor that hangs or overruns cannot take the epoch record away.
+
+A dry run skips steps 3–5's writes and both engines: the mode whose whole contract is
+"claims nothing" must not be able to act or advise.
 
 The collector never ssh's into Storage-NAS. It runs *on* Storage-NAS, so its
 Storage-NAS checks are local (`/proc`, `df`, the share paths) and its Docker and
@@ -234,8 +262,17 @@ block the collector.
 | `collection_attempt` | per-host transport outcome — **separate from check outcomes on purpose**, because it is what makes "no data" distinguishable from "no problem" after the fact |
 | `incident` | dedup state, first evidence, remedy counters |
 | `journal` | per-host journald cursor + rows: **the fleet's only durable log** |
-| `remedy` | every action, with its trigger evidence and post-check |
+| `remedy` | every action, with its trigger evidence and exit status (the verdict is the incident's next OK observation, not a stored post-check) |
 | `collector_run` | the monitor's own heartbeat, carrying a monotonic `epoch_seq` |
+| `command_run` | every operator invocation — including dry runs and failures — with argv, actor, exit status, bounded output head and the full output's digest |
+| `advisor_run` | one row per advisor per epoch, always: status, duration, requested/available window, error detail |
+| `insight` | additive advisor output: kind, severity, confidence, body, evidence, expiry. Not an incident and not a command |
+| `proposal` | an operator decision waiting to happen: `kind ∈ action|threshold_change`, payload, rationale, state, deadline, actor |
+| `threshold_override` | a live band change layered over a module's threshold file, with the previous band and the approving proposal |
+
+The five tables above are **additive**. Existing table semantics — incidents, resolution,
+`dismissed` versus `resolved`, the severity cap — are untouched. A missing table is
+created idempotently at startup, so an image rollback still reads the store.
 
 ### The incident key
 
@@ -346,6 +383,12 @@ re-typed key raises it. An integrator should refuse a version it does not know
 rather than read a document whose shape it is guessing at. Version 2 removed the
 per-item `known_condition` key, which no check ever set.
 
+The module platform added four **additive** keys without raising the version: `modules`
+and `disabled_modules` (discovery and enablement), `insights` (advisor output) and
+`proposals` (the pending approval queue, with a display-only `expired` flag). A disabled
+module appears in `disabled_modules` with a stated reason, never as an empty green
+section.
+
 ### The `verdict` field is three-valued, and that is the point
 
 `verdict ∈ ok | warn | fail | unknown`. It is deliberately **not** a boolean.
@@ -453,10 +496,186 @@ curl -s http://198.51.100.11:8787/api/status.json | python3 -c \
 
 ---
 
+## Modules — the contract, and where the CuBoxes went
+
+Every target family is a **module**: one package under `app/modules/`, discovered
+at startup, declaring `MODULE = Module(...)`. There is no hand-maintained list to
+forget and no way to fail quietly. A package that raises on import, has no
+`MODULE`, whose `id` disagrees with its directory name, or whose `id` duplicates
+another is a **startup error** (`modules.ModuleError`) — a module that does not
+load is a set of checks that never run, and the dashboard would show no row
+about it.
+
+`Module` members are declarations, not implementations:
+
+| Member | Meaning |
+|---|---|
+| `id` | the package name; discovery refuses a mismatch |
+| `title`, `order` | dashboard label and load order |
+| `targets` | the full reporting vocabulary (box ids, host names, `fleet`) |
+| `settings` | `Setting(key, default, kind)` tuples; the platform resolves env > default, typed, via `Context.settings(id)` |
+| `threshold_file` | the module's own threshold file, found beside the package |
+| `checks` | the module's check modules; a `per_box = True` check expands once per box |
+| `context` | config-only hook, **no I/O**, installed before every preload |
+| `preload` | **all** remote/local I/O, once per epoch, under the timeout the module passes (the fleet uses the platform ssh timeout) |
+| `after_epoch` | post-record hook, run after the evidence is durable |
+| `extra_check_ids` | incident ids the collector emits for this module and no `Check` class owns |
+| `commands`, `actions`, `advisors` | declared surfaces; all three default to empty, so a module that offers none says nothing |
+
+**The advisor surface is called `advisors()`, not `intelligence()`.** The design document
+called it `intelligence()`; the code does not. `Module.advisors()` in `app/module.py` is
+authoritative, and `app/intelligence.py` is the platform's reference advisor, not a module
+surface. The distinction matters at a module boundary: a module that implements an
+`intelligence()` method is offering nothing, silently — exactly the failure discovery
+refuses to have.
+
+**`owned_check_ids(mod)` is the one ownership rule.** It returns the module's `Check`
+class ids plus `extra_check_ids`, and both readers — the collector's disabled-module
+freeze and the remedy engine — import it from `module.py` rather than restating it.
+Ownership is by **check id**, never by target, because two modules may share a reporting
+target. `actions.allowed` additionally receives the module id, so an action-level
+override cannot be resolved against the wrong module.
+
+**Settings and thresholds belong to the module.** `app/config.py` holds only what
+every deployment shares; addresses, paths and box ids live in
+`modules/<id>/settings.py`, and every number lives in `modules/<id>/thresholds.conf`
+as data. A spec id claimed by two modules is a startup error. Ownership of
+collector-emitted rows is by **check id**, declared through `extra_check_ids`,
+never by target: two modules can share a reporting target, so a target set
+cannot say whose incident a row is.
+
+**Selection is platform configuration.** `SENTINEL_MODULES=id[,id]` narrows the
+set and `<ID>_ENABLED=0` disables one; both default to every discovered module.
+A selector naming an unknown id is a startup error — silently ignoring it would
+disable everything and read as a healthy fleet. A disabled module's incidents
+are **frozen every epoch**, never resolved, and its checks simply do not run.
+`checks.platform_modules()` returns the `checks.meta` **module** (not check
+classes); callers add it to the modules' own check modules and pass the whole
+set through `checks.registry(...)`. It owns `spec_coverage` and
+`modules_enabled`; no module may declare them, and they keep running when every
+module is disabled, so an empty fleet cannot read green.
+
+**The platform never imports a specific module.** `import modules` (the loader),
+`from modules import discover`, and `modules.discover` / `modules.discover_enabled`
+are the only allowed forms; anything under `app/` outside `app/modules/` that
+imports `modules.<id>` is a boundary break. That direction is what makes a
+module removable, and
+`tests/test_modules.py::test_platform_files_do_not_import_a_specific_module`
+enforces it (the test also grades its own detector). The other direction — the
+checks a module declares actually running, unchanged — is pinned by
+`python3 tools/parity.py --check tests/fixtures/parity-baseline.json`.
+
+**The three CuBox-shaped holes that used to live in `collect.py` are closed.**
+`preload()` no longer hardcodes host kinds and their pull order, because each
+module declares its own `preload`; there is no `LOCAL_HOST = "storage"` literal
+in the platform, because the module installs `local_host` in its context view and
+`escalate()` reads it from there; and the worker-text pull and journal capture
+are fleet code in `modules/fleet/preload.py`, not special cases inside the
+generic epoch. The collector now knows `Attempt`, the epoch phases and the
+`preload_*` installers, and nothing about a CuBox. The fleet itself is
+`app/modules/fleet/`: checks, its own parsers, settings, export, journal capture,
+the two shell probes and its `thresholds.conf`.
+
+---
+
+## Commands — explicit operator operations
+
+A command is never automatic and is not a remedy. A module declares its commands as data
+(`Command(id, title, handler, args, danger, resources, timeout_s)`); the platform exposes
+them through `ctl.py`, and the audit lives in `command_run`.
+
+```bash
+./deploy.sh --modules
+./deploy.sh --list-commands
+./deploy.sh --run fleet.serial_arm --arg box=cubox-1 --arg min=5
+./deploy.sh --run fleet.serial_break --arg box=cubox-1 --dry-run
+./deploy.sh --list-runs
+```
+
+`--modules` lists every **discovered** module, enabled or disabled: id, title,
+order, state, reporting targets and the expanded check count. `checks=` counts the module's
+OWN checks only; the platform's `spec_coverage` and `modules_enabled` checks are not
+included, so a module total of 73 against the fleet's 75 is not drift. `--showconf` carries
+the same summary beside the configuration and threshold coverage. A disabled module is
+named as disabled, never omitted — a module that vanishes from the list reads as one that
+does not exist.
+
+**The gate order is the contract.** `commands.dispatch()` refuses — before the handler is
+called — if the module is disabled, an argument is unknown or outside its choices, or a
+declared resource is already held. A refusal writes **no** audit row: nothing ran, and a
+row would make "an operator ran this" true of a command that never started. A handler that
+runs and fails writes a row and raises `CommandFailed`, which the CLI words `FAILED`
+rather than `REFUSED`.
+
+**Resource locks cross processes.** `--run` is a new process per invocation, so the lock
+is an `flock` on one file per resource under `MONITOR_LOCK_DIR` (`/tmp/sentinel-locks` by
+default), with an in-process set on top only to give a reentrant call a clear message.
+The commands that touch the port — `serial_arm`, `serial_disarm`, `serial_break` — declare
+the `serial` resource; `serial_status` and `serial_read` do not. Two operations cannot own
+one adapter.
+
+`box` arguments are a **closed key set**, not a hostname to try: the value becomes a
+filename (the arm file), so `../../etc/passwd` must be a refusal. The serial identity rule
+applies to every command that touches a port: it refuses when the box's adapter cannot be
+resolved from the chip's own serial and never falls back to `SERIAL_DEVICE`. A `BREAK` on
+the wrong box is not recoverable.
+
+**`serial_break` is declared but its write path is not wired.** It resolves identity and a
+dry run reports what it would send, but outside a dry run it refuses rather than pretend to
+reboot a box. So the command surface being "built" does not mean a real BREAK works yet;
+the arm/disarm/read/status commands do.
+
+---
+
+## Intelligence — advisors that can only propose
+
+An advisor is an in-container plug-in with `id`, `title`, `history_days` and
+`advise(ctx, snapshot) -> list[Insight]`. The platform owns selection, the snapshot, the
+runner and every write.
+
+**The snapshot is read-only and honest about its window.** It exposes only bounded read
+methods — it holds a connection internally, but no caller can reach it, and there is no
+write path. `window(days)` reports `available_days = min(history that exists, min(asked,
+cap))` — never the number asked for — and `_rows`/`sample_series`/`logs` bound every read
+and record a truncation when a cap was hit. Each `(target, metric)` series is read under
+its own cap, so a busy metric cannot starve the window to hours. An insight carries the
+requested window, the available window and every truncation.
+
+**The runner is bounded and isolated.** One fresh snapshot per advisor; an exception, a
+malformed insight or a store failure is recorded as that advisor's error row and never
+propagates — the epoch record already exists by then. The wall-clock budget is *measured,
+not enforced*: an overrun is recorded after the advisor returns, because killing it would
+leave a half-written insight.
+
+**Defaults.** `SENTINEL_ADVISORS` unset (or empty) selects the reference advisor; `none` is
+the explicit off switch; an explicit list replaces the default rather than adding to it. A
+selector that names nothing is a configuration defect and gets an error row, not a green
+no-op.
+
+**The reference advisor** (`app/intelligence.py`) is statistics only: it summarises the
+window's incidents and, when a metric's p95 is outside its band with at least 7 days of
+history, 20 samples and a sample span covering the window, emits a `threshold_suggestion`.
+It moves only the failing edge, by at most 25% of the band width, and writes nothing. The
+collector translates a stored suggestion into a pending proposal.
+
+**The LLM advisor** (`app/llm_advisor.py`) is registered only when provider **and**
+endpoint are set, and runs only when named in the selector. Configuring it is the
+operator's egress decision; the default selector never includes it. The API key is a
+credential and never reaches the store, a log line or `--showconf`. **The transport is not
+implemented in this delivery**: a selected, configured advisor raises an explicit "not
+implemented" error instead of making a silent network call.
+
+**Hard limits.** An advisor can never resolve or dismiss an incident, change a check
+result, apply a threshold or execute an action. Even under `full` authority it emits a
+proposal; the remediation engine is the only executor. It runs after evidence is durable,
+cannot alter the epoch, and gets one queue slot per epoch — not an unbounded backlog.
+
+---
+
 ## The checks
 
-67 check instances: 23 per CuBox, 10 on Backup-NAS, 8 on Storage-NAS/TVH/DVB,
-3 fleet-level — plus the rows the collector emits itself (`host_unreachable`,
+75 check instances: 26 per CuBox, 10 on Backup-NAS, 9 on Storage-NAS/TVH/DVB,
+4 fleet-level — plus the rows the collector emits itself (`host_unreachable`,
 `host_auth_failed`, `journal_capture`, `monitor_local_access`), which **no `Check`
 class owns** and which the renderer must therefore never derive from the registry
 alone. *"We cannot see cubox-1"* is exactly the row an operator must never lose
@@ -468,9 +687,12 @@ a doc is a count that is wrong:
 
 ```bash
 cd app && python3 -c \
-  "import checks,collections; print(collections.Counter(
-     x.target for x in checks.expand(checks.registry(*checks.all_modules()),
-     ['cubox-1','cubox-2'])))"
+  "import config, checks, collections, modules
+   m = modules.discover_enabled(config.Config())
+   classes = checks.registry(*([c for mod in m for c in mod.check_classes()]
+                               + list(checks.platform_modules())))
+   print(collections.Counter(x.target for x in checks.expand(
+       classes, checks.expansion_targets(m))))"
 ```
 
 ### CuBoxes
@@ -838,18 +1060,80 @@ Finnish titles from this library for exactly that reason.
 
 ---
 
-## Remedies — Tier 2, and what was removed
+## Remedies — the authority ladder as built, and what was removed
 
-**Nothing is auto-remedied today**: `heal.py` does not exist and
-`MONITOR_REMEDIES=0` by default. This section is the design the engine must
-implement, and the reasoning is the deliverable — a remedy that looks obviously
-right and is destructive is the hazard here.
+**The engine is built and nothing runs by default.** `app/heal.py` is the only code that
+executes an action; `app/actions.py` holds the pure permission decision. The defaults are
+deliberately asymmetric in three places: `MONITOR_REMEDIES=0` is the process kill switch,
+`SENTINEL_REMEDIATION=1` is the engine master switch, and the fleet module ships at
+authority `off`. A container that upgrades must not start acting because a new build
+shipped the engine.
 
 The governing rule: **a remedy may only run when its preconditions are positively
-observed, and any `unknown` in the precondition set means no remedy.** The
-collector calls the healer only after the epoch's evidence is durable, and only
-when not a dry run — the mode whose whole contract is "claims nothing" must not
-be able to take an action (item 55).
+observed, and any `unknown` in the precondition set means no remedy.**
+
+### The ladder
+
+Per module, overridable per action:
+
+| Level | Behaviour |
+|---|---|
+| `off` (default) | never executed automatically |
+| `advisory` | surfaced as advice only |
+| `propose` | writes one pending proposal per `(incident, action)`; a human approves it |
+| `scoped` | executes only action ids in the module's `ALLOW` list |
+| `full` | any declared action; a **destructive** action still needs its own switch |
+
+`<MODULE>_ACTION_<ID>_AUTHORITY` overrides one action in either direction. It is not a
+second switch: it is how an operator grants or withdraws authority for one action without
+widening the module. An approval is authority, not a bypass — `ctl.approve_proposal` asks
+the ladder with that one action forced to `full` and still passes every gate below; the
+destructive switch and the confirmed-incident rule cannot be lifted by approving.
+
+### The gates, in order
+
+`actions.allowed()` is pure and decides first: incident `state == "open"`, trigger match,
+engine master switch, known level, level above `off`/`advisory`/`propose`, scoped
+allow-list (case-insensitive), destructive switch. `heal.attempt()` then adds: not latched,
+attempt budget, cooldown, per-hour cap, the **resource locks**, a **dry run that must
+succeed**, and only then `run()`.
+
+The locks are flock files under `MONITOR_LOCK_DIR`, held across the dry run and the run:
+`heal:incident:<key>`, `heal:module:<module>` (a module cap of one) and whatever the
+action declares through `resources_for(incident)` (the fleet actions declare
+`fleet:state:<box>` and `fleet:transcode:<box>`). That is what makes the collector and a
+one-shot `ctl --approve` process serialize instead of double-executing one condition.
+
+Every gate is a refusal, and a refusal is not retried because a gate said no. A timeout, an
+exception, a refused dry run and a completed run are all **attempts**: each advances the
+incident's counter and cooldown, so a handler that crashes or hangs -- or one that exits 0
+and changes nothing -- latches instead of being retried every epoch forever. The handler
+runs on a daemon thread so the epoch is bounded even when Python cannot kill the thread.
+
+**Success is not the engine's to claim.** `attempt()` reports that an action *executed*.
+Whether it *worked* is decided by the incident machine's next positive observation — a
+check returning OK. An exit status of 0 is not evidence the condition cleared. The
+`Action.verify` tuple is declarative metadata: it names the check that should recover, and
+it is what makes the intent reviewable, but the engine does not consult it at runtime. A
+`verify` that disagrees with the triggering check is a documentation defect, not a second
+success criterion.
+
+### Proposals and live threshold overrides
+
+A `propose`-level action writes one pending `proposal` row per `(incident, action)`. One
+row per epoch would be a queue nobody can read. An expired row is shown `expired`, never
+reused, and a decided row (executed or rejected) buys the action its cooldown; expiry does
+not, because the deadline lapsed without anyone deciding. Approval re-resolves the action
+from the module loaded *now*, re-reads the incident *now*, and refuses if the incident is
+no longer live or the grant was withdrawn.
+
+The reference advisor's threshold suggestions become pending `threshold_change` proposals
+through the collector; the advisor itself stays write-free. An approval may move **only
+the failing edge**, toward the observation, by at most 25% of the band's current width;
+`green` is the operator's stated standard and never moves. The applied band is a
+`threshold_override` row, loaded as the *effective* band at every epoch — so it changes
+grading without a rebuild — and `--revert-threshold` deletes the row and reports the band
+the file declares next.
 
 ### Removed: sweep stale `*.part` — DELETED, not fixed
 
@@ -880,58 +1164,79 @@ the *smallest* file is the one killed and retried forever.
 Unit state alone cannot gate it either: `Type=simple` means `ActiveState=active`
 through the 300 s idle sleep, mid-job, and while spin-looping on `env_fail`.
 
-**Replaced by**: alert on `NRestarts` rising, plus one narrowly-scoped action
-(start the unit) gated on **all** of `ActiveState=inactive`, `is-enabled`, the
-pass lock free, and the heartbeat absent or older than `ExecMainStartTimestamp` —
-**and** on `/run/cubox-transcode.started` being absent. That marker exists because
-an auto-start that silently undoes an operator's deliberate `stop` is the exact
-defect it was added to fix after it contaminated a measurement on 2026-09-24.
+**Replaced by**: alert on `NRestarts` rising. No automatic unit-start action ships. The
+shipped `transcode_restart` is triggered by `deadlock_kills` and `stall_watch`, not by
+`NRestarts`, and it restarts rather than starting a deliberately stopped unit. The marker
+`/run/cubox-transcode.started` still exists because an auto-start that silently undoes an
+operator's deliberate `stop` is the exact defect it was added to fix after it contaminated
+a measurement on 2026-09-24.
 
-### Kept, heavily constrained: remount a stale `/mnt/state`
+### Shipped: `state_mount_cycle` and `transcode_restart`
 
-This is the fleet's known silent failure — a rebuild of the state export while a
-box is up invalidates the live mount, every `cubox-state` unit is gated on
-`ConditionPathIsMountPoint`, and a false condition is **not a failure**, so the
-15-minute save timer and the shutdown save both stop running and report nothing.
-The box looks healthy while quietly persisting nothing.
+Both are `state_changing` and both refuse a target that is not a CuBox — a repair aimed at
+the wrong machine is worse than no repair.
 
-The original spec (`umount || umount -l` then a bare `mount`) is **removed as
-written**, because on the two states where it fires most it is respectively a
-silent-data-loss generator and an unbounded hang:
+**`state_mount_cycle`** addresses the fleet's known silent failure: rebuilding the state
+export while a box is up invalidates the live mount, every `cubox-state` unit is gated on
+`ConditionPathIsMountPoint`, and a false condition is **not a failure**, so the save timer
+and shutdown save both stop running and report nothing. The shipped command is
 
-1. **Never `-l`.** Plain `umount` returning EBUSY means something holds the fs (an
-   in-flight `cubox-state` rsync, or a job's `&> "$logf"` handle held for 90 min).
-   `-l` detaches rather than unmounts: existing fds keep writing onto **deleted
-   inodes**, the save logs `save complete`, systemd records success, and the
-   post-check on the *new* mount reports green. That is the silent-persistence
-   failure, reproduced by its own cure. On EBUSY: record `fuser -m /mnt/state`
-   and **escalate**.
-2. **Never reuse a mountpoint predicate.** The repo has two that disagree —
-   `findmnt -n -M` (`worker.sh:178`) and `mountpoint -q` (`cubox-state:188`),
-   the latter being what `ConditionPathIsMountPoint=` uses. The probe must be the
-   **boot hook's own sentinel check, reused verbatim**: read `etc/hostname` from
-   the mount and compare against the device id. It is the only probe that catches
-   the **wrong-directory** mount, where QTS served the export root with rc=0.
-3. **A write forces a fresh LOOKUP** and fails ESTALE regardless of the NFS
-   attribute-cache window (~60 s, no `actimeo` set); a read can be answered from
-   cache and read as healthy. Write probe when the credential permits, sentinel
-   read as corroboration.
-4. **Refuse entirely** when the mount is not in mountinfo (a *boot hook* failure,
-   a different fault with a different fix), or when the server is unreachable
-   (that is `unknown`, and a remedy on `unknown` is a rule violation).
-5. Retry cap + latch, and the mount must be remediated **before** any worker
-   action on the same host.
+```sh
+if mountpoint -q /mnt/state; then
+  umount /mnt/state || { echo 'umount failed; mount table:' >&2;
+                         findmnt -rn -M /mnt/state >&2; exit 1; }
+fi
+mount -t nfs -o nolock,nfsvers=3 <backup>:/cubpxe/state/<box> /mnt/state || exit 1
+systemctl restart cubox-transcode
+```
+
+The umount is **guarded by `mountpoint`**: `state_dir_tmpfs` fires exactly when `STATE_DIR`
+resolved while `/mnt/state` was *not* mounted, and a bare `umount` there exits non-zero
+("not mounted"), which would abort before the mount that is the whole repair.
+
+The restart is part of the repair, not a second action: the worker fixes `STATE_DIR` at
+process start, so a remount alone leaves it holding the old export's handles. It runs only
+after the mount succeeds. A failed `mount` also aborts without restarting.
+
+**The automated path has no lazy fallback.** `umount -l` detaches rather than unmounts, so
+existing fds keep writing to deleted inodes while a later check of the new mount
+reads green.
+A failed plain `umount` is therefore a refusal: its stderr (normally EBUSY) and the current
+`findmnt` row are captured as the refusal detail — which is what `heal.attempt` stores on
+the remedy row — and the command does not mount or restart. `fuser` is not used: psmisc is
+absent from the fleet image. The fleet's documented operator repair may use `-l` when a
+human is present to judge the consequence; the automated action does not.
+
+**`transcode_restart`** restarts the worker, triggered by the CURRENT-STATE checks
+`heartbeat_age_min` (the age of the job in flight) and `pass_cadence_min` (an idle box
+whose pass cadence has stalled). It deliberately does **not** trigger on
+`deadlock_kills` (a 360-minute historical window) or `stall_watch` (a static capability
+check): a restart cannot clear a historical fact, so either would restart a healthy worker
+for hours after a fault that may already be over. It is not the `NRestarts` restart
+described above: it is bounded by the same engine gates and refuses a non-CuBox target. Before restarting it reads both the per-boot
+marker `/run/cubox-transcode.started` and the unit's active state over ssh. The fleet's
+contract is **present = "already started this boot"**, so **present + inactive** is a
+deliberate stop and the action refuses; **absent** (never started this boot — the state-save
+drop-in would start it too) and **present + active/failed** (wedged) are restartable. An
+unreadable marker or unit state is a refusal: "I could not ask" is neither permission nor
+evidence of a stop.
 
 ### A remedy that does not work must become visible, not retried
 
 One attempt per key per cooldown (30 min mount, 60 min worker) regardless of how
-many polls confirm. `post_check` runs after a settle window **longer than the
-thing's own timeout**. **Attempt 2 fails → LATCH**: severity rises, the tile
-renders "RED — remedy attempted N times, ineffective", and no further automatic
-action until a human clears it. Without the latch, remedy 1 is an unmount flap
-every poll. A `post_check` of `unknown` is **neither** success nor failure:
-freeze, count the attempt, do not advance toward LATCH, and surface "remedy
-outcome unknown" as its own flag.
+many polls confirm. **Every executed attempt counts**, whether the command exited
+0 or not: the engine does not claim success from an exit status, so the only
+success signal is the incident machine's **next OK observation**. A run that
+exits 0 and leaves the condition open is an attempted-but-ineffective remedy, and
+it cools down and advances toward the latch exactly like a failed one. There is no
+settle window and no post-check written by the engine — those columns exist on the
+`remedy` table for historical rows, and nothing populates them.
+
+**Attempt budget exhausted → LATCH**: severity rises, the tile renders "RED —
+remedy attempted N times, ineffective", and no further automatic action until a
+human clears it. Without the latch, remedy 1 is an unmount flap every poll. A
+later OK observation still resolves the incident even while the engine is
+latched — resolution is the check's fact, not the remedy's verdict.
 
 ### Deliberately alert-only
 
@@ -964,9 +1269,21 @@ the dashboard says so explicitly.
 | `./deploy.sh` | sync the tree, build **on the NAS**, `up -d`, health-check |
 | `--status` | container state, the collector's last epoch, and every endpoint's HTTP code |
 | `--once` / `--once --dry-run` | one epoch, printed; the dry run writes not a single row |
-| `--showconf` | configuration and threshold coverage, exit non-zero on any unclaimed spec |
+| `--showconf` | configuration, the module summary and threshold coverage, exit non-zero on any unclaimed spec |
+| `--modules` | every discovered module, enabled or disabled: id, title, order, state, targets, expanded check count |
 | `--authorise-backup` | install the monitor's key on Backup-NAS (**separate on purpose** — see below) |
 | `--logs` | follow the container log |
+| `--list-commands` | every module command, its arguments and its danger level |
+| `--run MODULE.COMMAND [--arg k=v]... [--dry-run]` | one operator command, gated and audited (the dry run belongs to the command) |
+| `--list-runs` | the command audit |
+| `--proposals` / `--approve ID` / `--reject ID` | the approvals inbox and the human decision |
+| `--insights` / `--advisors` | advisor output and advisor run health |
+| `--thresholds` / `--revert-threshold SPEC_ID` | live overrides with the band each replaced, and the one-command revert |
+| `--remedies` | the remedy audit, newest 20 |
+| `--actor NAME` | modifier for any ctl verb: attribute the command or approval to NAME (default `operator`) |
+
+The dashboard renders one section per enabled module plus an explicit disabled note;
+`--modules` and `--list-commands` name the module id of every discovery and every command.
 
 Two things it deliberately does *not* do. It never builds locally: this Mac is
 Apple Silicon and the NAS is x86_64, so a local build produces an aarch64 image
@@ -975,15 +1292,16 @@ that dies with `exec format error`. And a plain deploy never touches Backup-NAS 
 host's credentials is how a surprise gets introduced.
 
 Configuration is environment variables in the **monitor directory on
-Storage-NAS** — `/share/CACHEDEV1_DATA/Programs/sentinel/.env`, mode 600 —
+Storage-NAS** — `/share/CACHEDEV1_DATA/Programs/sentinel/.env`, mode 600 —  <!-- secretscan:ignore (deployment path, documented; no credential) -->
 not in the repo. It is created once from `.env.example` and is
 then **excluded from every deploy** (`deploy.sh` skips `.env` in the
 rsync and only writes it when it is ABSENT on the NAS). So editing the repo's
 copy, or the `.env.example` template, changes nothing on a running monitor and
 says nothing about it — the NAS file wins. That is items 79/83's shape: the live
 copy is authoritative and the checked-in file is a template. Thresholds are **data** in
-`checks.conf` — editing it and restarting the container changes the RAG
-boundaries, with no rebuild. That is the same contract the transcode worker has
+the module's own `thresholds.conf` (and, for platform/meta specs, `checks.conf`) —
+editing them and restarting the container changes the RAG boundaries, with no
+rebuild. That is the same contract the transcode worker has
 with `/mnt/state/transcode/config`, and it is deliberate.
 
 The two knobs that matter most:
@@ -1002,12 +1320,19 @@ The two knobs that matter most:
 ./test.sh shared   # one suite, by subject substring
 ```
 
-Four suites: dashboard contract tests (a loopback-only server, real headers),
-check fixtures captured **verbatim** from the live fleet, the collector's offline
-tests, and the shared layer's (T2) checks. New assertions are mutation-tested — a
-guard is reverted in a scratch copy and the suite must go **red** — because a test
-that cannot fail is worse than no test (item 26), and a check is a restatement of
-the code it tests until it is written by different code (item 45).
+Eleven suites (711 checks at the 2026-10-20 gate): dashboard contract tests (a
+loopback-only server, real headers), check fixtures captured **verbatim** from the live
+fleet, the collector's offline tests, the shared layer's (T2) checks, module discovery and
+the contract, command dispatch and locks, the authority ladder, advisors and the snapshot,
+serial identity, the incident lifecycle, and the proxy's access rules. New assertions are
+mutation-tested — a guard is reverted in a scratch copy and the suite must go **red** —
+because a test that cannot fail is worse than no test (item 26), and a check is a
+restatement of the code it tests until it is written by different code (item 45).
+
+`python3 tools/parity.py --check tests/fixtures/parity-baseline.json` pins the
+check-result baseline at 96 rows: the check classes run over the captured fixtures and
+must produce identical `(target, check_id, status, subject, detail)` before and after a
+structural change. It is the test the module migration was measured with.
 
 Two rules the suites enforce structurally, both learned by measurement:
 

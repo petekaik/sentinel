@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import Overview from "./Overview";
@@ -113,6 +113,33 @@ function mockBoth(status: unknown, intelligence: unknown) {
     })),
   );
 }
+
+const isIntelligence = (url: unknown) =>
+  String(url).includes("/api/v1/intelligence");
+
+/* Hold the intelligence answer until the test releases it. An absence
+   assertion made while the response is still pending would pass against a
+   read the page never consumed -- the bug the assertion exists to catch. */
+function mockDeferredIntelligence(status: unknown) {
+  let resolve!: (body: unknown) => void;
+  let reject!: (error: unknown) => void;
+  const pending = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  const fetchMock = vi.fn(async (url: string) => {
+    if (isIntelligence(url)) {
+      const body = await pending;
+      return { ok: true, status: 200, statusText: "OK", json: async () => body };
+    }
+    return { ok: true, status: 200, statusText: "OK", json: async () => status };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return { fetchMock, resolve, reject };
+}
+
+// Flush the fetch chain and the state update it feeds, inside `act`.
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -244,8 +271,35 @@ it("shows a banner when the last intelligence cycle failed", async () => {
   expect(await screen.findByLabelText("Fleet verdict")).toBeInTheDocument();
 });
 
+it("shows an amber banner when the last intelligence cycle overran", async () => {
+  // `budget` is not `error`: the cycle ran and its evidence is usable, it
+  // just took too long. The copy and the tone are different, so it needs its
+  // own assertion.
+  mockBoth(STATUS, {
+    ...INTELLIGENCE,
+    last_cycle: {
+      ...INTELLIGENCE.last_cycle,
+      status: "budget",
+      detail: "budget exceeded: 41000ms",
+    },
+  });
+  render(
+    <MemoryRouter>
+      <Overview />
+    </MemoryRouter>,
+  );
+
+  expect(
+    await screen.findByText(/exceeded its budget/i),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/budget exceeded: 41000ms/)).toBeInTheDocument();
+  expect(
+    await screen.findByLabelText("Fleet verdict"),
+  ).toBeInTheDocument();
+});
+
 it("shows no intelligence banner when the last cycle is ok", async () => {
-  mockBoth(STATUS, INTELLIGENCE);
+  const { fetchMock, resolve } = mockDeferredIntelligence(STATUS);
   render(
     <MemoryRouter>
       <Overview />
@@ -254,35 +308,36 @@ it("shows no intelligence banner when the last cycle is ok", async () => {
 
   await screen.findByLabelText("Fleet verdict");
   await waitFor(() =>
-    expect(screen.queryByText(/intelligence cycle/i)).toBeNull(),
+    expect(fetchMock.mock.calls.some(([url]) => isIntelligence(url))).toBe(true),
   );
+  // Release the read only now, then flush its state update: the absence is
+  // asserted against an answer the page actually consumed.
+  await act(async () => {
+    resolve(INTELLIGENCE);
+    await flush();
+  });
+  expect(screen.queryByText(/intelligence cycle/i)).toBeNull();
 });
 
 it("does not break the board when the intelligence read fails", async () => {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async (url: string) => {
-      if (String(url).includes("/api/v1/intelligence")) {
-        throw new TypeError("intelligence fetch failed");
-      }
-      return {
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        json: async () => STATUS,
-      };
-    }),
-  );
+  const { fetchMock, reject } = mockDeferredIntelligence(STATUS);
   render(
     <MemoryRouter>
       <Overview />
     </MemoryRouter>,
   );
 
-  // No banner: an unreadable intelligence surface is "we do not know", which
-  // is neither a failure nor a green all-clear.
   await screen.findByLabelText("Fleet verdict");
   await waitFor(() =>
-    expect(screen.queryByText(/intelligence cycle/i)).toBeNull(),
+    expect(fetchMock.mock.calls.some(([url]) => isIntelligence(url))).toBe(true),
   );
+  await act(async () => {
+    reject(new TypeError("intelligence fetch failed"));
+    await flush();
+  });
+
+  // No banner: an unreadable intelligence surface is "we do not know", which
+  // is neither a failure nor a green all-clear. The fleet board is untouched.
+  expect(screen.queryByText(/intelligence cycle/i)).toBeNull();
+  expect(screen.getByLabelText("Fleet verdict")).toBeInTheDocument();
 });

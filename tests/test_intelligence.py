@@ -2242,6 +2242,28 @@ def test_a_module_token_budget_bounds_its_pack_before_the_global_cap(results):
             "the global cap still applies across modules",
             total <= 250 and usage_global.get("_reduced"),
             "usage=%r total=%r" % (usage_global, total))
+        # THE FLOOR CASES. `_shrink` returning False is a pack that cannot be
+        # cut further; if it is still over budget at that point, the reduction
+        # flag must already be set -- otherwise the one case that matters is
+        # the one that reports nothing.
+        with mock.patch.object(intelligence_layer, "_shrink", return_value=False):
+            _, _, usage_floor = intelligence_layer.pack_views(views, tight, 16000)
+            _, _, usage_global_floor = intelligence_layer.pack_views(
+                views, wide, 50)
+        total_floor = sum(v for v in usage_global_floor.values()
+                          if isinstance(v, int))
+        results.check(
+            "a module at its shrink floor and over budget is reported",
+            usage_floor["fleet"] > 150
+            and "fleet" in (usage_floor.get("_reduced") or ()),
+            "usage=%r. The pack could not be cut and is over its cap, so a "
+            "flag set only by a successful shrink leaves this silent."
+            % (usage_floor,))
+        results.check(
+            "an unattainable global cap is reported, not silent",
+            total_floor > 50 and usage_global_floor.get("_reduced"),
+            "usage=%r. The loop `break`s at the floor, but the module over "
+            "the cap must already be named." % (usage_global_floor,))
     finally:
         conn.close()
         shutil.rmtree(tmp)

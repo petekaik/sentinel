@@ -276,23 +276,29 @@ def pack_views(views, grants, max_tokens, cfg=None):
         # the global cap can only cut whichever module is largest at the end.
         text = dump(pack)
         cap = ((grants.get(mid) or {}).get("budget") or {}).get("tokens")
-        cut = False
-        while cap and max(1, len(text.encode()) // 4) > int(cap) \
+        # THE FLAG IS THE PRE-LOOP ESTIMATE VS THE CAP, not a side effect of a
+        # successful shrink: a module already at its floor is still over
+        # budget, and a flag set only inside the loop reports nothing exactly
+        # when nothing could be dropped.
+        cut = bool(cap) and max(1, len(text.encode()) // 4) > int(cap)
+        while cut and max(1, len(text.encode()) // 4) > int(cap) \
                 and _shrink(pack):
             text = dump(pack)
-            cut = True
         texts[mid] = text
         usage[mid] = max(1, len(text.encode()) // 4)
         if cut:
             reduced.append(mid)
     while sum(usage.values()) > int(max_tokens):
         mid = sorted(usage, key=lambda m: (usage[m], m))[-1]
+        # NAMED BEFORE THE ATTEMPT. This module is over the global cap whether
+        # or not `_shrink` can do anything; the `break` below is the case that
+        # must not report an empty detail.
+        if mid not in reduced:
+            reduced.append(mid)
         if not _shrink(per_module[mid]):
             break
         texts[mid] = dump(per_module[mid])
         usage[mid] = max(1, len(texts[mid].encode()) // 4)
-        if mid not in reduced:
-            reduced.append(mid)
     if reduced:
         usage["_reduced"] = sorted(reduced)
     system = (

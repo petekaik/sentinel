@@ -38,25 +38,6 @@ export default function Overview() {
     return () => clearInterval(id);
   }, []);
 
-  // ONE READ OF THE INTELLIGENCE SURFACE, for the failure banner only. A
-  // rejected read means this page cannot say whether the last cycle ran, so it
-  // says nothing; an empty green board is the failure this banner exists to
-  // prevent. It is deliberately not part of the status poll: a model backend
-  // outage must not turn the fleet board's own refresh into an error.
-  useEffect(() => {
-    let alive = true;
-    getIntelligence()
-      .then((s) => {
-        if (alive) setCycle(s.last_cycle ?? null);
-      })
-      .catch(() => {
-        if (alive) setCycle(null);
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
-
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -78,6 +59,17 @@ export default function Overview() {
         setLastOk(Date.now());
         const secs = Number(s.collector?.interval_s);
         if (Number.isFinite(secs) && secs >= 5) nextMs.current = secs * 1000;
+        // THE LAST CYCLE CAN FAIL AFTER THIS PAGE LOADED, so it is read on
+        // every poll. Its own `catch`: a model backend outage must not set the
+        // page's status error, and a rejected read means "unknown", so it
+        // leaves the banner off rather than claim a green all-clear.
+        void getIntelligence()
+          .then((intel) => {
+            if (alive) setCycle(intel.last_cycle ?? null);
+          })
+          .catch(() => {
+            if (alive) setCycle(null);
+          });
       } catch (e) {
         if (!alive) return;
         setError(

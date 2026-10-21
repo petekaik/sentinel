@@ -896,8 +896,13 @@ The key reaches no insight, advisor-run detail, cycle row or traceback.
 **A failure is visible, never an empty green cycle.** A configured, selected model that
 cannot be reached records `status=error` with the detail `model call failed`, keeps
 `model_calls = 1`, and leaves the deterministic advisors' rows in place. The SPA shows the
-last cycle's status and detail on the Intelligence page, so an unreachable backend reads
-as a failed cycle rather than "the intelligence found nothing". The traceback stays in the
+last cycle's status and detail on the Intelligence page, and the Overview raises its own
+banner when the last cycle is `error` or `budget`, naming the redacted detail; the
+Overview re-reads `/api/v1/intelligence` on every poll, so a cycle that fails after the
+page loaded is still shown. A failed intelligence read renders no banner at all — "we do
+not know" is never an all-clear — and cannot affect the fleet board's own refresh. An
+unreachable backend therefore reads as a failed cycle rather than "the intelligence found
+nothing". The traceback stays in the
 collector's `ctx.module_errors["intelligence"]` and is not persisted, so the transport's
 own words cannot carry a credential into the store. An HTTP error, a refused redirect, a
 malformed body and a non-JSON reply are all failures; a malformed item inside a valid

@@ -2123,7 +2123,8 @@ def test_the_selector_accepts_the_configured_llm_advisor(results):
 def test_the_pack_obeys_the_row_budget_and_reduces_deterministically(results):
     tmp, conn, cfg, ctx, views = _model_views(selector="none")
     try:
-        grants = {m: cfg.intelligence_grant(m, ())[0] for m in views}
+        grants = {m: cfg.intelligence_grant(m, tuple(v.mod.intelligence))[0]
+                  for m, v in views.items()}
         _, full, usage_full = intelligence_layer.pack_views(
             views, grants, 16000)
         tight = {m: {"observe": True, "author": "off", "remediate": False,
@@ -2152,6 +2153,99 @@ def test_the_pack_obeys_the_row_budget_and_reduces_deterministically(results):
             <= target
             and small == again and usage_small == usage_again,
             "usage=%r target=%r" % (usage_small, target))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_json_escaped_secret_is_redacted_too(results):
+    tmp, conn = _grant_store()
+    try:
+        secret = 'can"ary-å'
+        escaped = json.dumps(secret)[1:-1]
+        store.record_check(conn, 1, "cubox-1", "host_unreachable", "ok",
+                           "reachable", subject="cubox-1")
+        store.record_journal(conn, "cubox-1", "cursor-1", time.time(),
+                             "worker", 6,
+                             "worker read community %s" % secret)
+        cfg = _cycle_cfg(
+            FLEET_INTELLIGENCE='{"observe": true}',
+            SNMP_INTELLIGENCE='{"observe": true}',
+            SNMP_COMMUNITIES=json.dumps({"sw1": secret}),
+            SENTINEL_LLM_PROVIDER="openai",
+            SENTINEL_LLM_ENDPOINT="http://127.0.0.1:1",
+            SENTINEL_LLM_KEY="canary-key-123",
+            SENTINEL_LLM_MODEL="probe")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        views = {}
+        for mod in mods:
+            if mod.id not in ("fleet", "snmp"):
+                continue
+            grant, _ = cfg.intelligence_grant(mod.id, tuple(mod.intelligence))
+            views[mod.id] = module_view.ModuleView(
+                conn, mod, ctx, {}, grant, now=time.time())
+        _reset_model(json.dumps({"insights": [], "proposals": []}))
+        adv = llm_advisor.LlmAdvisor("openai", cfg.llm_endpoint,
+                                     cfg.llm_key, cfg.llm_model)
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            adv.advise_views(ctx, views, cfg)
+        body = _FakeModel.calls[0]["user"]
+        results.check(
+            "a quoted, non-ASCII secret is redacted in BOTH forms",
+            secret not in body and escaped not in body
+            and "[redacted]" in body,
+            "the pack is serialized with ensure_ascii, so a secret containing "
+            "a quote or a non-ASCII character travels escaped and `secret in "
+            "text` misses it. secret=%r escaped=%r body=%r"
+            % (secret, escaped, body[:500]))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_pack_views_refuses_a_view_without_observe(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        grants = {m: cfg.intelligence_grant(m, tuple(v.mod.intelligence))[0]
+                  for m, v in views.items()}
+        grants["snmp"] = dict(grants["snmp"], observe=False)
+        _, user, usage = intelligence_layer.pack_views(views, grants, 16000)
+        results.check(
+            "a view whose grant lost observe is absent from the pack",
+            "MODULE fleet" in user and "MODULE snmp" not in user
+            and "snmp" not in (usage or {}),
+            "user=%r usage=%r. A view is only read when its grant says so; "
+            "pack_views must not trust its caller to have filtered."
+            % (user[:300], usage))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_one_malformed_model_item_does_not_drop_the_rest(results):
+    tmp, conn, cfg, ctx, views = _model_views()
+    try:
+        _reset_model(json.dumps({
+            "insights": [
+                {"module": "fleet", "kind": "diagnosis", "title": "bad",
+                 "body": "evidence is not an object", "target": "cubox-1",
+                 "evidence": "not-a-dict"},
+                {"module": "fleet", "kind": "diagnosis", "title": "good",
+                 "body": "kept", "target": "cubox-1"}],
+            "proposals": []}))
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        bodies = [r["body"] for r in conn.execute(
+            "SELECT body FROM insight WHERE advisor = 'llm'")]
+        usage = {r["module"]: r for r in
+                 store.list_intelligence_usage(conn, out["cycle_id"])}
+        results.check(
+            "a malformed item is dropped and the next one is still stored",
+            out["status"] == "ok" and bodies == ["kept"]
+            and usage.get("fleet", {}).get("dropped") == 1,
+            "bodies=%r usage=%r. One bad item must not abort the batch or "
+            "vanish without a count." % (bodies, usage))
     finally:
         conn.close()
         shutil.rmtree(tmp)
@@ -2231,4 +2325,7 @@ TESTS = (
     test_a_model_failure_keeps_the_deterministic_runs_and_is_red,
     test_the_selector_accepts_the_configured_llm_advisor,
     test_the_pack_obeys_the_row_budget_and_reduces_deterministically,
+    test_a_json_escaped_secret_is_redacted_too,
+    test_pack_views_refuses_a_view_without_observe,
+    test_one_malformed_model_item_does_not_drop_the_rest,
 )

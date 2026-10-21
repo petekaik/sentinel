@@ -165,11 +165,29 @@ def _secret_values(cfg):
     return sorted(out, key=len, reverse=True)
 
 
+def _json_inner(value):
+    """The escaped body a string takes inside a JSON document."""
+    try:
+        return json.dumps(value)[1:-1]
+    except (TypeError, ValueError):
+        return ""
+
+
 def redact(text, secrets):
+    """Replace a secret in BOTH forms it can take in a JSON pack.
+
+    The pack is serialIZED, so a secret containing a quote, a backslash or a
+    non-ASCII character travels escaped (`can"ary-å` -> `can\\"ary-\\u00e5`),
+    and matching the raw value alone would let it through. Longest secret
+    first, raw form then escaped form.
+    """
     text = "" if text is None else str(text)
     for secret in secrets:
-        if secret and secret in text:
-            text = text.replace(secret, "[redacted]")
+        if not secret:
+            continue
+        for form in (str(secret), _json_inner(str(secret))):
+            if form and form in text:
+                text = text.replace(form, "[redacted]")
     return text
 
 
@@ -231,6 +249,11 @@ def pack_views(views, grants, max_tokens, cfg=None):
     secrets = _secret_values(cfg)  # secretscan:ignore -- a redaction list, never logged
     per_module = {}
     for mid, view in views.items():
+        # THE GRANT IS CHECKED HERE TOO. The cycle only passes observing views
+        # today, but a pack that trusted its caller would send another module's
+        # evidence the first time a caller filtered by hand.
+        if (grants.get(mid) or {}).get("observe") is not True:
+            continue
         budget = (grants.get(mid) or {}).get("budget") or {}
         max_rows = int(budget.get("rows") or 200)
         max_days = getattr(view, "max_days", None) or 7
@@ -462,48 +485,66 @@ def _record_model(cfg, conn, views, model_result):
     except Exception:                          # noqa: BLE001 - best effort
         pass
 
-    counts = {"insights": {}, "proposals": {}}
+    counts = {"insights": {}, "proposals": {}, "dropped": {}}
+
+    def bump(mid):
+        counts["dropped"][mid] = counts["dropped"].get(mid, 0) + 1
+
     ids = []
     for item in model_result.get("insights") or ():
         mid = str(item.get("module") or "")
         view = views.get(mid)
+        # ONE ITEM AT A TIME. A malformed item (evidence that is not an object)
+        # is stored for nobody and must not take the rest of the batch with it;
+        # it is counted as a drop so the cycle does not report a clean sweep.
         try:
-            confidence = float(item.get("confidence") or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        insight = advisors.Insight(
-            module=mid, kind=str(item.get("kind") or "report"),
-            title=redact(item.get("title") or "", secrets),
-            body=redact(item.get("body") or "", secrets),
-            target=str(item.get("target") or ""),
-            check_id=str(item.get("check_id") or ""),
-            subject=str(item.get("subject") or ""),
-            severity=str(item.get("severity") or "info"),
-            confidence=confidence,
-            evidence=(item.get("evidence")
-                      if isinstance(item.get("evidence"), dict) else {}))
-        advisors.record(conn, "llm", insight, view)
+            try:
+                confidence = float(item.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            insight = advisors.Insight(
+                module=mid, kind=str(item.get("kind") or "report"),
+                title=redact(item.get("title") or "", secrets),
+                body=redact(item.get("body") or "", secrets),
+                target=str(item.get("target") or ""),
+                check_id=str(item.get("check_id") or ""),
+                subject=str(item.get("subject") or ""),
+                severity=str(item.get("severity") or "info"),
+                confidence=confidence,
+                # NOT COERCED: `advisors._record` refuses a non-dict evidence,
+                # and that refusal is the item's drop rather than a silent
+                # rewrite that loses its provenance.
+                evidence=item.get("evidence", {}))
+            advisors.record(conn, "llm", insight, view)
+        except Exception:                      # noqa: BLE001 - one item only
+            bump(mid)
+            continue
         counts["insights"][mid] = counts["insights"].get(mid, 0) + 1
 
     for item in model_result.get("proposals") or ():
         mid = str(item.get("module") or "")
-        payload = dict(item.get("payload") or {})
-        payload["classification"] = item.get("classification") or ""
-        payload["diff"] = item.get("diff") or ""
-        payload["requires_human"] = True
-        signature = json.dumps({"module": mid, "kind": item.get("kind"),
-                                "payload": payload},
-                               sort_keys=True, default=str)
-        if signature in pending:
-            # The same undecided proposal is already in the queue; a copy
-            # every cycle is noise, not new evidence.
+        try:
+            payload = dict(item.get("payload") or {})
+            payload["classification"] = item.get("classification") or ""
+            payload["diff"] = item.get("diff") or ""
+            payload["requires_human"] = True
+            signature = json.dumps({"module": mid, "kind": item.get("kind"),
+                                    "payload": payload},
+                                   sort_keys=True, default=str)
+            if signature in pending:
+                # The same undecided proposal is already in the queue; a copy
+                # every cycle is noise, not new evidence.
+                continue
+            rationale = redact(str(item.get("rationale") or payload["diff"]
+                                    or "model proposal for %s" % mid), secrets)
+            pid = store.record_proposal(
+                conn, module=mid, kind=str(item.get("kind") or ""),
+                payload=payload, rationale=rationale[:2000],
+                expires_at=time.time() + ttl_s)
+        except Exception:                      # noqa: BLE001 - one item only
+            bump(mid)
             continue
-        rationale = redact(str(item.get("rationale") or payload["diff"]
-                                or "model proposal for %s" % mid), secrets)
-        ids.append(store.record_proposal(
-            conn, module=mid, kind=str(item.get("kind") or ""),
-            payload=payload, rationale=rationale[:2000],
-            expires_at=time.time() + ttl_s))
+        ids.append(pid)
         pending.add(signature)
         counts["proposals"][mid] = counts["proposals"].get(mid, 0) + 1
     return ids, counts
@@ -656,7 +697,7 @@ def run_cycle(cfg, conn, ctx, now=None):
             try:
                 ids, counts = _record_model(cfg, conn, views, model_result)
                 proposals.extend(ids)
-                for name in ("insights", "proposals"):
+                for name in ("insights", "proposals", "dropped"):
                     for mid, n in counts[name].items():
                         row = usage.setdefault(mid, {})
                         row[name] = int(row.get(name) or 0) + n

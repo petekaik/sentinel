@@ -56,9 +56,10 @@ is quoted in each correction:
   firing.
 - **No remedy has executed on the live fleet.** That is no longer because the
   engine is missing — `heal.py` is built and every gate is tested. It is because
-  both switches are off by default: `MONITOR_REMEDIES=0` (process kill switch) and
-  the fleet module at authority `off`. Enabling remedies without a callable
-  engine still makes the process refuse to start rather than pretend. `dismiss`
+  `MONITOR_REMEDIES` defaults off (the process kill switch), `SENTINEL_REMEDIATION`
+  defaults on (the engine master switch), and every module's authority starts `off`,
+  so no action is admitted until an operator grants one. Enabling remedies without a
+  callable engine still makes the process refuse to start rather than pretend. `dismiss`
   (below) is not a remedy: it is an operator verb, and it changes nothing about
   the fleet.
 - **The LLM advisor's transport is absent on purpose.** Configuring a provider and

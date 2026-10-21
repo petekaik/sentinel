@@ -559,6 +559,47 @@ def reset_setting(cfg, conn, mod, key, actor):
     return settings_view(cfg, conn, [mod]).get(mod.id, {})
 
 
+def apply_discovery(cfg, conn, mod, device, rows, actor):
+    """Merge selected candidate rows and write ONCE, as a human change.
+
+    THE WHOLE MERGED VALUE IS VALIDATED (`write_settings` validates the body
+    against the effective configuration before the first row is written): a
+    partial write would leave a device pointing at rows the operator did not
+    select. A row already present for the same (device, oid) is replaced, so
+    re-running a discovery does not duplicate it.
+    """
+    effective = _effective_values(
+        cfg, conn, mod, {},
+        {s.key: s for s in mod.settings})
+    names = {str(r.get("name")) for r in (effective.get("SNMP_DEVICES") or [])}
+    if device not in names:
+        raise SettingsError(
+            "invalid_value",
+            "device %r is not in SNMP_DEVICES; add the device first" % device)
+    merged = list(effective.get("SNMP_CHECKS") or [])
+    # A stored row that is not an object stays in `merged` so `validate` refuses
+    # the whole write, rather than this loop crashing on it with an AttributeError.
+    by_oid = {(r.get("device"), r.get("oid")): i
+              for i, r in enumerate(merged) if isinstance(r, dict)}
+    for row in rows or ():
+        if not isinstance(row, dict) or row.get("device") != device:
+            raise SettingsError("invalid_value",
+                                "every discovery row must name device %r"
+                                % device)
+        clean = {k: row.get(k) for k in (
+            "device", "oid", "label", "unit", "direction", "green",
+            "amber", "kind", "expected")}
+        at = by_oid.get((clean["device"], clean["oid"]))
+        if at is None:
+            by_oid[(clean["device"], clean["oid"])] = len(merged)
+            merged.append(clean)
+        else:
+            merged[at] = clean
+    if not merged:
+        raise SettingsError("invalid_value", "no rows selected")
+    return write_settings(cfg, conn, mod, {"SNMP_CHECKS": merged}, actor)
+
+
 def set_enabled(cfg, conn, mod, enabled, actor):
     """Enable or disable one module as a settings override."""
     if not isinstance(enabled, bool):

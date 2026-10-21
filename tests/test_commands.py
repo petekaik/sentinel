@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import APP, Results                    # noqa: E402
 
 import commands                                    # noqa: E402
+import modules as module_loader                    # noqa: E402
 import store                                       # noqa: E402
 
 
@@ -1079,6 +1080,35 @@ def test_modules_lists_discovered_modules_and_their_state(results):
         "that does not exist" % (rc, fleet))
 
 
+def test_snmp_discover_is_declared_read_only_under_the_device_lock(results):
+    """A walk changes nothing, and the device name is validated in the handler.
+
+    `commands()` has no Context, so it cannot turn the configured device names
+    into `Arg(choices=...)` -- the refusals it can give are the handler's. What
+    it CAN declare is the lock scope: every SNMP walk takes the same device
+    resource, so two walks cannot share one device's socket budget.
+    """
+    snmp = [m for m in module_loader.discover() if m.id == "snmp"][0]
+    found = [c for c in snmp.commands() if c.id == "discover"]
+    cmd = found[0] if found else None
+    results.check(
+        "the snmp module declares a discover command",
+        cmd is not None, "commands=%r" % ([c.id for c in snmp.commands()],))
+    if cmd is None:
+        return
+    results.check(
+        "discover is read-only, locks the device and is bounded at 90s",
+        cmd.danger == "read_only" and "snmp:device" in cmd.resources
+        and cmd.timeout_s == 90,
+        "danger=%r resources=%r timeout=%r"
+        % (cmd.danger, cmd.resources, cmd.timeout_s))
+    results.check(
+        "the device argument is required and carries no static choices",
+        [a.name for a in cmd.args] == ["device", "max_oids"]
+        and cmd.args[0].required and cmd.args[0].choices is None,
+        "args=%r" % ([(a.name, a.required, a.choices) for a in cmd.args],))
+
+
 TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_disabled_module_refuses,
          test_a_held_resource_refuses_the_second_command,
@@ -1112,6 +1142,7 @@ TESTS = (test_bad_arguments_refuse_before_the_handler_runs,
          test_ctl_exposes_proposal_and_insight_verbs,
          test_list_commands_shows_each_commands_arguments,
          test_modules_lists_discovered_modules_and_their_state,
+         test_snmp_discover_is_declared_read_only_under_the_device_lock,
          # LAST TWO: a missing release leaks the process-global _HELD set,
          # which would make every later test refuse for the wrong reason.
          # Running them at the end keeps the failure attributed to the guard

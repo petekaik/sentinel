@@ -20,6 +20,7 @@ import actions                                    # noqa: E402
 import advisors                                   # noqa: E402
 import authorize                                  # noqa: E402
 import checks                                     # noqa: E402
+import commands as cmdlib                         # noqa: E402
 import config as config_mod                       # noqa: E402
 import ctl                                        # noqa: E402
 import heal                                       # noqa: E402
@@ -1438,6 +1439,127 @@ def test_an_unnamed_interface_row_is_reported_not_invented(results):
         "label a human cannot verify is worse than no row." % (cands, notes))
 
 
+def test_discover_refuses_an_unknown_device_and_never_walks(results):
+    mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+    cfg = config_mod.Config({"SNMP_DEVICES": "[]", "SNMP_TIMEOUT_S": "1"})
+    ctx = checks.Context(cfg, {}, {}, modules=(mod,))
+    try:
+        cmdlib.run(mod, "discover", {"device": "ghost"}, ctx=ctx)
+    except cmdlib.CommandError as exc:
+        results.check(
+            "an unconfigured device is refused before any walk",
+            "ghost" in str(exc) and "configured" in str(exc),
+            "got %r" % (exc,))
+    else:
+        results.check("an unconfigured device is refused", False,
+                      "discover accepted a device that is not configured")
+
+
+def test_discover_labels_an_interface_from_the_walk(results):
+    """ifName/ifOperStatus name the row; the names map is keyed by FULL OID.
+
+    `candidates()` takes names keyed by the row's OID, so the command has to
+    build that map from the walk's name columns. Passing the rows without it
+    drops every interface row with "index 1 could not be resolved".
+    """
+    mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+    cfg = config_mod.Config({
+        "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+        "SNMP_COMMUNITIES": '{"sw1":"public"}',
+        "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1"})
+    ctx = checks.Context(cfg, {}, {}, modules=(mod,))
+
+    def fake_walk(host, community, root, **kwargs):
+        if root == "1.3.6.1.2.1":
+            return ([("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string"),
+                     ("1.3.6.1.2.1.2.2.1.8.1", 1, "integer")], False)
+        return ([], False)
+
+    with mock.patch("modules.snmp.snmp.walk", side_effect=fake_walk):
+        res = cmdlib.run(mod, "discover", {"device": "sw1"}, ctx=ctx)
+    labels = [c["label"] for c in json.loads(res.output)["candidates"]]
+    results.check(
+        "the interface candidate is labelled with its ifName from the walk",
+        "Interface lan1" in labels,
+        "labels=%r. An index-keyed names map would leave this row unresolved."
+        % (labels,))
+
+
+def test_discovery_apply_writes_once_and_refuses_a_partial_bad_body(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+            "SNMP_COMMUNITIES": '{"sw1":"public"}',
+            "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1"})
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        settingsapi.apply_discovery(
+            cfg, conn, mod, "sw1",
+            [{"device": "sw1", "oid": "1.3.6.1.2.1.1.3.0", "label": "uptime",
+              "unit": "", "direction": "high_is_good", "green": 1,
+              "amber": 0, "kind": "gauge", "expected": None}],
+            "operator")
+        cfg.reload_settings(conn)
+        rows = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        results.check(
+            "apply writes the selected row through the settings API",
+            len(rows["SNMP_CHECKS"]["value"]) == 1,
+            "view=%r" % (rows["SNMP_CHECKS"],))
+        before = store.setting_rows(conn)
+        try:
+            settingsapi.apply_discovery(
+                cfg, conn, mod, "sw1",
+                [{"device": "sw1", "oid": "not-an-oid", "label": "bad"}],
+                "operator")
+        except settingsapi.SettingsError:
+            pass
+        results.check(
+            "a bad row refuses the whole write",
+            store.setting_rows(conn) == before,
+            "rows=%r" % (store.setting_rows(conn),))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_discover_routes_walk_and_refuse_an_unknown_device(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = make_cfg(os.path.join(tmp, "m.sqlite"),
+                       SENTINEL_WRITE_TOKEN="tok",
+                       SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+                       SNMP_COMMUNITIES='{"sw1":"public"}',
+                       SNMP_CHECKS="[]", SNMP_TIMEOUT_S="1")
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        conn.close()
+
+        def fake_walk(host, community, root, **kwargs):
+            if root == "1.3.6.1.2.1":
+                return ([("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string"),
+                         ("1.3.6.1.2.1.2.2.1.8.1", 1, "integer")], False)
+            return ([], False)
+
+        with mock.patch("modules.snmp.snmp.walk", side_effect=fake_walk):
+            status, body = _http(cfg, "POST", "/api/v1/modules/snmp/discover",
+                                 {"device": "sw1"}, token="tok")
+        labels = [c.get("label") for c in body.get("candidates") or []]
+        results.check(
+            "POST /modules/snmp/discover returns labelled candidates",
+            status == 200 and "Interface lan1" in labels,
+            "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "POST",
+                             "/api/v1/modules/snmp/discover/apply",
+                             {"device": "ghost", "rows": []}, token="tok")
+        results.check(
+            "an apply against an unconfigured device is a 422, not a 500",
+            status == 422
+            and (body.get("error") or {}).get("code") == "invalid_value",
+            "status=%r body=%r" % (status, body))
+    finally:
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -1495,4 +1617,8 @@ TESTS = (
     test_an_oid_component_boundary_keeps_a_lookalike_out_of_the_counter_table,
     test_names_are_keyed_by_full_oid_so_one_index_cannot_leak_across_tables,
     test_an_unnamed_interface_row_is_reported_not_invented,
+    test_discover_refuses_an_unknown_device_and_never_walks,
+    test_discover_labels_an_interface_from_the_walk,
+    test_discovery_apply_writes_once_and_refuses_a_partial_bad_body,
+    test_the_discover_routes_walk_and_refuse_an_unknown_device,
 )

@@ -1156,6 +1156,12 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[:3] == ["api", "v1", "commands"]:
                 self._run_command(cfg, conn, parts[3], parts[4], body)
                 return
+            if parts == ["api", "v1", "modules", "snmp", "discover"]:
+                self._discover(cfg, conn, body)
+                return
+            if parts == ["api", "v1", "modules", "snmp", "discover", "apply"]:
+                self._discover_apply(cfg, conn, body)
+                return
             self._error(404, "no_route", "no such /api/v1 route")
         except Exception as exc:                   # noqa: BLE001 - rendered
             self._error(500, "internal",
@@ -1180,6 +1186,72 @@ class Handler(BaseHTTPRequestHandler):
             self._error(409, "refused", str(exc))
             return
         self._json(200, {"ok": True, "message": message})
+
+    def _snmp_module(self):
+        """The discovered snmp Module, or None after answering 404."""
+        mod = {m.id: m for m in module_loader.discover()}.get("snmp")
+        if mod is None:
+            self._error(404, "no_module", "unknown module")
+        return mod
+
+    def _discover(self, cfg, conn, body):
+        """POST /modules/snmp/discover: walk a configured device, write nothing.
+
+        `dispatch`, not `run`, so the module-enabled gate and the audit row are
+        the same ones every other command gets. The walk's community never
+        appears here: it is read from the settings inside the handler.
+        """
+        if not isinstance(body, dict):
+            self._error(422, "invalid_body",
+                        "the request body must be a JSON object")
+            return
+        mod = self._snmp_module()
+        if mod is None:
+            return
+        cmd = {c.id: c for c in mod.commands()}.get("discover")
+        if cmd is None:
+            self._error(404, "no_command",
+                        "module 'snmp' has no command 'discover'")
+            return
+        try:
+            res = commands.dispatch(
+                mod.id, cmd, body, actor="operator", conn=conn,
+                module_enabled=cfg.module_enabled(mod.id),
+                ctx=ctl._context(cfg, {mod.id: mod}))
+        except commands.CommandFailed as exc:
+            self._error(500, "failed", str(exc))
+            return
+        except commands.CommandError as exc:
+            self._error(422, "refused", str(exc))
+            return
+        try:
+            payload = json.loads(res.output or "{}")
+        except ValueError:
+            self._error(500, "internal", "the walk returned no JSON payload")
+            return
+        self._json(200, payload)
+
+    def _discover_apply(self, cfg, conn, body):
+        """POST /modules/snmp/discover/apply: ONE validated settings write.
+
+        `apply_discovery` validates the whole merged list before writing, so a
+        refused selection leaves `SNMP_CHECKS` exactly as it was.
+        """
+        if not isinstance(body, dict):
+            self._error(422, "invalid_body",
+                        "the request body must be a JSON object")
+            return
+        mod = self._snmp_module()
+        if mod is None:
+            return
+        try:
+            out = settingsapi.apply_discovery(
+                cfg, conn, mod, str(body.get("device") or ""),
+                body.get("rows") or [], "operator")
+        except settingsapi.SettingsError as exc:
+            self._error(422, exc.code, exc.message, exc.field)
+            return
+        self._json(200, out)
 
     def _run_command(self, cfg, conn, module_id, command_id, body):
         if not isinstance(body, dict):

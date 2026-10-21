@@ -15,6 +15,7 @@ freezes their incidents instead of leaving them open forever.
 from module import Module, Setting
 
 from modules.snmp import checks as snmp_checks
+from modules.snmp import commands as snmp_commands
 from modules.snmp import preload
 from modules.snmp.settings import validate
 
@@ -71,6 +72,7 @@ MODULE = Module(
     context=preload.configure,
     preload=preload.preload,
     checks=(),
+    commands=snmp_commands.commands,
     check_instances=snmp_checks.instances,
     validate_settings=validate,
     # The reachability id exists in no class either (it is built per device by

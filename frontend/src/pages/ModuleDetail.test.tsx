@@ -242,6 +242,72 @@ it("renders one check row per target and attributes rows by check ownership", as
   // A collector-emitted check id named by `extra_check_ids` is owned even when
   // its target is not one of the module's reporting targets.
   expect(screen.getByText("extra-check detail")).toBeInTheDocument();
+
+  // Discovery belongs to the snmp page only.
+  expect(
+    screen.queryByRole("heading", { name: "Discover checks" }),
+  ).toBeNull();
+});
+
+it("offers the discovery sheet the configured devices on the snmp page", async () => {
+  // The sheet reuses this page's settings read; the device list is not a
+  // second fetch and not a free-text guess.
+  const snmp = {
+    id: "snmp",
+    title: "Network devices",
+    order: 30,
+    enabled: true,
+    targets: ["snmp"],
+    checks: [],
+    extra_check_ids: [],
+    settings: [],
+    commands: [],
+    actions: [],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      if (url === "/api/v1/modules") return respond(200, [snmp]);
+      if (url === "/api/v1/status")
+        return respond(200, {
+          ...status,
+          hosts: { snmp: host },
+          worst: [],
+          informational: [],
+          incidents: [],
+        });
+      if (url === "/api/v1/settings")
+        return respond(200, {
+          snmp: {
+            SNMP_DEVICES: {
+              value: [{ name: "sw1" }, { name: "sw2" }],
+              source: "db",
+            },
+          },
+        });
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+
+  render(
+    <MemoryRouter initialEntries={["/modules/snmp"]}>
+      <Routes>
+        <Route path="/modules/:id" element={<ModuleDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(
+    await screen.findByRole("heading", { name: "Discover checks" }),
+  ).toBeInTheDocument();
+  const select = screen.getByLabelText(
+    "Device to discover",
+  ) as HTMLSelectElement;
+  expect(select.value).toBe("sw1");
+  expect(Array.from(select.options).map((o) => o.value)).toEqual([
+    "sw1",
+    "sw2",
+  ]);
 });
 
 it("renders one row per (check, subject), not one per check id", async () => {

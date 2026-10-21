@@ -10,6 +10,7 @@ import {
   type SettingsView,
   type Status,
 } from "../api";
+import DiscoverySheet from "../components/DiscoverySheet";
 import SettingsForm from "../components/SettingsForm";
 import StaleBanner from "../components/StaleBanner";
 import StatusPill, { tone } from "../components/StatusPill";
@@ -310,6 +311,13 @@ export default function ModuleDetail() {
   const incidents = (status?.incidents ?? []).filter((r) =>
     belongs(r.target, r.check_id),
   );
+  // The discovery sheet reuses this page's settings read for its device list;
+  // it never fetches `/api/v1/settings` a second time.
+  const snmpDevices: string[] = Array.isArray(view?.snmp?.SNMP_DEVICES?.value)
+    ? view?.snmp?.SNMP_DEVICES?.value.map((d: { name?: string }) =>
+        String(d?.name ?? ""),
+      ).filter(Boolean)
+    : [];
 
   return (
     <>
@@ -597,6 +605,20 @@ export default function ModuleDetail() {
             </table>
           </div>
         </>
+      )}
+
+      {mod.id === "snmp" && (
+        <DiscoverySheet
+          moduleId="snmp"
+          devices={snmpDevices}
+          readOnly={locked}
+          onAuthRequired={(again) => {
+            retry.current = again;
+            setReadOnly(true);
+            setTokenOpen(true);
+          }}
+          onApplied={() => void load()}
+        />
       )}
 
       <h2>Commands</h2>

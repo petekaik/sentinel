@@ -343,6 +343,38 @@ export const api = {
     ),
 };
 
+/* SNMP discovery. A walk PROPOSES rows and writes nothing; the apply is one
+   settings write of the rows a human checked. `direction` is null on a state
+   row and on an unknown object, and a null band is never filled in here. */
+export type DiscoveryRow = {
+  device: string;
+  oid: string;
+  label: string;
+  kind: "gauge" | "state";
+  direction: "high_is_good" | "low_is_good" | null;
+  green: number | null;
+  amber: number | null;
+  expected: number | null;
+  unit: string;
+  observed: number | string | null;
+  confidence: "high" | "low";
+  note: string;
+};
+
+export type DiscoveryResult = {
+  device: string;
+  candidates: DiscoveryRow[];
+  notes: string[];
+  truncated: boolean;
+};
+
+export const discover = (id: string, device: string) =>
+  req<DiscoveryResult>("POST", `/api/v1/modules/${id}/discover`, { device });
+
+export const applyDiscovery = (id: string, device: string,
+                                rows: DiscoveryRow[]) =>
+  req("POST", `/api/v1/modules/${id}/discover/apply`, { device, rows });
+
 /* The intelligence surface. A grant says how far the intelligence may go on
    one module; the master switch is a `.env` fact and is read-only here. */
 export type IntelligenceGrant = {

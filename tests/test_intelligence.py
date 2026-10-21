@@ -2478,8 +2478,16 @@ def test_a_modification_cannot_be_applied_by_the_auto_path(results):
             settingsapi.write_authoring_change(
                 cfg, conn, mod, {"settings": after}, "intelligence:auto")
         except settingsapi.SettingsError as exc:
-            results.check("the auto path refuses a modification",
-                          "human" in str(exc).lower(), "got %r" % (exc,))
+            message = str(exc).lower()
+            # THE MESSAGE CARRIES THE CLASSIFICATION THE WRITE PATH COMPUTED,
+            # against its OWN cfg-derived effective map -- not this test's
+            # hand-built `before`. Requiring "modification" is what proves the
+            # write path classified it so; an INVALID refusal would pass a
+            # bare "human" test while never reaching the additive-only gate.
+            results.check(
+                "the auto path refuses a modification",
+                "modification" in message and "human" in message,
+                "got %r" % (exc,))
         else:
             results.check("the auto path refuses a modification", False,
                           "it applied a band change at author=auto")
@@ -3336,6 +3344,13 @@ def test_a_model_cycle_never_calls_heal_attempt(results):
                                 "cubox-1", store.Status.FAIL,
                                 "state dir on tmpfs")
         ctx.epoch_results = [_ran("cubox-1", "state_dir_tmpfs", "cubox-1")]
+        # With the switch off, `consider_nominations` returns immediately, so
+        # a cycle-side call would be invisible and this test vacuous.
+        results.check(
+            "the fixture really enables the kill switch",
+            cfg.remedies_enabled is True,
+            "MONITOR_REMEDIES did not reach the config; with it off a "
+            "consider_nominations call is a no-op")
         _reset_model(json.dumps({"proposals": [
             {"module": "fleet", "kind": "action",
              "payload": {"action_id": "state_mount_cycle",

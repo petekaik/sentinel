@@ -105,8 +105,10 @@ before and after `score_store`. Usage errors (missing `--db`, non-positive
 
 ## One implementation note
 
-A perfectly constant series has `MAD == 0`, so any departure from it has an
-unbounded robust z. `robust_z` reports a large finite sentinel (`1e9`) rather
-than `inf` so the score survives JSON on every surface. If a quantised metric
-(0/1 counters) starts producing false alarms at that scale, the fix is a
-granularity-aware scale, not a lower z threshold.
+`MAD == 0` means at least half the values sit at the median — a constant series
+is the extreme case, but the fleet's near-always-zero counters are the ordinary
+one — so a departure from that median has an unbounded robust z. `robust_z`
+reports a large finite sentinel (`1e9`) rather than `inf` so the score survives
+JSON on every surface. If a quantised metric (0/1 counters) starts producing
+false alarms at that scale, the fix is a granularity-aware scale, not a lower z
+threshold.

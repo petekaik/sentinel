@@ -245,8 +245,13 @@ def score_store(db_path, days=float(anomaly.SPAN_MIN_DAYS),
                 flags = {
                     "robust_z": rz_flag,
                     "level_shift": shift_flag,
-                    # detect's own priority: robust_z first, then level_shift.
-                    "detect": rz_flag or shift_flag,
+                    # The detector reading comes from `detect` itself, not from
+                    # `rz_flag or shift_flag`: the harness must measure the
+                    # function that will run, or it will keep agreeing with its
+                    # own copy of the rule after `detect` changes (item 84).
+                    "detect": anomaly.detect(points[:i + 1],
+                                             min_samples=min_samples,
+                                             z=z) is not None,
                     "baseline": thresholds.evaluate(value, spec)[0]
                                 is store.Status.FAIL,
                 }

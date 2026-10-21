@@ -9,10 +9,12 @@ SPAN_MIN_DAYS = 7
 Z_DEFAULT = 4.0
 SHIFT_LOW = 0.75
 SHIFT_HIGH = 1.33
-# ponytail: a perfectly constant series (MAD == 0) makes any departure an
-# infinitely large z. Reported as a large finite sentinel so the score survives
-# JSON on every surface; replace it with a granularity-aware scale when a
-# metric is known to quantise (e.g. 0/1 counters) and 1e9 starts flagging noise.
+# ponytail: MAD == 0 means at least half the values sit at the median (a
+# constant series is the extreme case; the fleet's near-always-zero counters are
+# the ordinary one), so a departure from that median has an unbounded z.
+# Reported as a large finite sentinel so the score survives JSON on every
+# surface; replace it with a granularity-aware scale when a metric is known to
+# quantise (e.g. 0/1 counters) and 1e9 starts flagging noise.
 Z_ZERO_SCALE = 1e9
 
 
@@ -38,8 +40,9 @@ def robust_z(value, values):
         return None
     scale = 1.4826 * spread
     if scale == 0:
-        # A perfectly constant series has no scale, so a departure from it has
-        # no finite z. No departure (value == med) scores 0.
+        # At least half the values sit at the median: the robust scale is zero,
+        # so a departure from that median has no finite z. No departure
+        # (value == med) scores 0.
         delta = float(value) - med
         return 0.0 if delta == 0 else math.copysign(Z_ZERO_SCALE, delta)
     return (float(value) - med) / scale

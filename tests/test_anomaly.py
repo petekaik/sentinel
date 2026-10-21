@@ -113,11 +113,16 @@ def test_the_replay_harness_scores_a_synthetic_store_and_writes_nothing(results)
             band is not None and band["recall"] == 1.0
             and band["false_alarms_per_1000"] == 0.0,
             "baseline=%r" % (band,))
+        # Compare against the CLASS total, not the overall: the fixture has one
+        # metric today, and a second metric would make the overall sum larger
+        # while every detector was still correctly scored.
+        block = out["classes"]["failed_units"]
         results.check(
-            "every detector is scored on the same minutes",
-            all(d["scored"] == out["scored_minutes"]
-                for d in out["classes"]["failed_units"]["detectors"].values()),
-            "classes=%r" % (out["classes"],))
+            "every detector is scored on the class's minutes",
+            block["scored_minutes"] > 0
+            and all(d["scored"] == block["scored_minutes"]
+                    for d in block["detectors"].values()),
+            "class=%r" % (block,))
     finally:
         shutil.rmtree(tmp)
 

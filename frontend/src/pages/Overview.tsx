@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type Status } from "../api";
+import {
+  api,
+  getIntelligence,
+  type IntelligenceState,
+  type Status,
+} from "../api";
 import StaleBanner, { span } from "../components/StaleBanner";
 import StatusPill, { tone } from "../components/StatusPill";
 
@@ -18,6 +23,10 @@ export default function Overview() {
   // that the connection died. This is the client-side half of that rule.
   const [lastOk, setLastOk] = useState<number | null>(null);
   const [clock, setClock] = useState(() => Date.now());
+  // The last intelligence cycle, when one was reported. Its own read: a model
+  // backend failing is not the fleet board failing, and a failed read here
+  // must leave the banner off rather than claim the intelligence is healthy.
+  const [cycle, setCycle] = useState<IntelligenceState["last_cycle"]>(null);
   // The collector's own interval, not a second literal: the page must refresh
   // at the rate the backend says it collects. Held in a ref because changing it
   // must not restart the effect (and re-fire the first request).
@@ -27,6 +36,25 @@ export default function Overview() {
   useEffect(() => {
     const id = setInterval(() => setClock(Date.now()), CLOCK_TICK_MS);
     return () => clearInterval(id);
+  }, []);
+
+  // ONE READ OF THE INTELLIGENCE SURFACE, for the failure banner only. A
+  // rejected read means this page cannot say whether the last cycle ran, so it
+  // says nothing; an empty green board is the failure this banner exists to
+  // prevent. It is deliberately not part of the status poll: a model backend
+  // outage must not turn the fleet board's own refresh into an error.
+  useEffect(() => {
+    let alive = true;
+    getIntelligence()
+      .then((s) => {
+        if (alive) setCycle(s.last_cycle ?? null);
+      })
+      .catch(() => {
+        if (alive) setCycle(null);
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -136,6 +164,26 @@ export default function Overview() {
       )}
 
       <StaleBanner collector={c} />
+
+      {/* THE ANALYSIS FAILING IS NOT THE FLEET FAILING. A selected model that
+          could not be reached is an `error` cycle, and an overrun is `budget`;
+          either leaves the deterministic evidence intact, so this sits above
+          the cards rather than replacing them. The detail is the server's,
+          already redacted -- never the model key. */}
+      {cycle && (cycle.status === "error" || cycle.status === "budget") && (
+        <div
+          className={`banner ${cycle.status === "error" ? "red" : "amber"}`}
+          role="alert"
+        >
+          <strong>
+            {cycle.status === "error"
+              ? "The last intelligence cycle failed."
+              : "The last intelligence cycle exceeded its budget."}
+          </strong>{" "}
+          {cycle.detail || "No detail was recorded."} The fleet below is still
+          the last measured state.
+        </div>
+      )}
 
       {/* A MODULE WHOSE SETTINGS DO NOT PARSE IS NOT AN EMPTY MODULE. Without
           this the only trace was a spec-less placeholder in `others`, which no

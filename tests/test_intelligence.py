@@ -2217,6 +2217,36 @@ def test_the_pack_obeys_the_row_budget_and_reduces_deterministically(results):
         shutil.rmtree(tmp)
 
 
+def test_a_module_token_budget_bounds_its_pack_before_the_global_cap(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        grants = {m: cfg.intelligence_grant(m, tuple(v.mod.intelligence))[0]
+                  for m, v in views.items()}
+        wide = {m: dict(g, budget=dict(g["budget"], tokens=100000))
+                for m, g in grants.items()}
+        tight = {m: dict(g, budget=dict(g["budget"], tokens=150))
+                 for m, g in grants.items()}
+        _, full, usage_full = intelligence_layer.pack_views(views, wide, 16000)
+        _, capped, usage = intelligence_layer.pack_views(views, tight, 16000)
+        results.check(
+            "a module's token budget bounds its own pack before the join",
+            usage_full["fleet"] > 150
+            and usage["fleet"] <= 150
+            and "fleet" in (usage.get("_reduced") or ())
+            and capped != full,
+            "tight=%r full=%r. A `budget.tokens` that is stored, displayed "
+            "and never enforced is not a budget." % (usage, usage_full))
+        _, _, usage_global = intelligence_layer.pack_views(views, wide, 250)
+        total = sum(v for v in usage_global.values() if isinstance(v, int))
+        results.check(
+            "the global cap still applies across modules",
+            total <= 250 and usage_global.get("_reduced"),
+            "usage=%r total=%r" % (usage_global, total))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 def test_a_json_escaped_secret_is_redacted_too(results):
     tmp, conn = _grant_store()
     try:
@@ -2766,6 +2796,7 @@ TESTS = (
     test_a_model_failure_keeps_the_deterministic_runs_and_is_red,
     test_the_selector_accepts_the_configured_llm_advisor,
     test_the_pack_obeys_the_row_budget_and_reduces_deterministically,
+    test_a_module_token_budget_bounds_its_pack_before_the_global_cap,
     test_a_json_escaped_secret_is_redacted_too,
     test_pack_views_refuses_a_view_without_observe,
     test_one_malformed_model_item_does_not_drop_the_rest,

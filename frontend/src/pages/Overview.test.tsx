@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import Overview from "./Overview";
@@ -80,6 +80,36 @@ function mockStatus(body: unknown = STATUS) {
       status: 200,
       statusText: "OK",
       json: async () => body,
+    })),
+  );
+}
+
+const INTELLIGENCE = {
+  enabled: true,
+  interval_s: 300,
+  backend: { provider: "openai", configured: true, model: "probe" },
+  modules: [],
+  usage: [],
+  last_cycle: {
+    id: 7,
+    ts: 1760000000,
+    status: "ok",
+    duration_ms: 900,
+    modules_read: "fleet",
+    model_calls: 1,
+    detail: "",
+  },
+};
+
+function mockBoth(status: unknown, intelligence: unknown) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () =>
+        String(url).includes("/api/v1/intelligence") ? intelligence : status,
     })),
   );
 }
@@ -185,4 +215,74 @@ it("shows a stale banner that refuses to call the data live", async () => {
 
   const banner = await screen.findByRole("alert");
   expect(banner).toHaveTextContent("STALE — this is not a live verdict.");
+});
+
+it("shows a banner when the last intelligence cycle failed", async () => {
+  // The model failing leaves the deterministic evidence and the fleet board
+  // intact, so the page must SAY the analysis is missing rather than show an
+  // unchanged, healthy-looking overview.
+  mockBoth(STATUS, {
+    ...INTELLIGENCE,
+    last_cycle: {
+      ...INTELLIGENCE.last_cycle,
+      status: "error",
+      detail: "model call failed",
+    },
+  });
+  render(
+    <MemoryRouter>
+      <Overview />
+    </MemoryRouter>,
+  );
+
+  expect(
+    await screen.findByText(/last intelligence cycle failed/i),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/model call failed/)).toBeInTheDocument();
+  // The fleet board is still there: this is a missing analysis, not a dead
+  // monitor.
+  expect(await screen.findByLabelText("Fleet verdict")).toBeInTheDocument();
+});
+
+it("shows no intelligence banner when the last cycle is ok", async () => {
+  mockBoth(STATUS, INTELLIGENCE);
+  render(
+    <MemoryRouter>
+      <Overview />
+    </MemoryRouter>,
+  );
+
+  await screen.findByLabelText("Fleet verdict");
+  await waitFor(() =>
+    expect(screen.queryByText(/intelligence cycle/i)).toBeNull(),
+  );
+});
+
+it("does not break the board when the intelligence read fails", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      if (String(url).includes("/api/v1/intelligence")) {
+        throw new TypeError("intelligence fetch failed");
+      }
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => STATUS,
+      };
+    }),
+  );
+  render(
+    <MemoryRouter>
+      <Overview />
+    </MemoryRouter>,
+  );
+
+  // No banner: an unreadable intelligence surface is "we do not know", which
+  // is neither a failure nor a green all-clear.
+  await screen.findByLabelText("Fleet verdict");
+  await waitFor(() =>
+    expect(screen.queryByText(/intelligence cycle/i)).toBeNull(),
+  );
 });

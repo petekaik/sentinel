@@ -236,12 +236,13 @@ def pack_views(views, grants, max_tokens, cfg=None):
     THE PACK IS ALREADY REDACTED. It is redacted here, where it is built, not
     only by the caller, because a pack handed to any other transport would
     otherwise carry whatever a journal line quoted. `usage` maps module id to
-    an estimated token count; when the total had to be reduced it also carries
-    `_reduced`, the module ids that were cut.
+    an estimated token count, after both budget passes; `_reduced` names the
+    module ids that were cut, by their own `budget.tokens` or by the global cap.
 
-    Budgets come from the grant: `budget.rows` bounds each summary and
-    `budget.bytes` bounds each module's JSON before the global token cap is
-    applied.
+    Budgets come from the grant: `budget.rows` bounds each summary,
+    `budget.bytes` bounds each module's JSON and `budget.tokens` bounds that
+    module's estimated size -- all before the global `max_tokens` cap is
+    applied across the joined pack.
     """
     grants = grants or {}
     views = views or {}
@@ -268,10 +269,22 @@ def pack_views(views, grants, max_tokens, cfg=None):
     def dump(pack):
         return redact(json.dumps(pack, sort_keys=True, default=str), secrets)
 
-    texts = {mid: dump(pack) for mid, pack in per_module.items()}
-    usage = {mid: max(1, len(text.encode()) // 4)
-             for mid, text in texts.items()}
-    reduced = []
+    texts, usage, reduced = {}, {}, []
+    for mid, pack in per_module.items():
+        # THE MODULE'S OWN TOKEN BUDGET, before the global one: a grant of
+        # `tokens` is a promise about this module's share of the request, and
+        # the global cap can only cut whichever module is largest at the end.
+        text = dump(pack)
+        cap = ((grants.get(mid) or {}).get("budget") or {}).get("tokens")
+        cut = False
+        while cap and max(1, len(text.encode()) // 4) > int(cap) \
+                and _shrink(pack):
+            text = dump(pack)
+            cut = True
+        texts[mid] = text
+        usage[mid] = max(1, len(text.encode()) // 4)
+        if cut:
+            reduced.append(mid)
     while sum(usage.values()) > int(max_tokens):
         mid = sorted(usage, key=lambda m: (usage[m], m))[-1]
         if not _shrink(per_module[mid]):

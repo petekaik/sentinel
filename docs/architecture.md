@@ -874,9 +874,11 @@ next cycle is the retry. The model never sees a module it was not granted: `pack
 re-checks the grant it is passed rather than trusting its caller.
 
 **Per-module budgets, then one global cap.** A grant's `budget.rows` bounds each module's
-summary and `budget.bytes` bounds that module's JSON before anything is concatenated. The
-joined pack is then held to `SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS` (default 16000) by
-shrinking the largest module — journals first, then lists and maps halved — until it fits.
+summary, `budget.bytes` bounds that module's JSON, and `budget.tokens` bounds that module's
+own estimated size — each module is shrunk on its own until it fits or nothing more can be
+dropped, before anything is concatenated. The joined pack is then held to
+`SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS` (default 16000) by shrinking the largest module —
+journals first, then lists and maps halved — until it fits.
 The cut is deterministic for the same input, and the cycle records
 `model pack reduced for <modules>` instead of truncating silently. The whole cycle is
 measured against `SENTINEL_INTELLIGENCE_BUDGET_MS` (default 30000), which also sets the

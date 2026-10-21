@@ -12,6 +12,7 @@ detail or evidence). The client has no logger at all; the tests assert the fact
 that would leak it if one were added -- the exception text.
 """
 
+import contextlib
 import os
 import socket
 import sys
@@ -129,6 +130,39 @@ def _request_parts(data):
     _, name, k = ber.parse(vb, 0)
     return (ber.parse_int(version), ber.parse_string(community), pdu_tag,
             ber.parse_int(rid), ber.parse_oid(name))
+
+
+def _oid_key(oid):
+    """Numeric order: as text, "...1.10.0" sorts before "...1.2.0"."""
+    return tuple(int(x) for x in oid.split("."))
+
+
+@contextlib.contextmanager
+def _agent(tree):
+    """The loopback agent above, answering GetNext against `tree`.
+
+    A GetNext names the next OID in NUMERIC order, or carries the v2c
+    endOfMibView (0x82) when there is none -- the two things a walk must tell
+    apart. A request that is not a GetNext is answered with noSuchObject so a
+    client that sends the wrong PDU tag fails the test instead of silently
+    walking a tree that answers anything.
+    """
+    ordered = sorted(tree, key=_oid_key)
+
+    def reply(request):
+        _, _, pdu_tag, _, oid = _request_parts(request)
+        if pdu_tag != 0xA1:
+            return _reply_with(ber.tlv(0x80, b""), vb_oid=oid)(request)
+        later = [o for o in ordered if _oid_key(o) > _oid_key(oid)]
+        if not later:
+            return _reply_with(ber.tlv(0x82, b""), vb_oid=oid)(request)
+        value, kind = tree[later[0]]
+        value_tlv = (ber.integer(value) if kind == "integer"
+                     else ber.octet(value))
+        return _reply_with(value_tlv, vb_oid=later[0])(request)
+
+    with FakeAgent(reply) as agent:
+        yield "127.0.0.1", agent.port
 
 
 def _reply_with(value_tlv, status=0, index=0, vb_oid=OID, rid=None,
@@ -579,6 +613,41 @@ def test_the_client_holds_no_logger(results):
         "unless it is masked, and nothing currently asserts that")
 
 
+def test_walk_follows_getnext_and_stops_cleanly(results):
+    tree = {"1.3.6.1.2.1.1.1.0": ("switch", "string"),
+            "1.3.6.1.2.1.1.3.0": (1234, "integer"),
+            "1.3.6.1.2.1.1.5.0": ("sw1", "string")}
+    with _agent(tree) as (host, port):
+        rows, truncated = snmp.walk(host, "public", "1.3.6.1.2.1.1",
+                                    port=port, max_oids=10)
+    results.check(
+        "walk returns every object under the root in order",
+        [r[0] for r in rows] == sorted(tree) and not truncated,
+        "rows=%r truncated=%r" % (rows, truncated))
+
+
+def test_walk_reports_truncation_instead_of_pretending_it_ended(results):
+    tree = {"1.3.6.1.2.1.1.%d.0" % i: (i, "integer") for i in range(1, 6)}
+    with _agent(tree) as (host, port):
+        rows, truncated = snmp.walk(host, "public", "1.3.6.1.2.1.1",
+                                    port=port, max_oids=2)
+    results.check("a capped walk says it was truncated",
+                  len(rows) == 2 and truncated is True,
+                  "rows=%r truncated=%r" % (rows, truncated))
+
+
+def test_walk_does_not_escape_the_root(results):
+    tree = {"1.3.6.1.2.1.1.1.0": (1, "integer"),
+            "1.3.6.1.2.1.2.2.1.8.1": (1, "integer")}
+    with _agent(tree) as (host, port):
+        rows, truncated = snmp.walk(host, "public", "1.3.6.1.2.1.1",
+                                    port=port, max_oids=10)
+    results.check(
+        "a GetNext past the subtree ends the walk",
+        [r[0] for r in rows] == ["1.3.6.1.2.1.1.1.0"] and not truncated,
+        "rows=%r" % (rows,))
+
+
 TESTS = (
     test_integer_round_trip,
     test_octet_string_round_trip,
@@ -597,4 +666,7 @@ TESTS = (
     test_timeout_after_one_retry,
     test_the_community_never_reaches_an_exception,
     test_the_client_holds_no_logger,
+    test_walk_follows_getnext_and_stops_cleanly,
+    test_walk_reports_truncation_instead_of_pretending_it_ended,
+    test_walk_does_not_escape_the_root,
 )

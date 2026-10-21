@@ -1,4 +1,4 @@
-"""The SNMP v2c client: one GET, one retry, a bounded UDP timeout.
+"""The SNMP v2c client: GET, GetNext, a bounded walk, one retry per request.
 
 No logging on purpose -- the community string is a secret and there is nothing
 this module could log that would not be either the packet or the credential.
@@ -19,6 +19,15 @@ class SnmpTimeout(SnmpError):
     pass
 
 
+class SnmpEndOfMib(SnmpError):
+    """The v2c endOfMibView exception: a GetNext past the last object.
+
+    It is an ANSWER, not a failure -- the agent looked and says there is
+    nothing after this OID. walk() turns it into a clean end; nothing else
+    should read it as a dead device.
+    """
+
+
 class SnmpTransportError(SnmpError):
     """The socket could not be used (DNS, unreachable, permission, ...).
 
@@ -30,11 +39,11 @@ class SnmpTransportError(SnmpError):
     """
 
 
-def _request(community, oid, request_id):
+def _request(community, oid, request_id, tag=0xA0):
     return ber.sequence(
         ber.integer(1),                       # v2c
         ber.octet(community),
-        ber.tlv(0xA0,                         # GetRequest
+        ber.tlv(tag,                          # 0xA0 GetRequest, 0xA1 GetNext
                 ber.integer(request_id) + ber.integer(0) +
                 ber.integer(0) +
                 # THE VARBIND ENDS WITH AN EXPLICIT NULL (RFC 3416 §4.2.1).
@@ -46,16 +55,54 @@ def _request(community, oid, request_id):
                 ber.sequence(ber.sequence(ber.oid(oid) + ber.tlv(0x05, b"")))))
 
 
-def get(host, community, oid, port=161, timeout=3.0, retries=1):
-    """(value, type) for one OID, or raise SnmpError/SnmpTimeout.
+def _decode(data, rid, host):
+    """(oid, value, kind) from a reply, or None when it answers another request.
 
-    EVERY failure is a SnmpError. A decode fault is wrapped because callers
-    isolate per device -- a raw IndexError from a truncated datagram would
-    escape that isolation and blank the module's rows for the epoch instead of
-    failing the one device that sent it.
+    The error-status and the v2c exception tags are answers, not values: 0x80
+    and 0x81 raise, and 0x82 raises SnmpEndOfMib so a walk can stop cleanly.
     """
+    try:
+        _, msg, _ = ber.parse(data, 0)
+        _, _version, i = ber.parse(msg, 0)
+        _, _community, i = ber.parse(msg, i)
+        ptag, pdu, _ = ber.parse(msg, i)
+        _, req, j = ber.parse(pdu, 0)
+        req_id = ber.parse_int(req)
+        _, err_status, j = ber.parse(pdu, j)
+        _, err_index, j = ber.parse(pdu, j)
+        _, varbinds, j = ber.parse(pdu, j)
+        _, vb, _ = ber.parse(varbinds, 0)
+        _, name, k = ber.parse(vb, 0)
+        name_text = ber.parse_oid(name)
+        vtag, value, _ = ber.parse(vb, k)
+        status = ber.parse_int(err_status)
+        index = ber.parse_int(err_index)
+        # A LATE DATAGRAM IS NOT THIS REQUEST'S ANSWER. The socket is fresh per
+        # attempt, but an ephemeral port can be reused, so the request-id (and
+        # the GetResponse tag) decide whether this reply is ours.
+        if ptag != 0xA2 or req_id != rid:
+            return None
+        if status:
+            raise SnmpError("error-status %d at %d" % (status, index))
+        if vtag == 0x80:
+            raise SnmpError("no such object: %s" % name_text)
+        if vtag == 0x81:
+            raise SnmpError("no such instance: %s" % name_text)
+        if vtag == 0x82:
+            raise SnmpEndOfMib("end of MIB view at %s" % name_text)
+        if vtag in (0x02, 0x41, 0x42, 0x43):     # integer/counter/gauge/ticks
+            return name_text, ber.parse_int(value), "integer"
+        if vtag == 0x04:
+            return name_text, ber.parse_string(value), "string"
+        raise SnmpError("unsupported value tag 0x%02x" % vtag)
+    except (IndexError, ValueError):
+        raise SnmpError("malformed response from %s" % host)
+
+
+def _one(host, community, oid, tag, port=161, timeout=3.0, retries=1):
+    """(oid, value, kind) for one request, or raise SnmpError/SnmpTimeout."""
     rid = int.from_bytes(os.urandom(4), "big") & 0x7fffffff
-    packet = _request(community, oid, rid)
+    packet = _request(community, oid, rid, tag)
     for _ in range(retries + 1):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
@@ -68,39 +115,56 @@ def get(host, community, oid, port=161, timeout=3.0, retries=1):
             raise SnmpTransportError("cannot query %s: %s" % (host, exc))
         finally:
             sock.close()
-        try:
-            _, msg, _ = ber.parse(data, 0)
-            _, _version, i = ber.parse(msg, 0)
-            _, _community, i = ber.parse(msg, i)
-            ptag, pdu, _ = ber.parse(msg, i)
-            _, req, j = ber.parse(pdu, 0)
-            req_id = ber.parse_int(req)
-            _, err_status, j = ber.parse(pdu, j)
-            _, err_index, j = ber.parse(pdu, j)
-            _, varbinds, j = ber.parse(pdu, j)
-            _, vb, _ = ber.parse(varbinds, 0)
-            _, name, k = ber.parse(vb, 0)
-            name_text = ber.parse_oid(name)
-            vtag, value, _ = ber.parse(vb, k)
-            status = ber.parse_int(err_status)
-            index = ber.parse_int(err_index)
-        except (IndexError, ValueError):
-            raise SnmpError("malformed response from %s" % host)
-        # A LATE DATAGRAM IS NOT THIS REQUEST'S ANSWER. The socket is fresh per
-        # attempt, but an ephemeral port can be reused, so the request-id (and
-        # the GetResponse tag) decide whether this reply is ours; anything else
-        # is treated like a lost packet and the retry still runs.
-        if ptag != 0xA2 or req_id != rid:
-            continue
-        if status:
-            raise SnmpError("error-status %d at %d" % (status, index))
-        if vtag == 0x80:
-            raise SnmpError("no such object: %s" % name_text)
-        if vtag == 0x81:
-            raise SnmpError("no such instance: %s" % name_text)
-        if vtag in (0x02, 0x41, 0x42, 0x43):     # integer/counter/gauge/ticks
-            return ber.parse_int(value), "integer"
-        if vtag == 0x04:
-            return ber.parse_string(value), "string"
-        raise SnmpError("unsupported value tag 0x%02x" % vtag)
+        got = _decode(data, rid, host)
+        if got is not None:
+            return got
     raise SnmpTimeout("no answer from %s for %s" % (host, oid))
+
+
+def get(host, community, oid, port=161, timeout=3.0, retries=1):
+    """(value, type) for one OID, or raise SnmpError/SnmpTimeout.
+
+    EVERY failure is a SnmpError. A decode fault is wrapped because callers
+    isolate per device -- a raw IndexError from a truncated datagram would
+    escape that isolation and blank the module's rows for the epoch instead of
+    failing the one device that sent it.
+    """
+    _, value, kind = _one(host, community, oid, 0xA0, port=port,
+                          timeout=timeout, retries=retries)
+    return value, kind
+
+
+def getnext(host, community, oid, port=161, timeout=3.0, retries=1):
+    """(next_oid, value, type) after `oid`, or raise SnmpEndOfMib.
+
+    The returned name is the agent's, not ours: only the reply can say which
+    object follows, which is why a walk trusts it and then checks the subtree.
+    """
+    return _one(host, community, oid, 0xA1, port=port, timeout=timeout,
+                retries=retries)
+
+
+def walk(host, community, root, port=161, timeout=3.0, max_oids=2000,
+         retries=1):
+    """(rows, truncated) for every object at or under `root`.
+
+    `rows` is [(oid, value, type)], in the agent's order. `truncated` is True
+    when the cap stopped the walk: a caller that reports a capped walk as a
+    complete tree reports missing objects as absent, which is the one thing a
+    monitor must never do.
+    """
+    rows, oid = [], root
+    while len(rows) < max_oids:
+        try:
+            next_oid, value, kind = getnext(host, community, oid, port=port,
+                                            timeout=timeout, retries=retries)
+        except SnmpEndOfMib:
+            return rows, False
+        # A GetNext that leaves the subtree is the end of it: the next object
+        # exists, but it is not this walk's. Without this the walk reads a
+        # neighbouring MIB branch as part of the root.
+        if next_oid != root and not next_oid.startswith(root + "."):
+            return rows, False
+        rows.append((next_oid, value, kind))
+        oid = next_oid
+    return rows, True

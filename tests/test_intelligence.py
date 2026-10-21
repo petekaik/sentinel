@@ -2736,6 +2736,101 @@ def test_the_revert_route_needs_the_token_and_restores(results):
         shutil.rmtree(tmp)
 
 
+def test_anomaly_detection_is_off_by_default(results):
+    cfg = config_mod.Config({})
+    results.check("anomaly detection is off until the harness says it wins",
+                  cfg.intelligence_anomaly is False,
+                  "an unmeasured detector must not ship enabled")
+
+
+def test_an_enabled_detector_emits_only_insights(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+        specs = harness.load_specs(cfg)
+        spec = next(s for s in specs.values() if s.owner == "fleet")
+        for i in range(45):
+            store.record_sample(conn, 1, "cubox-1", spec.metric,
+                                value=50.0 + (i % 3))
+        store.record_sample(conn, 1, "cubox-1", spec.metric, value=1.0)
+        store.record_check(conn, 1, "cubox-1", "host_unreachable", "ok",
+                           "reachable", subject="cubox-1")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, specs, {}, modules=mods)
+        intelligence_layer.run_cycle(cfg, conn, ctx, now=time.time())
+        kinds = [r["kind"] for r in conn.execute("SELECT kind FROM insight")]
+        results.check("an enabled detector emits an anomaly insight",
+                      "anomaly" in kinds, "kinds=%r" % (kinds,))
+        results.check(
+            "the anomaly insight wrote no check result",
+            conn.execute("SELECT COUNT(*) FROM check_run").fetchone()[0] == 1,
+            "an insight changed grading")
+        evidence = json.loads(conn.execute(
+            "SELECT evidence_json FROM insight WHERE kind='anomaly'"
+        ).fetchone()[0])
+        results.check(
+            "the insight states the statistic, the window and the sample count",
+            evidence.get("statistic", {}).get("samples") == 46
+            and "window" in evidence,
+            "evidence=%r" % (evidence,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_truncated_series_is_skipped_and_counted(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+        specs = harness.load_specs(cfg)
+        fleet = [s for s in specs.values() if s.owner == "fleet"]
+        long_metric, short_metric = fleet[0].metric, fleet[1].metric
+        for i in range(30):
+            store.record_sample(conn, 1, "cubox-1", long_metric,
+                                value=50.0 + (i % 3))
+        store.record_sample(conn, 1, "cubox-1", long_metric, value=1.0)
+        for i in range(22):
+            store.record_sample(conn, 1, "cubox-1", short_metric, value=10.0)
+        store.record_sample(conn, 1, "cubox-1", short_metric, value=99.0)
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, specs, {}, modules=mods)
+        real_init = module_view.ModuleView.__init__
+        real_detect = intelligence_layer.anomaly.detect
+        seen = []
+
+        def _cap_24(self, *args, **kwargs):
+            real_init(self, *args, **kwargs)
+            self.caps["sample_rows"] = 24
+
+        def _spy(points, *args, **kwargs):
+            seen.append(list(points))
+            return real_detect(points, *args, **kwargs)
+
+        with mock.patch.object(module_view.ModuleView, "__init__", _cap_24), \
+                mock.patch.object(intelligence_layer.anomaly, "detect", _spy):
+            intelligence_layer.run_cycle(cfg, conn, ctx, now=time.time())
+        titles = [r["title"] for r in conn.execute(
+            "SELECT title FROM insight WHERE kind='anomaly'")]
+        results.check(
+            "a truncated series never reaches detect",
+            len(seen) == 1 and len(seen[0]) == 23,
+            "detect saw %r points" % ([len(p) for p in seen],))
+        results.check(
+            "only the complete series produced an anomaly",
+            len(titles) == 1 and short_metric in titles[0]
+            and long_metric not in titles[0],
+            "titles=%r" % (titles,))
+        results.check(
+            "the skipped series is counted, not silently dropped",
+            any("skipped 1 truncated series" in n for n in ctx.notes),
+            "notes=%r" % (ctx.notes,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_additive_auto_applies_and_the_proposal_records_it,
     test_a_silencing_change_cannot_be_applied_by_the_auto_path,
@@ -2784,6 +2879,9 @@ TESTS = (
     test_no_grant_reads_nothing_and_says_so,
     test_a_granted_module_is_read_and_recorded,
     test_the_cadence_skips_a_second_cycle,
+    test_anomaly_detection_is_off_by_default,
+    test_an_enabled_detector_emits_only_insights,
+    test_a_truncated_series_is_skipped_and_counted,
     test_the_global_switch_stops_the_cycle,
     test_a_second_skipped_cycle_inside_the_interval_returns_none,
     test_each_granted_modules_report_survives_the_dedupe,

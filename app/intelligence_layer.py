@@ -19,6 +19,7 @@ import time
 import traceback
 
 import advisors
+import anomaly
 import authorize
 import intelligence
 import llm_advisor
@@ -701,6 +702,58 @@ def run_cycle(cfg, conn, ctx, now=None):
             advisors.note_advisor_problem(
                 conn, ctx, want, module,
                 "selector names no advisor: %r" % want)
+        # ANOMALY DETECTION IS ADVICE, NOT GRADING. It is wired here but OFF
+        # until the replay harness shows a win with a margin on the real
+        # fleet's series (SENTINEL_INTELLIGENCE_ANOMALY, docs/superpowers/plans/
+        # 2026-10-21-anomaly-result.md). It writes insights only: no check
+        # status, no incident, no threshold changes.
+        if getattr(cfg, "intelligence_anomaly", False):
+            for mod in modules:
+                view = views.get(mod.id)
+                if view is None:
+                    continue
+                since = view.now - min(view.requested_days or 7,
+                                       max_days) * advisors.DAY
+                skipped = 0
+                for target, metric in view.sample_keys(since)[:200]:
+                    series = view.sample_series(
+                        since, target, metric,
+                        limit=view.caps["sample_rows"])
+                    # NEVER REASON FROM A TRUNCATED SERIES. A read that hit
+                    # `sample_rows` is a slice with its oldest rows dropped, so
+                    # it is not the window the insight would claim. Count it
+                    # rather than scoring it.
+                    if view.truncated.get(
+                            advisors.series_key(target, metric)):
+                        skipped += 1
+                        continue
+                    points = [(r["ts"], r["value"]) for r in series]
+                    found = anomaly.detect(points)
+                    if found is None:
+                        continue
+                    insight = advisors.Insight(
+                        module=mod.id, kind="anomaly",
+                        title="%s %s: %s" % (target, metric, found["kind"]),
+                        body=("The newest reading is unusual for this series: "
+                              "%r over %d samples. This is advice, not a "
+                              "grading change." % (found, found["samples"])),
+                        target=target, severity="notable",
+                        # THE METRIC IS THE SUBJECT: the insight's dedupe
+                        # identity is (advisor, kind, target, check_id,
+                        # subject, module), so two anomalous metrics on one
+                        # host would otherwise share an identity and the
+                        # second would overwrite the first.
+                        subject=metric,
+                        confidence=0.5,
+                        evidence={
+                            "statistic": found,
+                            "window": {
+                                "requested_days": view.requested_days,
+                                "available_days": view.available_days}})
+                    advisors.record(conn, "anomaly", insight, view)
+                if skipped:
+                    ctx.note("anomaly: skipped %d truncated series for %s"
+                             % (skipped, mod.id))
         proposals = propose_thresholds(cfg, conn, ctx, runs)
     except Exception as exc:
         ctx.note("intelligence cycle failed: %s" % exc)

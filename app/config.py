@@ -305,6 +305,12 @@ class Config:
                 "SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS must be > 0, got %d"
                 % max_tokens)
         self.intelligence_model_max_tokens = max_tokens  # secretscan:ignore -- identifier
+        # THE ANOMALY DETECTOR IS OFF UNTIL THE REPLAY HARNESS SHOWS IT WINS.
+        # The live comparison is pending (docs/superpowers/plans/
+        # 2026-10-21-anomaly-result.md); an unmeasured detector emitting advice
+        # on the fleet would be exactly the confident claim this layer forbids.
+        self.intelligence_anomaly = _bool("SENTINEL_INTELLIGENCE_ANOMALY",
+                                          False, e)
 
         # How long an operator has to decide a proposal. EXPIRY IS A REAL
         # DEADLINE, not a display nicety: an approval is a statement about the

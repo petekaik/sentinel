@@ -13,6 +13,7 @@ history.
 | File | Role |
 |---|---|
 | `/app/anomaly.py` | `median`, `mad`, `robust_z`, `level_shift`, `detect` — stdlib only, bounded, no writes |
+| `/app/intelligence_layer.py` | the gated per-series pass (task 22): insights only, off by default, skips a truncated series |
 | `/scripts/score-anomaly.py` | read-only replay: each detector versus the existing band baseline |
 | `/tests/test_anomaly.py` | the four statistics contracts, plus a synthetic-store run of the harness |
 | `/tests/run_all.py` | registers the suite |
@@ -91,6 +92,27 @@ The baseline missed the `backup_disk_free_gb` breach because 10% of a healthy
 three. This proves the plumbing and the label join; it says nothing about the
 fleet, and the sample size is 87 minutes.
 
+## The switch (task 22): wired, still `0`
+
+`Config.intelligence_anomaly` (`SENTINEL_INTELLIGENCE_ANOMALY`, default
+`False`) now gates a per-series `anomaly.detect` pass in
+`intelligence_layer.run_cycle`. When enabled, the cycle emits `kind="anomaly"`
+insights stating the statistic, the window and the sample count, with the
+metric as the insight's `subject` (the dedupe identity is
+`(advisor, kind, target, check_id, subject, module)`, so two anomalous metrics
+on one host would otherwise overwrite each other inside the dedupe window). It
+writes no check result and resolves no incident.
+
+**Decision: the switch stays `0`.** The live comparison above is still PENDING:
+no win with a margin over the baseline has been measured on the fleet's own
+series, and the synthetic exercise is plumbing evidence, not a fleet result. An
+unmeasured detector must not ship enabled.
+
+A series whose read hit `sample_rows` is recorded in `view.truncated` and is
+**skipped and counted** (the cycle note names the module and the count), never
+scored: a slice with its oldest rows dropped is not the window an insight would
+claim.
+
 ## Verification
 
 ```text
@@ -98,6 +120,18 @@ fleet, and the sample size is 87 minutes.
                        synthetic-store harness test)
 ./test.sh           -> 1196 checks, 0 failed (baseline was 1187; +9 from this suite)
 ```
+
+Task 22 added the switch and its seven checks to the intelligence suite:
+
+```text
+./test.sh intelligence -> 197 checks, 0 failed
+./test.sh              -> 1203 checks, 0 failed (1196 + 7)
+```
+
+The three truncation-guard checks (`a truncated series never reaches detect`,
+`only the complete series produced an anomaly`, `the skipped series is counted`)
+all go red when the guard is disabled, so they pin the behaviour rather than
+re-describe it.
 
 The harness run itself writes nothing: the suite compares the store's bytes
 before and after `score_store`. Usage errors (missing `--db`, non-positive

@@ -716,6 +716,24 @@ name, a malformed OID, an unreachable band order and a v3 version at save time.
 The full model is
 [`app/modules/snmp/README.md`](../app/modules/snmp/README.md).
 
+### Discovery — a walk proposes, the operator applies
+
+`GETNEXT` exists in the module for exactly one job.
+`POST /api/v1/modules/snmp/discover` runs the `snmp.discover` command, which
+walks a configured device's interface and host-resources subtrees
+(`snmp.walk`, capped by `max_oids` and reporting whether the cap truncated it)
+and returns candidate check rows. The command writes nothing: applying a
+candidate is a separate `POST .../discover/apply`, which is
+`settingsapi.apply_discovery` -- one validated `SNMP_CHECKS` write through the
+same path and token gate as every other settings write.
+
+A candidate is reviewed before it lands. It carries a checked-in starting band
+and the observed value, never a band widened to fit that observation; a counter
+is named in the notes and not proposed (a monotonic value has no band that
+describes the device), and an unnameable interface row is reported rather than
+invented. The community is read from the settings inside the walk handler and
+is not an argument, a result field, an audit value or a log line.
+
 ---
 
 ## Commands — explicit operator operations

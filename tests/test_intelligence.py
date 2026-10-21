@@ -1528,6 +1528,34 @@ def test_discovery_apply_writes_once_and_refuses_a_partial_bad_body(results):
         shutil.rmtree(tmp)
 
 
+def test_discovery_apply_never_writes_the_community(results):
+    tmp, conn = _grant_store()
+    try:
+        canary = "comm-canary-42"
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+            "SNMP_COMMUNITIES": json.dumps({"sw1": canary}),
+            "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1"})
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        settingsapi.apply_discovery(
+            cfg, conn, mod, "sw1",
+            [{"device": "sw1", "oid": "1.3.6.1.2.1.1.3.0", "label": "uptime",
+              "unit": "", "direction": "high_is_good", "green": 1,
+              "amber": 0, "kind": "gauge", "expected": None}],
+            "operator")
+        text = json.dumps(
+            [{"%s/%s" % k: v for k, v in store.setting_rows(conn).items()}],
+            default=str) + json.dumps(
+            [dict(r) for r in conn.execute("SELECT * FROM setting_change")],
+            default=str)
+        results.check(
+            "the community is absent from the applied settings and the audit",
+            canary not in text, "found the credential in %r" % (text[:500],))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 def test_add_device_merges_communities_and_redacts_them(results):
     """A new device's community is merged SERVER-side, because the map is secret.
 
@@ -1758,6 +1786,7 @@ TESTS = (
     test_discover_refuses_an_unknown_device_and_never_walks,
     test_discover_labels_an_interface_from_the_walk,
     test_discovery_apply_writes_once_and_refuses_a_partial_bad_body,
+    test_discovery_apply_never_writes_the_community,
     test_add_device_merges_communities_and_redacts_them,
     test_the_add_device_route_is_token_gated_and_refuses_a_duplicate,
     test_the_discover_routes_walk_and_refuse_an_unknown_device,

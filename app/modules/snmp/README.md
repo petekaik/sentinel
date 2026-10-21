@@ -6,10 +6,12 @@ are rows in the settings, and saving a row makes it appear on the next
 collection.
 
 **Read-only, v2c only.** The module issues `GET` requests and nothing else; it
-never writes to a device, never sends a `SET`, and never walks a subtree. SNMP
-v3 (USM/encryption) is not implemented, and a device configured with any
-version other than `v2c` is refused when the settings are parsed rather than
-silently polled with the wrong protocol.
+never writes to a device and never sends a `SET`. `GETNEXT` is used by exactly
+one thing -- the explicit `discover` operator command, which walks a subtree to
+propose candidate rows -- and a walk writes no setting by itself. SNMP v3
+(USM/encryption) is not implemented, and a device configured with any version
+other than `v2c` is refused when the settings are parsed rather than silently
+polled with the wrong protocol.
 
 Every address in this file and in `.env.example` is documentation-range
 placeholder; real device addresses belong in the gitignored `.env` or the
@@ -77,6 +79,43 @@ Spec ids are namespaced by module, so they cannot collide with a
 `thresholds.conf` spec. Two rows with the same label get distinct slugs
 (`cpu_load`, `cpu_load_2`) because the dashboard looks a reading up by metric
 name.
+
+## Adding a device by discovery
+
+```text
+add a device row (name, address, community)
+  -> Discover
+  -> review the candidates, edit labels and bands
+  -> Add selected
+  -> the next collection reports the rows
+```
+
+**Add a device.** The add-device form writes the device and its community in
+one validated write. The community is merged server-side into
+`SNMP_COMMUNITIES` (the browser cannot read that map), and it is never returned.
+
+**Discover.** `discover` walks the device's interface and host-resources
+subtrees and returns candidates. It writes nothing: a walk has no path to the
+settings, so reviewing is always a separate, explicit step.
+
+**Review.** Each candidate carries a checked-in starting band
+(`STARTING_BANDS`), never a band widened to fit the observation. The operator
+edits labels and bands here; an unwanted row is simply not selected.
+
+**What is not proposed.** Counters (`ifInOctets`, ...) are not proposed yet:
+they are monotonic, so any band over one describes the sampling interval rather
+than the device. They are named in the response's notes, and so is an interface
+row whose index has no `ifName` -- a label a human cannot verify is not
+invented.
+
+**Add selected.** One `apply_discovery` call validates the whole merged
+`SNMP_CHECKS` list before writing, so a bad selected row refuses the entire
+selection rather than leaving half of it in force.
+
+**Next collection.** The rows appear on the next epoch. An interface that is
+currently down is proposed as a `state` row expecting `up`, so it reports
+**observed-down** (FAIL) -- the truth about the device. Discovery never makes a
+down interface green.
 
 ## Grading
 
@@ -167,6 +206,8 @@ SNMP_CHECKS='[{"device":"switch-1","oid":"1.3.6.1.2.1.2.2.1.8.1",
 | `settings.py` | parsing (`SnmpConfig`), the community map, and the save-time rules (`validate`) |
 | `preload.py` | one poll per enabled device per epoch; installs `ctx.snmp_facts` |
 | `checks.py` | `SnmpReachable` / `SnmpOid` and the dynamic `instances(ctx)` |
+| `discovery.py` | `walk()` rows -> candidate check rows: starting bands, counter/unnamed-row notes, and no invented value |
+| `commands.py` | the `discover` command: walks one configured device and returns candidates; writes no setting |
 | `thresholds.conf` | deliberately comment-only: bands live on the settings rows |
 
 The module opens no platform attempt row: an SNMP device is not an ssh host, so

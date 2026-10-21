@@ -31,6 +31,29 @@ const candidate = {
   note: "observed down",
 };
 
+/* A known object with a suggested band, in the direction it was written. */
+const processor = {
+  device: "sw1",
+  oid: "1.3.6.1.2.1.25.3.3.1.2.1",
+  label: "Processor 1",
+  kind: "gauge" as const,
+  direction: "low_is_good" as const,
+  green: 70,
+  amber: 90,
+  expected: null,
+  unit: "%",
+  observed: 99,
+  confidence: "high" as const,
+  note: "",
+};
+
+const discovery = {
+  device: "sw1",
+  candidates: [candidate, processor],
+  notes: [],
+  truncated: false,
+};
+
 type Call = { url: string; method?: string; body?: unknown };
 
 function record(calls: Call[], url: string, init?: RequestInit) {
@@ -46,19 +69,13 @@ afterEach(() => {
   sessionStorage.clear();
 });
 
-it("lists a candidate without a band and adds the checked rows in one apply", async () => {
+it("lists candidates without inventing a band and applies the edited checked rows once", async () => {
   const calls: Call[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
       record(calls, String(url), init);
-      if (url === "/api/v1/modules/snmp/discover")
-        return respond(200, {
-          device: "sw1",
-          candidates: [candidate],
-          notes: [],
-          truncated: false,
-        });
+      if (url === "/api/v1/modules/snmp/discover") return respond(200, discovery);
       if (url === "/api/v1/modules/snmp/discover/apply")
         return respond(200, { SNMP_CHECKS: { value: [], source: "db" } });
       throw new Error(`unexpected request: ${url}`);
@@ -70,24 +87,47 @@ it("lists a candidate without a band and adds the checked rows in one apply", as
   );
   fireEvent.click(screen.getByRole("button", { name: "Discover" }));
 
-  const label = await screen.findByLabelText(`Label for ${candidate.oid}`);
-  const row = label.closest("tr") as HTMLElement;
+  const lowRow = (
+    await screen.findByLabelText(`Label for ${candidate.oid}`)
+  ).closest("tr") as HTMLElement;
 
   // The observed value and the server's note are shown verbatim; nothing here
   // derives a value the walk did not return.
-  expect(within(row).getByText("42")).toBeInTheDocument();
-  expect(within(row).getByText("observed down")).toBeInTheDocument();
-  expect(within(row).getByText("low")).toBeInTheDocument();
-  expect(within(row).getByText("gauge")).toBeInTheDocument();
+  expect(within(lowRow).getByText("42")).toBeInTheDocument();
+  expect(within(lowRow).getByText("observed down")).toBeInTheDocument();
+  expect(within(lowRow).getByText("low")).toBeInTheDocument();
+  expect(within(lowRow).getByText("gauge")).toBeInTheDocument();
 
   // An unknown/low-confidence row has NO band: no green, no amber, no
-  // `state == expected`. The cell must say so rather than invent a threshold.
-  expect(within(row).queryByText(/green|amber|state ==/)).toBeNull();
-  expect(within(row).getByText("—")).toBeInTheDocument();
+  // `state == expected`. The cell says so rather than inventing a threshold.
+  expect(within(lowRow).queryByText(/green|amber|state ==/)).toBeNull();
+  expect(within(lowRow).getByText("—")).toBeInTheDocument();
 
-  fireEvent.click(within(row).getByLabelText(`Add ${candidate.oid}`));
+  // A known gauge row renders its checked-in band in its own direction and the
+  // unit the server supplied.
+  const bandRow = screen
+    .getByLabelText(`Label for ${processor.oid}`)
+    .closest("tr") as HTMLElement;
+  expect(
+    (screen.getByLabelText(`Label for ${processor.oid}`) as HTMLInputElement)
+      .value,
+  ).toBe("Processor 1");
+  expect(
+    within(bandRow).getByText("green ≤ 70 %, amber ≤ 90 %"),
+  ).toBeInTheDocument();
+  expect(within(bandRow).getByText("99 %")).toBeInTheDocument();
+  expect(within(bandRow).getByText("high")).toBeInTheDocument();
+
+  // The label is editable before the row is added.
+  fireEvent.change(screen.getByLabelText(`Label for ${candidate.oid}`), {
+    target: { value: "Mystery object" },
+  });
+
+  fireEvent.click(screen.getByLabelText(`Add ${candidate.oid}`));
+  fireEvent.click(within(bandRow).getByLabelText(`Add ${processor.oid}`));
   fireEvent.click(screen.getByRole("button", { name: "Add selected" }));
 
+  // ONE apply carries BOTH checked rows, with the edited label.
   await waitFor(() =>
     expect(
       calls.filter((c) => c.url === "/api/v1/modules/snmp/discover/apply"),
@@ -98,28 +138,99 @@ it("lists a candidate without a band and adds the checked rows in one apply", as
   ).toEqual({
     url: "/api/v1/modules/snmp/discover/apply",
     method: "POST",
-    body: { device: "sw1", rows: [candidate] },
+    body: {
+      device: "sw1",
+      rows: [{ ...candidate, label: "Mystery object" }, processor],
+    },
   });
 });
 
-it("keeps Add selected locked without a token", async () => {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () =>
-      respond(200, {
-        device: "sw1",
-        candidates: [candidate],
-        notes: [],
-        truncated: false,
-      }),
-    ),
-  );
+it("fails closed: with no readOnly prop the apply is locked", async () => {
+  // The plan's literal call is `<DiscoverySheet moduleId="snmp" />`; it must
+  // never render an enabled apply with no token behind it.
+  vi.stubGlobal("fetch", vi.fn(async () => respond(200, discovery)));
 
-  render(<DiscoverySheet moduleId="snmp" devices={["sw1"]} readOnly />);
+  render(<DiscoverySheet moduleId="snmp" devices={["sw1"]} />);
   fireEvent.click(screen.getByRole("button", { name: "Discover" }));
   await screen.findByLabelText(`Label for ${candidate.oid}`);
 
   expect(screen.getByRole("button", { name: "Add selected" })).toBeDisabled();
+  expect(
+    screen.getAllByText(/writes locked/).length,
+  ).toBeGreaterThan(0);
+  expect(screen.getByRole("button", { name: "Save device" })).toBeDisabled();
+});
+
+it("adds a device and its community in one write, then selects it", async () => {
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      record(calls, String(url), init);
+      if (url === "/api/v1/modules/snmp/devices")
+        return respond(200, {
+          SNMP_DEVICES: {
+            value: [
+              { name: "sw1", address: "192.0.2.10" },
+              { name: "sw2", address: "192.0.2.11" },
+            ],
+            source: "db",
+          },
+          // The server never echoes a secret; the client never had one.
+          SNMP_COMMUNITIES: { value: null, secret_set: true, source: "db" },
+        });
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+
+  render(
+    <DiscoverySheet moduleId="snmp" devices={["sw1"]} readOnly={false} />,
+  );
+
+  fireEvent.change(screen.getByLabelText("Device name"), {
+    target: { value: "sw2" },
+  });
+  fireEvent.change(screen.getByLabelText("Address"), {
+    target: { value: "192.0.2.11" },
+  });
+  fireEvent.change(screen.getByLabelText("Community"), {
+    target: { value: "s3cret" },
+  });
+  fireEvent.change(screen.getByLabelText("Port"), {
+    target: { value: "1161" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save device" }));
+
+  await waitFor(() =>
+    expect(
+      calls.filter((c) => c.url === "/api/v1/modules/snmp/devices"),
+    ).toHaveLength(1),
+  );
+  expect(
+    calls.filter((c) => c.url === "/api/v1/modules/snmp/devices")[0],
+  ).toEqual({
+    url: "/api/v1/modules/snmp/devices",
+    method: "POST",
+    body: {
+      name: "sw2",
+      address: "192.0.2.11",
+      community: "s3cret", // secretscan:ignore (test fixture, not a credential)
+      port: 1161,
+    },
+  });
+
+  // The new device is selected and offered without waiting for the parent's
+  // settings reload.
+  const select = screen.getByLabelText("Device to discover") as HTMLSelectElement;
+  await waitFor(() => expect(select.value).toBe("sw2"));
+  expect(Array.from(select.options).map((o) => o.value)).toEqual([
+    "sw1",
+    "sw2",
+  ]);
+  expect(
+    (screen.getByLabelText("Community") as HTMLInputElement).value,
+  ).toBe("");
+  expect(screen.getByText(/Added device sw2/)).toBeInTheDocument();
 });
 
 it("opens the shared token dialog on a 401 apply", async () => {
@@ -141,13 +252,7 @@ it("opens the shared token dialog on a 401 apply", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
-      if (url === "/api/v1/modules/snmp/discover")
-        return respond(200, {
-          device: "sw1",
-          candidates: [candidate],
-          notes: [],
-          truncated: false,
-        });
+      if (url === "/api/v1/modules/snmp/discover") return respond(200, discovery);
       if (url === "/api/v1/modules/snmp/discover/apply")
         return respond(401, {
           error: {

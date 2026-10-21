@@ -618,6 +618,7 @@ export default function ModuleDetail() {
             setTokenOpen(true);
           }}
           onApplied={() => void load()}
+          onDeviceAdded={() => void load()}
         />
       )}
 

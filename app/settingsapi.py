@@ -600,6 +600,75 @@ def apply_discovery(cfg, conn, mod, device, rows, actor):
     return write_settings(cfg, conn, mod, {"SNMP_CHECKS": merged}, actor)
 
 
+def add_device(cfg, conn, mod, name, address, community, actor, port=161):
+    """Add one SNMP device and its community in ONE validated write.
+
+    `SNMP_COMMUNITIES` is a write-only secret map: `settings_view` never
+    returns it, so the SPA cannot merge a new entry into the map it cannot
+    read -- a browser-side merge would erase every other device's community.
+    The merge happens HERE, against the effective map, and both keys are
+    written together so `write_settings` validates the whole set (every device
+    has a community, every community names a device) before the first row
+    lands. The secret is redacted by the existing audit path.
+    """
+    check_declarations([mod])
+    name = str(name or "").strip()
+    address = str(address or "").strip()
+    community = str(community or "").strip()
+    if not name:
+        raise SettingsError("invalid_value", "the device name is required",
+                            "SNMP_DEVICES")
+    if not address:
+        raise SettingsError("invalid_value", "the device address is required",
+                            "SNMP_DEVICES")
+    if not community:
+        raise SettingsError("invalid_value", "the community is required",
+                            "SNMP_COMMUNITIES")
+    if isinstance(port, bool):
+        raise SettingsError("invalid_value", "port must be an integer",
+                            "SNMP_DEVICES")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        raise SettingsError("invalid_value", "port must be an integer",
+                            "SNMP_DEVICES")
+    if not 0 < port < 65536:
+        raise SettingsError("invalid_value",
+                            "port must be between 1 and 65535",
+                            "SNMP_DEVICES")
+    effective = _effective_values(
+        cfg, conn, mod, {}, {s.key: s for s in mod.settings})
+    devices = effective.get("SNMP_DEVICES") or []
+    if not isinstance(devices, list):
+        raise SettingsError(
+            "invalid_value",
+            "SNMP_DEVICES's stored/.env value is not a list", "SNMP_DEVICES")
+    if any(isinstance(row, dict)
+           and str(row.get("name") or "").strip() == name for row in devices):
+        raise SettingsError("invalid_value",
+                            "device %r is already configured" % name,
+                            "SNMP_DEVICES")
+    communities = effective.get("SNMP_COMMUNITIES") or {}
+    if not isinstance(communities, dict):
+        raise SettingsError(
+            "invalid_value",
+            "SNMP_COMMUNITIES's stored/.env value is not an object",
+            "SNMP_COMMUNITIES")
+    # A stored row that is not an object stays in the list so `validate`
+    # refuses the whole write instead of this loop raising AttributeError --
+    # the same rule `apply_discovery` follows.
+    merged_devices = list(devices) + [{
+        "name": name, "address": address, "port": port,
+        "version": "v2c", "enabled": True,
+    }]
+    merged_communities = dict(communities)
+    merged_communities[name] = community
+    return write_settings(
+        cfg, conn, mod,
+        {"SNMP_DEVICES": merged_devices,
+         "SNMP_COMMUNITIES": merged_communities}, actor)
+
+
 def set_enabled(cfg, conn, mod, enabled, actor):
     """Enable or disable one module as a settings override."""
     if not isinstance(enabled, bool):

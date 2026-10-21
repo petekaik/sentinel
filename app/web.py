@@ -1162,6 +1162,9 @@ class Handler(BaseHTTPRequestHandler):
             if parts == ["api", "v1", "modules", "snmp", "discover", "apply"]:
                 self._discover_apply(cfg, conn, body)
                 return
+            if parts == ["api", "v1", "modules", "snmp", "devices"]:
+                self._add_device(cfg, conn, body)
+                return
             self._error(404, "no_route", "no such /api/v1 route")
         except Exception as exc:                   # noqa: BLE001 - rendered
             self._error(500, "internal",
@@ -1259,6 +1262,33 @@ class Handler(BaseHTTPRequestHandler):
             out = settingsapi.apply_discovery(
                 cfg, conn, mod, str(body.get("device") or ""),
                 rows, "operator")
+        except settingsapi.SettingsError as exc:
+            self._error(422, exc.code, exc.message, exc.field)
+            return
+        self._json(200, out)
+
+    def _add_device(self, cfg, conn, body):
+        """POST /modules/snmp/devices: add a device and its community at once.
+
+        The community is write-only, so the merge into `SNMP_COMMUNITIES` is
+        done server-side against the effective map; see
+        `settingsapi.add_device`. The response is the module's settings view,
+        which redacts the secret.
+        """
+        if not isinstance(body, dict):
+            self._error(422, "invalid_body",
+                        "the request body must be a JSON object")
+            return
+        mod = self._snmp_module()
+        if mod is None:
+            return
+        port = body.get("port", 161)
+        if port in (None, ""):
+            port = 161
+        try:
+            out = settingsapi.add_device(
+                cfg, conn, mod, body.get("name"), body.get("address"),
+                body.get("community"), "operator", port=port)
         except settingsapi.SettingsError as exc:
             self._error(422, exc.code, exc.message, exc.field)
             return

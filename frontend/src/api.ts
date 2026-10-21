@@ -375,6 +375,19 @@ export const applyDiscovery = (id: string, device: string,
                                 rows: DiscoveryRow[]) =>
   req("POST", `/api/v1/modules/${id}/discover/apply`, { device, rows });
 
+/* A device is added together with its community because the community map is
+   a write-only secret: the browser cannot merge a new entry into a map it
+   cannot read. The server does the merge and returns the module's view. */
+export type NewDevice = {
+  name: string;
+  address: string;
+  community: string;
+  port?: number;
+};
+
+export const addDevice = (id: string, body: NewDevice) =>
+  req<ModuleSettingsView>("POST", `/api/v1/modules/${id}/devices`, body);
+
 /* The intelligence surface. A grant says how far the intelligence may go on
    one module; the master switch is a `.env` fact and is read-only here. */
 export type IntelligenceGrant = {

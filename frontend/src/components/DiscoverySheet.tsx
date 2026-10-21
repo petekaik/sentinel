@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  addDevice,
   applyDiscovery,
   discover,
   isUnauthorized,
@@ -43,21 +44,34 @@ function band(row: DiscoveryRow): string {
 export default function DiscoverySheet({
   moduleId,
   devices,
-  readOnly,
+  readOnly = true,
   onAuthRequired,
   onApplied,
+  onDeviceAdded,
 }: {
   moduleId: string;
   devices: string[];
   /* The page's own lock (`readOnly` there is a stored token plus the server's
-     writes_enabled). The sheet owns no second lock state. */
+     writes_enabled). The sheet owns no second lock state, and it FAILS CLOSED:
+     a caller that forgets the prop gets a locked sheet, never an enabled
+     apply with no token behind it. */
   readOnly?: boolean;
   /* Same convention as every other write surface on the page: a 401 parks the
      call for the parent's ONE TokenDialog to retry. */
   onAuthRequired?: (retry: () => void) => void;
   onApplied?: () => void;
+  /* The parent re-reads `/api/v1/settings` so its device list includes the new
+     device; the sheet also remembers it locally, so the selection cannot race
+     that read. */
+  onDeviceAdded?: (name: string) => void;
 }) {
   const [device, setDevice] = useState(devices[0] ?? "");
+  const [added, setAdded] = useState<string[]>([]);
+  const [newName, setNewName] = useState("");
+  const [address, setAddress] = useState("");
+  const [community, setCommunity] = useState("");
+  const [port, setPort] = useState("161");
+  const [saving, setSaving] = useState(false);
   const [candidates, setCandidates] = useState<DiscoveryRow[] | null>(null);
   const [notes, setNotes] = useState<string[]>([]);
   const [truncated, setTruncated] = useState(false);
@@ -66,6 +80,9 @@ export default function DiscoverySheet({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // The picker offers what the page read plus anything this sheet just added,
+  // so a selection cannot race the parent's settings reload.
+  const options = [...devices, ...added.filter((d) => !devices.includes(d))];
 
   /* One unlock surface: the page's shared dialog. A 401 on either call parks
      the call so it can be repeated after the token is stored. */
@@ -125,6 +142,43 @@ export default function DiscoverySheet({
     }
   }
 
+  /* The community is write-only: it goes to the server, which merges it into
+     SNMP_COMMUNITIES -- never into a map this component built from what it
+     could read (it can read nothing). */
+  async function saveDevice() {
+    const name = newName.trim();
+    const addr = address.trim();
+    if (!name || !addr || !community.trim()) {
+      setError("A device needs a name, an address and a community.");
+      return;
+    }
+    const p = Number(port);
+    if (port.trim() === "" || !Number.isInteger(p) || p < 1 || p > 65535) {
+      setError("Port must be an integer between 1 and 65535.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await addDevice(moduleId, { name, address: addr, community, port: p });
+      setAdded((prev) => (prev.includes(name) ? prev : [...prev, name]));
+      setDevice(name);
+      // The previous device's candidates are not this device's.
+      setCandidates(null);
+      setNewName("");
+      setAddress("");
+      setCommunity("");
+      setPort("161");
+      setNotice(`Added device ${name}. Walk it to review its objects.`);
+      onDeviceAdded?.(name);
+    } catch (e) {
+      if (!auth(e, () => void saveDevice())) setError(message(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <section>
       <h2>Discover checks</h2>
@@ -133,7 +187,7 @@ export default function DiscoverySheet({
         writes nothing; only the rows you check are added.
       </p>
       <div className="setting-actions">
-        {devices.length > 0 ? (
+        {options.length > 0 ? (
           <select
             aria-label="Device to discover"
             value={device}
@@ -145,7 +199,7 @@ export default function DiscoverySheet({
               setNotice(null);
             }}
           >
-            {devices.map((d) => (
+            {options.map((d) => (
               <option key={d} value={d}>
                 {d}
               </option>
@@ -169,6 +223,77 @@ export default function DiscoverySheet({
           {busy ? "Working…" : "Discover"}
         </button>
       </div>
+
+      <h3>Add a device</h3>
+      <p className="sub">
+        The community is stored write-only in <code>SNMP_COMMUNITIES</code>:
+        this form sends it once and the page never reads it back. Every
+        existing device keeps its own community.
+      </p>
+      <div className="setting">
+        <label htmlFor="discover-new-name">Device name</label>
+        <input
+          id="discover-new-name"
+          type="text"
+          value={newName}
+          disabled={saving}
+          onChange={(e) => setNewName(e.target.value)}
+        />
+      </div>
+      <div className="setting">
+        <label htmlFor="discover-new-address">Address</label>
+        <input
+          id="discover-new-address"
+          type="text"
+          value={address}
+          disabled={saving}
+          onChange={(e) => setAddress(e.target.value)}
+        />
+      </div>
+      <div className="setting">
+        <label htmlFor="discover-new-community">Community</label>
+        <input
+          id="discover-new-community"
+          type="password"
+          autoComplete="off"
+          value={community}
+          disabled={saving}
+          onChange={(e) => setCommunity(e.target.value)}
+        />
+      </div>
+      <div className="setting">
+        <label htmlFor="discover-new-port">Port</label>
+        <input
+          id="discover-new-port"
+          type="number"
+          min={1}
+          max={65535}
+          value={port}
+          disabled={saving}
+          onChange={(e) => setPort(e.target.value)}
+        />
+      </div>
+      <div className="setting-actions">
+        <button
+          type="button"
+          disabled={
+            saving ||
+            readOnly ||
+            !newName.trim() ||
+            !address.trim() ||
+            !community.trim()
+          }
+          onClick={() => void saveDevice()}
+        >
+          {saving ? "Saving…" : "Save device"}
+        </button>
+        {readOnly && (
+          <span className="badge source">
+            writes locked — a token is required
+          </span>
+        )}
+      </div>
+
       {error && (
         <p className="banner red" role="alert">
           {error}

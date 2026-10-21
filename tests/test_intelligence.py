@@ -1528,6 +1528,116 @@ def test_discovery_apply_writes_once_and_refuses_a_partial_bad_body(results):
         shutil.rmtree(tmp)
 
 
+def test_add_device_merges_communities_and_redacts_them(results):
+    """A new device's community is merged SERVER-side, because the map is secret.
+
+    The SPA cannot read `SNMP_COMMUNITIES`, so a browser-side merge would have
+    to send a map built from nothing and erase every other device's community.
+    """
+    tmp, conn = _grant_store()
+    try:
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+            "SNMP_COMMUNITIES": '{"sw1":"public"}',
+            "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1"})
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        out = settingsapi.add_device(
+            cfg, conn, mod, "sw2", "192.0.2.11", "s3cret", "operator",
+            port=1161)
+        rows = store.setting_rows(conn)
+        devices = rows.get(("snmp", "SNMP_DEVICES"))
+        communities = rows.get(("snmp", "SNMP_COMMUNITIES"))
+        results.check(
+            "adding a device keeps the existing community and adds the new one",
+            communities == {"sw1": "public", "sw2": "s3cret"},
+            "communities=%r. A browser-side merge cannot do this: the read "
+            "surface never returns the map." % (communities,))
+        results.check(
+            "the new device row carries its address, port and the v2c default",
+            [d.get("name") for d in devices or []] == ["sw1", "sw2"]
+            and devices[-1].get("address") == "192.0.2.11"
+            and devices[-1].get("port") == 1161
+            and devices[-1].get("version") == "v2c"
+            and devices[-1].get("enabled") is True,
+            "devices=%r" % (devices,))
+        text = json.dumps(out)
+        results.check(
+            "the returned view never carries either community",
+            "public" not in text and "s3cret" not in text
+            and out["SNMP_COMMUNITIES"]["value"] is None,
+            "view=%r" % (out,))
+        before = store.setting_rows(conn)
+        try:
+            settingsapi.add_device(
+                cfg, conn, mod, "sw1", "192.0.2.12", "other", "operator")
+        except settingsapi.SettingsError as exc:
+            results.check(
+                "a duplicate device name is refused",
+                exc.code == "invalid_value" and "sw1" in exc.message,
+                "got %r" % (exc,))
+        else:
+            results.check("a duplicate device name is refused", False,
+                          "add_device accepted a duplicate name")
+        try:
+            settingsapi.add_device(
+                cfg, conn, mod, "sw3", "192.0.2.13", "   ", "operator")
+        except settingsapi.SettingsError as exc:
+            results.check(
+                "a blank community is refused and names its field",
+                exc.field == "SNMP_COMMUNITIES",
+                "got %r" % (exc,))
+        else:
+            results.check("a blank community is refused", False,
+                          "add_device accepted a blank community")
+        results.check(
+            "a refused add stores nothing",
+            store.setting_rows(conn) == before,
+            "rows=%r" % (store.setting_rows(conn),))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_add_device_route_is_token_gated_and_refuses_a_duplicate(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = make_cfg(os.path.join(tmp, "m.sqlite"),
+                       SENTINEL_WRITE_TOKEN="tok",
+                       SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+                       SNMP_COMMUNITIES='{"sw1":"public"}',
+                       SNMP_CHECKS="[]", SNMP_TIMEOUT_S="1")
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        conn.close()
+
+        body = {"name": "sw2", "address": "192.0.2.11",
+                "community": "s3cret", "port": 1161}
+        status, out = _http(cfg, "POST", "/api/v1/modules/snmp/devices", body)
+        results.check(
+            "the add-device route is token-gated",
+            status == 401,
+            "status=%r body=%r" % (status, out))
+        status, out = _http(cfg, "POST", "/api/v1/modules/snmp/devices", body,
+                            token="tok")
+        results.check(
+            "the route adds the device and never echoes the community",
+            status == 200
+            and [d.get("name") for d in out["SNMP_DEVICES"]["value"]]
+            == ["sw1", "sw2"]
+            and "s3cret" not in json.dumps(out),
+            "status=%r body=%r" % (status, out))
+        status, out = _http(cfg, "POST", "/api/v1/modules/snmp/devices", body,
+                            token="tok")
+        results.check(
+            "a duplicate name is a 422 at the route, not a 500",
+            status == 422
+            and (out.get("error") or {}).get("code") == "invalid_value"
+            and (out.get("error") or {}).get("field") == "SNMP_DEVICES",
+            "status=%r body=%r" % (status, out))
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_the_discover_routes_walk_and_refuse_an_unknown_device(results):
     tmp = tempfile.mkdtemp()
     try:
@@ -1648,5 +1758,7 @@ TESTS = (
     test_discover_refuses_an_unknown_device_and_never_walks,
     test_discover_labels_an_interface_from_the_walk,
     test_discovery_apply_writes_once_and_refuses_a_partial_bad_body,
+    test_add_device_merges_communities_and_redacts_them,
+    test_the_add_device_route_is_token_gated_and_refuses_a_duplicate,
     test_the_discover_routes_walk_and_refuse_an_unknown_device,
 )

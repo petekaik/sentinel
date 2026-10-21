@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                       # noqa: E402
 from test_dashboard import _serve, make_cfg       # noqa: E402
 
+import authorize                                  # noqa: E402
 import checks                                     # noqa: E402
 import config as config_mod                       # noqa: E402
 import module                                     # noqa: E402
@@ -777,6 +778,127 @@ def test_a_merged_sample_read_is_marked_only_when_rows_are_dropped(results):
         shutil.rmtree(tmp)
 
 
+def _snmp_mod():
+    return [m for m in module_loader.discover() if m.id == "snmp"][0]
+
+
+def _snmp_before(devices, checks):
+    return {"SNMP_DEVICES": devices, "SNMP_CHECKS": checks,
+            "SNMP_TIMEOUT_S": 3}
+
+
+def _device(name):
+    return {"name": name, "address": "192.0.2.10", "port": 161,
+            "version": "v2c", "enabled": True}
+
+
+def _check(device, oid, label, green=70, amber=90):
+    return {"device": device, "oid": oid, "label": label, "unit": "%",
+            "direction": "low_is_good", "green": green, "amber": amber,
+            "kind": "gauge", "expected": None}
+
+
+def test_adding_a_row_is_additive_and_auto_applicable(results):
+    mod = _snmp_mod()
+    before = _snmp_before([_device("sw1")], [_check("sw1", "1.3.6.1.2.1.1", "cpu")])
+    after = _snmp_before(
+        [_device("sw1"), _device("sw2")],
+        [_check("sw1", "1.3.6.1.2.1.1", "cpu"),
+         _check("sw2", "1.3.6.1.2.1.2", "mem")])
+    cls, detail = authorize.classify({"settings": after}, mod, before)
+    results.check("a new device and check row is additive",
+                  cls == authorize.ADDITIVE, "got %s: %s" % (cls, detail))
+    results.check("additive is auto-applicable only at author=auto",
+                  authorize.may_auto_apply(cls, "auto")
+                  and not authorize.may_auto_apply(cls, "propose"),
+                  "author=propose must still be a proposal")
+
+
+def test_removing_or_disabling_rows_is_silencing(results):
+    mod = _snmp_mod()
+    before = _snmp_before(
+        [_device("sw1"), _device("sw2")],
+        [_check("sw1", "1.3.6.1.2.1.1", "cpu"),
+         _check("sw2", "1.3.6.1.2.1.2", "mem")])
+    variants = {
+        "removed check": _snmp_before(
+            [_device("sw1"), _device("sw2")],
+            [_check("sw1", "1.3.6.1.2.1.1", "cpu")]),
+        "removed device": _snmp_before(
+            [_device("sw1")],
+            [_check("sw1", "1.3.6.1.2.1.1", "cpu")]),
+        "disabled device": _snmp_before(
+            [dict(_device("sw1"), enabled=False), _device("sw2")],
+            [_check("sw1", "1.3.6.1.2.1.1", "cpu"),
+             _check("sw2", "1.3.6.1.2.1.2", "mem")]),
+    }
+    for name, after in variants.items():
+        cls, detail = authorize.classify({"settings": after}, mod, before)
+        results.check("%s is silencing" % name, cls == authorize.SILENCING,
+                      "got %s: %s" % (cls, detail))
+        results.check("%s is never auto-applicable" % name,
+                      not authorize.may_auto_apply(cls, "auto"),
+                      "author=auto must not apply it")
+
+
+def test_a_label_or_oid_change_is_an_identity_change(results):
+    mod = _snmp_mod()
+    before = _snmp_before([_device("sw1")],
+                          [_check("sw1", "1.3.6.1.2.1.1", "cpu")])
+    renamed = _snmp_before([_device("sw1")],
+                           [_check("sw1", "1.3.6.1.2.1.1", "processor")])
+    moved = _snmp_before([_device("sw1")],
+                         [_check("sw1", "1.3.6.1.2.1.2", "cpu")])
+    for name, after in (("renamed label", renamed), ("changed OID", moved)):
+        cls, detail = authorize.classify({"settings": after}, mod, before)
+        results.check("%s is silencing, not cosmetic" % name,
+                      cls == authorize.SILENCING,
+                      "got %s: %s. The subject is the incident key."
+                      % (cls, detail))
+
+
+def test_a_band_widened_past_a_failing_observation_is_silencing(results):
+    mod = _snmp_mod()
+    before = _snmp_before([_device("sw1")],
+                          [_check("sw1", "1.3.6.1.2.1.1", "cpu",
+                                  green=70, amber=90)])
+    # This row is low_is_good: value 100 is FAIL under amber=90. A new amber
+    # of 120 would grade it WARN; 130 would grade it OK.
+    widened = _snmp_before([_device("sw1")],
+                           [_check("sw1", "1.3.6.1.2.1.1", "cpu",
+                                   green=70, amber=130)])
+    identity = ("sw1", "1.3.6.1.2.1.1", "cpu")
+    cls, detail = authorize.classify(
+        {"settings": widened}, mod, before,
+        observations={identity: [(100.0, "fail")]})
+    results.check(
+        "a widening that turns a failing observation OK is silencing",
+        cls == authorize.SILENCING, "got %s: %s" % (cls, detail))
+    tightened = _snmp_before([_device("sw1")],
+                             [_check("sw1", "1.3.6.1.2.1.1", "cpu",
+                                     green=60, amber=80)])
+    cls, detail = authorize.classify(
+        {"settings": tightened}, mod, before,
+        observations={identity: [(100.0, "fail")]})
+    results.check(
+        "a tightening is a modification, never auto-applied",
+        cls == authorize.MODIFICATION
+        and not authorize.may_auto_apply(cls, "auto"),
+        "got %s: %s" % (cls, detail))
+
+
+def test_a_secret_or_undeclared_key_is_invalid(results):
+    mod = _snmp_mod()
+    before = _snmp_before([_device("sw1")], [])
+    for name, change in {
+        "secret": {"SNMP_COMMUNITIES": {"sw1": "public"}},
+        "undeclared": {"NOT_A_SETTING": 1},
+    }.items():
+        cls, detail = authorize.classify({"settings": change}, mod, before)
+        results.check("%s is invalid" % name, cls == authorize.INVALID,
+                      "got %s: %s" % (cls, detail))
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -806,4 +928,9 @@ TESTS = (
     test_a_key_list_over_the_budget_is_marked_truncated,
     test_the_row_budget_does_not_shrink_the_per_series_cap,
     test_a_merged_sample_read_is_marked_only_when_rows_are_dropped,
+    test_adding_a_row_is_additive_and_auto_applicable,
+    test_removing_or_disabling_rows_is_silencing,
+    test_a_label_or_oid_change_is_an_identity_change,
+    test_a_band_widened_past_a_failing_observation_is_silencing,
+    test_a_secret_or_undeclared_key_is_invalid,
 )

@@ -1255,6 +1255,24 @@ def test_consider_proposes_a_destructive_action_at_full_and_never_runs_it(result
         shutil.rmtree(tmp)
 
 
+def test_showconf_states_the_grant_and_never_the_key(results):
+    cfg = config_mod.Config({
+        "FLEET_INTELLIGENCE": '{"observe": true, "author": "propose"}',
+        "SENTINEL_LLM_KEY": "canary-key-123",
+        "FLEET_ALLOW_DESTRUCTIVE": "1"})
+    text = cfg.describe()
+    results.check(
+        "showconf names the grant and its lanes",
+        "fleet" in text and "observe" in text and "propose" in text,
+        "describe=%r" % (text,))
+    results.check(
+        "showconf warns that the destructive switch is no longer honoured",
+        "ALLOW_DESTRUCTIVE" in text and "human approval" in text,
+        "describe=%r" % (text,))
+    results.check("showconf never prints the key",
+                  "canary-key-123" not in text, "describe=%r" % (text,))
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -1303,4 +1321,5 @@ TESTS = (
     test_a_broken_cadence_read_is_a_recorded_cycle_error,
     test_a_destructive_action_is_refused_at_full_without_approval,
     test_consider_proposes_a_destructive_action_at_full_and_never_runs_it,
+    test_showconf_states_the_grant_and_never_the_key,
 )

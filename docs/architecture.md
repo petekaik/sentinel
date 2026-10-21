@@ -767,6 +767,38 @@ the arm/disarm/read/status commands do.
 
 ---
 
+## The intelligence layer — grants, scoped views, two invariants
+
+The layer is specified in
+`docs/superpowers/specs/2026-10-21-sentinel-intelligence-layer-design.md`. It is one
+platform capability, not a second monitoring system: the deterministic analyzers, the
+advisors below and the optional model backend all read through the same scoped view and
+write only proposals. The remediation engine remains the only executor.
+
+**Grants default off.** Each module declares the lanes it supports — `observe`,
+`author` (`off|propose|auto`) and `remediate` — and an operator grants them per module
+through the Settings/Intelligence page (stored in the DB), with
+`<MODULE>_INTELLIGENCE` in `.env` as the fallback for a module with no stored grant. An
+ungranted module reads nothing. A grant naming a lane the module does not declare
+refuses startup, and a malformed grant grants nothing and says why. `--showconf` prints
+the effective matrix and never the model key.
+
+Two invariants hold **above** the matrix; no grant, authority level, per-action override
+or approval-time option waives them:
+
+1. **The intelligence may never silence its own evidence.** Every authoring change is
+   classified (`app/authorize.py`) as additive, modification, silencing or invalid. Only
+   additive changes may apply at `author=auto`; removals, disablings, identity changes
+   and any widening past a failing observation are always a human proposal. The layer
+   has no write path to incidents, check results, thresholds or grants.
+2. **Destructive actions are human-approved at every tier.** `actions.allowed()` refuses
+   a destructive action without `approved=True`, and `actions.approval_policy()` — called
+   only on a human approval path — is the only constructor that sets it. The retired
+   `<MODULE>_ALLOW_DESTRUCTIVE` switch grants nothing; `--showconf` warns if it is still
+   set.
+
+---
+
 ## Intelligence — advisors that can only propose
 
 An advisor is an in-container plug-in with `id`, `title`, `history_days` and

@@ -439,6 +439,21 @@ class Config:
                   self.llm_model or "default")
                if self.llm_provider and self.llm_endpoint else "not configured")
         lines.append("llm advisor        : %s" % llm)
+        # The grant MATRIX, not the values: a lane that is off reads as off
+        # here, which is the question --showconf exists to answer. A grant
+        # that failed to parse grants nothing and says why rather than
+        # disappearing from the summary.
+        lines.append("intelligence       : %s (every %ds)" % (
+            "enabled" if self.intelligence_enabled else "disabled",
+            self.intelligence_interval_s))
+        import modules as module_loader
+        for mod in module_loader.discover():
+            grant, why = self.intelligence_grant(
+                mod.id, tuple(mod.intelligence))
+            lines.append("  %-8s grant     : observe=%s author=%s remediate=%s%s"
+                         % (mod.id, grant["observe"], grant["author"],
+                            grant["remediate"],
+                            (" ERROR: %s" % why) if why else ""))
         for key in self.deprecated_destructive_keys:
             lines.append(
                 "warning            : %s is no longer honoured; destructive "

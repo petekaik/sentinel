@@ -1,0 +1,293 @@
+import { useEffect, useState } from "react";
+import {
+  deleteGrant,
+  getIntelligence,
+  hasToken,
+  putGrant,
+  type IntelligenceGrant,
+  type IntelligenceState,
+} from "../api";
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function when(ts: number): string {
+  return new Date(ts * 1000).toLocaleString();
+}
+
+/* The grant grid. The MASTER SWITCH IS NOT HERE: it is `SENTINEL_INTELLIGENCE`
+   in the monitor's `.env`, so it is rendered read-only -- a checkbox that
+   cannot be saved is a lie. Every lane a module does not declare is disabled
+   with the reason beside it, and a save is only a stored intent: the collector
+   reads grants at the start of a cycle, so the grid says so. */
+export default function Intelligence() {
+  const [data, setData] = useState<IntelligenceState | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, IntelligenceGrant>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function load() {
+    try {
+      setData(await getIntelligence());
+      setError(null);
+    } catch (e) {
+      setError(message(e));
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const draft = (m: IntelligenceState["modules"][number]) =>
+    drafts[m.id] ?? m.grant;
+
+  function edit(
+    id: string,
+    current: IntelligenceGrant,
+    patch: Partial<IntelligenceGrant>,
+  ) {
+    setDrafts((d) => ({ ...d, [id]: { ...(d[id] ?? current), ...patch } }));
+  }
+
+  async function save(id: string, grant: IntelligenceGrant) {
+    setBusy(id);
+    try {
+      await putGrant(id, grant);
+      // The server answers with the stored view; a GET keeps one authority for
+      // what is in force and drops this module's draft.
+      setDrafts((d) => {
+        const next = { ...d };
+        delete next[id];
+        return next;
+      });
+      await load();
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function reset(id: string) {
+    setBusy(id);
+    try {
+      await deleteGrant(id);
+      setDrafts((d) => {
+        const next = { ...d };
+        delete next[id];
+        return next;
+      });
+      await load();
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (!data && !error) return <p className="sub">Loading intelligence…</p>;
+  if (!data) {
+    return (
+      <section className="unreachable" role="alert">
+        <h2>Intelligence unreachable — this is not “nothing granted”</h2>
+        <p>
+          The monitor could not answer <code>/api/v1/intelligence</code>, so it
+          is unknown what the intelligence may read.
+        </p>
+        <p className="sub">{error}</p>
+      </section>
+    );
+  }
+
+  const modules = [...data.modules].sort(
+    (a, b) => a.order - b.order || a.title.localeCompare(b.title),
+  );
+  // The SAVED grants, not the drafts: an unsaved tick has not changed what the
+  // collector will read, and this sentence must describe the next collection.
+  const granted = modules.some(
+    (m) => m.grant.observe || m.grant.author !== "off" || m.grant.remediate,
+  );
+
+  return (
+    <>
+      <h2>Intelligence</h2>
+      <p className="sub">
+        What the monitor's intelligence may read and act on, per module. A
+        saved grant applies on the next collection.
+      </p>
+
+      <section className="module-card">
+        <p>
+          Master switch:{" "}
+          <span className={`pill ${data.enabled ? "green" : "grey"}`}>
+            {data.enabled ? "ON" : "OFF"}
+          </span>{" "}
+          <span className="sub">
+            set by <code>SENTINEL_INTELLIGENCE</code> in the monitor's{" "}
+            <code>.env</code> — read-only here
+          </span>
+        </p>
+        <p className="sub">Cycle interval: {data.interval_s}s</p>
+        <p>
+          Backend:{" "}
+          {data.backend.configured ? (
+            <span className="pill green">CONFIGURED</span>
+          ) : (
+            <span className="pill grey">NOT CONFIGURED</span>
+          )}{" "}
+          <span className="sub">
+            {data.backend.model
+              ? `model ${data.backend.model}`
+              : "no model set"}
+            {data.backend.provider ? ` · ${data.backend.provider}` : ""}
+          </span>
+        </p>
+      </section>
+
+      <section className="module-card">
+        <h3>Last cycle</h3>
+        {data.last_cycle ? (
+          <p className="sub">
+            <span
+              className={`pill ${
+                data.last_cycle.status === "ok" ? "green" : "amber"
+              }`}
+            >
+              {data.last_cycle.status}
+            </span>{" "}
+            {when(data.last_cycle.ts)} · {data.last_cycle.duration_ms}ms ·{" "}
+            {data.last_cycle.model_calls} model call
+            {data.last_cycle.model_calls === 1 ? "" : "s"}
+            {data.last_cycle.detail ? ` · ${data.last_cycle.detail}` : ""}
+          </p>
+        ) : (
+          <p className="sub">No intelligence cycle has run yet.</p>
+        )}
+        {data.usage.length > 0 && (
+          <div className="scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Module</th>
+                  <th>Rows</th>
+                  <th>Bytes</th>
+                  <th>Insights</th>
+                  <th>Proposals</th>
+                  <th>Dropped</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.usage.map((u) => (
+                  <tr key={u.module}>
+                    <td>{u.module}</td>
+                    <td>{u.rows_read}</td>
+                    <td>{u.bytes_read}</td>
+                    <td>{u.insights}</td>
+                    <td>{u.proposals}</td>
+                    <td>{u.dropped}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {!granted && (
+        <p className="notice">
+          No modules granted — the intelligence is reading nothing.
+        </p>
+      )}
+
+      {error && <p role="alert">{error}</p>}
+      {!hasToken() && (
+        <p className="sub">
+          No write token in this tab — every save will be refused. Unlock writes
+          on the Settings page.
+        </p>
+      )}
+
+      {modules.map((m) => {
+        const g = draft(m);
+        const supported = (lane: string) => m.supported.includes(lane);
+        return (
+          <section className="module-card" key={m.id}>
+            <h3>
+              {m.title} <span className="sub">· {m.id}</span>
+            </h3>
+            {m.error && <p className="notice">{m.error}</p>}
+            <p className="sub">
+              grant source: {m.source} · supported:{" "}
+              {m.supported.join(", ") || "(none)"}
+            </p>
+            <p>
+              <label>
+                <input
+                  type="checkbox"
+                  aria-label={`${m.id} observe`}
+                  checked={g.observe}
+                  onChange={(e) =>
+                    edit(m.id, g, { observe: e.target.checked })
+                  }
+                />{" "}
+                observe
+              </label>{" "}
+              <label>
+                <input
+                  type="checkbox"
+                  aria-label={`${m.id} remediate`}
+                  checked={g.remediate}
+                  disabled={!supported("remediate")}
+                  onChange={(e) =>
+                    edit(m.id, g, { remediate: e.target.checked })
+                  }
+                />{" "}
+                remediate
+                {!supported("remediate") && (
+                  <span className="sub"> — not supported by this module</span>
+                )}
+              </label>{" "}
+              <label>
+                author{" "}
+                <select
+                  aria-label={`${m.id} author`}
+                  value={g.author}
+                  disabled={!supported("author")}
+                  onChange={(e) =>
+                    edit(m.id, g, {
+                      author: e.target.value as IntelligenceGrant["author"],
+                    })
+                  }
+                >
+                  <option value="off">off</option>
+                  <option value="propose">propose</option>
+                  <option value="auto">auto</option>
+                </select>
+              </label>
+            </p>
+            <p className="sub">
+              budget: {g.budget.rows} rows · {g.budget.bytes} bytes ·{" "}
+              {g.budget.tokens} tokens
+            </p>
+            <button
+              type="button"
+              disabled={busy === m.id}
+              onClick={() => void save(m.id, g)}
+            >
+              Save {m.id}
+            </button>{" "}
+            <button
+              type="button"
+              disabled={busy === m.id}
+              onClick={() => void reset(m.id)}
+            >
+              Reset {m.id}
+            </button>
+          </section>
+        );
+      })}
+    </>
+  );
+}

@@ -5,6 +5,7 @@ import ModuleDetail from "./pages/ModuleDetail";
 import Settings from "./pages/Settings";
 import Incidents from "./pages/Incidents";
 import Proposals from "./pages/Proposals";
+import Intelligence from "./pages/Intelligence";
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
         <NavLink to="/settings">Settings</NavLink>
         <NavLink to="/incidents">Incidents</NavLink>
         <NavLink to="/proposals">Proposals</NavLink>
+        <NavLink to="/intelligence">Intelligence</NavLink>
       </nav>
       <main>
         <Routes>
@@ -25,6 +27,7 @@ export default function App() {
           <Route path="/settings" element={<Settings />} />
           <Route path="/incidents" element={<Incidents />} />
           <Route path="/proposals" element={<Proposals />} />
+          <Route path="/intelligence" element={<Intelligence />} />
         </Routes>
       </main>
     </div>

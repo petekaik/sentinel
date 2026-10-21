@@ -342,3 +342,39 @@ export const api = {
       { enabled },
     ),
 };
+
+/* The intelligence surface. A grant says how far the intelligence may go on
+   one module; the master switch is a `.env` fact and is read-only here. */
+export type IntelligenceGrant = {
+  observe: boolean;
+  author: "off" | "propose" | "auto";
+  remediate: boolean;
+  budget: { rows: number; bytes: number; tokens: number };
+};
+
+export type IntelligenceModule = {
+  id: string; title: string; order: number;
+  supported: string[]; grant: IntelligenceGrant;
+  error: string; source: "db" | "env" | "default";
+};
+
+export type IntelligenceState = {
+  enabled: boolean; interval_s: number;
+  backend: { provider: string; configured: boolean; model: string };
+  last_cycle: null | { id: number; ts: number; status: string;
+                        duration_ms: number; modules_read: string;
+                        model_calls: number; detail: string };
+  usage: Array<{ module: string; rows_read: number; bytes_read: number;
+                  insights: number; proposals: number; dropped: number }>;
+  modules: IntelligenceModule[];
+};
+
+export const getIntelligence = () =>
+  req<IntelligenceState>("GET", "/api/v1/intelligence");
+
+export const putGrant = (id: string, grant: Partial<IntelligenceGrant>) =>
+  req<IntelligenceModule>("PUT", `/api/v1/modules/${id}/intelligence`, grant);
+
+/* Drop the stored override; the default (every lane off) applies again. */
+export const deleteGrant = (id: string) =>
+  req<IntelligenceModule>("DELETE", `/api/v1/modules/${id}/intelligence`);

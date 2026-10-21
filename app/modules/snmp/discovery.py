@@ -8,7 +8,9 @@ nothing it cannot justify:
     about the sampling interval rather than about the device -- it is named in
     `notes` and never proposed as a gauge;
   * a string/opaque value has no numeric grade;
-  * a table row whose index has no name gets no label a human could verify;
+  * a table row whose index has no name gets no label a human could verify --
+    unless its table's index is itself verifiable (`hrDeviceIndex`), which
+    `requires_name` decides per table;
   * an unknown numeric object gets NO band and `confidence="low"`: a band
     invented from one observation would encode the device's state at that
     instant as if it were the healthy state;
@@ -33,32 +35,41 @@ COUNTER_PREFIXES = {
 }
 
 # Checked in and inspectable: these are reviewed starting points, not derived
-# values. A label containing `{name}` is a table column and needs `names`.
+# values. A label containing `{name}` is a table column and needs a name for the
+# row's FULL OID ({"1.3.6.1.2.1.2.2.1.8.1": "lan1"}); an index-keyed map would
+# let `ifOperStatus.1` and `hrProcessorLoad.1` share the name "lan1".
+#
+# `requires_name` decides what happens when that name is absent. An interface
+# index moves on reconfiguration, so an unnamed interface row is reported and
+# NOT proposed: a check against a stale ifIndex fails loudly, and a label a
+# human cannot verify is worse than no row. `hrDeviceIndex` is stable and
+# "processor 1" is itself verifiable, so an unnamed processor row keeps its own
+# index as the placeholder rather than disappearing.
 STARTING_BANDS = {
     "1.3.6.1.2.1.2.2.1.7": {
         "kind": "state", "expected": 1, "direction": None,
         "green": None, "amber": None, "unit": "",
-        "label": "Admin {name}",
+        "label": "Admin {name}", "requires_name": True,
     },
     "1.3.6.1.2.1.2.2.1.8": {
         "kind": "state", "expected": 1, "direction": None,
         "green": None, "amber": None, "unit": "",
-        "label": "Interface {name}",
+        "label": "Interface {name}", "requires_name": True,
     },
     "1.3.6.1.2.1.25.3.3.1.2": {
         "kind": "gauge", "expected": None, "direction": "low_is_good",
         "green": 70, "amber": 90, "unit": "%",
-        "label": "Processor {name}",
+        "label": "Processor {name}", "requires_name": False,
     },
     "1.3.6.1.4.1.2021.4.5": {
         "kind": "gauge", "expected": None, "direction": "high_is_good",
         "green": 4096, "amber": 2048, "unit": "kB",
-        "label": "Total memory",
+        "label": "Total memory", "requires_name": False,
     },
     "1.3.6.1.4.1.2021.4.6": {
         "kind": "gauge", "expected": None, "direction": "high_is_good",
         "green": 1024, "amber": 512, "unit": "kB",
-        "label": "Free memory",
+        "label": "Free memory", "requires_name": False,
     },
 }
 
@@ -78,15 +89,21 @@ def _match(oid, table):
 
 
 def _label(spec, oid, names):
-    """(label, why); `why` is set when no human-verifiable label exists."""
+    """(label, why); `why` is set when no human-verifiable label exists.
+
+    `names` is keyed by the row's FULL OID, never by the bare index: one walk
+    carries `ifOperStatus.1` and `hrProcessorLoad.1`, and an index key would
+    hand both tables the same name.
+    """
     if "{name}" not in spec["label"]:
         return spec["label"], None
+    name = names.get(oid)
+    if name:
+        return spec["label"].format(name=name), None
     index = oid.rsplit(".", 1)[-1]
-    name = names.get(index)
-    if not name:
-        return None, ("index %s has no name, so the label would be a bare "
-                      "number" % index)
-    return spec["label"].format(name=name), None
+    if spec["requires_name"]:
+        return None, ("index %s could not be resolved to a name" % index)
+    return spec["label"].format(name=index), None
 
 
 def _outside(spec, value):
@@ -103,8 +120,9 @@ def _outside(spec, value):
 def candidates(device, rows, names=None):
     """(candidates, notes) from a walk's [(oid, value, type)] rows.
 
-    `names` maps a table index to a human name ({"1": "lan1"}). Candidates are
-    deduped by OID; notes name the rows deliberately not proposed and say why.
+    `names` maps a row's FULL OID to a human name
+    ({"1.3.6.1.2.1.2.2.1.8.1": "lan1"}). Candidates are deduped by OID; notes
+    name the rows deliberately not proposed and say why.
     """
     names = names or {}
     out, notes, seen = [], [], set()

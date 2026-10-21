@@ -1331,7 +1331,7 @@ def test_the_startup_banner_reads_the_stored_grant(results):
 def test_interface_status_becomes_a_state_check_expecting_up(results):
     cands, notes = discovery.candidates(
         "sw1", [("1.3.6.1.2.1.2.2.1.8.1", 2, "integer")],
-        names={"1": "lan1"})
+        names={"1.3.6.1.2.1.2.2.1.8.1": "lan1"})
     row = [c for c in cands if c["oid"].endswith(".8.1")][0]
     results.check(
         "ifOperStatus expects 1 (up), not the observed down value",
@@ -1367,7 +1367,7 @@ def test_a_starting_band_is_never_loosened_to_fit_the_observation(results):
     # hrProcessorLoad's starting band is green 70 / amber 90 (low_is_good).
     cands, _ = discovery.candidates(
         "sw1", [("1.3.6.1.2.1.25.3.3.1.2.1", 99, "integer")],
-        names={"1": "cpu0"})
+        names={"1.3.6.1.2.1.25.3.3.1.2.1": "cpu0"})
     row = cands[0]
     results.check(
         "the starting band stays 70/90 even when the observation is 99",
@@ -1376,6 +1376,66 @@ def test_a_starting_band_is_never_loosened_to_fit_the_observation(results):
     results.check(
         "the observation outside the band is flagged for review",
         "outside" in row["note"], "row=%r" % (row,))
+
+
+def test_an_oid_component_boundary_keeps_a_lookalike_out_of_the_counter_table(results):
+    """`.100.1` is not `ifInOctets` just because the digits begin with `10`.
+
+    OID prefix matching is component-wise. A string-prefix match would report a
+    real numeric object as an unproposable counter and the operator would never
+    see it in the candidate list.
+    """
+    cands, notes = discovery.candidates(
+        "sw1", [("1.3.6.1.2.1.2.2.1.100.1", 5, "integer")])
+    results.check(
+        "a numeric prefix is not a string prefix",
+        len(cands) == 1 and cands[0]["confidence"] == "low"
+        and not any("counter" in n for n in notes),
+        "cands=%r notes=%r" % (cands, notes))
+
+
+def test_names_are_keyed_by_full_oid_so_one_index_cannot_leak_across_tables(results):
+    """One walk carries ifOperStatus.1 and hrProcessorLoad.1; `1` is not a key.
+
+    An index-keyed map gives BOTH rows the name "lan1", so the processor
+    candidate reads `Processor lan1` at high confidence -- a label borrowed from
+    another table's index.
+    """
+    cands, notes = discovery.candidates(
+        "sw1",
+        [("1.3.6.1.2.1.2.2.1.8.1", 1, "integer"),
+         ("1.3.6.1.2.1.25.3.3.1.2.1", 99, "integer")],
+        names={"1.3.6.1.2.1.2.2.1.8.1": "lan1"})
+    by_oid = {c["oid"]: c for c in cands}
+    iface = by_oid.get("1.3.6.1.2.1.2.2.1.8.1")
+    proc = by_oid.get("1.3.6.1.2.1.25.3.3.1.2.1")
+    results.check(
+        "the interface row takes the name keyed by its own OID",
+        iface is not None and "lan1" in iface["label"],
+        "cands=%r notes=%r" % (cands, notes))
+    results.check(
+        "the processor row does not borrow another table's index name",
+        proc is not None and "lan1" not in proc["label"]
+        and "Processor 1" in proc["label"],
+        "cands=%r notes=%r. hrDeviceIndex is stable, so the placeholder is its "
+        "own index -- never the interface's name." % (cands, notes))
+
+
+def test_an_unnamed_interface_row_is_reported_not_invented(results):
+    """ifIndex moves on reconfiguration; a guessed interface label is worse.
+
+    Unlike hrDeviceIndex, an interface index is not self-describing, so the row
+    is named in `notes` rather than proposed with a placeholder.
+    """
+    cands, notes = discovery.candidates(
+        "sw1", [("1.3.6.1.2.1.2.2.1.8.1", 1, "integer")])
+    results.check(
+        "an unnamed interface row is a note naming the OID and its index",
+        cands == []
+        and any("1.3.6.1.2.1.2.2.1.8.1" in n and "index 1" in n
+                for n in notes),
+        "cands=%r notes=%r. A row against a stale ifIndex fails loudly; a "
+        "label a human cannot verify is worse than no row." % (cands, notes))
 
 
 TESTS = (
@@ -1432,4 +1492,7 @@ TESTS = (
     test_an_unknown_oid_gets_no_band_and_low_confidence,
     test_counters_are_named_as_not_checkable_not_given_a_gauge,
     test_a_starting_band_is_never_loosened_to_fit_the_observation,
+    test_an_oid_component_boundary_keeps_a_lookalike_out_of_the_counter_table,
+    test_names_are_keyed_by_full_oid_so_one_index_cannot_leak_across_tables,
+    test_an_unnamed_interface_row_is_reported_not_invented,
 )

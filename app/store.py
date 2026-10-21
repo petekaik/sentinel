@@ -984,6 +984,27 @@ def list_proposals(conn, state=None, limit=100):
     return [dict(r) for r in rows]
 
 
+def list_applied_changes(conn, limit=50):
+    """Executed `intelligence:auto` changes, newest first, payload included.
+
+    The history behind a revert: each row carries the `before` it replaced, so
+    the surface that offers the undo reads the same record the undo restores.
+    Only auto-applied rows are here -- an executed human approval is a decision,
+    and it is read from the proposal queue, not from this list.
+    """
+    rows = conn.execute(
+        "SELECT * FROM proposal WHERE state = 'executed' "
+        "AND actor = 'intelligence:auto' "
+        "ORDER BY COALESCE(executed_at, ts) DESC, id DESC LIMIT ?",
+        (limit,)).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = _proposal_payload(row)
+        out.append(item)
+    return out
+
+
 DECISION_STATES = ("approved", "rejected", "expired")
 
 

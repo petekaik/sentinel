@@ -2494,6 +2494,18 @@ def test_the_revert_route_needs_the_token_and_restores(results):
             "intelligence:auto")
         pid = store.list_proposals(conn, state="executed")[0]["id"]
         conn.close()
+        status, board = _http(cfg, "GET", "/api/v1/proposals")
+        applied = board.get("applied") or []
+        row = applied[0] if applied else {}
+        payload = row.get("payload") or {}
+        results.check(
+            "an auto-applied change is on the proposals read with its diff "
+            "and the before a revert restores",
+            status == 200 and len(applied) == 1 and row.get("id") == pid
+            and payload.get("classification") == "additive"
+            and payload.get("diff")
+            and payload.get("before") == {"SNMP_CHECKS": []},
+            "status=%s applied=%r" % (status, applied))
         status, _ = _http(cfg, "POST",
                           "/api/v1/intelligence/revert/%d" % pid)
         results.check("the revert route is token-gated", status == 401,

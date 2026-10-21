@@ -667,10 +667,11 @@ def test_the_read_surface(results):
         # list, never both.
         code, hdrs, body = _req(base + "/api/v1/proposals")
         results.check(
-            "GET /api/v1/proposals is {pending, expired}, uncached",
+            "GET /api/v1/proposals is {pending, expired, applied}, uncached",
             code == 200 and isinstance(body, dict)
             and isinstance(body.get("pending"), list)
             and isinstance(body.get("expired"), list)
+            and isinstance(body.get("applied"), list)
             and hdrs.get("Cache-Control") == CACHE,
             "code=%s body=%r" % (code, body))
 

@@ -944,7 +944,15 @@ class Handler(BaseHTTPRequestHandler):
                            + [r for r in pending_rows
                               if store.proposal_expired(r, now)])
                 expired.sort(key=lambda r: r["id"], reverse=True)
-                self._json(200, {"pending": pending, "expired": expired})
+                self._json(200, {
+                    "pending": pending,
+                    "expired": expired,
+                    # THE AUTOMATIC-CHANGE HISTORY. Executed auto-applied rows
+                    # are neither a queue nor a decision: they are what the
+                    # platform changed on its own, and the only rows that may be
+                    # reverted. One fetch serves the queue and its undo log.
+                    "applied": store.list_applied_changes(conn),
+                })
                 return
             if path.startswith("/api/v1"):
                 # AN API 404 IS JSON. Falling through to the legacy plain-text

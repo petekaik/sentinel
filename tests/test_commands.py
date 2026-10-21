@@ -427,7 +427,8 @@ def test_ctl_refuses_dry_run_for_deciding_verbs(results):
     for argv in (["--approve", "1", "--dry-run"],
                  ["--dry-run", "--approve", "1"],
                  ["--reject", "1", "--dry-run"],
-                 ["--revert-threshold", "mem", "--dry-run"]):
+                 ["--revert-threshold", "mem", "--dry-run"],
+                 ["--revert-change", "1", "--dry-run"]):
         outcomes[tuple(argv)] = _run_ctl(argv, {})[0]
     results.check(
         "every deciding verb refuses --dry-run with a non-zero exit",
@@ -863,7 +864,8 @@ def _if_bodies(block, cond):
 
 _CTL_VERBS = ("--modules", "--list-commands", "--run", "--arg", "--actor",
               "--list-runs", "--proposals", "--approve", "--reject",
-              "--insights", "--advisors", "--thresholds", "--revert-threshold")
+              "--insights", "--advisors", "--thresholds", "--revert-threshold",
+              "--revert-change")
 
 
 def test_deploy_exposes_the_command_surface(results):
@@ -1025,7 +1027,7 @@ def test_ctl_exposes_proposal_and_insight_verbs(results):
     text = open(os.path.join(root, "app", "ctl.py")).read()
     wanted = ("--proposals", "--approve", "--reject", "--insights",
               "--remedies", "--advisors", "--thresholds",
-              "--revert-threshold")
+              "--revert-threshold", "--revert-change")
     missing = [v for v in wanted if v not in text]
     results.check("ctl.py exposes the proposal and insight verbs", not missing,
                   "missing=%r" % (missing,))

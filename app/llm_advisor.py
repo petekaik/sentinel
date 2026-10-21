@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 
 import advisors
+import commands as command_lib
 
 # A RESPONSE IS MODEL-CONTROLLED INPUT. The endpoint can stream for as long as
 # it likes inside the request timeout, so the read is capped rather than
@@ -69,6 +70,10 @@ class OpenAIClient:
         body = json.dumps({
             "model": self.model,
             "temperature": 0,
+            # The answer is one small JSON object. Bounding the completion
+            # keeps a chatty model from spending the whole cycle budget on
+            # prose, and keeps the cost predictable.
+            "max_tokens": 2000,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
         }).encode()
@@ -170,10 +175,33 @@ class LlmAdvisor(advisors.Advisor):
         # exact text that leaves the box, because that is where the promise is.
         user = intelligence_layer.redact(
             user, intelligence_layer._secret_values(cfg))
+        budget_s = max(1, cfg.intelligence_budget_ms // 1000)
         client = OpenAIClient(
-            self.endpoint, self.api_key, self.model,
-            timeout_s=max(1, cfg.intelligence_budget_ms // 1000))
-        content, tin, tout = client.complete(system, user)
+            self.endpoint, self.api_key, self.model, timeout_s=budget_s)
+        # A REQUEST TIMEOUT IS PER SOCKET OPERATION, NOT A TOTAL DEADLINE. A
+        # slow-drip endpoint can hold the call far past `timeout_s`, so the
+        # cycle gets a hard wall-clock bound and then moves on. The abandoned
+        # thread is the platform's documented `call_bounded` behaviour.
+        state, value = command_lib.call_bounded(
+            lambda: client.complete(system, user), budget_s)
+        if state == "timeout":
+            raise ModelError(
+                "the model call exceeded its %ss budget" % budget_s) from None
+        if state == "error":
+            if isinstance(value, ModelError):
+                raise value
+            raise ModelError(
+                "the model call failed (%s)" % type(value).__name__) from None
+        content, tin, tout = value
+        # A model may wrap the JSON in a Markdown fence even when told not to.
+        # Strip exactly one leading/trailing fence; do not repair anything else,
+        # so malformed content still reads as malformed.
+        content = (content or "").strip()
+        if content.startswith("```"):
+            lines = content.splitlines()[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            content = "\n".join(lines).strip()
         try:
             payload = json.loads(content)
         except ValueError:

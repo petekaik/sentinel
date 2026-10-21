@@ -263,4 +263,34 @@ describe("Intelligence", () => {
       .toBeInTheDocument();
     expect(screen.getByText("cubox-1/cpu.metric")).toBeInTheDocument();
   });
+
+  it("distinguishes a model-call failure from a partial read", async () => {
+    const state = stateWith([
+      moduleFixture({
+        grant: { observe: true, author: "off", remediate: false, budget },
+      }),
+    ]);
+    state.last_cycle = {
+      id: 8,
+      ts: 1760000000,
+      status: "error",
+      duration_ms: 1000,
+      model_calls: 1,
+      detail: "model call failed: the model call exceeded its 30s budget",
+      modules_granted: ["fleet"],
+      modules_read: ["fleet"],
+      notes: [],
+    };
+    state.modules_granted = ["fleet"];
+    state.modules_read = ["fleet"];
+    state.granted_not_read = [];
+    stubReads(state);
+    render(<Intelligence />);
+    expect(
+      await screen.findByText(/The model call failed/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/exceeded its 30s budget/i)).toBeInTheDocument();
+    expect(screen.queryByText(/did not read every granted module/i))
+      .toBeNull();
+  });
 });

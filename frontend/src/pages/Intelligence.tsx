@@ -203,8 +203,11 @@ export default function Intelligence() {
               <strong>
                 The last intelligence cycle was {data.last_cycle.status}.
               </strong>{" "}
-              It did not read every granted module; the named modules were not
-              analysed, so their absence below is not a clean result.
+              {(data.granted_not_read ?? []).length > 0
+                ? "It did not read every granted module; the named modules were not analysed, so their absence below is not a clean result."
+                : data.last_cycle.status === "error"
+                  ? "The model call failed. The deterministic evidence is still recorded; no model insights were produced."
+                  : "The cycle did not complete; the evidence below is still the last measured state."}
               {(data.last_cycle.notes ?? []).length > 0 && (
                 <ul>
                   {data.last_cycle.notes.map((n) => (

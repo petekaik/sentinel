@@ -2172,6 +2172,76 @@ def test_a_model_failure_keeps_the_deterministic_runs_and_is_red(results):
             "canary-key-123" not in (row["detail"] or "")
             and "canary-key-123" not in json.dumps(ctx.module_errors),
             "the credential reached the store")
+        results.check(
+            "the cycle detail names the model failure reason",
+            "timed out" in (row["detail"] or ""),
+            "detail=%r: the operator must see WHY, not just 'model call "
+            "failed'" % (row["detail"],))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_model_prompt_states_the_insight_schema(results):
+    system, _, _ = intelligence_layer.pack_views({}, {}, 16000)
+    results.check(
+        "the model prompt names every insight field",
+        all(f in system for f in ('"kind"', '"title"', '"body"',
+                                  '"severity"', '"confidence"')),
+        "system=%r" % (system[:700],))
+    results.check(
+        "the model prompt demands JSON only, with no fences",
+        "no Markdown fences" in system,
+        "system=%r" % (system[:300],))
+
+
+def test_a_fenced_model_response_is_still_parsed(results):
+    tmp, conn, cfg, ctx, views = _model_views()
+    try:
+        _reset_model("```json\n"
+                     + json.dumps({"insights": [], "proposals": []})
+                     + "\n```")
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            adv = llm_advisor.LlmAdvisor(
+                provider=cfg.llm_provider, endpoint=cfg.llm_endpoint,
+                api_key=cfg.llm_key, model=cfg.llm_model)  # secretscan:ignore -- identifier
+            out = adv.advise_views(ctx, views, cfg)
+        results.check(
+            "a Markdown-fenced JSON response is parsed, not rejected",
+            out["insights"] == [] and out["proposals"] == [],
+            "out=%r" % (out,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_model_call_over_the_budget_is_a_model_error(results):
+    class _SlowModel:
+        def __init__(self, *a, **k):
+            pass
+
+        def complete(self, system, user):
+            time.sleep(2)
+            return ("{}", 1, 1)
+
+    tmp, conn, cfg, ctx, views = _model_views(
+        SENTINEL_INTELLIGENCE_BUDGET_MS="1000")
+    try:
+        with mock.patch.object(llm_advisor, "OpenAIClient", _SlowModel):
+            adv = llm_advisor.LlmAdvisor(
+                provider=cfg.llm_provider, endpoint=cfg.llm_endpoint,
+                api_key=cfg.llm_key, model=cfg.llm_model)  # secretscan:ignore -- identifier
+            try:
+                adv.advise_views(ctx, views, cfg)
+            except llm_advisor.ModelError as exc:
+                results.check(
+                    "a model call past the budget is a bounded ModelError",
+                    "exceeded its 1s budget" in str(exc),
+                    "got %r" % (exc,))
+            else:
+                results.check(
+                    "a model call past the budget is a bounded ModelError",
+                    False, "the call was not bounded")
     finally:
         conn.close()
         shutil.rmtree(tmp)
@@ -3809,6 +3879,9 @@ TESTS = (
     test_the_cycle_makes_one_model_call_and_stores_proposals,
     test_a_wrapped_model_settings_change_records_the_right_before,
     test_a_model_failure_keeps_the_deterministic_runs_and_is_red,
+    test_the_model_prompt_states_the_insight_schema,
+    test_a_fenced_model_response_is_still_parsed,
+    test_a_model_call_over_the_budget_is_a_model_error,
     test_the_selector_accepts_the_configured_llm_advisor,
     test_the_pack_obeys_the_row_budget_and_reduces_deterministically,
     test_a_module_token_budget_bounds_its_pack_before_the_global_cap,

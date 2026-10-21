@@ -346,8 +346,20 @@ def pack_views(views, grants, max_tokens, cfg=None):
         "You are Sentinel's intelligence analyst. You never grade checks, "
         "never resolve incidents, never claim an action succeeded, and never "
         "propose removing, disabling or widening a check past a failing "
-        "observation. Output one JSON object with keys `insights` and "
-        "`proposals`. Every item names one of the module ids you were given. "
+        "observation. Return ONLY one JSON object: no prose, no Markdown "
+        "fences. The exact schema is "
+        '{"insights":[{"module":"<module id>",'
+        '"kind":"anomaly|diagnosis|threshold_suggestion|report",'
+        '"title":"<short title>","body":"<text>",'
+        '"target":"<target or empty>","check_id":"<check id or empty>",'
+        '"subject":"<subject or empty>",'
+        '"severity":"info|notable|actionable","confidence":0.0,'
+        '"evidence":{}}],'
+        '"proposals":[{"module":"<module id>",'
+        '"kind":"check_set|settings_change|threshold_change|action",'
+        '"payload":{},"rationale":"<text>"}]}. '
+        "Every insight MUST carry kind, title and body; an item without them "
+        "is discarded. Every item names one of the module ids you were given. "
         "Evidence must cite ids present in the pack. A proposal is a request "
         "for a human decision, not an action you may perform.")
     user = "\n\n".join("MODULE %s\n%s" % (mid, texts[mid])
@@ -1133,15 +1145,22 @@ def run_cycle(cfg, conn, ctx, now=None):
             model_calls = 1
             try:
                 model_result = backend.advise_views(ctx, views, cfg)
-            except Exception:
+            except Exception as exc:
                 # KEEP WHAT THE ADVISORS FOUND. A configured model that cannot
                 # be reached is a RED cycle with a recorded reason, never a
-                # quiet empty one. The traceback stays in memory: it is the
-                # only place the transport's own words are allowed to exist.
+                # quiet empty one. The traceback stays in memory; the persisted
+                # detail names the ModelError's own words, which never contain
+                # the key, so the operator can see WHY without the log.
                 ctx.module_errors["intelligence"] = traceback.format_exc()[-2000:]
+                if isinstance(exc, llm_advisor.ModelError):
+                    reason = (str(exc).strip().splitlines()
+                              or ["model error"])[0]
+                else:
+                    reason = "internal error (%s)" % type(exc).__name__
                 return _finish(conn, ctx, "error", started, granted, read,
-                               "model call failed", runs=runs, usage=usage,
-                               model_calls=model_calls, notes=notes())
+                               "model call failed: %s" % reason, runs=runs,
+                               usage=usage, model_calls=model_calls,
+                               notes=notes())
             try:
                 ids, counts = _record_model(cfg, conn, views, model_result,
                                             ctx, grants)

@@ -2076,6 +2076,49 @@ def test_the_cycle_makes_one_model_call_and_stores_proposals(results):
         shutil.rmtree(tmp)
 
 
+def test_a_wrapped_model_settings_change_records_the_right_before(results):
+    """The model may send `{"settings": {...}}`; the stored `before` must be
+    keyed by the SETTING keys, not by the wrapper's single `settings` key."""
+    tmp, conn, cfg, ctx, views = _model_views(
+        SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]')
+    try:
+        _reset_model(json.dumps({
+            "insights": [],
+            "proposals": [
+                {"module": "snmp", "kind": "settings_change",
+                 "payload": {"settings": {"SNMP_TIMEOUT_S": 5}},
+                 "rationale": "raise the per-request timeout"}]}))
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        pid = out["proposals"][0]
+        payload = json.loads(store.get_proposal(conn, pid)["payload_json"])
+        results.check(
+            "a wrapped model payload is stored with its inner map and a before "
+            "keyed by the same settings",
+            payload.get("settings") == {"SNMP_TIMEOUT_S": 5}
+            and payload.get("before") == {"SNMP_TIMEOUT_S": 3},
+            "payload=%r" % (payload,))
+        # The world moves while the proposal waits.
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        settingsapi.write_settings(cfg, conn, mod, {"SNMP_TIMEOUT_S": 10},
+                                   "operator")
+        try:
+            ctl.approve_proposal(cfg, conn, {"snmp": mod}, pid, "operator")
+        except ctl.ProposalRefused as exc:
+            refusal = str(exc)
+        else:
+            refusal = ""
+        results.check(
+            "the stale guard sees the right key and refuses the wrapped "
+            "proposal, leaving it pending",
+            "changed since the proposal was written" in refusal.lower()
+            and store.get_proposal(conn, pid)["state"] == "pending",
+            "refusal=%r" % (refusal,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 def test_a_model_failure_keeps_the_deterministic_runs_and_is_red(results):
     tmp, conn, cfg, ctx, views = _model_views(selector="reference,llm")
     try:
@@ -2710,6 +2753,7 @@ TESTS = (
     test_a_transport_failure_raises_model_error,
     test_validation_resolves_citations_lanes_and_live_incidents,
     test_the_cycle_makes_one_model_call_and_stores_proposals,
+    test_a_wrapped_model_settings_change_records_the_right_before,
     test_a_model_failure_keeps_the_deterministic_runs_and_is_red,
     test_the_selector_accepts_the_configured_llm_advisor,
     test_the_pack_obeys_the_row_budget_and_reduces_deterministically,

@@ -524,18 +524,28 @@ def _record_model(cfg, conn, views, model_result):
     for item in model_result.get("proposals") or ():
         mid = str(item.get("module") or "")
         try:
-            payload = dict(item.get("payload") or {})
-            payload["classification"] = item.get("classification") or ""
-            payload["diff"] = item.get("diff") or ""
-            payload["requires_human"] = True
+            body = dict(item.get("payload") or {})
+            payload = {
+                "classification": item.get("classification") or "",
+                "diff": item.get("diff") or "",
+                "requires_human": True,
+            }
             if item.get("kind") in ("check_set", "settings_change"):
-                # THE DIFF IS AGAINST THESE VALUES. An approval compares them
-                # with the settings NOW and refuses a proposal whose world has
-                # moved; without the record there is nothing to compare against.
+                # ONE STORED SHAPE: the inner settings map under `settings` and
+                # a `before` keyed by those setting keys. The model may send the
+                # body itself or `{"settings": {...}}`; both are stored alike, so
+                # the approval guard and the SPA diff read the same keys. The
+                # earlier shape keyed `before` by the OUTER payload's keys, which
+                # for the wrapped form put a single `settings: null` in there.
+                settings = body.get("settings")
+                if not isinstance(settings, dict):
+                    settings = body
                 view = views.get(mid)
                 seen = getattr(view, "module_settings", None) or {}
-                payload["before"] = {key: seen.get(key)
-                                     for key in (item.get("payload") or {})}
+                payload["settings"] = settings
+                payload["before"] = {key: seen.get(key) for key in settings}
+            else:
+                payload = dict(body, **payload)
             signature = json.dumps({"module": mid, "kind": item.get("kind"),
                                     "payload": payload},
                                    sort_keys=True, default=str)

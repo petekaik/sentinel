@@ -308,11 +308,12 @@ def _approve_threshold(cfg, conn, mods, row, payload, actor):
 def _approve_settings(cfg, conn, mods, row, payload, actor):
     """Apply one approved `check_set`/`settings_change` proposal.
 
-    THE PAYLOAD MAY BE FLAT OR WRAPPED. The model path stores the change body
-    itself (`{"SNMP_TIMEOUT_S": 5}`) beside `classification`/`diff`/
-    `requires_human`; the auto path records `{"settings": {...}, "before": ...}`.
-    Both are accepted, and the declared-setting check in
-    `write_authoring_change` still refuses any other key.
+    THE PAYLOAD MAY BE FLAT OR WRAPPED. New model and auto proposals store
+    `{"settings": {...}, "before": ...}`; a row written before that shape (or a
+    direct fixture) may carry the change body itself beside `classification`/
+    `diff`/`requires_human`. Both are normalised to the wrapped shape here, and
+    the declared-setting check in `write_authoring_change` still refuses any
+    other key.
 
     A STALE DIFF IS REFUSED, NOT RE-CLASSIFIED INTO A NEW DECISION. The proposal
     was written against a `before` the model saw; if the current settings no

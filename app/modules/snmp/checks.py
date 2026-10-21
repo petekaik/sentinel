@@ -243,10 +243,14 @@ def instances(ctx):
             out.append(SnmpOrphan(row["device"], row, check_id))
             continue
         spec_id = "snmp.%s.%s" % (device_slug, slug)
-        ctx.dynamic_specs[spec_id] = thresholds.Spec(
+        spec = thresholds.Spec(
             spec_id, metric=spec_id, unit=row.get("unit") or "",
             direction=row.get("direction") or "high_is_good",
             green=row.get("green"), amber=row.get("amber"),
             target="snmp")
+        # Same attribution a file-declared spec gets from `load_many`: without
+        # it, a scoped view cannot tell which module's band this is.
+        spec.owner = "snmp"
+        ctx.dynamic_specs[spec_id] = spec
         out.append(SnmpOid(dev["name"], row, check_id, spec_id))
     return out

@@ -11,11 +11,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                       # noqa: E402
 from test_dashboard import _serve, make_cfg       # noqa: E402
 
+import checks                                     # noqa: E402
 import config as config_mod                       # noqa: E402
 import module                                     # noqa: E402
+import module_view                                # noqa: E402
 import modules as module_loader                   # noqa: E402
 import settingsapi                                # noqa: E402
 import store                                      # noqa: E402
+import thresholds                                 # noqa: E402
 
 
 def test_every_module_declares_its_intelligence_lanes(results):
@@ -518,6 +521,147 @@ def test_a_malformed_grant_is_reported_not_fatal_to_the_server(results):
         shutil.rmtree(tmp)
 
 
+def _view_store():
+    tmp, conn = _grant_store()
+    now = 1_800_000_000
+    # `record_check`/`record_sample` stamp `time.time()`, not a caller
+    # timestamp, so each row's `ts` is set explicitly after the insert. The
+    # ages above are what the window assertions grade; the fleet's 2-day-old
+    # rows are what a module-scoped window must NOT report for a new module.
+    for seq, (target, check_id, ts) in enumerate((
+            ("a", "a_check", now - 2 * 86400),
+            ("a", "a_check", now - 60),
+            ("b", "b_check", now - 60))):
+        store.record_check(conn, seq, target, check_id, "ok", "detail",
+                           subject="s")
+        conn.execute("UPDATE check_run SET ts = ? WHERE id = "
+                     "last_insert_rowid()", (ts,))
+    for ts, target, metric, value in (
+            (now - 3 * 86400, "a", "a.metric", 1.0),
+            (now - 60, "a", "a.metric", 2.0),
+            (now - 60, "b", "b.metric", 9.0),
+            (now - 60, "b", "orphan.metric", 9.0)):
+        store.record_sample(conn, 1, target, metric, value=value)
+        conn.execute("UPDATE sample SET ts = ? WHERE id = "
+                     "last_insert_rowid()", (ts,))
+    return tmp, conn, now
+
+
+def _fake_module(mid, targets, ids):
+    return module.Module(id=mid, title=mid, targets=tuple(targets),
+                         extra_check_ids=tuple(ids))
+
+
+def test_a_view_reads_only_its_own_rows(results):
+    tmp, conn, now = _view_store()
+    try:
+        specs = {"a.metric": thresholds.Spec("a.metric", metric="a.metric",
+                                             green=1, amber=0, target="a"),
+                 "b.metric": thresholds.Spec("b.metric", metric="b.metric",
+                                             green=1, amber=0, target="b")}
+        specs["a.metric"].owner = "a"
+        specs["b.metric"].owner = "b"
+        cfg = config_mod.Config({})
+        a = _fake_module("a", ("a",), ("a_check",))
+        b = _fake_module("b", ("b",), ("b_check",))
+        ctx = checks.Context(cfg, specs, {}, modules=(a, b))
+        view = module_view.ModuleView(
+            conn, a, ctx, specs, {"observe": True, "author": "off",
+                                  "remediate": False,
+                                  "budget": {"rows": 100, "bytes": 4096,
+                                             "tokens": 100}}, now=now)
+        runs = view.check_runs(now - 7 * 86400)
+        results.check(
+            "check_runs contains only the module's check ids",
+            {r["check_id"] for r in runs} == {"a_check"}
+            and len(runs) == 2,
+            "runs=%r" % (runs,))
+        results.check(
+            "sample_keys contains only the module's series",
+            view.sample_keys(now - 7 * 86400) == [("a", "a.metric")],
+            "keys=%r" % (view.sample_keys(now - 7 * 86400),))
+        results.check(
+            "the unowned series cannot be read by name",
+            _raises_keyerror(lambda: view.sample_stats(
+                now - 7 * 86400, "b", "b.metric")),
+            "an advisor must not read another module's series")
+        b_view = module_view.ModuleView(
+            conn, b, checks.Context(cfg, specs, {}, modules=(a, b)),
+            specs, {"observe": True, "author": "off", "remediate": False,
+                    "budget": {"rows": 100, "bytes": 4096, "tokens": 100}},
+            now=now)
+        results.check(
+            "a metric with no spec is attributed by a UNIQUE target",
+            ("b", "orphan.metric") in b_view.sample_keys(now - 7 * 86400),
+            "keys=%r. The fallback is what keeps an unattributed metric from "
+            "silently vanishing." % (b_view.sample_keys(now - 7 * 86400),))
+        results.check(
+            "module a cannot see module b's series",
+            ("b", "orphan.metric") not in view.sample_keys(now - 7 * 86400),
+            "keys=%r" % (view.sample_keys(now - 7 * 86400),))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def _raises_keyerror(fn):
+    try:
+        fn()
+    except KeyError:
+        return True
+    return False
+
+
+def test_a_new_modules_window_is_its_own_history(results):
+    tmp, conn, now = _view_store()
+    try:
+        specs = {"b.metric": thresholds.Spec("b.metric", metric="b.metric",
+                                             green=1, amber=0, target="b")}
+        specs["b.metric"].owner = "b"
+        cfg = config_mod.Config({})
+        b = _fake_module("b", ("b",), ("b_check",))
+        ctx = checks.Context(cfg, specs, {}, modules=(b,))
+        view = module_view.ModuleView(conn, b, ctx, specs, {}, now=now)
+        since, available = view.window(30)
+        results.check(
+            "a module with one recent row reports ~0 days, not the store's age",
+            0 <= available < 0.1,
+            "available=%r. The fleet module's three-day-old rows must not "
+            "lend this module a window it never had." % (available,))
+        results.check("the window's since is the module's own oldest row",
+                      since >= now - 120, "since=%r now=%r" % (since, now))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_logs_are_scoped_to_declared_targets_and_secrets_are_absent(results):
+    tmp, conn, now = _view_store()
+    try:
+        cfg = config_mod.Config({})
+        b = module.Module(id="b", title="b", targets=("b",),
+                          settings=[module.Setting("B_TOKEN", "s3cret",
+                                                    secret=True),
+                                    module.Setting("B_NAME", "visible")])
+        ctx = checks.Context(cfg, {}, {}, modules=(b,))
+        view = module_view.ModuleView(conn, b, ctx, {}, {}, now=now)
+        results.check(
+            "the module's non-secret setting is visible",
+            view.module_settings.get("B_NAME") == "visible",
+            "settings=%r" % (view.module_settings,))
+        results.check(
+            "the module's secret is absent from the view",
+            "B_TOKEN" not in view.module_settings,
+            "settings=%r" % (view.module_settings,))
+        results.check(
+            "a log target the module does not declare raises",
+            _raises_keyerror(lambda: view.logs("a", now - 86400)),
+            "a view must not read another module's journal")
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -540,4 +684,7 @@ TESTS = (
     test_grant_writes_need_the_token_and_validate,
     test_a_deleted_grant_reports_the_layer_that_now_applies,
     test_a_malformed_grant_is_reported_not_fatal_to_the_server,
+    test_a_view_reads_only_its_own_rows,
+    test_a_new_modules_window_is_its_own_history,
+    test_logs_are_scoped_to_declared_targets_and_secrets_are_absent,
 )

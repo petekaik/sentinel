@@ -35,8 +35,10 @@ toward the observation by at most 25% of the band's WIDTH (`|amber - green|`);
 the boundary on the strength of one observation, which is a threshold change
 dressed as a suggestion.
 
-The advisor is platform-level (`module = "platform"`): it spans every module,
-and reusing a real module id would put its advice in that module's report.
+The class default is platform-level (`module = "platform"`), so a standalone
+run attributes its advice to the platform. The intelligence cycle sets
+`module` to the id of the module whose view it is reading, because an
+insight written through a module's view must name that module as its owner.
 """
 
 import math
@@ -144,7 +146,7 @@ class ReferenceAdvisor(advisors.Advisor):
             lines.append("%s: %d incident(s) (%d live, %d closed)"
                          % (label, len(rows), n_live, len(rows) - n_live))
         return advisors.Insight(
-            module="platform", kind="report",
+            module=self.module, kind="report",
             title="Incidents in the last %s days" % available,
             body="\n".join(lines),
             severity="notable" if live else "info",
@@ -246,7 +248,7 @@ class ReferenceAdvisor(advisors.Advisor):
                 "max_step": step,
             })
             out.append(advisors.Insight(
-                module="platform", kind="threshold_suggestion",
+                module=self.module, kind="threshold_suggestion",
                 target=target, check_id=getattr(spec, "id", metric),
                 severity="notable", confidence=0.5,
                 title=("%s %s: p%d %s %s is outside the band "

@@ -316,13 +316,13 @@ def _record(conn, advisor_id, insight, snap):
             store.record_insight(conn, advisor=advisor_id, **insight.__dict__)
 
 
-def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
-                 specs=None):
-    """Run each advisor once, in order, bounded and isolated. NEVER raises.
+def record(conn, advisor_id, insight, snapshot):
+    """Store one insight through the same dedupe/window path the runner uses."""
+    return _record(conn, advisor_id, insight, snapshot)
 
-    ONE FRESH SNAPSHOT PER ADVISOR, so no advisor can see what another read,
-    and `history_days` is capped before the window is requested -- the cap is
-    the platform's, not the advisor's.
+
+def run_advisor(adv, conn, ctx, snapshot, budget_ms=5000, history_cap_days=30):
+    """Run ONE advisor against `snapshot`, bounded and isolated. NEVER raises.
 
     THE BUDGET IS MEASURED, NOT ENFORCED. The call is synchronous and there is
     no preemption -- the epoch WAITS for each advisor to return -- so a run
@@ -335,83 +335,96 @@ def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
     PROPAGATED. The epoch has already stored its evidence and its own record
     before this runs, and an advisor must not be able to take either down.
     """
+    t0 = time.time()
+    status, detail = "ok", ""
+    insights = []
+    try:
+        # THE ADVISOR'S OWN REQUEST, overridable per advisor, then CAPPED by
+        # the platform. The override is read through the Config when a ctx
+        # carries one (the production path); an offline caller that passes
+        # no cfg keeps the class attribute.
+        default_days = int(getattr(adv, "history_days", 7))
+        cfg = getattr(ctx, "cfg", None)
+        requested = (cfg.advisor_history_days(
+            getattr(adv, "id", ""), default_days)
+            if cfg is not None
+            and hasattr(cfg, "advisor_history_days") else default_days)
+        days = min(requested, int(history_cap_days))
+        # THE ADVISOR MUST ASK FOR THE SAME WINDOW THE RUNNER RESOLVED.
+        # `advise()` calls `snapshot.window(self.history_days)` itself, so
+        # without this assignment a per-advisor override was a no-op for
+        # the reference advisor: the runner resolved 14 days, then the
+        # advisor asked for its class default 7 and the second call won
+        # both `requested_days` and `since`. Setting the effective request
+        # on the instance keeps the override authoritative while the
+        # snapshot's own `max_days` still enforces the platform cap.
+        try:
+            adv.history_days = days
+        except Exception:                      # noqa: BLE001 - frozen obj
+            # A frozen advisor keeps its own ask; Snapshot.max_days still
+            # caps the span it can read, so this degrades to the cap rather
+            # than to unchecked history.
+            pass
+        snapshot.window(days)
+        insights = adv.advise(ctx, snapshot) or []
+        detail = "%d insight(s), window %s/%s days" % (
+            len(insights), snapshot.available_days, snapshot.requested_days)
+        for insight in insights:
+            _record(conn, adv.id, insight, snapshot)
+    except Exception:                          # noqa: BLE001 - isolated
+        status, detail = "error", traceback.format_exc()
+
+    duration_ms = int((time.time() - t0) * 1000)
+    if status == "ok" and duration_ms > budget_ms:
+        status = "budget"
+        detail += " (budget exceeded: %dms > %dms)" % (duration_ms,
+                                                       budget_ms)
+    entry = {"advisor": getattr(adv, "id", ""),
+             "module": getattr(adv, "module", ""),
+             "ok": status == "ok",
+             "status": status,
+             "detail": detail,
+             "duration_ms": duration_ms,
+             "requested_days": snapshot.requested_days,
+             "available_days": snapshot.available_days,
+             # The insights themselves travel back so the collector can
+             # translate a threshold suggestion into a proposal. Additive:
+             # the advisor remains write-free and the runner remains the
+             # only writer of insight rows.
+             "insights": insights}
+    if conn is not None:
+        try:
+            store.record_advisor_run(
+                conn, advisor=entry["advisor"],
+                module=entry["module"], status=status,
+                duration_ms=duration_ms,
+                window_requested_days=snapshot.requested_days,
+                window_available_days=snapshot.available_days,
+                detail=detail)
+        except Exception:                      # noqa: BLE001 - isolated
+            entry["detail"] += " (advisor_run record failed: %s)" % (
+                traceback.format_exc().strip().replace("\n", " | ")[-300:])
+    return entry
+
+
+def run_advisors(advisors, conn, ctx, budget_ms=5000, history_cap_days=30,
+                 specs=None):
+    """Run each advisor once, in order, bounded and isolated. NEVER raises.
+
+    ONE FRESH SNAPSHOT PER ADVISOR, so no advisor can see what another read,
+    and `history_days` is capped before the window is requested -- the cap is
+    the platform's, not the advisor's.
+
+    A thin loop over `run_advisor`, which owns the statuses, the `record` call
+    and the `advisor_run` row.
+    """
     # The threshold specs travel with the snapshot so an advisor can compare a
     # metric to its band. `specs` is explicit for a caller with no ctx (the
     # offline suites); otherwise the epoch's context is the one source of them.
     if specs is None:
         specs = getattr(ctx, "specs", None)
-    out = []
-    for adv in advisors:
-        t0 = time.time()
-        snap = Snapshot(conn, max_days=history_cap_days, specs=specs)
-        status, detail = "ok", ""
-        insights = []
-        try:
-            # THE ADVISOR'S OWN REQUEST, overridable per advisor, then CAPPED by
-            # the platform. The override is read through the Config when a ctx
-            # carries one (the production path); an offline caller that passes
-            # no cfg keeps the class attribute.
-            default_days = int(getattr(adv, "history_days", 7))
-            cfg = getattr(ctx, "cfg", None)
-            requested = (cfg.advisor_history_days(
-                getattr(adv, "id", ""), default_days)
-                if cfg is not None
-                and hasattr(cfg, "advisor_history_days") else default_days)
-            days = min(requested, int(history_cap_days))
-            # THE ADVISOR MUST ASK FOR THE SAME WINDOW THE RUNNER RESOLVED.
-            # `advise()` calls `snapshot.window(self.history_days)` itself, so
-            # without this assignment a per-advisor override was a no-op for
-            # the reference advisor: the runner resolved 14 days, then the
-            # advisor asked for its class default 7 and the second call won
-            # both `requested_days` and `since`. Setting the effective request
-            # on the instance keeps the override authoritative while the
-            # snapshot's own `max_days` still enforces the platform cap.
-            try:
-                adv.history_days = days
-            except Exception:                      # noqa: BLE001 - frozen obj
-                # A frozen advisor keeps its own ask; Snapshot.max_days still
-                # caps the span it can read, so this degrades to the cap rather
-                # than to unchecked history.
-                pass
-            snap.window(days)
-            insights = adv.advise(ctx, snap) or []
-            detail = "%d insight(s), window %s/%s days" % (
-                len(insights), snap.available_days, snap.requested_days)
-            for insight in insights:
-                _record(conn, adv.id, insight, snap)
-        except Exception:                          # noqa: BLE001 - isolated
-            status, detail = "error", traceback.format_exc()
-
-        duration_ms = int((time.time() - t0) * 1000)
-        if status == "ok" and duration_ms > budget_ms:
-            status = "budget"
-            detail += " (budget exceeded: %dms > %dms)" % (duration_ms,
-                                                           budget_ms)
-        entry = {"advisor": getattr(adv, "id", ""),
-                 "module": getattr(adv, "module", ""),
-                 "ok": status == "ok",
-                 "status": status,
-                 "detail": detail,
-                 "duration_ms": duration_ms,
-                 "requested_days": snap.requested_days,
-                 "available_days": snap.available_days,
-                 # The insights themselves travel back so the collector can
-                 # translate a threshold suggestion into a proposal. Additive:
-                 # the advisor remains write-free and the runner remains the
-                 # only writer of insight rows.
-                 "insights": insights}
-        out.append(entry)
-
-        if conn is not None:
-            try:
-                store.record_advisor_run(
-                    conn, advisor=entry["advisor"],
-                    module=entry["module"], status=status,
-                    duration_ms=duration_ms,
-                    window_requested_days=snap.requested_days,
-                    window_available_days=snap.available_days,
-                    detail=detail)
-            except Exception:                      # noqa: BLE001 - isolated
-                entry["detail"] += " (advisor_run record failed: %s)" % (
-                    traceback.format_exc().strip().replace("\n", " | ")[-300:])
-    return out
+    return [run_advisor(adv, conn, ctx,
+                        Snapshot(conn, max_days=history_cap_days, specs=specs),
+                        budget_ms=budget_ms,
+                        history_cap_days=history_cap_days)
+            for adv in advisors]

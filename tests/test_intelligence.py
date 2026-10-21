@@ -6,14 +6,18 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import harness                                    # noqa: E402
 from harness import Results                       # noqa: E402
 from test_dashboard import _serve, make_cfg       # noqa: E402
 
+import advisors                                   # noqa: E402
 import authorize                                  # noqa: E402
 import checks                                     # noqa: E402
 import config as config_mod                       # noqa: E402
+import intelligence_layer                         # noqa: E402
 import module                                     # noqa: E402
 import module_view                                # noqa: E402
 import modules as module_loader                   # noqa: E402
@@ -980,6 +984,97 @@ def test_a_warn_that_stays_warn_is_a_modification(results):
                   "a band change is never additive")
 
 
+def _cycle_cfg(**env):
+    base = {"MONITOR_CHECKS": harness.CHECKS_CONF}
+    base.update(env)
+    return config_mod.Config(base)
+
+
+def test_no_grant_reads_nothing_and_says_so(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg()
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        last = store.last_intelligence_cycle(conn)
+        results.check(
+            "the cycle records that nothing was granted",
+            last is not None and "no modules granted" in last["detail"],
+            "last=%r out=%r" % (last, out))
+        results.check(
+            "no advisor ran for an ungranted module",
+            conn.execute("SELECT COUNT(*) FROM advisor_run").fetchone()[0] == 0,
+            "an ungranted module was read")
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_granted_module_is_read_and_recorded(results):
+    tmp, conn = _grant_store()
+    try:
+        now = int(time.time())
+        store.record_check(conn, 1, "cubox-1", "host_unreachable", "ok",
+                           "reachable", subject="cubox-1")
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_INTERVAL_S="60")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        out = intelligence_layer.run_cycle(cfg, conn, ctx, now=now)
+        last = store.last_intelligence_cycle(conn)
+        results.check(
+            "the cycle names the module it read",
+            last is not None and "fleet" in last["modules_read"],
+            "last=%r" % (last,))
+        results.check(
+            "the reference analyzer ran and recorded its run",
+            conn.execute("SELECT COUNT(*) FROM advisor_run WHERE advisor='reference'")
+            .fetchone()[0] == 1,
+            "out=%r" % (out,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_cadence_skips_a_second_cycle(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_INTERVAL_S="300")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        now = int(time.time())
+        first = intelligence_layer.run_cycle(cfg, conn, ctx, now=now)
+        second = intelligence_layer.run_cycle(cfg, conn, ctx, now=now + 10)
+        results.check(
+            "a cycle inside the interval does not run",
+            first is not None and second is None,
+            "first=%r second=%r" % (first, second))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_global_switch_stops_the_cycle(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(SENTINEL_INTELLIGENCE="0",
+                         FLEET_INTELLIGENCE='{"observe": true}')
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        intelligence_layer.run_cycle(cfg, conn, ctx)
+        last = store.last_intelligence_cycle(conn)
+        results.check(
+            "SENTINEL_INTELLIGENCE=0 records a visible skip",
+            last is not None and last["status"] == "skipped"
+            and "SENTINEL_INTELLIGENCE" in last["detail"],
+            "last=%r" % (last,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -1018,4 +1113,8 @@ TESTS = (
     test_a_state_rows_expected_moved_onto_a_failing_value_is_silencing,
     test_the_modules_own_validation_can_refuse_an_additive_edit,
     test_a_warn_that_stays_warn_is_a_modification,
+    test_no_grant_reads_nothing_and_says_so,
+    test_a_granted_module_is_read_and_recorded,
+    test_the_cadence_skips_a_second_cycle,
+    test_the_global_switch_stops_the_cycle,
 )

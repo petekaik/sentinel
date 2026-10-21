@@ -48,6 +48,7 @@ import advisors
 import checks
 import config as config_mod
 import intelligence
+import intelligence_layer
 from module import owned_check_ids
 import modules as module_loader
 import store
@@ -474,92 +475,6 @@ def _note_advisor_problem(conn, ctx, advisor, module, detail):
                  % (advisor, line[-1] if line else "unknown"))
 
 
-def _propose_thresholds(cfg, conn, ctx, runs):
-    """Translate threshold suggestions into proposals a human can approve.
-
-    THE ADVISOR STAYS WRITE-FREE. It returned data; the collector is the writer,
-    exactly as it is for incident rows. Without this the threshold-approval path
-    in `ctl.py` is unreachable -- an insight that says "tighten amber" with no
-    route to a proposal is a recommendation nobody can act on.
-
-    ONE PENDING PROPOSAL PER SPEC. The reference advisor runs every epoch, so a
-    row per suggestion would fill the queue with copies of one idea. An existing
-    pending row (or one still inside its TTL) means the human has not decided
-    yet; writing another changes nothing except the queue length.
-    """
-    if conn is None:
-        return []
-    specs = getattr(ctx, "specs", None) or {}
-    ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
-    now = time.time()
-
-    # A LAPSED PROPOSAL IS ABSENT, NOT A DECISION. The healer's sweep does not
-    # run when MONITOR_REMEDIES=0, so without this a dead pending row would
-    # block its spec's new proposals for as long as the collector runs.
-    try:
-        store.expire_proposals(conn, now)
-    except Exception as exc:                       # noqa: BLE001 - isolated
-        line = str(exc).splitlines()
-        ctx.note("could not expire lapsed proposals: %s"
-                 % (line[0] if line else type(exc).__name__))
-
-    written = []
-    for run in runs or ():
-        # AN ERROR/BUDGET RUN'S INSIGHT MAY NOT BE DURABLE. The runner carries
-        # the insight objects back on that path too, and proposing from one
-        # would cite evidence the store rejected.
-        if run.get("status") != "ok":
-            continue
-        for insight in run.get("insights") or ():
-            if getattr(insight, "kind", "") != "threshold_suggestion":
-                continue
-            try:
-                evidence = insight.evidence or {}
-                proposed = evidence.get("proposed") or {}
-                green = proposed.get("green")
-                amber = proposed.get("amber")
-                spec = specs.get(getattr(insight, "check_id", ""))
-                if spec is None or green is None or amber is None:
-                    continue
-                module = getattr(spec, "owner", None)
-                if not module:
-                    # A spec with no owning module cannot be approved: the
-                    # approval path resolves it through that module's file.
-                    continue
-                # THE NEWEST PROPOSAL SPEAKS, NOT JUST THE PENDING ONE. A row
-                # rejected (or executed) seconds ago must not regenerate on the
-                # next epoch, or `--reject` is decoration and an approved band
-                # is re-proposed before anyone can see whether it helped. The
-                # suppression lasts one TTL; after that a still-outside band is
-                # new evidence and may be proposed again.
-                last = store.last_threshold_proposal(conn, spec.id)
-                if last is not None:
-                    if (last["state"] == "pending"
-                            and not store.proposal_expired(last, now)):
-                        continue
-                    if last["state"] in ("rejected", "executed"):
-                        stamp = (last.get("decided_at")
-                                 if last["state"] == "rejected"
-                                 else last.get("executed_at"))
-                        stamp = stamp or last["ts"]
-                        if float(stamp) + ttl_s > now:
-                            continue
-                pid = store.record_proposal(
-                    conn, module=module, kind="threshold_change",
-                    payload={"spec_id": spec.id, "module": module,
-                             "green": green, "amber": amber},
-                    rationale="%s: %s" % (run.get("advisor", "advisor"),
-                                          insight.title),
-                    expires_at=time.time() + ttl_s)
-                written.append(pid)
-            except Exception as exc:               # noqa: BLE001 - isolated
-                line = str(exc).splitlines()
-                ctx.note("could not record a threshold proposal from %r: %s"
-                         % (run.get("advisor", "advisor"),
-                            line[0] if line else type(exc).__name__))
-    return written
-
-
 def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
     """Run the selected advisors of the enabled modules. NEVER raises.
 
@@ -568,6 +483,11 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
     exists before any advisor runs, so an advisor that hangs or overruns cannot
     disappear it. Advisor time is consequently not part of the epoch's
     `duration_ms`; each advisor's own row records its duration and overrun.
+
+    THE UNGATED RUNNER. `collect_once` now calls
+    `intelligence_layer.run_cycle`, which reads only modules with an `observe`
+    grant; this function stays public for the tests and for a caller that
+    wants every selected advisor with no grant check.
 
     AN EMPTY SELECTION RUNS NOTHING. `SENTINEL_ADVISORS` defaults to the
     reference advisor; `none` is the explicit off switch and parses to no ids,
@@ -678,7 +598,7 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
             specs=getattr(ctx, "specs", None))
         # AFTER the insights are durable. A proposal whose evidence was never
         # stored is a decision nobody can audit.
-        _propose_thresholds(cfg, conn, ctx, runs)
+        intelligence_layer.propose_thresholds(cfg, conn, ctx, runs)
         return runs
     except Exception as exc:                       # noqa: BLE001 - isolated
         lines = str(exc).splitlines()
@@ -818,12 +738,20 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
         store.record_collector_run(
             conn, seq, duration_ms, len(results), errors,
             note="; ".join(ctx.notes) or None)
-        # ADVISORS AFTER THE EPOCH ROW, per the spec's order: persist the epoch,
-        # then enqueue advisor runs. `record()` above already made the evidence
-        # durable, and this row is now the dashboard's proof the monitor is
-        # alive -- an advisor that hangs or overruns cannot take it away. Never
-        # on a dry run, whose contract is "claims nothing".
-        run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=True)
+        # THE INTELLIGENCE CYCLE AFTER THE EPOCH ROW, per the spec's order:
+        # persist the epoch, then enqueue advisor runs. `record()` above
+        # already made the evidence durable, and this row is now the
+        # dashboard's proof the monitor is alive -- an advisor that hangs or
+        # overruns cannot take it away. The cycle records its own failures as
+        # a cycle row; this last guard covers the only paths it cannot (a
+        # store that cannot be read), so it can never take the epoch with it.
+        # Never on a dry run, whose contract is "claims nothing".
+        try:
+            intelligence_layer.run_cycle(cfg, conn, ctx)
+        except Exception as exc:                   # noqa: BLE001 - isolated
+            lines = str(exc).splitlines()
+            ctx.note("intelligence cycle failed: %s"
+                     % (lines[0] if lines else type(exc).__name__))
         if seq % PRUNE_EVERY == 0:
             store.prune(conn)
 

@@ -1052,12 +1052,21 @@ def test_a_dry_run_epoch_runs_no_advisor(results):
             saved = fleet_mod._advisors
             fleet_mod._advisors = lambda: [Counter()]
             old_ids = f.cfg.advisor_ids
+            old_grant = f.cfg._base_env.get("FLEET_INTELLIGENCE")
             f.cfg.advisor_ids = ("counter",)
+            # Granted, so the only reason the counter does not run is the dry
+            # run itself -- an ungranted module would not run either way and
+            # the assertion would pass for the wrong reason (item 80).
+            f.cfg._base_env["FLEET_INTELLIGENCE"] = '{"observe": true}'
             try:
                 collect.collect_once(f.cfg, f.conn, dry_run=True)
             finally:
                 fleet_mod._advisors = saved
                 f.cfg.advisor_ids = old_ids
+                if old_grant is None:
+                    f.cfg._base_env.pop("FLEET_INTELLIGENCE", None)
+                else:
+                    f.cfg._base_env["FLEET_INTELLIGENCE"] = old_grant
             rows = f.conn.execute("SELECT COUNT(*) AS n FROM advisor_run") \
                 .fetchone()["n"]
             results.check(
@@ -1094,12 +1103,21 @@ def test_the_runner_reads_the_epoch_that_just_finished(results):
             saved = fleet_mod._advisors
             fleet_mod._advisors = lambda: [Reader()]
             old_ids = f.cfg.advisor_ids
+            old_grant = f.cfg._base_env.get("FLEET_INTELLIGENCE")
             f.cfg.advisor_ids = ("reader",)
+            # THE CYCLE READS ONLY GRANTED MODULES (item 77's rule: an
+            # ungranted module is never read). These two tests are about
+            # ordering and isolation, not about the gate, so they grant it.
+            f.cfg._base_env["FLEET_INTELLIGENCE"] = '{"observe": true}'
             try:
                 out = collect.collect_once(f.cfg, f.conn)
             finally:
                 fleet_mod._advisors = saved
                 f.cfg.advisor_ids = old_ids
+                if old_grant is None:
+                    f.cfg._base_env.pop("FLEET_INTELLIGENCE", None)
+                else:
+                    f.cfg._base_env["FLEET_INTELLIGENCE"] = old_grant
             results.check(
                 "advisors run after this epoch's evidence is durable",
                 out["seq"] in Reader.epochs,
@@ -1123,12 +1141,21 @@ def test_a_raising_advisor_cannot_lose_the_epoch_record(results):
             saved = fleet_mod._advisors
             fleet_mod._advisors = lambda: [_Boom()]
             old_ids = f.cfg.advisor_ids
+            old_grant = f.cfg._base_env.get("FLEET_INTELLIGENCE")
             f.cfg.advisor_ids = ("boom",)
+            # See `test_the_runner_reads_the_epoch_that_just_finished`: the
+            # cycle reads only granted modules, and this test is about a
+            # raising advisor, not about the gate.
+            f.cfg._base_env["FLEET_INTELLIGENCE"] = '{"observe": true}'
             try:
                 out = collect.collect_once(f.cfg, f.conn)
             finally:
                 fleet_mod._advisors = saved
                 f.cfg.advisor_ids = old_ids
+                if old_grant is None:
+                    f.cfg._base_env.pop("FLEET_INTELLIGENCE", None)
+                else:
+                    f.cfg._base_env["FLEET_INTELLIGENCE"] = old_grant
             row = store.last_collection(f.conn)
             runs = f.conn.execute("SELECT * FROM advisor_run").fetchall()
             results.check(

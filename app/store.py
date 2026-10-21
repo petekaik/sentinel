@@ -878,6 +878,22 @@ def record_proposal(conn, module, kind, payload, rationale, expires_at=0):
     return cur.lastrowid
 
 
+def record_applied_change(conn, module, kind, payload, rationale, actor):
+    """Record an automatically applied change as an already-executed proposal.
+
+    NOT routed through `claim_proposal`: no human decided this, and writing
+    `approved` would fabricate a decision. `executed` is the fact.
+    """
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO proposal (ts, module, kind, payload_json, rationale, "
+        "state, expires_at, decided_at, actor, executed_at) "
+        "VALUES (?,?,?,?,?,'executed',?,?,?,?)",
+        (now, module, kind, json.dumps(payload), rationale, now, now, actor,
+         now))
+    return cur.lastrowid
+
+
 def get_proposal(conn, proposal_id):
     row = conn.execute("SELECT * FROM proposal WHERE id = ?",
                        (proposal_id,)).fetchone()

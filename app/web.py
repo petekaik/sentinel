@@ -1113,7 +1113,8 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     def do_POST(self):
-        """`/api/v1/proposals/<id>/{approve,reject}` and
+        """`/api/v1/proposals/<id>/{approve,reject}`,
+        `/api/v1/intelligence/revert/<id>` and
         `/api/v1/commands/<module>/<id>`.
 
         Auth is checked BEFORE the store is opened, exactly as
@@ -1153,6 +1154,10 @@ class Handler(BaseHTTPRequestHandler):
                     and parts[4] in ("approve", "reject")):
                 self._proposal_decision(conn, parts[3], parts[4])
                 return
+            if (len(parts) == 5 and parts[:3] == ["api", "v1", "intelligence"]
+                    and parts[3] == "revert"):
+                self._revert_change(conn, parts[4])
+                return
             if len(parts) == 5 and parts[:3] == ["api", "v1", "commands"]:
                 self._run_command(cfg, conn, parts[3], parts[4], body)
                 return
@@ -1185,6 +1190,20 @@ class Handler(BaseHTTPRequestHandler):
                     "operator")
             else:
                 message = ctl.reject_proposal(conn, proposal_id, "operator")
+        except ctl.ProposalRefused as exc:
+            self._error(409, "refused", str(exc))
+            return
+        self._json(200, {"ok": True, "message": message})
+
+    def _revert_change(self, conn, raw_id):
+        try:
+            proposal_id = int(raw_id)
+        except ValueError:
+            self._error(409, "refused", "no proposal %r" % (raw_id,))
+            return
+        try:
+            message = ctl.revert_change(self.cfg, conn, proposal_id,
+                                        "operator")
         except ctl.ProposalRefused as exc:
             self._error(409, "refused", str(exc))
             return

@@ -396,6 +396,11 @@ def _http(cfg, method, path, body=None, token=None):
         conn.close()
         return resp.status, payload
     finally:
+        # `shutdown()` STOPS `serve_forever`, whose thread stays alive after
+        # `server_close()` -- and it can still be inside a request, holding the
+        # SQLite file, when the caller's `shutil.rmtree` runs (measured as
+        # `FileNotFoundError: m.sqlite-wal`). Order matters: stop, then close.
+        httpd.shutdown()
         httpd.server_close()
 
 
@@ -2251,7 +2256,270 @@ def test_one_malformed_model_item_does_not_drop_the_rest(results):
         shutil.rmtree(tmp)
 
 
+def test_additive_auto_applies_and_the_proposal_records_it(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+            "SNMP_COMMUNITIES": '{"sw1":"public"}',
+            "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1",
+            "SNMP_INTELLIGENCE": '{"observe": true, "author": "auto"}'})
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        before = {"SNMP_DEVICES": [{"name": "sw1", "address": "192.0.2.10"}],
+                  "SNMP_CHECKS": [], "SNMP_TIMEOUT_S": 1}
+        after = {"SNMP_DEVICES": before["SNMP_DEVICES"],
+                 "SNMP_CHECKS": [{"device": "sw1",
+                                  "oid": "1.3.6.1.2.1.1.3.0",
+                                  "label": "uptime", "unit": "",
+                                  "direction": "high_is_good", "green": 1,
+                                  "amber": 0, "kind": "gauge",
+                                  "expected": None}],
+                 "SNMP_TIMEOUT_S": 1}
+        cls, why = authorize.classify({"settings": after}, mod, before)
+        settingsapi.write_authoring_change(
+            cfg, conn, mod, {"settings": after}, "intelligence:auto")
+        rows = store.list_proposals(conn, state="executed")
+        results.check("an additive change classifies additive",
+                      cls == authorize.ADDITIVE, "got %s: %s" % (cls, why))
+        results.check(
+            "the auto-applied change is recorded as an executed proposal",
+            len(rows) == 1 and rows[0]["actor"] == "intelligence:auto",
+            "rows=%r" % (rows,))
+        cfg.reload_settings(conn)
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        results.check("the settings actually changed",
+                      len(view["SNMP_CHECKS"]["value"]) == 1,
+                      "view=%r" % (view["SNMP_CHECKS"],))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_silencing_change_cannot_be_applied_by_the_auto_path(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+            "SNMP_COMMUNITIES": '{"sw1":"public"}',
+            "SNMP_CHECKS": '[{"device":"sw1","oid":"1.3.6.1.2.1.1",'
+                           '"label":"cpu","direction":"low_is_good",'
+                           '"green":70,"amber":90,"kind":"gauge"}]',
+            "SNMP_TIMEOUT_S": "1",
+            "SNMP_INTELLIGENCE": '{"observe": true, "author": "auto"}'})
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        before = {"SNMP_DEVICES": [{"name": "sw1", "address": "192.0.2.10"}],
+                  "SNMP_CHECKS": [{"device": "sw1", "oid": "1.3.6.1.2.1.1",
+                                   "label": "cpu", "unit": "",
+                                   "direction": "low_is_good", "green": 70,
+                                   "amber": 90, "kind": "gauge",
+                                   "expected": None}],
+                  "SNMP_TIMEOUT_S": 1}
+        after = {"SNMP_DEVICES": before["SNMP_DEVICES"], "SNMP_CHECKS": [],
+                 "SNMP_TIMEOUT_S": 1}
+        try:
+            settingsapi.write_authoring_change(
+                cfg, conn, mod, {"settings": after}, "intelligence:auto")
+        except settingsapi.SettingsError as exc:
+            results.check("the auto path refuses a silencing change",
+                          "human" in str(exc).lower(), "got %r" % (exc,))
+        else:
+            results.check("the auto path refuses a silencing change", False,
+                          "it applied a removal at author=auto")
+        results.check("nothing was written",
+                      store.setting_rows(conn) == {},
+                      "rows=%r" % (store.setting_rows(conn),))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def _authoring_cfg():
+    return config_mod.Config({
+        "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+        "SNMP_COMMUNITIES": '{"sw1":"public"}',
+        "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1",
+        "SNMP_INTELLIGENCE": '{"observe": true, "author": "auto"}'})
+
+
+def _uptime_check():
+    return {"device": "sw1", "oid": "1.3.6.1.2.1.1.3.0", "label": "uptime",
+            "unit": "", "direction": "high_is_good", "green": 1, "amber": 0,
+            "kind": "gauge", "expected": None}
+
+
+def test_a_human_approval_applies_a_model_settings_change(results):
+    """The model stores its change body FLAT, beside the classification it was
+    graded with. An approval must apply exactly that body -- not refuse it
+    because `write_authoring_change` expects the wrapped shape."""
+    tmp, conn = _grant_store()
+    try:
+        cfg = _authoring_cfg()
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        pid = store.record_proposal(
+            conn, module="snmp", kind="settings_change",
+            payload={"SNMP_CHECKS": [_uptime_check()],
+                     "classification": "additive", "diff": "added 1 row",
+                     "requires_human": True},
+            rationale="model proposal", expires_at=time.time() + 3600)
+        try:
+            msg = ctl.approve_proposal(cfg, conn, {"snmp": mod}, pid,
+                                       "operator")
+        except ctl.ProposalRefused as exc:
+            msg = "REFUSED: %s" % exc
+        cfg.reload_settings(conn)
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        row = store.get_proposal(conn, pid)
+        results.check("a flat model payload is applied by its approval",
+                      row["state"] == "executed"
+                      and len(view["SNMP_CHECKS"]["value"]) == 1,
+                      "msg=%r state=%r checks=%r"
+                      % (msg, row["state"], view["SNMP_CHECKS"]["value"]))
+        runs = [r for r in store.list_command_runs(conn)
+                if r["command"] == "approve_proposal"]
+        results.check("the approval is audited as a success",
+                      len(runs) == 1 and runs[0]["exit_status"] == 0
+                      and runs[0]["actor"] == "operator",
+                      "runs=%r" % (runs,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_human_may_approve_a_change_auto_may_not(results):
+    """The additive-only rule is scoped to `intelligence:auto`. A human saying
+    yes to a removal is a decision, and `executed` is what happened."""
+    tmp, conn = _grant_store()
+    try:
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+            "SNMP_COMMUNITIES": '{"sw1":"public"}',
+            "SNMP_CHECKS": '[{"device":"sw1","oid":"1.3.6.1.2.1.1",'
+                           '"label":"cpu","direction":"low_is_good",'
+                           '"green":70,"amber":90,"kind":"gauge"}]',
+            "SNMP_TIMEOUT_S": "1",
+            "SNMP_INTELLIGENCE": '{"observe": true, "author": "auto"}'})
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        pid = store.record_proposal(
+            conn, module="snmp", kind="check_set",
+            payload={"SNMP_CHECKS": [], "classification": "silencing",
+                     "diff": "removed 1 SNMP_CHECKS row(s)",
+                     "requires_human": True},
+            rationale="model proposal", expires_at=time.time() + 3600)
+        try:
+            ctl.approve_proposal(cfg, conn, {"snmp": mod}, pid, "operator")
+        except ctl.ProposalRefused:
+            pass
+        cfg.reload_settings(conn)
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "a human-approved silencing change is applied and marked executed",
+            row["state"] == "executed" and view["SNMP_CHECKS"]["value"] == [],
+            "state=%r checks=%r" % (row["state"],
+                                    view["SNMP_CHECKS"]["value"]))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_revert_restores_the_recorded_before_and_is_audited(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _authoring_cfg()
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        settingsapi.write_authoring_change(
+            cfg, conn, mod, {"settings": {"SNMP_CHECKS": [_uptime_check()]}},
+            "intelligence:auto")
+        pid = store.list_proposals(conn, state="executed")[0]["id"]
+        try:
+            msg = ctl.revert_change(cfg, conn, pid)
+        except ctl.ProposalRefused as exc:
+            msg = "REFUSED: %s" % exc
+        cfg.reload_settings(conn)
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        results.check(
+            "a revert restores the before the auto change recorded",
+            view["SNMP_CHECKS"]["value"] == [], "msg=%r checks=%r"
+            % (msg, view["SNMP_CHECKS"]["value"]))
+        runs = [r for r in store.list_command_runs(conn)
+                if r["command"] == "revert_change"]
+        results.check(
+            "the revert is audited as an operator write",
+            len(runs) == 1 and runs[0]["exit_status"] == 0
+            and runs[0]["actor"] == "operator", "runs=%r" % (runs,))
+        # EACH GUARD IS ISOLATED WITH A PAYLOAD THAT WOULD RESTORE, so a
+        # missing `before` cannot mask a broken state or actor check. `pid` is
+        # executed but relabelled a human decision; `pending` is an auto-actor
+        # row that was never applied.
+        pending = store.record_proposal(
+            conn, module="snmp", kind="settings_change",
+            payload={"SNMP_CHECKS": [_uptime_check()],
+                     "before": {"SNMP_CHECKS": []}},
+            rationale="never applied", expires_at=time.time() + 3600)
+        conn.execute("UPDATE proposal SET actor = 'intelligence:auto' "
+                     "WHERE id = ?", (pending,))
+        conn.execute("UPDATE proposal SET actor = 'operator' WHERE id = ?",
+                     (pid,))
+        conn.commit()
+        refused = []
+        for bad in (pid, pending):
+            try:
+                ctl.revert_change(cfg, conn, bad)
+            except ctl.ProposalRefused:
+                refused.append(bad)
+        results.check(
+            "only an executed intelligence:auto change reverts: a human "
+            "decision and a pending row are both refused",
+            refused == [pid, pending],
+            "refused=%r -- a human-approved row is a decision, not a revert"
+            % (refused,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_revert_route_needs_the_token_and_restores(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = make_cfg(os.path.join(tmp, "m.sqlite"),
+                       SENTINEL_WRITE_TOKEN="tok",
+                       SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+                       SNMP_COMMUNITIES='{"sw1":"public"}',
+                       SNMP_CHECKS="[]", SNMP_TIMEOUT_S="1")
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        settingsapi.write_authoring_change(
+            cfg, conn, mod, {"settings": {"SNMP_CHECKS": [_uptime_check()]}},
+            "intelligence:auto")
+        pid = store.list_proposals(conn, state="executed")[0]["id"]
+        conn.close()
+        status, _ = _http(cfg, "POST",
+                          "/api/v1/intelligence/revert/%d" % pid)
+        results.check("the revert route is token-gated", status == 401,
+                      "status=%s" % (status,))
+        status, body = _http(cfg, "POST",
+                             "/api/v1/intelligence/revert/%d" % pid,
+                             token="tok")
+        conn = store.connect(cfg.db_path)
+        checks = store.setting_rows(conn).get(("snmp", "SNMP_CHECKS"))
+        conn.close()
+        results.check(
+            "the revert route restores the recorded before",
+            status == 200 and body.get("ok") is True
+            and not checks, "status=%s body=%r checks=%r"
+            % (status, body, checks))
+    finally:
+        shutil.rmtree(tmp)
+
+
 TESTS = (
+    test_additive_auto_applies_and_the_proposal_records_it,
+    test_a_silencing_change_cannot_be_applied_by_the_auto_path,
+    test_a_human_approval_applies_a_model_settings_change,
+    test_a_human_may_approve_a_change_auto_may_not,
+    test_a_revert_restores_the_recorded_before_and_is_audited,
+    test_the_revert_route_needs_the_token_and_restores,
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
     test_remediate_without_actions_is_refused,

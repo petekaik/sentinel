@@ -26,8 +26,15 @@ import commands
 import config as config_mod
 import heal
 import modules as module_loader
+import settingsapi
 import store
 import thresholds
+
+# The keys an auto-applied or model-authored proposal adds beside the settings
+# body. `_approve_settings` strips them so a flat payload from the model path
+# (`{"SNMP_TIMEOUT_S": 5, "classification": ...}`) can be applied as a change
+# without those keys being refused as undeclared settings.
+PROPOSAL_META = ("classification", "diff", "requires_human", "before")
 
 # The largest band change one approval may apply, as a fraction of the band's
 # own width. The reference advisor proposes at most this step; requiring it
@@ -297,6 +304,39 @@ def _approve_threshold(cfg, conn, mods, row, payload, actor):
                            previous["green"], previous["amber"]))
 
 
+def _approve_settings(cfg, conn, mods, row, payload, actor):
+    """Apply one approved `check_set`/`settings_change` proposal.
+
+    THE PAYLOAD MAY BE FLAT OR WRAPPED. The model path stores the change body
+    itself (`{"SNMP_TIMEOUT_S": 5}`) beside `classification`/`diff`/
+    `requires_human`; the auto path records `{"settings": {...}, "before": ...}`.
+    Both are accepted, and the declared-setting check in
+    `write_authoring_change` still refuses any other key.
+    """
+    module_id = row["module"]
+    mod = mods.get(module_id)
+    if mod is None:
+        raise ProposalRefused("module %r is not discovered" % module_id)
+    settings = payload.get("settings")
+    if not isinstance(settings, dict):
+        settings = {k: v for k, v in payload.items()
+                    if k != "settings" and k not in PROPOSAL_META}
+    # CLAIM BEFORE THE WRITE, exactly as the action and threshold paths do: two
+    # concurrent approvals of one proposal must not both apply a change.
+    if store.claim_proposal(conn, row["id"], actor) != 1:
+        raise ProposalRefused("proposal %s is no longer pending" % row["id"])
+    try:
+        settingsapi.write_authoring_change(
+            cfg, conn, mod, {"settings": settings}, actor)
+    except BaseException:
+        # A failed apply is not a decision; leave the proposal pending for a
+        # corrected retry. The claim is released, the write is all-or-nothing.
+        store.release_proposal(conn, row["id"])
+        raise
+    store.mark_proposal_executed(conn, row["id"])
+    return "proposal %d applied" % row["id"]
+
+
 def approve_proposal(cfg, conn, mods, proposal_id, actor, ctx=None):
     """Approve one proposal. Raises ProposalRefused; returns a message.
 
@@ -344,6 +384,8 @@ def approve_proposal(cfg, conn, mods, proposal_id, actor, ctx=None):
                 ctx if ctx is not None else _context(cfg, mods))
         elif row["kind"] == "threshold_change":
             detail = _approve_threshold(cfg, conn, mods, row, payload, actor)
+        elif row["kind"] in ("check_set", "settings_change"):
+            detail = _approve_settings(cfg, conn, mods, row, payload, actor)
         else:
             raise ProposalRefused(
                 "proposal kind %r cannot be approved" % (row["kind"],))
@@ -409,6 +451,48 @@ def revert_threshold(cfg, conn, mods, spec_id, actor="operator"):
     return detail
 
 
+def revert_change(cfg, conn, proposal_id, actor="operator"):
+    """Restore what an auto-applied change replaced -- as a human write.
+
+    ONLY an executed `intelligence:auto` row may be reverted: a pending row was
+    never applied, and a human-approved one was a decision, which undoing is
+    another decision rather than a revert. The recorded `before` goes through
+    `write_settings`, so it is re-validated and audited like any operator write.
+    """
+    t0 = time.time()
+    row = store.get_proposal(conn, proposal_id)
+    module = (row or {}).get("module", "")
+    try:
+        if (row is None or row["state"] != "executed"
+                or row["actor"] != "intelligence:auto"):
+            raise ProposalRefused(
+                "proposal %s is not an auto-applied change" % (proposal_id,))
+        before = _payload(row).get("before") or {}
+        if not before:
+            raise ProposalRefused(
+                "proposal %s recorded no before values to restore"
+                % (proposal_id,))
+        mod = next((m for m in module_loader.discover()
+                    if m.id == row["module"]), None)
+        if mod is None:
+            raise ProposalRefused(
+                "module %r is not discovered" % (row["module"],))
+        try:
+            settingsapi.write_settings(cfg, conn, mod, before, actor)
+        except settingsapi.SettingsError as exc:
+            raise ProposalRefused(
+                "the recorded settings no longer validate: %s" % exc)
+        detail = ("proposal %d reverted: restored the recorded before"
+                  % (proposal_id,))
+    except ProposalRefused as exc:
+        _audit_command(conn, module, "revert_change", actor,
+                       {"proposal": proposal_id}, False, str(exc), t0)
+        raise
+    _audit_command(conn, module, "revert_change", actor,
+                   {"proposal": proposal_id}, True, detail, t0)
+    return detail
+
+
 def _display_state(row, now):
     """A pending row past its deadline is shown EXPIRED, not pending."""
     if row["state"] == "pending" and store.proposal_expired(row, now):
@@ -434,13 +518,16 @@ def main(argv=None):
     ap.add_argument("--advisors", action="store_true")
     ap.add_argument("--thresholds", action="store_true")
     ap.add_argument("--revert-threshold", metavar="SPEC_ID")
+    ap.add_argument("--revert-change", metavar="ID")
     args = ap.parse_args(argv)
 
     # A DECIDING VERB UNDER --dry-run IS REFUSED, NOT SILENTLY EXECUTED. The
-    # flag promises nothing changes; an approval, a rejection and a threshold
-    # revert all change something by definition. Accepting the combination and
-    # ignoring the flag is the worst of both. `--run` keeps its meaning.
-    if args.dry_run and (args.approve or args.reject or args.revert_threshold):
+    # flag promises nothing changes; an approval, a rejection, a threshold
+    # revert and an automatic-change revert all change something by definition.
+    # Accepting the combination and ignoring the flag is the worst of both.
+    # `--run` keeps its meaning.
+    if args.dry_run and (args.approve or args.reject or args.revert_threshold
+                         or args.revert_change):
         print("--dry-run is not supported for this verb", file=sys.stderr)
         return 2
 
@@ -567,7 +654,8 @@ def main(argv=None):
         conn.close()
         return 0
 
-    if args.approve or args.reject or args.revert_threshold:
+    if (args.approve or args.reject or args.revert_threshold
+            or args.revert_change):
         conn = store.connect(cfg.db_path)
         store.init(conn)
         try:
@@ -581,6 +669,12 @@ def main(argv=None):
                 if not args.reject.isdigit():
                     ap.error("--reject expects a proposal id")
                 print(reject_proposal(conn, int(args.reject), args.actor))
+                return 0
+            if args.revert_change:
+                if not args.revert_change.isdigit():
+                    ap.error("--revert-change expects a proposal id")
+                print(revert_change(cfg, conn, int(args.revert_change),
+                                    args.actor))
                 return 0
             print(revert_threshold(cfg, conn, mods, args.revert_threshold,
                                    args.actor))

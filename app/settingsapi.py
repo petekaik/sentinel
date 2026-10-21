@@ -540,6 +540,61 @@ def write_settings(cfg, conn, mod, body, actor):
     return settings_view(cfg, conn, [mod]).get(mod.id, {})
 
 
+def write_authoring_change(cfg, conn, mod, change, actor):
+    """Apply a full-value settings change through the normal write path.
+
+    THE CLASSIFIER DECIDES, NOT THE CALLER. An `intelligence:auto` actor may
+    apply only `additive`; `modification` and `silencing` are refused here and
+    belong in a pending proposal.
+
+    THE CLASSIFIER SEES THE NORMALISED VALUES. `write_settings` stores every
+    declared row field, so the `before` read back from `_effective_values`
+    carries an omitted field as `None`. Comparing that against a partial row
+    would call an untouched row a modification and refuse an addition that
+    changed nothing else.
+    """
+    import authorize
+    settings = (change or {}).get("settings") or {}
+    declared = _declared(mod)
+    values = {}
+    for key, value in settings.items():
+        setting = declared.get(key)
+        if setting is None:
+            raise SettingsError("invalid_value",
+                                "%r is not a declared setting" % key, key)
+        try:
+            parsed = setting.parse(value)
+            if setting.kind == "list":
+                rows, why = setting.parse_item(parsed)
+                if rows is None:
+                    raise SettingsError("invalid_value", why, key)
+                parsed = rows
+        except (TypeError, ValueError) as exc:
+            raise SettingsError("invalid_value", str(exc), key)
+        values[key] = parsed
+    effective = _effective_values(cfg, conn, mod, {}, declared)
+    before = {key: effective.get(key) for key in values}
+    classification, detail = authorize.classify(
+        {"settings": values}, mod, before)
+    if classification == authorize.INVALID:
+        raise SettingsError("invalid_value", detail)
+    if (str(actor) == "intelligence:auto"
+            and classification != authorize.ADDITIVE):
+        raise SettingsError(
+            "invalid_value",
+            "refused: %s requires human approval (%s)"
+            % (classification, detail))
+    out = write_settings(cfg, conn, mod, values, actor)
+    if str(actor) == "intelligence:auto":
+        store.record_applied_change(
+            conn, mod.id, "settings_change",
+            {"settings": values, "before": before,
+             "classification": classification, "diff": detail,
+             "requires_human": authorize.requires_human(classification)},
+            detail, actor)
+    return out
+
+
 def reset_setting(cfg, conn, mod, key, actor):
     """Delete one override so `.env`/the default applies again.
 

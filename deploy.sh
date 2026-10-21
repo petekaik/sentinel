@@ -37,6 +37,8 @@
 #   ./deploy.sh --thresholds       # active threshold overrides
 #   ./deploy.sh --revert-threshold SPEC_ID
 #                                  # drop one override, restoring the file band
+#   ./deploy.sh --revert-change ID # undo an auto-applied change (executed,
+#                                  #   intelligence:auto); restores its `before`
 #   --actor NAME                   # modifier for a ctl verb: attribute the run
 #                                  #   or approval to NAME (default: operator)
 #
@@ -181,6 +183,14 @@ while [ $# -gt 0 ]; do
                     usage >&2; exit 2 ;;
             esac
             MODE=ctl; SAW_CTL=1; PASSTHRU+=(--revert-threshold "$2"); shift ;;
+        --revert-change)
+            [ $# -ge 2 ] || { echo "unknown argument: --revert-change needs a proposal id" >&2
+                              usage >&2; exit 2; }
+            case "$2" in
+                -*) echo "unknown argument: --revert-change needs a proposal id, not '$2'" >&2
+                    usage >&2; exit 2 ;;
+            esac
+            MODE=ctl; SAW_CTL=1; PASSTHRU+=(--revert-change "$2"); shift ;;
         --dismiss)          MODE=dismiss
                             # Everything after --dismiss belongs to dismiss.py,
                             # including a --reason whose text contains anything

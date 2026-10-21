@@ -2443,6 +2443,54 @@ def test_a_silencing_change_cannot_be_applied_by_the_auto_path(results):
         shutil.rmtree(tmp)
 
 
+def test_a_modification_cannot_be_applied_by_the_auto_path(results):
+    """ADDITIVE ONLY is a WRITE-PATH rule, not only `may_auto_apply`'s.
+
+    The tests above drive a removal (silencing) through this path; nothing drove
+    a band change, so a mutation that let `write_authoring_change` apply
+    `modification` for `intelligence:auto` stayed green. No observation makes
+    this a widening, so the classifier calls it a modification and the write
+    path is what must refuse it.
+    """
+    tmp, conn = _grant_store()
+    try:
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
+            "SNMP_COMMUNITIES": '{"sw1":"public"}',
+            "SNMP_CHECKS": '[{"device":"sw1","oid":"1.3.6.1.2.1.1",'
+                           '"label":"cpu","direction":"low_is_good",'
+                           '"green":70,"amber":90,"kind":"gauge"}]',
+            "SNMP_TIMEOUT_S": "3",
+            "SNMP_INTELLIGENCE": '{"observe": true, "author": "auto"}'})
+        mod = _snmp_mod()
+        before = _snmp_before(
+            [{"name": "sw1", "address": "192.0.2.10"}],
+            [{"device": "sw1", "oid": "1.3.6.1.2.1.1", "label": "cpu",
+              "unit": "", "direction": "low_is_good", "green": 70,
+              "amber": 90, "kind": "gauge", "expected": None}])
+        after = dict(before, SNMP_CHECKS=[
+            dict(before["SNMP_CHECKS"][0], amber=130)])
+        cls, why = authorize.classify({"settings": after}, mod, before)
+        results.check("a band change with no failing observation is a "
+                      "modification", cls == authorize.MODIFICATION,
+                      "got %s: %s" % (cls, why))
+        try:
+            settingsapi.write_authoring_change(
+                cfg, conn, mod, {"settings": after}, "intelligence:auto")
+        except settingsapi.SettingsError as exc:
+            results.check("the auto path refuses a modification",
+                          "human" in str(exc).lower(), "got %r" % (exc,))
+        else:
+            results.check("the auto path refuses a modification", False,
+                          "it applied a band change at author=auto")
+        results.check("no modification was written",
+                      store.setting_rows(conn) == {},
+                      "rows=%r" % (store.setting_rows(conn),))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 def _authoring_cfg():
     return config_mod.Config({
         "SNMP_DEVICES": '[{"name":"sw1","address":"192.0.2.10"}]',
@@ -3271,7 +3319,16 @@ def test_a_fabricated_incident_or_action_is_dropped_and_counted(results):
 
 
 def test_a_model_cycle_never_calls_heal_attempt(results):
-    tmp, conn, cfg, ctx, views = _model_views(FLEET_AUTHORITY="full")
+    """THE KILL SWITCH IS ON: a call from the cycle would actually execute.
+
+    With `MONITOR_REMEDIES` off, `consider_nominations` returns immediately, so
+    a mutation that called it from `run_cycle` was invisible to this suite. The
+    guard under test is the epoch deferral itself, so the fixture enables
+    execution: a mutation that executes the nomination it just wrote turns
+    `heal.attempt` on (mocked, so nothing reaches the fleet).
+    """
+    tmp, conn, cfg, ctx, views = _model_views(FLEET_AUTHORITY="full",
+                                              MONITOR_REMEDIES="1")
     try:
         key = store.incident_key("cubox-1", "state_dir_tmpfs", "cubox-1")
         for seq in range(1, store.CONFIRM_POLLS + 1):
@@ -3300,6 +3357,11 @@ def test_a_model_cycle_never_calls_heal_attempt(results):
             and body.get("auto_execute") is True
             and body.get("ladder") == "allowed",
             "row=%r payload=%r" % (stored[0] if stored else None, body))
+        results.check(
+            "the nominated action did not run in the cycle that wrote it",
+            stored and stored[0]["executed_at"] is None
+            and stored[0]["actor"] is None,
+            "row=%r" % (stored[0] if stored else None,))
     finally:
         conn.close()
         shutil.rmtree(tmp)
@@ -3308,6 +3370,7 @@ def test_a_model_cycle_never_calls_heal_attempt(results):
 TESTS = (
     test_additive_auto_applies_and_the_proposal_records_it,
     test_a_silencing_change_cannot_be_applied_by_the_auto_path,
+    test_a_modification_cannot_be_applied_by_the_auto_path,
     test_a_human_approval_applies_a_model_settings_change,
     test_a_human_may_approve_a_change_auto_may_not,
     test_a_stale_proposal_is_refused_and_left_pending,

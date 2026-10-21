@@ -972,6 +972,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = config_mod.Config()
+    config_mod.validate_grants(cfg, module_loader.discover())
 
     if args.showconf:
         print(cfg.describe())

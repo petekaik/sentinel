@@ -21,6 +21,7 @@ door with no UI left to undo it.
 import hmac
 
 import checks
+import config as config_mod
 import store
 import thresholds
 
@@ -46,6 +47,9 @@ RESERVED_KEYS = frozenset((
     "MONITOR_REMEDIES", "MONITOR_DRY_RUN",
     "SENTINEL_MODULES", "SENTINEL_REMEDIATION", "SENTINEL_ADVISORS",
     "SENTINEL_PROPOSAL_TTL_H",
+    "SENTINEL_INTELLIGENCE", "SENTINEL_INTELLIGENCE_INTERVAL_S",
+    "SENTINEL_INTELLIGENCE_BUDGET_MS",
+    "SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS",
 ))
 RESERVED_PREFIXES = ("SENTINEL_ADVISOR_", "SENTINEL_LLM_")
 
@@ -76,6 +80,12 @@ def check_declarations(modules):
                     "module %r; the overlay is keyed by the bare env name, so "
                     "a module could otherwise rewrite the monitor's own "
                     "configuration" % (setting.key, mod.id), setting.key)
+            if setting.key.endswith("_INTELLIGENCE"):
+                raise SettingsError(
+                    "reserved_key",
+                    "setting %r ends in _INTELLIGENCE, which is the "
+                    "platform-owned grant key for a module; a module may not "
+                    "declare its own grant" % setting.key, setting.key)
             other = owner.get(setting.key)
             if other is not None and other != mod.id:
                 raise SettingsError(
@@ -345,6 +355,83 @@ def authorized(cfg, headers):
     if not got.startswith("Bearer "):
         return False
     return hmac.compare_digest(got[7:].encode("utf-8"), token.encode("utf-8"))
+
+
+GRANT_SUFFIX = "_INTELLIGENCE"
+
+
+def grant_key(mod):
+    """The module-unique bare key a grant is stored under."""
+    return "%s%s" % (mod.id.upper(), GRANT_SUFFIX)
+
+
+def grants_view(cfg, conn, modules):
+    """Every discovered module's grant, its supported lanes and its source.
+
+    THE STORED ROW IS THE `db` VALUE. Reading `cfg.env` for it would label an
+    unreloaded `Config`'s stale overlay `db` -- and `write_grant` returns this
+    view for the row it just wrote, before any caller has reloaded.
+    """
+    stored = store.setting_rows(conn)
+    out = {}
+    for mod in modules:
+        key = grant_key(mod)
+        row = (mod.id, key)
+        raw = stored[row] if row in stored else cfg.env.get(key)
+        grant, why = config_mod.parse_grant(
+            raw, key, tuple(getattr(mod, "intelligence", ("observe",))))
+        out[mod.id] = {
+            "supported": list(getattr(mod, "intelligence", ("observe",))),
+            "grant": grant,
+            "error": why,
+            "source": ("db" if row in stored
+                       else "env" if raw not in (None, "") else "default"),
+        }
+    return out
+
+
+def write_grant(cfg, conn, mod, body, actor):
+    """Validate and store one module's grant. The whole body is validated
+    before the first write, exactly as `write_settings` does."""
+    if not isinstance(body, dict):
+        raise SettingsError("invalid_body", "the grant body must be an object")
+    key = grant_key(mod)
+    supported = tuple(getattr(mod, "intelligence", ("observe",)))
+    current, why = config_mod.parse_grant(cfg.env.get(key), key, supported)
+    if why:
+        # A stored/.env grant that cannot be parsed must be fixed, not
+        # overwritten by a merge against a value nobody can read.
+        raise SettingsError("invalid_value", why, "intelligence")
+    unknown = sorted(set(body) - {"observe", "author", "remediate", "budget"})
+    if unknown:
+        raise SettingsError(
+            "invalid_value",
+            "%s has unknown key(s) %s" % (key, ", ".join(repr(k) for k in unknown)),
+            "intelligence")
+    merged = dict(current)
+    for name in ("observe", "author", "remediate"):
+        if name in body:
+            merged[name] = body[name]
+    if "budget" in body:
+        if not isinstance(body["budget"], dict):
+            raise SettingsError("invalid_value", "%s.budget must be an object"
+                                % key, "budget")
+        budget = dict(current.get("budget") or {})
+        budget.update(body["budget"])
+        merged["budget"] = budget
+    grant, why = config_mod.validate_grant(merged, key, supported)
+    if why:
+        raise SettingsError("invalid_value", why, "intelligence")
+    store.put_setting(conn, mod.id, key, grant, actor)
+    return grants_view(cfg, conn, [mod])[mod.id]
+
+
+def reset_grant(cfg, conn, mod, actor):
+    """Delete the override; the default (all lanes off) applies again."""
+    key = grant_key(mod)
+    if (mod.id, key) in store.setting_rows(conn):
+        store.delete_setting(conn, mod.id, key, actor)
+    return grants_view(cfg, conn, [mod])[mod.id]
 
 
 def _declared(mod):

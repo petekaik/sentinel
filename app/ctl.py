@@ -432,6 +432,7 @@ def main(argv=None):
         return 2
 
     cfg = config_mod.Config()
+    config_mod.validate_grants(cfg, module_loader.discover())
 
     if args.modules:
         # Discovery only -- no module contexts, no store, no connection.

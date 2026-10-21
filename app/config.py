@@ -120,6 +120,32 @@ def parse_grant(raw, key, supported):
     return value, ""
 
 
+def validate_grants(cfg, modules):
+    """Refuse to start on a grant that names nothing or cannot be read.
+
+    The same loud-failure rule as a misspelt SENTINEL_MODULES: an inert grant
+    reads on the dashboard like a working one.
+    """
+    known = {m.id for m in modules}
+    for mod in modules:
+        key = "%s_INTELLIGENCE" % mod.id.upper()
+        raw = cfg.env.get(key)
+        if raw in (None, ""):
+            continue
+        _, why = parse_grant(raw, key, tuple(mod.intelligence))
+        if why:
+            raise ValueError(why)
+    for key in cfg.env:
+        if key == "SENTINEL_INTELLIGENCE" or not key.endswith("_INTELLIGENCE"):
+            continue
+        module_id = key[:-len("_INTELLIGENCE")].lower()
+        if module_id not in known:
+            raise ValueError(
+                "%s names module %r, which does not exist (discovered: %s); "
+                "a misspelt grant would otherwise be inert and look fine"
+                % (key, module_id, ", ".join(sorted(known))))
+
+
 class Config:
     """Everything the collector needs that is not module-owned."""
 

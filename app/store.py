@@ -413,6 +413,34 @@ CREATE TABLE IF NOT EXISTS setting_change (
     new_json TEXT,
     actor    TEXT NOT NULL
 );
+
+-- INTELLIGENCE CYCLE. One row per cycle: what it was allowed to read, what it
+-- actually read, how long it took, and whether the model was called. Budget
+-- use is per module because that is the unit the operator grants.
+CREATE TABLE IF NOT EXISTS intelligence_cycle (
+    id              INTEGER PRIMARY KEY,
+    ts              REAL    NOT NULL,
+    status          TEXT    NOT NULL,
+    duration_ms     INTEGER,
+    modules_granted TEXT    NOT NULL,
+    modules_read    TEXT    NOT NULL,
+    model_calls     INTEGER NOT NULL DEFAULT 0,
+    tokens_in       INTEGER,
+    tokens_out      INTEGER,
+    detail          TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS intelligence_cycle_ts ON intelligence_cycle (ts);
+
+CREATE TABLE IF NOT EXISTS intelligence_usage (
+    cycle_id   INTEGER NOT NULL,
+    module     TEXT    NOT NULL,
+    rows_read  INTEGER NOT NULL DEFAULT 0,
+    bytes_read INTEGER NOT NULL DEFAULT 0,
+    insights   INTEGER NOT NULL DEFAULT 0,
+    proposals  INTEGER NOT NULL DEFAULT 0,
+    dropped    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (cycle_id, module)
+);
 """
 
 
@@ -662,6 +690,45 @@ def record_advisor_run(conn, advisor, module, status, duration_ms,
          int(window_requested_days), float(window_available_days), detail),
     )
     return cur.lastrowid
+
+
+def record_intelligence_cycle(conn, status, duration_ms, granted, read,
+                              model_calls=0, tokens_in=None, tokens_out=None,
+                              detail=""):
+    cur = conn.execute(
+        "INSERT INTO intelligence_cycle (ts, status, duration_ms, "
+        "modules_granted, modules_read, model_calls, tokens_in, tokens_out, "
+        "detail) VALUES (?,?,?,?,?,?,?,?,?)",
+        (time.time(), status, int(duration_ms), json.dumps(list(granted)),
+         json.dumps(list(read)), int(model_calls), tokens_in, tokens_out,
+         detail))
+    return cur.lastrowid
+
+
+def record_intelligence_usage(conn, cycle_id, module, rows_read=0,
+                              bytes_read=0, insights=0, proposals=0,
+                              dropped=0):
+    conn.execute(
+        "INSERT INTO intelligence_usage (cycle_id, module, rows_read, "
+        "bytes_read, insights, proposals, dropped) VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(cycle_id, module) DO UPDATE SET "
+        "rows_read=excluded.rows_read, bytes_read=excluded.bytes_read, "
+        "insights=excluded.insights, proposals=excluded.proposals, "
+        "dropped=excluded.dropped",
+        (cycle_id, module, int(rows_read), int(bytes_read), int(insights),
+         int(proposals), int(dropped)))
+
+
+def last_intelligence_cycle(conn):
+    row = conn.execute(
+        "SELECT * FROM intelligence_cycle ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(row) if row else None
+
+
+def list_intelligence_usage(conn, cycle_id):
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM intelligence_usage WHERE cycle_id = ? ORDER BY module",
+        (cycle_id,))]
 
 
 def last_advisor_run(conn, advisor):

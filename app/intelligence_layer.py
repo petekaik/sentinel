@@ -741,16 +741,24 @@ def run_cycle(cfg, conn, ctx, now=None):
                 skipped = unscorable = 0
                 for target, metric in keys:
                     if series_read >= ANOMALY_MAX_SERIES:
-                        capped = "capped at %d series" % ANOMALY_MAX_SERIES
+                        capped = ("stopped after %d series (series cap %d)"
+                                  % (series_read, ANOMALY_MAX_SERIES))
                         break
                     if rows_read >= ANOMALY_MAX_ROWS:
-                        capped = "capped at %d rows" % ANOMALY_MAX_ROWS
+                        # THE ACTUAL COUNT, not the cap: the last read can be
+                        # up to `sample_rows` (20,000) rows, so a note naming
+                        # 10,000 would be a claim the pass did not keep.
+                        capped = ("stopped after %d rows read (row cap %d)"
+                                  % (rows_read, ANOMALY_MAX_ROWS))
                         break
                     series = view.sample_series(
                         since, target, metric,
                         limit=view.caps["sample_rows"])
                     series_read += 1
                     rows_read += len(series)
+                    row = usage.setdefault(mod.id, {})
+                    row["rows_read"] = (int(row.get("rows_read") or 0)
+                                        + len(series))
                     # NEVER REASON FROM A TRUNCATED SERIES. A read that hit
                     # `sample_rows` is a slice with its oldest rows dropped, so
                     # it is not the window the insight would claim. Count it
@@ -798,7 +806,6 @@ def run_cycle(cfg, conn, ctx, now=None):
                             # module to this insight.
                             "truncated": {}})
                     advisors.record(conn, "anomaly", insight, view)
-                    row = usage.setdefault(mod.id, {})
                     row["insights"] = int(row.get("insights") or 0) + 1
                 if skipped:
                     ctx.note("anomaly: skipped %d truncated series for %s"

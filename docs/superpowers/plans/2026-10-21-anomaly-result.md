@@ -116,13 +116,19 @@ that read dropped pairs, so a pass over it could only report "no anomaly" about
 a list nobody saw.
 
 The pass is **bounded per cycle** at 20 series or 10,000 rows read, whichever
-comes first, and the cycle note says which cap stopped it. One series can be
-20,000 rows (two weeks of minute samples); materialising 200 of them measured
-43.5 s for ~40 series against a 30 s cycle budget. One series the detector
-cannot read is counted and skipped rather than aborting the pass, and every
-insight counts in `intelligence_usage.insights`. The window falls back to a
-fixed 7 days when no advisor resolved one, and the evidence cites the series'
-own measured span rather than the ask.
+comes first. One series can be 20,000 rows (two weeks of minute samples);
+materialising 200 of them measured 43.5 s for ~40 series against a 30 s cycle
+budget. Rows are counted after each series is read whole, and the note reports
+the **actual** total (`stopped after 30 rows read (row cap 10)`), not the cap:
+checking before a read lets one 20,000-row series overshoot, so a note naming
+10,000 would be a claim the pass did not keep. A legitimately full series is
+never passed a reduced `limit`, because that would mark it truncated for the
+pass's own budget. One series the detector cannot read is counted and skipped
+rather than aborting the pass; every insight counts in
+`intelligence_usage.insights` and every series' rows in
+`intelligence_usage.rows_read`. The window falls back to a fixed 7 days when no
+advisor resolved one, and the evidence cites the series' own measured span
+rather than the ask.
 
 ## Verification
 
@@ -135,8 +141,8 @@ own measured span rather than the ask.
 Task 22 added the switch and its checks to the intelligence suite:
 
 ```text
-./test.sh intelligence -> 208 checks, 0 failed
-./test.sh              -> 1214 checks, 0 failed (1196 + 18)
+./test.sh intelligence -> 210 checks, 0 failed
+./test.sh              -> 1216 checks, 0 failed (1196 + 20)
 ```
 
 The truncation-guard checks go red when the guard is disabled; the cap and

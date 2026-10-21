@@ -2746,8 +2746,11 @@ def test_anomaly_detection_is_off_by_default(results):
 def test_an_enabled_detector_emits_only_insights(results):
     tmp, conn = _grant_store()
     try:
+        # NO ADVISOR: nothing else may call `window()` and set requested_days,
+        # so this exercises the anomaly pass's own fixed 7-day fallback.
         cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
-                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+                         SENTINEL_INTELLIGENCE_ANOMALY="1",
+                         SENTINEL_ADVISORS="none")
         specs = harness.load_specs(cfg)
         spec = next(s for s in specs.values() if s.owner == "fleet")
         for i in range(45):
@@ -2766,9 +2769,9 @@ def test_an_enabled_detector_emits_only_insights(results):
             "the anomaly insight wrote no check result",
             conn.execute("SELECT COUNT(*) FROM check_run").fetchone()[0] == 1,
             "an insight changed grading")
-        evidence = json.loads(conn.execute(
-            "SELECT evidence_json FROM insight WHERE kind='anomaly'"
-        ).fetchone()[0])
+        row = conn.execute(
+            "SELECT evidence_json FROM insight WHERE kind='anomaly'").fetchone()
+        evidence = json.loads(row[0]) if row else {}
         window = evidence.get("window") or {}
         results.check(
             "the insight states the statistic, the window and the sample count",
@@ -2781,10 +2784,11 @@ def test_an_enabled_detector_emits_only_insights(results):
             and window.get("available_days") is not None,
             "window=%r" % (window,))
         usage = [dict(r) for r in conn.execute(
-            "SELECT module, insights FROM intelligence_usage")]
+            "SELECT module, insights, rows_read FROM intelligence_usage")]
         results.check(
-            "the anomaly is counted in the cycle's usage",
-            any(r["module"] == "fleet" and r["insights"] >= 1 for r in usage),
+            "the anomaly and its rows are counted in the cycle's usage",
+            any(r["module"] == "fleet" and r["insights"] >= 1
+                and r["rows_read"] == 46 for r in usage),
             "usage=%r" % (usage,))
     finally:
         conn.close()
@@ -2879,8 +2883,9 @@ def test_the_anomaly_pass_is_capped_and_says_so(results):
             "detect ran for %d series" % (len(seen),))
         results.check(
             "the capped pass is recorded, not silent",
-            any("capped at %d series" % intelligence_layer.ANOMALY_MAX_SERIES
-                in n for n in ctx.notes),
+            any("stopped after %d series"
+                % intelligence_layer.ANOMALY_MAX_SERIES in n
+                for n in ctx.notes),
             "notes=%r" % (ctx.notes,))
     finally:
         conn.close()
@@ -2912,8 +2917,45 @@ def test_the_anomaly_row_cap_stops_the_pass(results):
             "the anomaly pass stops at the row cap",
             len(seen) == 2, "detect ran for %d series" % (len(seen),))
         results.check(
-            "the row-capped pass is recorded, not silent",
-            any("capped at 25 rows" in n for n in ctx.notes),
+            "the note reports the rows actually read, not the cap",
+            any("stopped after 42 rows read (row cap 25)" in n
+                for n in ctx.notes),
+            "notes=%r" % (ctx.notes,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_series_longer_than_the_row_cap_is_read_whole_and_counted(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+        specs = harness.load_specs(cfg)
+        for i in range(30):
+            store.record_sample(conn, 1, "fleet", "probe_a", value=float(i))
+        for i in range(5):
+            store.record_sample(conn, 1, "fleet", "probe_b", value=float(i))
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, specs, {}, modules=mods)
+        seen = []
+        real_detect = intelligence_layer.anomaly.detect
+
+        def _spy(points, *args, **kwargs):
+            seen.append(len(points))
+            return real_detect(points, *args, **kwargs)
+
+        with mock.patch.object(intelligence_layer, "ANOMALY_MAX_ROWS", 10), \
+                mock.patch.object(intelligence_layer.anomaly, "detect", _spy):
+            intelligence_layer.run_cycle(cfg, conn, ctx, now=time.time())
+        results.check(
+            "a series longer than the row cap is read whole, not truncated "
+            "by the pass's own budget",
+            seen == [30], "detect saw %r points" % (seen,))
+        results.check(
+            "the note reports the actual rows read, not the cap",
+            any("stopped after 30 rows read (row cap 10)" in n
+                for n in ctx.notes),
             "notes=%r" % (ctx.notes,))
     finally:
         conn.close()
@@ -3049,6 +3091,7 @@ TESTS = (
     test_a_truncated_series_is_skipped_and_counted,
     test_the_anomaly_pass_is_capped_and_says_so,
     test_the_anomaly_row_cap_stops_the_pass,
+    test_a_series_longer_than_the_row_cap_is_read_whole_and_counted,
     test_a_truncated_key_list_skips_the_pass_with_a_reason,
     test_one_unscorable_series_does_not_abort_the_pass,
     test_the_global_switch_stops_the_cycle,

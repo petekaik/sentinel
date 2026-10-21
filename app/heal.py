@@ -300,6 +300,26 @@ def _advisory(cfg, conn, module_id, action, inc, key):
     return True
 
 
+def epoch_triples(results):
+    """The (target, check_id, subject) triples one epoch observed.
+
+    Accepts the collector's `CheckResult` objects and plain tuples alike, because
+    the freshness gate has TWO readers -- `consider` for incidents and
+    `consider_nominations` for a prior cycle's nominations -- and a second
+    spelling of the triple is exactly the drift item 84 cost this project. One
+    implementation, exported so `intelligence_layer` asks the same question when
+    it decides whether a nomination may be marked at all.
+    """
+    out = set()
+    for r in results or ():
+        if hasattr(r, "target"):
+            out.add((r.target, getattr(r, "check_id", None),
+                     getattr(r, "subject", "") or ""))
+        else:
+            out.add(tuple(r))
+    return out
+
+
 def consider(cfg, conn, seq, results, ctx):
     """The collector seam: consider confirmed incidents for enabled modules.
 
@@ -337,8 +357,7 @@ def consider(cfg, conn, seq, results, ctx):
     # evidence nobody produced this epoch, so the incident's own triple must
     # appear in THIS epoch's results. `results` is the collector's list; a
     # result means the check ran, whatever it said.
-    ran = {(getattr(r, "target", None), getattr(r, "check_id", None),
-            getattr(r, "subject", "")) for r in results}
+    ran = epoch_triples(results)
 
     out = []
     for mod in getattr(ctx, "modules", ()):
@@ -449,4 +468,69 @@ def consider(cfg, conn, seq, results, ctx):
             out.append((key, action.id,
                         attempt(action, inc, ctx, policy, conn, seq,
                                 module_id=mod.id)))
+    return out
+
+
+def consider_nominations(cfg, conn, seq, results, ctx):
+    """Execute the previous cycle's ladder-approved nominations.
+
+    NO MODEL CALLS HERE. The proposal is durable data written by a prior cycle;
+    this runs after evidence is durable and before the next intelligence cycle.
+    A nomination whose incident is gone, or whose triple this epoch did not
+    observe, is EXPIRED rather than executed -- a decision made on stale
+    evidence is the false-green this platform exists to prevent. A nomination
+    the ladder now refuses (the grant narrowed, the incident is latched) is left
+    PENDING for a human: the diagnosis is still worth a decision.
+
+    `cfg.authority` and never `actions.approval_policy`: the latter is a human's
+    approval, and this path is not a human.
+    """
+    if (conn is None or getattr(cfg, "dry_run", False)
+            or getattr(getattr(ctx, "cfg", None), "dry_run", False)):
+        return []
+    # MONITOR_REMEDIES IS THE EXECUTION KILL SWITCH. With it off nothing may
+    # run; `consider` has already written no new nominations, and a nomination
+    # left over from before the switch was turned off must not execute either.
+    if not getattr(cfg, "remedies_enabled", False):
+        return []
+    ran = epoch_triples(results)
+    out = []
+    for row in store.list_pending_nominations(conn):
+        payload = store._proposal_payload(row)
+        key = payload.get("incident_key")
+        incident = store.get_live_incident(conn, key) if key else None
+        if incident is None or incident.get("state") != "open":
+            store.decide_proposal(conn, row["id"], "expired", "ladder")
+            out.append((row["id"], "expired: incident is not open"))
+            continue
+        triple = (incident.get("target"), incident.get("check_id"),
+                  incident.get("subject", ""))
+        if triple not in ran:
+            store.decide_proposal(conn, row["id"], "expired", "ladder")
+            out.append((row["id"], "expired: no evidence this epoch"))
+            continue
+        mod = next((m for m in getattr(ctx, "modules", ())
+                    if m.id == row["module"]), None)
+        if mod is None:
+            store.decide_proposal(conn, row["id"], "expired", "ladder")
+            out.append((row["id"], "expired: module not enabled"))
+            continue
+        action = next((a for a in mod.actions()
+                       if a.id == payload.get("action_id")), None)
+        if action is None:
+            store.decide_proposal(conn, row["id"], "expired", "ladder")
+            out.append((row["id"], "expired: action no longer declared"))
+            continue
+        policy = cfg.authority(mod.id)
+        ok, why = actions.allowed(action, incident, policy)
+        if not ok:
+            # The ladder withdrew or narrowed the grant after the nomination.
+            # Leave it pending for a human rather than discard the diagnosis.
+            out.append((row["id"], "refused: %s" % why))
+            continue
+        res = attempt(action, incident, ctx, policy, conn, seq,
+                      module_id=mod.id)
+        if res.get("executed"):
+            store.mark_ladder_executed(conn, row["id"])
+        out.append((row["id"], res.get("why", "")))
     return out

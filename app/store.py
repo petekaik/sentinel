@@ -956,6 +956,36 @@ def last_action_proposal(conn, incident_key, action_id):
     return None
 
 
+def list_pending_nominations(conn):
+    """Pending action proposals the ladder marked for automatic execution.
+
+    The mark lives in the payload, not in a column: `auto_execute` is written by
+    the intelligence cycle only after every gate answered yes, and it is read
+    back here at the NEXT epoch -- which is the whole point of deferring.
+    """
+    out = []
+    for row in conn.execute(
+            "SELECT * FROM proposal WHERE kind = 'action' AND state = 'pending' "
+            "ORDER BY id").fetchall():
+        payload = _proposal_payload(row)
+        if payload.get("auto_execute") is True:
+            out.append(dict(row))
+    return out
+
+
+def mark_ladder_executed(conn, proposal_id):
+    """pending -> executed, actor `ladder`. Rowcount 0 means it was decided.
+
+    NOT routed through `decide_proposal`: `executed` is not a human decision,
+    and `decided_at` would claim one. The conditional UPDATE is what stops a
+    second epoch from re-recording a nomination a human already rejected.
+    """
+    cur = conn.execute(
+        "UPDATE proposal SET state = 'executed', executed_at = ?, actor = 'ladder' "
+        "WHERE id = ? AND state = 'pending'", (time.time(), proposal_id))
+    return cur.rowcount
+
+
 def last_threshold_proposal(conn, spec_id):
     """The NEWEST `threshold_change` proposal for one spec, whatever its state.
 

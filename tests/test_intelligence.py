@@ -2069,7 +2069,11 @@ def test_the_cycle_makes_one_model_call_and_stores_proposals(results):
             len(actions) == 1 and actions[0]["state"] == "pending"
             and ap.get("requires_human") is True
             and ap.get("action_id") == "state_mount_cycle"
-            and "auto_execute" not in ap,
+            # The model sent `auto_execute: True`; the marker overwrote it. The
+            # incident here is still PENDING (one FAIL, not CONFIRM_POLLS), so
+            # this epoch's ladder answer is no.
+            and ap.get("auto_execute") is False
+            and ap.get("ladder") == "human",
             "payload=%r" % (ap,))
     finally:
         conn.close()
@@ -3038,6 +3042,240 @@ def test_one_unscorable_series_does_not_abort_the_pass(results):
         shutil.rmtree(tmp)
 
 
+# ---------------------------------------------------------------------------
+# Nominations: the cycle marks, the NEXT epoch executes. No model at run time.
+# ---------------------------------------------------------------------------
+
+
+def _open_and_nominate(conn, action, auto=True):
+    for seq in range(1, store.CONFIRM_POLLS + 1):
+        store.sync_incident(conn, seq, "t", "c", "s", store.Status.FAIL,
+                            "bad", {"why": "fixture"})
+    key = store.incident_key("t", "c", "s")
+    pid = store.record_proposal(
+        conn, module="probe", kind="action",
+        payload={"action_id": action.id, "incident_key": key,
+                 "auto_execute": auto},
+        rationale="diagnosis", expires_at=time.time() + 3600)
+    return key, pid
+
+
+def _ladder_action(danger="state_changing", ran=None):
+    return actions.Action(
+        id="fix", title="Fix", triggers=[("c", "*")],
+        danger=danger,
+        dry_run=lambda ctx, inc: actions.Result(True, "ok"),
+        run=(lambda ctx, inc: ran.append(inc["key"]) or actions.Result(True, "done"))
+        if ran is not None else lambda ctx, inc: actions.Result(True, "done"),
+        verify=("c", "*"))
+
+
+def _ladder_module(action):
+    return module.Module(id="probe", title="Probe",
+                         intelligence=("observe", "author", "remediate"),
+                         actions=lambda: [action])
+
+
+def _ran(target="t", check_id="c", subject="s"):
+    return type("_R", (), {"target": target, "check_id": check_id,
+                           "subject": subject})()
+
+
+def test_a_nomination_executes_on_the_next_epoch(results):
+    tmp, conn = _grant_store()
+    try:
+        ran = []
+        action = _ladder_action(ran=ran)
+        mod = _ladder_module(action)
+        cfg = config_mod.Config({"PROBE_AUTHORITY": "full",
+                                 "MONITOR_REMEDIES": "1"})
+        key, pid = _open_and_nominate(conn, action)
+        ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
+                                "attempt_factory": None})()
+        heal.consider_nominations(cfg, conn, 99, [_ran()], ctx)
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "the ladder executes the nomination on the next epoch",
+            ran == [key] and row["state"] == "executed",
+            "ran=%r row=%r" % (ran, row))
+        results.check(
+            "the ladder is the recorded actor, not a human",
+            row["actor"] == "ladder" and row["executed_at"],
+            "row=%r" % (row,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_nomination_without_fresh_evidence_is_expired(results):
+    tmp, conn = _grant_store()
+    try:
+        action = _ladder_action()
+        mod = _ladder_module(action)
+        cfg = config_mod.Config({"PROBE_AUTHORITY": "full",
+                                 "MONITOR_REMEDIES": "1"})
+        _, pid = _open_and_nominate(conn, action)
+        ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
+                                "attempt_factory": None})()
+        heal.consider_nominations(cfg, conn, 99, [], ctx)
+        row = store.get_proposal(conn, pid)
+        results.check("no fresh evidence expires the nomination",
+                      row["state"] == "expired", "row=%r" % (row,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_nomination_whose_incident_cleared_is_expired_not_executed(results):
+    tmp, conn = _grant_store()
+    try:
+        ran = []
+        action = _ladder_action(ran=ran)
+        mod = _ladder_module(action)
+        cfg = config_mod.Config({"PROBE_AUTHORITY": "full",
+                                 "MONITOR_REMEDIES": "1"})
+        _, pid = _open_and_nominate(conn, action)
+        # The condition cleared between the cycle that nominated and this one.
+        store.sync_incident(conn, 4, "t", "c", "s", store.Status.OK, "back")
+        ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
+                                "attempt_factory": None})()
+        heal.consider_nominations(cfg, conn, 99, [_ran()], ctx)
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "a nomination whose incident cleared is expired, never executed",
+            ran == [] and row["state"] == "expired",
+            "ran=%r row=%r" % (ran, row))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_propose_level_action_is_a_human_decision_not_a_nomination(results):
+    tmp, conn = _grant_store()
+    try:
+        ran = []
+        action = _ladder_action(ran=ran)
+        mod = _ladder_module(action)
+        cfg = config_mod.Config({"PROBE_AUTHORITY": "propose",
+                                 "MONITOR_REMEDIES": "1"})
+        key, _ = _open_and_nominate(conn, action, auto=False)
+        incident = store.get_live_incident(conn, key)
+        payload = intelligence_layer.mark_nomination(
+            {"action_id": "fix", "incident_key": key}, mod,
+            {"remediate": True}, incident, {("t", "c", "s")}, cfg)
+        pid = store.record_proposal(conn, module="probe", kind="action",
+                                    payload=payload, rationale="diagnosis",
+                                    expires_at=time.time() + 3600)
+        ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
+                                "attempt_factory": None})()
+        heal.consider_nominations(cfg, conn, 99, [_ran()], ctx)
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "a propose-level action is left to the human path, not the ladder",
+            payload["auto_execute"] is False and payload["ladder"] == "human"
+            and ran == [] and row["state"] == "pending",
+            "payload=%r ran=%r row=%r" % (payload, ran, row))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_destructive_action_is_never_marked_for_auto_execution(results):
+    ran = []
+    action = _ladder_action(danger="destructive", ran=ran)
+    mod = _ladder_module(action)
+    incident = {"state": "open", "target": "t", "check_id": "c",
+                "subject": "s"}
+    for level in ("advisory", "propose", "scoped", "full"):
+        cfg = config_mod.Config({"PROBE_AUTHORITY": level,
+                                 "PROBE_ALLOW": "fix",
+                                 "MONITOR_REMEDIES": "1"})
+        # BOTH POLICIES: the operator's, and an APPROVED one leaked into this
+        # automatic path (the shape a bug would produce by asking
+        # `approval_policy` instead of `cfg.authority`). The marker's explicit
+        # `danger` guard is what still says no, and this is the mutation proof
+        # of it -- removing that guard alone would not change the plain case,
+        # because `allowed` already refuses.
+        policies = [("operator's", cfg.authority("probe")),
+                    ("an approval's", actions.approval_policy(
+                        {"authority": level, "allow": ("fix",)}, "fix"))]
+        for which, policy in policies:
+            stub = type("_Cfg", (), {
+                "authority": lambda self, mid, p=policy: p})()
+            payload = intelligence_layer.mark_nomination(
+                {"action_id": "fix", "incident_key": "t|c|s"}, mod,
+                {"remediate": True}, incident, {("t", "c", "s")}, stub)
+            results.check(
+                "a destructive action is never marked auto_execute "
+                "(at %s under %s policy)" % (level, which),
+                payload["auto_execute"] is False
+                and payload["ladder"] == "human",
+                "payload=%r" % (payload,))
+    results.check("marking a destructive action never runs it", ran == [],
+                  "ran=%r" % (ran,))
+
+
+def test_a_fabricated_incident_or_action_is_dropped_and_counted(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        key = store.incident_key("cubox-1", "state_dir_tmpfs", "cubox-1")
+        store.sync_incident(conn, 1, "cubox-1", "state_dir_tmpfs", "cubox-1",
+                            store.Status.FAIL, "state dir on tmpfs")
+        grants = {"fleet": {"observe": True, "author": "off",
+                            "remediate": True}}
+        payload = {"proposals": [
+            {"module": "fleet", "kind": "action",
+             "payload": {"action_id": "state_mount_cycle",
+                         "incident_key": "cubox-1|no_such_check|cubox-1"}},
+            {"module": "fleet", "kind": "action",
+             "payload": {"action_id": "no_such_action",
+                         "incident_key": key}}]}
+        _, props, dropped = intelligence_layer.validate_model_output(
+            payload, views, grants, conn=conn)
+        results.check(
+            "a fabricated incident id is dropped and counted",
+            props == [] and dropped.get("fleet") == 2,
+            "props=%r dropped=%r" % (props, dropped))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_model_cycle_never_calls_heal_attempt(results):
+    tmp, conn, cfg, ctx, views = _model_views(FLEET_AUTHORITY="full")
+    try:
+        key = store.incident_key("cubox-1", "state_dir_tmpfs", "cubox-1")
+        for seq in range(1, store.CONFIRM_POLLS + 1):
+            store.sync_incident(conn, seq, "cubox-1", "state_dir_tmpfs",
+                                "cubox-1", store.Status.FAIL,
+                                "state dir on tmpfs")
+        ctx.epoch_results = [_ran("cubox-1", "state_dir_tmpfs", "cubox-1")]
+        _reset_model(json.dumps({"proposals": [
+            {"module": "fleet", "kind": "action",
+             "payload": {"action_id": "state_mount_cycle",
+                         "incident_key": key},
+             "rationale": "cycle the state mount"}]}))
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel), \
+                mock.patch.object(heal, "attempt") as attempted:
+            out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        stored = [store.get_proposal(conn, pid) for pid in out["proposals"]]
+        body = json.loads(stored[0]["payload_json"]) if stored else {}
+        results.check(
+            "a model cycle makes ZERO heal.attempt calls",
+            attempted.call_count == 0 and len(stored) == 1,
+            "calls=%r status=%r proposals=%r"
+            % (attempted.call_count, out["status"], out["proposals"]))
+        results.check(
+            "the cycle instead writes the nomination as a durable pending row",
+            stored and stored[0]["state"] == "pending"
+            and body.get("auto_execute") is True
+            and body.get("ladder") == "allowed",
+            "row=%r payload=%r" % (stored[0] if stored else None, body))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_additive_auto_applies_and_the_proposal_records_it,
     test_a_silencing_change_cannot_be_applied_by_the_auto_path,
@@ -3132,4 +3370,11 @@ TESTS = (
     test_a_json_escaped_secret_is_redacted_too,
     test_pack_views_refuses_a_view_without_observe,
     test_one_malformed_model_item_does_not_drop_the_rest,
+    test_a_nomination_executes_on_the_next_epoch,
+    test_a_nomination_without_fresh_evidence_is_expired,
+    test_a_nomination_whose_incident_cleared_is_expired_not_executed,
+    test_a_propose_level_action_is_a_human_decision_not_a_nomination,
+    test_a_destructive_action_is_never_marked_for_auto_execution,
+    test_a_fabricated_incident_or_action_is_dropped_and_counted,
+    test_a_model_cycle_never_calls_heal_attempt,
 )

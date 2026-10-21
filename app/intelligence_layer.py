@@ -18,9 +18,11 @@ import json
 import time
 import traceback
 
+import actions
 import advisors
 import anomaly
 import authorize
+import heal
 import intelligence
 import llm_advisor
 import modules as module_loader
@@ -488,14 +490,49 @@ def validate_model_output(payload, views, grants, conn=None):
     return kept, proposals, dropped
 
 
-def _record_model(cfg, conn, views, model_result):
+def mark_nomination(payload, mod, grant, incident, results, cfg):
+    """Set `auto_execute` on a model action proposal, or explicitly not.
+
+    A NOMINATION IS NOT AN EXECUTION. The marker runs no action: it records
+    that the ladder, asked now with the authority in force now, would allow
+    this one at the NEXT epoch's post-evidence seam. The executor re-asks every
+    gate, so a grant withdrawn in between is a refusal, not a race.
+
+    THE GATES BESIDES `allowed`: the module must be granted `remediate`, the
+    action must still be declared, its incident must be OPEN and observed by
+    THIS epoch, and it must not be destructive. The `danger` check is a second,
+    structural guard on top of the ladder's approval rule -- a destructive
+    action is never marked, whatever a future approval policy might say.
+    """
+    auto = False
+    action_id = payload.get("action_id")
+    action = next((a for a in (mod.actions() if mod is not None else ())
+                   if a.id == action_id), None)
+    if ((grant or {}).get("remediate") and action is not None
+            and action.danger != "destructive"
+            and incident is not None
+            and incident.get("state") == "open"
+            and (incident.get("target"), incident.get("check_id"),
+                 incident.get("subject", "")) in heal.epoch_triples(results)):
+        ok, why = actions.allowed(action, incident, cfg.authority(mod.id))
+        auto = bool(ok)
+    payload = dict(payload)
+    payload["auto_execute"] = auto
+    payload["ladder"] = ("allowed" if auto else "human")
+    return payload
+
+
+def _record_model(cfg, conn, views, model_result, ctx=None, grants=None):
     """Store validated model output. Returns (proposal ids, counts).
 
     MODEL-AUTHORED CHANGES ARE ALWAYS PROPOSALS. Nothing here writes settings,
-    and nothing sets `auto_execute`: a human records the decision, and the
-    approval path (not the model) is what may apply it. Insight and rationale
-    text is redacted again on the way in, because the model can only echo what
-    it was sent but the store must not be the place a secret is first seen.
+    and the only thing that sets `auto_execute` is `mark_nomination` -- the
+    model's own value is discarded by validation and overwritten here, and the
+    marker's yes is for the NEXT epoch's executor, never for this cycle. A human
+    records every other decision, and the approval path (not the model) is what
+    may apply it. Insight and rationale text is redacted again on the way in,
+    because the model can only echo what it was sent but the store must not be
+    the place a secret is first seen.
     """
     secrets = _secret_values(cfg)  # secretscan:ignore -- a redaction list, never logged
     ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
@@ -573,6 +610,16 @@ def _record_model(cfg, conn, views, model_result):
                 payload["before"] = {key: seen.get(key) for key in settings}
             else:
                 payload = dict(body, **payload)
+            if item.get("kind") == "action":
+                # THE REAL INCIDENT ROW, NOT THE MODEL'S CLAIM ABOUT IT. The
+                # marker asks the ladder with the state, triple and authority in
+                # force now; the executor re-asks at the next epoch's seam.
+                key = body.get("incident_key")
+                payload = mark_nomination(
+                    payload, getattr(views.get(mid), "mod", None),
+                    (grants or {}).get(mid) or {},
+                    store.get_live_incident(conn, key) if key else None,
+                    getattr(ctx, "epoch_results", set()), cfg)
             signature = json.dumps({"module": mid, "kind": item.get("kind"),
                                     "payload": payload},
                                    sort_keys=True, default=str)
@@ -847,7 +894,8 @@ def run_cycle(cfg, conn, ctx, now=None):
                                "model call failed", runs=runs, usage=usage,
                                model_calls=model_calls)
             try:
-                ids, counts = _record_model(cfg, conn, views, model_result)
+                ids, counts = _record_model(cfg, conn, views, model_result,
+                                            ctx, grants)
                 proposals.extend(ids)
                 for name in ("insights", "proposals", "dropped"):
                     for mid, n in counts[name].items():

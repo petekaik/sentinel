@@ -703,6 +703,10 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
     # `record_collector_run` with no other try, so an escaping exception would
     # lose the epoch record (the dashboard's stale banner and `--once`'s
     # traceback). The epoch proceeds and the failure is named in its notes.
+    #
+    # THE EPOCH'S OWN TRIPLES, for the intelligence cycle's nomination marker:
+    # an action may be nominated only for an incident this epoch observed.
+    ctx.epoch_results = results
     if healer is not None and not (dry_run or cfg.dry_run):
         try:
             healer.consider(cfg, conn, seq, results, ctx)
@@ -710,6 +714,18 @@ def collect_once(cfg, conn, dry_run=False, hosts_only=None, healer=None):
             lines = str(exc).splitlines()
             ctx.note("healing failed: %s"
                      % (lines[0] if lines else type(exc).__name__))
+        # THE PREVIOUS CYCLE'S NOMINATIONS RUN HERE, AFTER THIS EPOCH'S EVIDENCE
+        # AND BEFORE THE NEXT MODEL CALL. The model is nowhere in this path: the
+        # proposal is durable data, and only now can its incident be re-checked
+        # against fresh observations. Isolated like `consider` -- a store failure
+        # here must not take the epoch record with it.
+        if callable(getattr(healer, "consider_nominations", None)):
+            try:
+                healer.consider_nominations(cfg, conn, seq, results, ctx)
+            except Exception as exc:               # noqa: BLE001 - isolated
+                lines = str(exc).splitlines()
+                ctx.note("nomination execution failed: %s"
+                         % (lines[0] if lines else type(exc).__name__))
 
     duration_ms = int((_now() - t0) * 1000)
     if not (dry_run or cfg.dry_run):

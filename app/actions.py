@@ -112,6 +112,19 @@ def effective_level(action, policy):
     return _level(action, policy or {})
 
 
+def allow_listed(action, policy):
+    """Whether the `scoped` allow-list names this action.
+
+    BOTH SIDES LOWERCASED: config.py keeps the operator's spelling, but an
+    action declared elsewhere (or a policy built by hand) must match the same
+    way rather than on a case coincidence. ONE implementation, because the
+    ladder and the two readers that ask it about a destructive proposal must
+    not disagree about whether the grant still names the action.
+    """
+    return action.id.lower() in tuple(
+        str(a).lower() for a in (policy or {}).get("allow", ()))
+
+
 def approval_policy(policy, action_id):
     """A policy whose effective level for ONE action is `full` and approved.
 
@@ -161,11 +174,9 @@ def allowed(action, incident, policy=None, module_id=None):
         return False, "advisory only"
     if level == "propose":
         return False, "propose: needs operator approval"
-    # BOTH SIDES LOWERCASED for the allow-list: config.py lowercases the
-    # entries, but an action declared elsewhere (or a policy built by hand)
-    # must match the same way rather than on a case coincidence.
-    if level == "scoped" and action.id.lower() not in tuple(
-            str(a).lower() for a in policy.get("allow", ())):
+    # THE ALLOW-LIST IS THE `scoped` GRANT. `allow_listed` owns the
+    # case-insensitive comparison so the proposal readers ask it identically.
+    if level == "scoped" and not allow_listed(action, policy):
         return False, "scoped: %r is not in the allow-list" % action.id
     if action.danger == "destructive" and not getattr(policy, "approved", False):
         return False, "destructive action requires human approval at every tier"

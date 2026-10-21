@@ -328,12 +328,16 @@ approval flow are in [`docs/architecture.md`](docs/architecture.md).
 | `SENTINEL_REMEDIATION` | `1` | engine master switch *within* the ladder; a module still needs an authority level above `off` |
 | `<MODULE>_AUTHORITY` | `off` | per-module level: `off`, `advisory`, `propose`, `scoped`, `full` |
 | `<MODULE>_ALLOW` | empty | the allow-list `scoped` executes from |
-| `<MODULE>_ALLOW_DESTRUCTIVE` | `0` | a destructive action needs this even under `full` |
 | `<MODULE>_ACTION_<ID>_AUTHORITY` | module level | override one action up or down |
 | `SENTINEL_ADVISORS` | `reference` | comma-separated `module.advisor` / bare advisor ids; `none` is the explicit off switch |
 | `SENTINEL_ADVISOR_MAX_HISTORY_DAYS` | `30` | the cap on history any advisor may read; negative refuses to start |
 | `SENTINEL_PROPOSAL_TTL_H` | `24` | hours an operator has to decide a proposal; zero or negative refuses to start |
 | `SENTINEL_LLM_PROVIDER`, `SENTINEL_LLM_ENDPOINT`, `SENTINEL_LLM_KEY`, `SENTINEL_LLM_MODEL` | empty | the LLM seam. Configuring provider **and** endpoint makes it selectable; it never joins the default selector. No transport ships in this delivery |
+
+A destructive action is never executed by an automatic path, at any level: only an
+approved proposal runs it, and at `scoped` the current allow-list must still name it.
+The retired `<MODULE>_ALLOW_DESTRUCTIVE` switch is no longer honoured; `--showconf`
+warns if it is still set.
 
 `SENTINEL_WRITE_TOKEN` and `SENTINEL_LLM_KEY` are the two secrets in `.env`. Neither is
 written to the store, a log line or `--showconf`; the write token is also never returned

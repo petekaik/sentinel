@@ -403,12 +403,17 @@ def consider(cfg, conn, seq, results, ctx):
                 # A DESTRUCTIVE ACTION IS PROPOSED AT `scoped`/`full` TOO: it
                 # is never executed by this path, so the proposal is the only
                 # way invariant 2 lets it happen at all. The approval carries
-                # `approved`, which is what the ladder requires.
+                # `approved`, which is what the ladder requires. At `scoped`
+                # the proposal is written ONLY while the allow-list still
+                # names the action -- a proposal must not outlive the grant
+                # that produced it.
                 level = actions.effective_level(cand, policy)
                 if (proposal_for is None and can_execute
                         and (level == "propose"
                              or (cand.danger == "destructive"
-                                 and level in ("scoped", "full")))
+                                 and level in ("scoped", "full")
+                                 and (level != "scoped"
+                                      or actions.allow_listed(cand, policy))))
                         and actions.allowed(
                             cand, inc, actions.approval_policy(policy,
                                                                cand.id))[0]):

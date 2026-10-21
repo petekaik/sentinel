@@ -148,8 +148,13 @@ def _approve_action(cfg, conn, mod, payload, row, actor, ctx):
     elif action.danger == "destructive" and level in ("scoped", "full"):
         # The proposal exists because invariant 2 converted an unattended
         # destructive execution into a human decision. Approving it is that
-        # decision; the ladder still applies every other gate.
-        pass
+        # decision; the ladder still applies every other gate. At `scoped` the
+        # CURRENT allow-list must still name the action -- removing it from
+        # the grant withdraws the proposal's authority.
+        if level == "scoped" and not actions.allow_listed(action, policy):
+            raise ProposalRefused(
+                "the action is no longer in the scoped allow-list; the grant "
+                "that produced this proposal was withdrawn")
     else:
         raise ProposalRefused(
             "the action's authority is now %r, not a level that could have "

@@ -3,7 +3,8 @@
 DECLARATION IS NOT PERMISSION. These actions exist so the engine has something
 to select; the fleet module still ships at authority `off`, and `actions.allowed`
 is what decides (incident confirmed, trigger matched, level, allow-list,
-destructive switch). Nothing here is called except through heal.attempt().
+human approval for a destructive action). Nothing here is called except through
+heal.attempt().
 
 TWO CALLABLES, NOT ONE FLAG. The engine calls `dry_run(ctx, incident)` and
 `run(ctx, incident)` and passes no `dry_run` argument. A single implementation

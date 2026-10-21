@@ -1976,14 +1976,14 @@ class _ActMod:
 
 class _ProposalCfg:
     def __init__(self, authority="propose", remedies=True, ttl_h=24,
-                 enabled=True, advisor_ids=(), max_history_days=30):
+                 enabled=True, advisor_ids=(), max_history_days=30, allow=()):
         self.remedies_enabled = remedies
         self.dry_run = False
         self.proposal_ttl_s = ttl_h * 3600
         self.advisor_ids = tuple(advisor_ids)
         self.advisor_max_history_days = max_history_days
         self._policy = actions.Authority(
-            authority=authority, allow=(), enabled=enabled)
+            authority=authority, allow=allow, enabled=enabled)
 
     def authority(self, module_id):
         return self._policy
@@ -2404,6 +2404,61 @@ def test_an_approval_refuses_a_withdrawn_propose_grant(results):
                 "refusal=%r ran=%r -- forcing `full` without checking the "
                 "current level turns an old proposal into a permission that "
                 "was revoked" % (got, ran))
+    finally:
+        _close(tmp, conn)
+
+
+def test_a_scoped_destructive_approval_needs_the_current_allow_list(results):
+    """`scoped` means the named actions only -- and a destructive action's
+    proposal must not become a way around that removal."""
+    tmp, conn = _store()
+    try:
+        ran = []
+        mod = _ActMod([_action(danger="destructive", ran=ran)])
+        inc = _open_incident(conn)
+
+        # The engine does not even ask while the grant excludes the action.
+        out = heal.consider(_ProposalCfg(authority="scoped", allow=()),
+                            conn, 4, [_Ran()], _ProposalCtx([mod]))
+        results.check(
+            "a scoped destructive action outside the allow-list is not proposed",
+            out == [] and store.list_proposals(conn, state="pending") == []
+            and ran == [],
+            "out=%r pending=%r ran=%r"
+            % (out, store.list_proposals(conn, state="pending"), ran))
+
+        # A proposal written while it was listed is not authority after the
+        # operator removes it from the allow-list.
+        pid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        try:
+            ctl.approve_proposal(_ProposalCfg(authority="scoped", allow=()),
+                                 conn, {"m": mod}, pid, "operator",
+                                 ctx=object())
+            got = ""
+        except ctl.ProposalRefused as exc:
+            got = str(exc)
+        results.check(
+            "a scoped destructive approval is refused once the action left "
+            "the allow-list",
+            "withdrawn" in got and ran == []
+            and store.get_proposal(conn, pid)["state"] == "pending",
+            "refusal=%r ran=%r row=%r"
+            % (got, ran, store.get_proposal(conn, pid)))
+
+        # Clear any attempt the refused path wrongly spent (the bug this
+        # guards), so the positive half is an independent observation.
+        conn.execute("UPDATE incident SET remedy_attempts = 0, "
+                     "remedy_last_at = NULL WHERE key = ?", (inc["key"],))
+        pid2 = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        msg = ctl.approve_proposal(
+            _ProposalCfg(authority="scoped", allow=("a",)), conn, {"m": mod},
+            pid2, "operator", ctx=object())
+        results.check(
+            "and it executes while the current allow-list still names it",
+            ran == [1] and "executed" in msg
+            and store.get_proposal(conn, pid2)["state"] == "executed",
+            "ran=%r msg=%r row=%r"
+            % (ran, msg, store.get_proposal(conn, pid2)))
     finally:
         _close(tmp, conn)
 
@@ -3062,6 +3117,7 @@ TESTS = (test_requested_window_is_reported_against_what_exists,
          test_an_advisor_error_run_never_proposes,
          test_display_state_marks_a_lapsed_pending_row_expired,
          test_an_approval_refuses_a_withdrawn_propose_grant,
+         test_a_scoped_destructive_approval_needs_the_current_allow_list,
          test_a_store_fault_during_approval_is_a_clean_refusal,
          test_the_attempt_cap_latches_before_proposing,
          test_an_executed_proposal_is_not_reproposed_inside_the_cooldown,

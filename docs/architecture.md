@@ -1222,19 +1222,21 @@ Per module, overridable per action:
 | `advisory` | surfaced as advice only |
 | `propose` | writes one pending proposal per `(incident, action)`; a human approves it |
 | `scoped` | executes only action ids in the module's `ALLOW` list |
-| `full` | any declared action; a **destructive** action still needs its own switch |
+| `full` | any declared action, except that a **destructive** action always needs human approval |
 
 `<MODULE>_ACTION_<ID>_AUTHORITY` overrides one action in either direction. It is not a
 second switch: it is how an operator grants or withdraws authority for one action without
 widening the module. An approval is authority, not a bypass — `ctl.approve_proposal` asks
 the ladder with that one action forced to `full` and still passes every gate below; the
-destructive switch and the confirmed-incident rule cannot be lifted by approving.
+engine switch and the confirmed-incident rule cannot be lifted by approving, while
+approval is the only thing that admits a destructive action. The retired
+`<MODULE>_ALLOW_DESTRUCTIVE` switch is no longer honoured.
 
 ### The gates, in order
 
 `actions.allowed()` is pure and decides first: incident `state == "open"`, trigger match,
 engine master switch, known level, level above `off`/`advisory`/`propose`, scoped
-allow-list (case-insensitive), destructive switch. `heal.attempt()` then adds: not latched,
+allow-list (case-insensitive), then human approval for a destructive action. `heal.attempt()` then adds: not latched,
 attempt budget, cooldown, per-hour cap, the **resource locks**, a **dry run that must
 succeed**, and only then `run()`.
 

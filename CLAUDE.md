@@ -100,9 +100,9 @@ A module declares these as data; the platform owns dispatch, execution and every
   closed key set, and serial actions refuse without a chip-serial-resolved adapter.
 - **Actions** are executed only by `heal.attempt()`. `actions.allowed()` is the pure
   ladder: confirmed incident → trigger → engine switch → level → scoped allow-list →
-  destructive switch. The level is per module and overridable per action;
-  `SENTINEL_REMEDIATION` is the engine switch, `MONITOR_REMEDIES` the process kill switch,
-  and both default off.
+  human approval for a destructive action. The level is per module and overridable per
+  action; `SENTINEL_REMEDIATION` is the engine switch, `MONITOR_REMEDIES` the process
+  kill switch, and both default off.
 - **Advisors** get a read-only `Snapshot` and may only return insights. The runner gives
   each a fresh snapshot, caps `history_days` with `SENTINEL_ADVISOR_MAX_HISTORY_DAYS`,
   records an `advisor_run` row for every run (error, overrun included), and never lets an
@@ -117,11 +117,13 @@ A module declares these as data; the platform owns dispatch, execution and every
 | `SENTINEL_REMEDIATION` | `1` | engine master switch; a module still needs a level |
 | `<MODULE>_AUTHORITY` | `off` | `off`, `advisory`, `propose`, `scoped`, `full` |
 | `<MODULE>_ALLOW` | empty | the allow-list `scoped` may execute |
-| `<MODULE>_ALLOW_DESTRUCTIVE` | `0` | required for a destructive action even under `full` |
 | `<MODULE>_ACTION_<ID>_AUTHORITY` | module level | one action up or down, either direction |
 
 A `propose`-level action writes a pending proposal; approval is **authority, not a
-bypass** and re-passes every gate.
+bypass** and re-passes every gate. A destructive action is **never executed by an
+automatic path, at any level**: only an approved proposal runs it, and at `scoped` the
+current allow-list must still name it. The retired `<MODULE>_ALLOW_DESTRUCTIVE` switch
+is no longer honoured; `Config.describe()` warns if it is still set.
 
 | Threshold layer | Where | Who writes it |
 |---|---|---|

@@ -70,10 +70,11 @@ class OpenAIClient:
         body = json.dumps({
             "model": self.model,
             "temperature": 0,
-            # The answer is one small JSON object. Bounding the completion
-            # keeps a chatty model from spending the whole cycle budget on
-            # prose, and keeps the cost predictable.
-            "max_tokens": 2000,
+            # The answer is one small JSON object, but a REASONING model spends
+            # this budget on its chain of thought before the answer. 2,000 was
+            # enough to starve deepseek-v4-flash into content=null; 8,000 leaves
+            # room for the reasoning and the JSON while still bounding cost.
+            "max_tokens": 8000,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
         }).encode()
@@ -103,7 +104,10 @@ class OpenAIClient:
             raise ModelError("response too large")
         try:
             payload = json.loads(raw.decode())
-            content = payload["choices"][0]["message"]["content"]
+            choice = payload["choices"][0]
+            content = choice["message"]["content"]
+            finish = choice.get("finish_reason") if isinstance(choice, dict) \
+                else None
             usage = payload.get("usage")
             if not isinstance(usage, dict):
                 usage = {}
@@ -112,7 +116,11 @@ class OpenAIClient:
                 "the model endpoint returned a malformed body") from None
         if not isinstance(content, str):
             raise ModelError(
-                "the model endpoint returned no message content") from None
+                "the model returned no message content%s; a reasoning model "
+                "may have spent its completion budget before the answer -- "
+                "raise max_tokens or use a chat model"
+                % ((" (finish_reason=%s)" % finish) if finish else "")) \
+                from None
         return (content, usage.get("prompt_tokens"),
                 usage.get("completion_tokens"))
 

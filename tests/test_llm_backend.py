@@ -216,8 +216,34 @@ def test_a_truncated_body_is_a_model_error_not_a_traceback(results):
         httpd.server_close()
 
 
+def test_a_reasoning_model_with_no_content_names_the_cause(results):
+    httpd, base = _serve()
+    try:
+        _Handler.reply = {
+            "choices": [{"message": {"content": None},
+                         "finish_reason": "length"}],
+            "usage": {},
+        }
+        client = llm_advisor.OpenAIClient(base, "", "probe")
+        try:
+            client.complete("sys", "user")
+        except llm_advisor.ModelError as exc:
+            results.check(
+                "a content-less reasoning response names the cause",
+                "finish_reason=length" in str(exc)
+                and "reasoning" in str(exc),
+                "error=%r" % (exc,))
+        else:
+            results.check("a content-less reasoning response names the cause",
+                          False, "no exception")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 TESTS = (
     test_one_request_with_the_key_only_in_the_header,
+    test_a_reasoning_model_with_no_content_names_the_cause,
     test_a_failing_request_never_names_the_key,
     test_a_slow_endpoint_times_out_and_says_so,
     test_malformed_json_is_a_model_error_not_an_empty_success,

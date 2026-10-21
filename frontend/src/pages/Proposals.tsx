@@ -147,6 +147,15 @@ function tone(classification: string): string {
    `requires_human` marker beside it: the row is a scheduled execution, not a
    human item. Destructive actions are never marked, whatever the tier. */
 function ActionState({ payload }: { payload: ProposalPayload }) {
+  /* DESTRUCTIVE FIRST. No producer marks one, but a row carrying both flags
+     must read as the tier rule -- a destructive action is never automatic. */
+  if (payload.danger === "destructive") {
+    return (
+      <span className="badge human">
+        Human approval required at every tier
+      </span>
+    );
+  }
   if (payload.auto_execute === true) {
     return (
       <span className="pill green">
@@ -154,13 +163,7 @@ function ActionState({ payload }: { payload: ProposalPayload }) {
       </span>
     );
   }
-  return (
-    <span className="badge human">
-      {payload.danger === "destructive"
-        ? "Human approval required at every tier"
-        : "Human approval required"}
-    </span>
-  );
+  return <span className="badge human">Human approval required</span>;
 }
 
 /* The authoring diff: the classification, the requires-human marker, the

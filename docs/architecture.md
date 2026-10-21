@@ -1323,9 +1323,11 @@ in “Remedies” below; the invariants are the two under “The intelligence la
 | `full` | any declared non-destructive action may execute on its own |
 
 Set the level per module with `<MODULE>_AUTHORITY` (default `off`) or per action with
-`<MODULE>_ACTION_<ID>_AUTHORITY`. The engine has two further switches, both off or
-narrow by default: `MONITOR_REMEDIES` (process kill switch) and `SENTINEL_REMEDIATION`
-(engine master). An approval is authority, not a bypass: it re-asks the ladder with that
+`<MODULE>_ACTION_<ID>_AUTHORITY`. Above that sit two switches: `MONITOR_REMEDIES=0` by
+default is the process kill switch, and `SENTINEL_REMEDIATION` is the engine master
+switch, which defaults **on**. The narrow default is the module authority: every module
+starts at `off`, and a container that upgrades must not start acting because a new build
+shipped the engine. An approval is authority, not a bypass: it re-asks the ladder with that
 one action forced to `full` and still refuses if the incident is gone, the grant was
 withdrawn, or another gate refuses.
 

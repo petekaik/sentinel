@@ -198,6 +198,25 @@ it("names the tier for a destructive action", async () => {
   expect(screen.queryByText(/Ladder-approved/)).not.toBeInTheDocument();
 });
 
+it("never shows the ladder badge on a destructive action, even with both flags", async () => {
+  // No producer emits both today; the surface must not depend on that.
+  mockPending({
+    ...pending,
+    id: 9,
+    payload_json: actionPayload({
+      danger: "destructive",
+      auto_execute: true,
+      ladder: "allowed",
+    }),
+  });
+  render(<Proposals />);
+
+  expect(
+    await screen.findByText("Human approval required at every tier"),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/Ladder-approved/)).not.toBeInTheDocument();
+});
+
 /* --- authoring diffs and the automatic-change history ------------------- */
 
 const checkSet = {

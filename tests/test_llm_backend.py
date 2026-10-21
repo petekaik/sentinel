@@ -19,6 +19,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
              "usage": {"prompt_tokens": 11, "completion_tokens": 7}}
     status = 200
     delay = 0.0
+    location = ""
 
     def do_POST(self):
         import time
@@ -26,15 +27,24 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         _Handler.requests.append({
             "path": self.path,
+            "port": self.server.server_address[1],
             "headers": dict(self.headers),
             "body": json.loads(body.decode() or "{}"),
         })
         if _Handler.delay:
             time.sleep(_Handler.delay)
         self.send_response(_Handler.status)
+        if _Handler.location:
+            self.send_header("Location", _Handler.location)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(_Handler.reply).encode())
+
+    def do_GET(self):
+        # urllib follows a 302 by re-issuing the request as a GET, headers
+        # included, so a redirect target that only counted POSTs would look
+        # clean while the key was already there.
+        self.do_POST()
 
     def log_message(self, *a):
         pass
@@ -42,7 +52,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 def _serve():
     _Handler.requests = []
-    _Handler.status, _Handler.delay = 200, 0.0
+    _Handler.status, _Handler.delay, _Handler.location = 200, 0.0, ""
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd, "http://127.0.0.1:%d" % httpd.server_address[1]
@@ -120,9 +130,57 @@ def test_malformed_json_is_a_model_error_not_an_empty_success(results):
         httpd.shutdown()
 
 
+def test_a_redirect_is_refused_and_never_reaches_its_target(results):
+    target, target_base = _serve()
+    target_port = target.server_address[1]
+    httpd, base = _serve()
+    try:
+        _Handler.status = 302
+        _Handler.reply = {}
+        _Handler.location = target_base + "/v1/chat/completions"
+        client = llm_advisor.OpenAIClient(base, "canary-key-123", "probe")
+        try:
+            client.complete("sys", "user")
+        except llm_advisor.ModelError as exc:
+            results.check(
+                "a redirect is a ModelError, not a followed request",
+                "302" in str(exc) and "canary-key-123" not in str(exc),
+                "error=%r" % (exc,))
+        else:
+            results.check("a redirect is a ModelError", False, "no exception")
+        followed = [r for r in _Handler.requests if r["port"] == target_port]
+        results.check(
+            "the key never follows a redirect to another host",
+            not followed, "the Location host received %r" % (followed,))
+    finally:
+        httpd.shutdown()
+        target.shutdown()
+
+
+def test_a_non_dict_usage_is_ignored_rather_than_crashing(results):
+    httpd, base = _serve()
+    try:
+        _Handler.reply = {"choices": [{"message": {"content": "{}"}}],
+                          "usage": ["not", "a", "dict"]}
+        client = llm_advisor.OpenAIClient(base, "", "probe")
+        try:
+            content, tin, tout = client.complete("sys", "user")
+        except llm_advisor.ModelError as exc:
+            results.check("a non-dict usage does not break the call", False,
+                          "error=%r" % (exc,))
+        else:
+            results.check("a non-dict usage does not break the call",
+                          content == "{}" and tin is None and tout is None,
+                          "content=%r usage=%r/%r" % (content, tin, tout))
+    finally:
+        httpd.shutdown()
+
+
 TESTS = (
     test_one_request_with_the_key_only_in_the_header,
     test_a_failing_request_never_names_the_key,
     test_a_slow_endpoint_times_out_and_says_so,
     test_malformed_json_is_a_model_error_not_an_empty_success,
+    test_a_redirect_is_refused_and_never_reaches_its_target,
+    test_a_non_dict_usage_is_ignored_rather_than_crashing,
 )

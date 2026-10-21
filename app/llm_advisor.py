@@ -30,6 +30,19 @@ class ModelError(RuntimeError):
     """A model call failed. The message never contains the key."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is a second request to a host nobody configured, and urllib
+    replays the request headers there -- `Authorization` included. Refuse."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused",
+                                     headers, fp)
+
+
+# The opener is stateless and holds the single policy a client may have.
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class OpenAIClient:
     """One OpenAI-compatible chat-completions request. No retry: the next
     intelligence cycle is the retry."""
@@ -56,7 +69,7 @@ class OpenAIClient:
         req = urllib.request.Request(url, data=body, headers=headers,
                                      method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with _OPENER.open(req, timeout=self.timeout_s) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             raise ModelError("the model endpoint answered HTTP %s" % exc.code)
@@ -67,7 +80,9 @@ class OpenAIClient:
         try:
             payload = json.loads(raw.decode())
             content = payload["choices"][0]["message"]["content"]
-            usage = payload.get("usage") or {}
+            usage = payload.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
         except (ValueError, KeyError, IndexError, TypeError):
             raise ModelError("the model endpoint returned a malformed body")
         if not isinstance(content, str):

@@ -1,12 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   deleteGrant,
   getIntelligence,
   hasToken,
+  isUnauthorized,
   putGrant,
   type IntelligenceGrant,
   type IntelligenceState,
 } from "../api";
+import TokenDialog from "../components/TokenDialog";
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -26,6 +28,12 @@ export default function Intelligence() {
   const [drafts, setDrafts] = useState<Record<string, IntelligenceGrant>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // A missing token makes every save a guaranteed 401, so the write buttons are
+  // disabled until one is stored. A STORED-BUT-WRONG token is not knowable here;
+  // that case surfaces as a 401 and opens the same dialog.
+  const [readOnly, setReadOnly] = useState(() => !hasToken());
+  const [tokenOpen, setTokenOpen] = useState(false);
+  const retry = useRef<(() => void) | null>(null);
 
   async function load() {
     try {
@@ -51,20 +59,36 @@ export default function Intelligence() {
     setDrafts((d) => ({ ...d, [id]: { ...(d[id] ?? current), ...patch } }));
   }
 
+  function dropDraft(id: string) {
+    setDrafts((d) => {
+      const next = { ...d };
+      delete next[id];
+      return next;
+    });
+  }
+
+  /* A 401 is the one failure a token fixes, so it opens the unlock dialog and
+     keeps the action for a retry -- the same contract Proposals and
+     EnableToggle use, and the same TokenDialog (never a second one). */
+  function authRequired(retryAction: () => void, what: string) {
+    retry.current = retryAction;
+    setReadOnly(true);
+    setTokenOpen(true);
+    setError(`A write token is required to ${what} a grant.`);
+  }
+
   async function save(id: string, grant: IntelligenceGrant) {
     setBusy(id);
+    setError(null);
     try {
       await putGrant(id, grant);
-      // The server answers with the stored view; a GET keeps one authority for
+      // The server answers with the grants view; a GET keeps one authority for
       // what is in force and drops this module's draft.
-      setDrafts((d) => {
-        const next = { ...d };
-        delete next[id];
-        return next;
-      });
+      dropDraft(id);
       await load();
     } catch (e) {
-      setError(message(e));
+      if (isUnauthorized(e)) authRequired(() => void save(id, grant), "save");
+      else setError(message(e));
     } finally {
       setBusy(null);
     }
@@ -72,16 +96,14 @@ export default function Intelligence() {
 
   async function reset(id: string) {
     setBusy(id);
+    setError(null);
     try {
       await deleteGrant(id);
-      setDrafts((d) => {
-        const next = { ...d };
-        delete next[id];
-        return next;
-      });
+      dropDraft(id);
       await load();
     } catch (e) {
-      setError(message(e));
+      if (isUnauthorized(e)) authRequired(() => void reset(id), "reset");
+      else setError(message(e));
     } finally {
       setBusy(null);
     }
@@ -202,10 +224,13 @@ export default function Intelligence() {
       )}
 
       {error && <p role="alert">{error}</p>}
-      {!hasToken() && (
+      {readOnly && (
         <p className="sub">
-          No write token in this tab — every save will be refused. Unlock writes
-          on the Settings page.
+          Writes are locked in this tab — a valid write token is required to
+          change a grant.{" "}
+          <button type="button" onClick={() => setTokenOpen(true)}>
+            Unlock writes
+          </button>
         </p>
       )}
 
@@ -273,14 +298,14 @@ export default function Intelligence() {
             </p>
             <button
               type="button"
-              disabled={busy === m.id}
+              disabled={readOnly || busy === m.id}
               onClick={() => void save(m.id, g)}
             >
               Save {m.id}
             </button>{" "}
             <button
               type="button"
-              disabled={busy === m.id}
+              disabled={readOnly || busy === m.id}
               onClick={() => void reset(m.id)}
             >
               Reset {m.id}
@@ -288,6 +313,18 @@ export default function Intelligence() {
           </section>
         );
       })}
+
+      <TokenDialog
+        open={tokenOpen}
+        onClose={() => {
+          retry.current = null;
+          setTokenOpen(false);
+        }}
+        onSaved={() => {
+          setReadOnly(false);
+          retry.current?.();
+        }}
+      />
     </>
   );
 }

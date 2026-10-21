@@ -369,12 +369,26 @@ export type IntelligenceState = {
   modules: IntelligenceModule[];
 };
 
+/* What a grant write returns: the `grants_view` entry for the module, which
+   carries no id/title/order -- the caller already knows which module it wrote. */
+export type IntelligenceGrantView = Pick<
+  IntelligenceModule,
+  "supported" | "grant" | "error" | "source"
+>;
+
 export const getIntelligence = () =>
   req<IntelligenceState>("GET", "/api/v1/intelligence");
 
 export const putGrant = (id: string, grant: Partial<IntelligenceGrant>) =>
-  req<IntelligenceModule>("PUT", `/api/v1/modules/${id}/intelligence`, grant);
+  req<IntelligenceGrantView>(
+    "PUT",
+    `/api/v1/modules/${id}/intelligence`,
+    grant,
+  );
 
 /* Drop the stored override; the default (every lane off) applies again. */
 export const deleteGrant = (id: string) =>
-  req<IntelligenceModule>("DELETE", `/api/v1/modules/${id}/intelligence`);
+  req<IntelligenceGrantView>(
+    "DELETE",
+    `/api/v1/modules/${id}/intelligence`,
+  );

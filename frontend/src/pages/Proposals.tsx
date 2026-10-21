@@ -142,14 +142,43 @@ function tone(classification: string): string {
   return "grey";
 }
 
+/* An ACTION proposal's disposition. `auto_execute` is the ladder's own answer,
+   written by the marker and not by the model, and it wins over the generic
+   `requires_human` marker beside it: the row is a scheduled execution, not a
+   human item. Destructive actions are never marked, whatever the tier. */
+function ActionState({ payload }: { payload: ProposalPayload }) {
+  if (payload.auto_execute === true) {
+    return (
+      <span className="pill green">
+        Ladder-approved — executes on the next collection
+      </span>
+    );
+  }
+  return (
+    <span className="badge human">
+      {payload.danger === "destructive"
+        ? "Human approval required at every tier"
+        : "Human approval required"}
+    </span>
+  );
+}
+
 /* The authoring diff: the classification, the requires-human marker, the
    server's own machine-readable summary as a list, and the values side by
-   side. Removed and added rows carry the class that colours them. */
+   side. Removed and added rows carry the class that colours them. An action
+   proposal has no diff; it has a disposition. */
 function ChangeDiff({ proposal }: { proposal: Proposal | AppliedProposal }) {
+  const payload = payloadOf(proposal);
+  if (proposal.kind === "action") {
+    return (
+      <div className="diff">
+        <ActionState payload={payload} />
+      </div>
+    );
+  }
   if (proposal.kind !== "check_set" && proposal.kind !== "settings_change") {
     return null;
   }
-  const payload = payloadOf(proposal);
   const classification = String(payload.classification || "");
   const before = (
     payload.before && typeof payload.before === "object" ? payload.before : {}

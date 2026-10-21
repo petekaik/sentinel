@@ -1307,6 +1307,68 @@ Finnish titles from this library for exactly that reason.
 
 ---
 
+## Remediation and the ladder — the operator runbook
+
+The short form an operator needs. The mechanics, the gates and the deleted remedies are
+in “Remedies” below; the invariants are the two under “The intelligence layer”.
+
+### The five levels
+
+| Level | What happens to a non-destructive action |
+|---|---|
+| `off` | nothing — not executed, not proposed, not surfaced |
+| `advisory` | surfaced as an insight; nothing is written and nothing runs |
+| `propose` | one pending proposal per `(incident, action)`; a human approves it |
+| `scoped` | executes on its own, but **only** action ids in the module's `ALLOW` list |
+| `full` | any declared non-destructive action may execute on its own |
+
+Set the level per module with `<MODULE>_AUTHORITY` (default `off`) or per action with
+`<MODULE>_ACTION_<ID>_AUTHORITY`. The engine has two further switches, both off or
+narrow by default: `MONITOR_REMEDIES` (process kill switch) and `SENTINEL_REMEDIATION`
+(engine master). An approval is authority, not a bypass: it re-asks the ladder with that
+one action forced to `full` and still refuses if the incident is gone, the grant was
+withdrawn, or another gate refuses.
+
+**Destructive actions always propose, at every tier.** `scoped` and `full` may execute
+non-destructive actions; a destructive action is written as a pending proposal and
+requires a human approval. `ALLOW_DESTRUCTIVE` is retired — `<MODULE>_ALLOW_DESTRUCTIVE`
+is no longer read and grants nothing (`--showconf` warns if it is still set). The SPA
+says “Human approval required at every tier” for such a row.
+
+**A model nomination executes one epoch later, not now.** The nomination marker records
+`auto_execute` (and `ladder: "allowed"`) only when the ladder, asked with the authority in
+force now, would allow a non-destructive action at the next epoch's post-evidence seam.
+The executor then re-asks every gate: it runs the action only while its incident is still
+`open` and its `(target, check_id, subject)` was observed by the epoch that just finished.
+An incident that is gone, or evidence this epoch did not collect, **expires** the
+nomination rather than executing it. A grant withdrawn in between leaves it pending for a
+human. So “Ladder-approved” in the SPA means scheduled, not guaranteed: it still has to
+survive every gate. A refused nomination stays pending for the proposal TTL and is shown
+as “Human approval required”, never as approved.
+
+### The two invariants
+
+1. **The intelligence may never silence its own evidence.** Every authoring change is
+   classified additive, modification, silencing or invalid. Only additive changes may
+   apply unattended; removals, disablings, identity changes and any widening past a
+   failing observation are always a human proposal. The layer has no write path to
+   incidents, results, thresholds or grants.
+2. **Destructive actions are human-approved at every tier.** No grant, level, per-action
+   override or approval-time option waives it.
+
+### Reversing an auto-applied additive change
+
+An automatically applied change is history, not a queue. In the SPA open **Proposals →
+Automatic changes** and press **Revert**, or call
+`POST /api/v1/intelligence/revert/<id>` with the write token, or run `ctl.py
+--revert-change <id>`. The revert restores the `before` recorded with the change, through
+the same validating settings writer as any operator edit, and is audited. It refuses when
+the row was already reverted or when the current settings no longer equal what the change
+wrote — in that second case something else has changed them, and restoring the old values
+would overwrite that change. A reverted row stays in the history with its marker.
+
+---
+
 ## Remedies — the authority ladder as built, and what was removed
 
 **The engine is built and nothing runs by default.** `app/heal.py` is the only code that

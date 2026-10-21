@@ -121,6 +121,82 @@ it("shows a refusal, keeps it visible, and reloads the queue", async () => {
   expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(2);
 });
 
+/* --- action proposals and the ladder ----------------------------------- */
+
+function actionPayload(extra: Record<string, unknown>) {
+  return JSON.stringify({
+    action_id: "transcode_restart",
+    incident_key: "cubox-1|stalled||",
+    target: "cubox-1",
+    check_id: "stalled",
+    subject: "",
+    classification: "action",
+    ...extra,
+  });
+}
+
+function mockPending(row: unknown) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => respond(200, { pending: [row], expired: [], applied: [] })),
+  );
+}
+
+it("shows a ladder-approved action as a scheduled execution, not a human item", async () => {
+  // The model row may still carry the generic marker beside `auto_execute`;
+  // the ladder's own answer is what decides, and it is a scheduled execution.
+  mockPending({
+    ...pending,
+    id: 6,
+    payload_json: actionPayload({
+      auto_execute: true,
+      ladder: "allowed",
+      requires_human: true,
+    }),
+  });
+  render(<Proposals />);
+
+  expect(
+    await screen.findByText(
+      "Ladder-approved — executes on the next collection",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("requires human")).not.toBeInTheDocument();
+});
+
+it("shows an action without auto_execute as a human decision", async () => {
+  // A refused nomination stays pending; it must not read as approved.
+  mockPending({
+    ...pending,
+    id: 7,
+    payload_json: actionPayload({ auto_execute: false, ladder: "human" }),
+  });
+  render(<Proposals />);
+
+  expect(
+    await screen.findByText("Human approval required"),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/Ladder-approved/)).not.toBeInTheDocument();
+});
+
+it("names the tier for a destructive action", async () => {
+  mockPending({
+    ...pending,
+    id: 8,
+    payload_json: actionPayload({
+      danger: "destructive",
+      auto_execute: false,
+      ladder: "human",
+    }),
+  });
+  render(<Proposals />);
+
+  expect(
+    await screen.findByText("Human approval required at every tier"),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/Ladder-approved/)).not.toBeInTheDocument();
+});
+
 /* --- authoring diffs and the automatic-change history ------------------- */
 
 const checkSet = {

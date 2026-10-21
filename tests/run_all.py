@@ -22,6 +22,7 @@ from harness import Results                     # noqa: E402
 
 import test_checks_fixtures as fixture_tests    # noqa: E402
 import test_advisors as advisor_tests           # noqa: E402
+import test_anomaly as anomaly_tests            # noqa: E402
 import test_api_v1 as api_tests                 # noqa: E402
 import test_collect_offline as collect_tests    # noqa: E402
 import test_commands as command_tests           # noqa: E402
@@ -92,6 +93,8 @@ SUITES = (
     ("snmp -- the settings-driven module: reachability vs OID rows, save-time "
      "validation, and the dynamic manifest (no device, no real network)",
      snmp_module_tests.TESTS),
+    ("anomaly -- robust statistics over one series, and the measured harness",
+     anomaly_tests.TESTS),
 )
 
 

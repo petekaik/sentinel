@@ -19,6 +19,7 @@ selects it sees "not implemented" instead of a silent green epoch that looks
 like a clean diagnosis of nothing.
 """
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -55,7 +56,8 @@ class OpenAIClient:
 
     def complete(self, system, user):
         if not self.endpoint or not self.model:
-            raise ModelError("the model backend needs an endpoint and a model")
+            raise ModelError(
+                "the model backend needs an endpoint and a model") from None
         url = self.endpoint + "/v1/chat/completions"
         body = json.dumps({
             "model": self.model,
@@ -72,11 +74,19 @@ class OpenAIClient:
             with _OPENER.open(req, timeout=self.timeout_s) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
-            raise ModelError("the model endpoint answered HTTP %s" % exc.code)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            # `exc` from urllib can name the URL; the key is only in a header,
-            # but build a fresh message anyway so no client stack leaks.
-            raise ModelError("the model endpoint timed out or was unreachable")
+            raise ModelError("the model endpoint answered HTTP %s"
+                             % exc.code) from None
+        except http.client.HTTPException:
+            # Includes IncompleteRead and BadStatusLine: the peer controlled
+            # the bytes, so its text must not reach a traceback.
+            raise ModelError(
+                "the model endpoint returned a malformed response") from None
+        except OSError:
+            # URLError and TimeoutError are OSErrors. urllib's text can name
+            # the URL, so build a fresh message anyway: the key lives only in
+            # a header, and no client stack should leak.
+            raise ModelError(
+                "the model endpoint timed out or was unreachable") from None
         try:
             payload = json.loads(raw.decode())
             content = payload["choices"][0]["message"]["content"]
@@ -84,9 +94,11 @@ class OpenAIClient:
             if not isinstance(usage, dict):
                 usage = {}
         except (ValueError, KeyError, IndexError, TypeError):
-            raise ModelError("the model endpoint returned a malformed body")
+            raise ModelError(
+                "the model endpoint returned a malformed body") from None
         if not isinstance(content, str):
-            raise ModelError("the model endpoint returned no message content")
+            raise ModelError(
+                "the model endpoint returned no message content") from None
         return (content, usage.get("prompt_tokens"),
                 usage.get("completion_tokens"))
 

@@ -13,6 +13,7 @@ appears after deployment. So the container is given addresses, a user, a key and
 an explicit known_hosts file, and every one of those is a variable.
 """
 
+import json
 import os
 import re
 
@@ -29,6 +30,94 @@ def _bool(name, default, env):
     if v is None or v == "":
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+INTELLIGENCE_LANES = ("observe", "author", "remediate")
+AUTHOR_LEVELS = ("off", "propose", "auto")
+DEFAULT_BUDGET = {"rows": 500, "bytes": 32768, "tokens": 2000}
+
+
+def default_grant():
+    """A grant that reads nothing and acts on nothing."""
+    return {"observe": False, "author": "off", "remediate": False,
+            "budget": dict(DEFAULT_BUDGET)}
+
+
+def validate_grant(value, key, supported):
+    """(grant, why). `why` is "" on success; the default is never substituted
+    for a malformed value here -- the caller decides, and the cycle records."""
+    if not isinstance(value, dict):
+        return None, "%s must be a JSON object, got %s" % (
+            key, type(value).__name__)
+    allowed = {"observe", "author", "remediate", "budget"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        return None, "%s has unknown key(s) %s; allowed: %s" % (
+            key, ", ".join(repr(k) for k in unknown),
+            ", ".join(sorted(allowed)))
+    grant = default_grant()
+    if "observe" in value:
+        if not isinstance(value["observe"], bool):
+            return None, "%s.observe must be true or false, got %r" % (
+                key, value["observe"])
+        grant["observe"] = value["observe"]
+    if "remediate" in value:
+        if not isinstance(value["remediate"], bool):
+            return None, "%s.remediate must be true or false, got %r" % (
+                key, value["remediate"])
+        grant["remediate"] = value["remediate"]
+        if grant["remediate"] and "remediate" not in supported:
+            return None, ("%s.remediate is not a lane module %r declares; "
+                          "supported: %s" % (
+                              key, key[:-len("_INTELLIGENCE")].lower(),
+                              ", ".join(supported) or "(none)"))
+    if "author" in value:
+        level = str(value["author"]).strip().lower()
+        if level not in AUTHOR_LEVELS:
+            return None, "%s.author must be one of %r, got %r" % (
+                key, list(AUTHOR_LEVELS), value["author"])
+        if level != "off" and "author" not in supported:
+            return None, ("%s.author is not a lane module %r declares" % (
+                key, key[:-len("_INTELLIGENCE")].lower()))
+        grant["author"] = level
+    if "budget" in value:
+        budget = value["budget"]
+        if not isinstance(budget, dict):
+            return None, "%s.budget must be an object" % key
+        unknown = sorted(set(budget) - set(DEFAULT_BUDGET))
+        if unknown:
+            return None, "%s.budget has unknown key(s) %s" % (
+                key, ", ".join(repr(k) for k in unknown))
+        for name in DEFAULT_BUDGET:
+            if name not in budget:
+                continue
+            n = budget[name]
+            if isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+                return None, "%s.budget.%s must be a positive integer, got %r" % (
+                    key, name, n)
+            grant["budget"][name] = n
+    if grant["observe"] is False and grant["author"] != "off":
+        return None, ("%s.author is %r while observe is off; a module that is "
+                      "not read cannot author" % (key, grant["author"]))
+    return grant, ""
+
+
+def parse_grant(raw, key, supported):
+    """Parse one env/stored value. A malformed value grants NOTHING and
+    returns the reason; it is never silently defaulted to a working grant."""
+    if raw is None or raw == "":
+        return default_grant(), ""
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except ValueError as exc:
+            return default_grant(), "%s is not valid JSON: %s" % (key, exc)
+    else:
+        value = raw
+    value, why = validate_grant(value, key, supported)
+    if why:
+        return default_grant(), why
+    return value, ""
 
 
 class Config:
@@ -136,6 +225,28 @@ class Config:
                 "SENTINEL_ADVISOR_BUDGET_MS must be > 0, got %d" % budget)
         self.advisor_budget_ms = budget
 
+        # Intelligence layer. The master switch is deployment-only, like
+        # MONITOR_REMEDIES: the per-module grants are the editable surface.
+        self.intelligence_enabled = _bool("SENTINEL_INTELLIGENCE", True, e)
+        interval = int(_env("SENTINEL_INTELLIGENCE_INTERVAL_S",
+                            str(self.advisor_interval_s), e))
+        if interval <= 0:
+            raise ValueError(
+                "SENTINEL_INTELLIGENCE_INTERVAL_S must be > 0, got %d" % interval)
+        self.intelligence_interval_s = interval
+        budget = int(_env("SENTINEL_INTELLIGENCE_BUDGET_MS", "30000", e))
+        if budget <= 0:
+            raise ValueError(
+                "SENTINEL_INTELLIGENCE_BUDGET_MS must be > 0, got %d" % budget)
+        self.intelligence_budget_ms = budget
+        max_tokens = int(_env("SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS",
+                              "16000", e))
+        if max_tokens <= 0:
+            raise ValueError(
+                "SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS must be > 0, got %d"
+                % max_tokens)
+        self.intelligence_model_max_tokens = max_tokens  # secretscan:ignore -- identifier
+
         # How long an operator has to decide a proposal. EXPIRY IS A REAL
         # DEADLINE, not a display nicety: an approval is a statement about the
         # incident as it stands, and a proposal acted on three days later is an
@@ -199,6 +310,11 @@ class Config:
         if days <= 0:
             raise ValueError("%s must be > 0, got %d" % (key, days))
         return days
+
+    def intelligence_grant(self, module_id, supported=INTELLIGENCE_LANES):
+        """(grant, why) for one module. A malformed value grants nothing."""
+        key = "%s_INTELLIGENCE" % module_id.upper()
+        return parse_grant(self.env.get(key), key, tuple(supported))
 
     def authority(self, module_id):
         """The remedy policy for one module. Off unless an operator says otherwise.

@@ -146,12 +146,16 @@ def getnext(host, community, oid, port=161, timeout=3.0, retries=1):
 
 def walk(host, community, root, port=161, timeout=3.0, max_oids=2000,
          retries=1):
-    """(rows, truncated) for every object at or under `root`.
+    """(rows, truncated) for objects after `root`, within its subtree.
+
+    `root` itself is never returned: a GetNext is strictly greater than the
+    OID it names, so a walk starts at the first object after the root.
 
     `rows` is [(oid, value, type)], in the agent's order. `truncated` is True
-    when the cap stopped the walk: a caller that reports a capped walk as a
+    when objects remain past the cap: a caller that reports a capped walk as a
     complete tree reports missing objects as absent, which is the one thing a
-    monitor must never do.
+    monitor must never do. A cap that lands exactly on the last object is not
+    truncation, so one probe past the cap decides it.
     """
     rows, oid = [], root
     while len(rows) < max_oids:
@@ -163,8 +167,20 @@ def walk(host, community, root, port=161, timeout=3.0, max_oids=2000,
         # A GetNext that leaves the subtree is the end of it: the next object
         # exists, but it is not this walk's. Without this the walk reads a
         # neighbouring MIB branch as part of the root.
-        if next_oid != root and not next_oid.startswith(root + "."):
+        if not next_oid.startswith(root + "."):
             return rows, False
         rows.append((next_oid, value, kind))
         oid = next_oid
-    return rows, True
+    if not rows:                                # max_oids <= 0: asked for none
+        return rows, False
+    # The cap stopped the walk. ONE probe says whether the subtree really
+    # ended at it; silence or a transport failure leaves the answer unknown,
+    # and unknown must be reported as truncated rather than as complete.
+    try:
+        nxt, _, _ = getnext(host, community, oid, port=port, timeout=timeout,
+                            retries=retries)
+    except SnmpEndOfMib:
+        return rows, False
+    except SnmpError:
+        return rows, True
+    return rows, nxt.startswith(root + ".")

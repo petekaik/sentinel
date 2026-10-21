@@ -622,7 +622,7 @@ def test_walk_follows_getnext_and_stops_cleanly(results):
                                     port=port, max_oids=10)
     results.check(
         "walk returns every object under the root in order",
-        [r[0] for r in rows] == sorted(tree) and not truncated,
+        [r[0] for r in rows] == sorted(tree, key=_oid_key) and not truncated,
         "rows=%r truncated=%r" % (rows, truncated))
 
 
@@ -648,6 +648,31 @@ def test_walk_does_not_escape_the_root(results):
         "rows=%r" % (rows,))
 
 
+def test_a_walk_that_ends_exactly_at_the_cap_is_not_truncated(results):
+    tree = {"1.3.6.1.2.1.1.%d.0" % i: (i, "integer") for i in range(1, 3)}
+    with _agent(tree) as (host, port):
+        rows, truncated = snmp.walk(host, "public", "1.3.6.1.2.1.1",
+                                    port=port, max_oids=2)
+    results.check(
+        "a subtree with exactly max_oids objects reports no truncation",
+        len(rows) == 2 and truncated is False,
+        "rows=%r truncated=%r -- the cap alone is not truncation, and a tree "
+        "reported incomplete forever invites a retry that can never succeed"
+        % (rows, truncated))
+
+
+def test_a_walk_with_one_object_past_the_cap_is_truncated(results):
+    tree = {"1.3.6.1.2.1.1.%d.0" % i: (i, "integer") for i in range(1, 4)}
+    with _agent(tree) as (host, port):
+        rows, truncated = snmp.walk(host, "public", "1.3.6.1.2.1.1",
+                                    port=port, max_oids=2)
+    results.check(
+        "a subtree with max_oids + 1 objects reports truncation",
+        len(rows) == 2 and truncated is True,
+        "rows=%r truncated=%r -- a cap that hides a real object without "
+        "saying so reads as a complete tree" % (rows, truncated))
+
+
 TESTS = (
     test_integer_round_trip,
     test_octet_string_round_trip,
@@ -669,4 +694,6 @@ TESTS = (
     test_walk_follows_getnext_and_stops_cleanly,
     test_walk_reports_truncation_instead_of_pretending_it_ended,
     test_walk_does_not_escape_the_root,
+    test_a_walk_that_ends_exactly_at_the_cap_is_not_truncated,
+    test_a_walk_with_one_object_past_the_cap_is_truncated,
 )

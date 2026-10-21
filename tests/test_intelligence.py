@@ -1,5 +1,6 @@
 """Intelligence layer: grants, scoped views, invariants, discovery, authoring."""
 
+import http.client
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import Results                       # noqa: E402
+from test_dashboard import _serve, make_cfg       # noqa: E402
 
 import config as config_mod                       # noqa: E402
 import module                                     # noqa: E402
@@ -358,6 +360,164 @@ def test_a_partial_grant_write_preserves_the_stored_lanes(results):
         shutil.rmtree(tmp)
 
 
+def _http(cfg, method, path, body=None, token=None):
+    httpd, base = _serve(cfg)
+    try:
+        host, port = base.replace("http://", "").split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=10)
+        headers = {}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = "Bearer %s" % token
+        conn.request(method, path, body=data, headers=headers)
+        resp = conn.getresponse()
+        payload = json.loads(resp.read().decode() or "{}")
+        conn.close()
+        return resp.status, payload
+    finally:
+        httpd.server_close()
+
+
+def test_the_intelligence_read_names_grants_and_never_the_key(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = make_cfg(os.path.join(tmp, "m.sqlite"),
+                       SENTINEL_WRITE_TOKEN="tok",
+                       SENTINEL_LLM_PROVIDER="openai",
+                       SENTINEL_LLM_ENDPOINT="http://127.0.0.1:1",
+                       SENTINEL_LLM_KEY="canary-key-123",
+                       SENTINEL_LLM_MODEL="probe-model")
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        conn.close()
+        status, body = _http(cfg, "GET", "/api/v1/intelligence")
+        text = json.dumps(body)
+        results.check("the intelligence read answers 200", status == 200,
+                      "status=%r body=%r" % (status, body))
+        results.check(
+            "it names every discovered module and its supported lanes",
+            {m["id"] for m in body.get("modules", [])}
+            >= {"fleet", "system", "snmp"}
+            and body["modules"][0]["supported"],
+            "body=%r" % (body,))
+        results.check(
+            "it reports the backend as configured without the key",
+            body.get("backend", {}).get("configured") is True
+            and "model" in body.get("backend", {})
+            and "canary-key-123" not in text,
+            "backend=%r" % (body.get("backend"),))
+        results.check(
+            "no grant is in force by default",
+            all(m["grant"]["observe"] is False
+                and m["grant"]["author"] == "off"
+                for m in body["modules"]),
+            "a default grant must read nothing")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_grant_writes_need_the_token_and_validate(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = make_cfg(os.path.join(tmp, "m.sqlite"),
+                       SENTINEL_WRITE_TOKEN="tok")
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        conn.close()
+        status, _ = _http(cfg, "PUT", "/api/v1/modules/fleet/intelligence",
+                          {"observe": True})
+        results.check("an unauthenticated grant write is 401", status == 401,
+                      "status=%r" % (status,))
+        status, body = _http(cfg, "PUT", "/api/v1/modules/system/intelligence",
+                             {"observe": True, "remediate": True}, token="tok")
+        results.check(
+            "an unsupported lane is a 422, not a silent truncation",
+            status == 422 and "remediate" in json.dumps(body),
+            "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "PUT", "/api/v1/modules/fleet/intelligence",
+                             {"observe": True, "author": "auto"}, token="tok")
+        results.check("a valid grant write is 200", status == 200,
+                      "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "GET", "/api/v1/modules")
+        fleet = [m for m in body if m.get("id") == "fleet"][0]
+        results.check(
+            "the module manifest carries the grant",
+            fleet.get("intelligence", {}).get("grant", {}).get("author")
+            == "auto",
+            "manifest=%r" % (fleet.get("intelligence"),))
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_a_deleted_grant_reports_the_layer_that_now_applies(results):
+    """The DELETE response must describe the grant IN FORCE after the delete.
+
+    `_settings_write` reloads before dispatching, so `cfg.env` holds the stored
+    overlay; reading it after the row is gone would echo the deleted grant back
+    labelled `env` -- a write whose answer is the value it just removed.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = make_cfg(os.path.join(tmp, "m.sqlite"),
+                       SENTINEL_WRITE_TOKEN="tok",
+                       SNMP_INTELLIGENCE='{"observe": true}')
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        conn.close()
+        status, _ = _http(cfg, "PUT", "/api/v1/modules/snmp/intelligence",
+                          {"observe": True, "author": "auto"}, token="tok")
+        results.check("the grant to be deleted is in force", status == 200,
+                      "status=%r" % (status,))
+        status, body = _http(cfg, "DELETE",
+                             "/api/v1/modules/snmp/intelligence", token="tok")
+        results.check(
+            "a delete falls back to the .env grant, not the deleted row",
+            status == 200 and body.get("source") == "env"
+            and body.get("grant", {}).get("observe") is True
+            and body.get("grant", {}).get("author") == "off",
+            "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "DELETE",
+                             "/api/v1/modules/fleet/intelligence", token="tok")
+        results.check(
+            "a delete with no row and no .env falls back to the default",
+            status == 200 and body.get("source") == "default"
+            and body.get("grant", {}).get("observe") is False,
+            "status=%r body=%r" % (status, body))
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_a_malformed_grant_is_reported_not_fatal_to_the_server(results):
+    """The web process stays up on a bad grant; the collector/ctl refuse.
+
+    Refusing to serve would take the dead-man switch down with the very
+    configuration error it is the one surface able to show.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = make_cfg(os.path.join(tmp, "m.sqlite"),
+                       SYSTEM_INTELLIGENCE='{"author": "sometimes"}')
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        conn.close()
+        status, body = _http(cfg, "GET", "/api/v1/intelligence")
+        system = [m for m in body.get("modules", []) if m.get("id") == "system"]
+        results.check(
+            "a malformed grant does not take the read surface down",
+            status == 200 and bool(system),
+            "status=%r body=%r" % (status, body))
+        results.check(
+            "the malformed grant is a per-module error, granting nothing",
+            bool(system) and "author" in system[0].get("error", "")
+            and system[0]["grant"]["observe"] is False,
+            "system=%r" % (system[0] if system else None,))
+    finally:
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -376,4 +536,8 @@ TESTS = (
     test_the_startup_validator_accepts_the_effective_grants,
     test_a_stored_grant_that_became_unsupported_refuses_startup,
     test_a_partial_grant_write_preserves_the_stored_lanes,
+    test_the_intelligence_read_names_grants_and_never_the_key,
+    test_grant_writes_need_the_token_and_validate,
+    test_a_deleted_grant_reports_the_layer_that_now_applies,
+    test_a_malformed_grant_is_reported_not_fatal_to_the_server,
 )

@@ -249,6 +249,12 @@ def module_manifests(cfg, conn, modules, specs):
                          for c in mod.commands()],
             "actions": [{"id": a.id, "title": a.title, "danger": a.danger}
                         for a in mod.actions()],
+            "intelligence": {
+                "supported": list(getattr(mod, "intelligence", ("observe",))),
+                "grant": cfg.intelligence_grant(
+                    mod.id, tuple(getattr(mod, "intelligence",
+                                          ("observe",))))[0],
+            },
         })
     return out
 
@@ -433,10 +439,17 @@ def write_grant(cfg, conn, mod, body, actor):
 
 
 def reset_grant(cfg, conn, mod, actor):
-    """Delete the override; the default (all lanes off) applies again."""
+    """Delete the override; the default (all lanes off) applies again.
+
+    THE RELOAD IS LOAD-BEARING, not hygiene: the caller reloads before
+    dispatching, so `cfg.env` still carries the overlay this call just deleted.
+    Reading it without a reload would return the removed grant labelled `env`
+    -- a delete whose answer is the value it removed.
+    """
     key = grant_key(mod)
     if (mod.id, key) in store.setting_rows(conn):
         store.delete_setting(conn, mod.id, key, actor)
+    cfg.reload_settings(conn)
     return grants_view(cfg, conn, [mod])[mod.id]
 
 

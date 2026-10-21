@@ -387,6 +387,32 @@ def build_state(cfg, conn, now=None):
     }
 
 
+def build_intelligence(cfg, conn):
+    """The Intelligence page's whole read contract.
+
+    THE KEY AND EVERY SECRET ARE ABSENT BY CONSTRUCTION: this function reads
+    grant values and config booleans, never `cfg.llm_key`, and never a secret
+    setting's value.
+    """
+    modules = module_loader.discover()
+    grants = settingsapi.grants_view(cfg, conn, modules)
+    last = store.last_intelligence_cycle(conn)
+    usage = store.list_intelligence_usage(conn, last["id"]) if last else []
+    return {
+        "enabled": bool(cfg.intelligence_enabled),
+        "interval_s": cfg.intelligence_interval_s,
+        "backend": {
+            "provider": cfg.llm_provider if cfg.llm_provider == "openai" else "",
+            "configured": bool(cfg.llm_provider and cfg.llm_endpoint),
+            "model": cfg.llm_model,
+        },
+        "modules": [dict(grants[m.id], id=m.id, title=m.title, order=m.order)
+                    for m in modules],
+        "last_cycle": last,
+        "usage": usage,
+    }
+
+
 # ---------------------------------------------------------------------------
 # The status API
 #
@@ -894,6 +920,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 })
                 return
+            if path == "/api/v1/intelligence":
+                return self._json(200, build_intelligence(self.cfg, conn))
             if path == "/api/v1/insights":
                 self._json(200, store.list_insights(conn))
                 return
@@ -1063,6 +1091,10 @@ class Handler(BaseHTTPRequestHandler):
             elif method == "PUT" and tail == ["enabled"]:
                 out = settingsapi.set_enabled(cfg, conn, mod,
                                               body.get("enabled"), "operator")
+            elif method == "PUT" and tail == ["intelligence"]:
+                out = settingsapi.write_grant(cfg, conn, mod, body, "operator")
+            elif method == "DELETE" and tail == ["intelligence"]:
+                out = settingsapi.reset_grant(cfg, conn, mod, "operator")
             elif method == "DELETE" and len(tail) == 2 and tail[0] == "settings":
                 out = settingsapi.reset_setting(cfg, conn, mod, tail[1],
                                                 "operator")

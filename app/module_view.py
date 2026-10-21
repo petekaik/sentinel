@@ -15,6 +15,13 @@ import module
 
 class ModuleView(advisors.Snapshot):
     def __init__(self, conn, mod, ctx, specs, grant, now=None, max_days=None):
+        # THE GRANT IS THE FIRST THING CONSULTED. A module without `observe`
+        # gets no view at all -- raising here is what makes the docstring's
+        # claim true of every caller, rather than of a caller that filters.
+        if (grant or {}).get("observe") is not True:
+            raise PermissionError(
+                "module %r has no observe grant; a view is only built for a "
+                "module allowed to read its own evidence" % (mod.id,))
         owned_specs = {
             sid: spec for sid, spec in (specs or {}).items()
             if getattr(spec, "owner", None) == mod.id
@@ -33,8 +40,11 @@ class ModuleView(advisors.Snapshot):
                         for sid, spec in owned_specs.items()}
         budget = (grant or {}).get("budget") or {}
         if budget.get("rows"):
+            # `rows` bounds the merged reads. `sample_rows` stays the
+            # platform's 20000: it is two weeks of minute samples, and
+            # shrinking it to the row budget would make a 7-day series a
+            # truncated 8-hour slice that no analyzer may judge.
             self.caps["rows"] = int(budget["rows"])
-            self.caps["sample_rows"] = int(budget["rows"])
         if budget.get("bytes"):
             self.caps["log_bytes"] = int(budget["bytes"])
 
@@ -108,20 +118,27 @@ class ModuleView(advisors.Snapshot):
     def sample_keys(self, since, limit=None):
         if self._conn is None or not self.targets:
             return []
+        cap = self.caps["rows"] if limit is None \
+            else min(int(limit), self.caps["rows"])
         marks = ",".join("?" * len(self.targets))
+        # One extra row, so hitting the cap can be TOLD apart from a result
+        # that happened to be exactly cap-sized -- the same probe the base
+        # class uses. An unmarked cap lets the reference advisor advise on a
+        # prefix while its evidence claims the whole window.
         rows = self._conn.execute(
             "SELECT DISTINCT target, metric FROM sample WHERE ts >= ? "
-            "AND target IN (%s) ORDER BY target, metric" % marks,
-            (since,) + self.targets).fetchall()
+            "AND target IN (%s) ORDER BY target, metric LIMIT ?" % marks,
+            (since,) + self.targets + (cap + 1,)).fetchall()
         out = []
         for target, metric in rows:
             if self._owned_pair(target, metric):
                 out.append((target, metric))
             else:
                 self.unattributed[metric] = target
-        cap = self.caps["rows"] if limit is None \
-            else min(int(limit), self.caps["rows"])
-        return out[:cap]
+        if len(rows) > cap:
+            self.truncated["sample_keys"] = True
+            out = out[:cap]
+        return out
 
     def sample_series(self, since, target, metric, limit=None):
         self._require_pair(target, metric)
@@ -139,7 +156,10 @@ class ModuleView(advisors.Snapshot):
             rows = super().sample_series(since, target, metric,
                                          limit=self.caps["sample_rows"])
             out.extend(rows)
-            if len(out) >= cap:
+            # STRICTLY GREATER: an exact fit dropped nothing, and marking it
+            # truncated would be a false alarm the analyzer cannot tell from
+            # a real one.
+            if len(out) > cap:
                 out = out[:cap]
                 self.truncated["samples"] = True
                 break

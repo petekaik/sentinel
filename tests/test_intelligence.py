@@ -621,7 +621,8 @@ def test_a_new_modules_window_is_its_own_history(results):
         cfg = config_mod.Config({})
         b = _fake_module("b", ("b",), ("b_check",))
         ctx = checks.Context(cfg, specs, {}, modules=(b,))
-        view = module_view.ModuleView(conn, b, ctx, specs, {}, now=now)
+        view = module_view.ModuleView(conn, b, ctx, specs, {"observe": True},
+                                      now=now)
         since, available = view.window(30)
         results.check(
             "a module with one recent row reports ~0 days, not the store's age",
@@ -644,7 +645,8 @@ def test_logs_are_scoped_to_declared_targets_and_secrets_are_absent(results):
                                                     secret=True),
                                     module.Setting("B_NAME", "visible")])
         ctx = checks.Context(cfg, {}, {}, modules=(b,))
-        view = module_view.ModuleView(conn, b, ctx, {}, {}, now=now)
+        view = module_view.ModuleView(conn, b, ctx, {}, {"observe": True},
+                                      now=now)
         results.check(
             "the module's non-secret setting is visible",
             view.module_settings.get("B_NAME") == "visible",
@@ -657,6 +659,119 @@ def test_logs_are_scoped_to_declared_targets_and_secrets_are_absent(results):
             "a log target the module does not declare raises",
             _raises_keyerror(lambda: view.logs("a", now - 86400)),
             "a view must not read another module's journal")
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_view_without_an_observe_grant_is_refused(results):
+    tmp, conn, now = _view_store()
+    try:
+        b = _fake_module("b", ("b",), ("b_check",))
+        ctx = checks.Context(config_mod.Config({}), {}, {}, modules=(b,))
+        for why, grant in (("an empty grant", {}),
+                           ("the default grant", config_mod.default_grant()),
+                           ("a truthy non-boolean", {"observe": 1})):
+            try:
+                module_view.ModuleView(conn, b, ctx, {}, grant, now=now)
+            except PermissionError as exc:
+                results.check(
+                    "%s builds no view, naming the module" % why,
+                    b.id in str(exc),
+                    "PermissionError did not name the module: %r" % (exc,))
+            else:
+                results.check(
+                    "%s builds no view" % why, False,
+                    "ModuleView was built with grant=%r; a view that can read "
+                    "without observe makes the grant advisory" % (grant,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_key_list_over_the_budget_is_marked_truncated(results):
+    tmp, conn, now = _view_store()
+    try:
+        # A third pair for target "b", so the row budget can bite.
+        store.record_sample(conn, 1, "b", "extra.metric", value=5.0)
+        conn.execute("UPDATE sample SET ts = ? WHERE id = last_insert_rowid()",
+                     (now - 60,))
+        b = _fake_module("b", ("b",), ("b_check",))
+        ctx = checks.Context(config_mod.Config({}), {}, {}, modules=(b,))
+        capped = module_view.ModuleView(
+            conn, b, ctx, {}, {"observe": True, "budget": {"rows": 2}},
+            now=now)
+        keys = capped.sample_keys(now - 7 * 86400)
+        results.check(
+            "a key list over the row budget is capped AND marked truncated",
+            len(keys) == 2 and capped.truncated.get("sample_keys") is True,
+            "keys=%r truncated=%r. An unmarked cap lets the reference advisor "
+            "advise on a prefix of the metrics while its evidence claims the "
+            "window." % (keys, capped.truncated))
+        exact = module_view.ModuleView(
+            conn, b, ctx, {}, {"observe": True, "budget": {"rows": 3}},
+            now=now)
+        keys = exact.sample_keys(now - 7 * 86400)
+        results.check(
+            "a key list exactly at the budget is not marked truncated",
+            len(keys) == 3 and "sample_keys" not in exact.truncated,
+            "keys=%r truncated=%r" % (keys, exact.truncated))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_row_budget_does_not_shrink_the_per_series_cap(results):
+    tmp, conn, now = _view_store()
+    try:
+        for i in range(600):
+            store.record_sample(conn, 1, "b", "bulk.metric", value=float(i))
+            conn.execute(
+                "UPDATE sample SET ts = ? WHERE id = last_insert_rowid()",
+                (now - 600 + i,))
+        b = _fake_module("b", ("b",), ("b_check",))
+        ctx = checks.Context(config_mod.Config({}), {}, {}, modules=(b,))
+        view = module_view.ModuleView(
+            conn, b, ctx, {}, {"observe": True, "budget": {"rows": 500}},
+            now=now)
+        rows = view.sample_series(now - 7 * 86400, "b", "bulk.metric")
+        results.check(
+            "a 600-point series is fully readable under a 500-row budget",
+            len(rows) == 600 and view.caps["sample_rows"] == 20000
+            and "samples:b/bulk.metric" not in view.truncated,
+            "len=%d caps=%r truncated=%r. Shrinking sample_rows to the row "
+            "budget turns a 7-day minute series into a truncated 8-hour "
+            "slice no analyzer may judge."
+            % (len(rows), view.caps, view.truncated))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_merged_sample_read_is_marked_only_when_rows_are_dropped(results):
+    tmp, conn, now = _view_store()
+    try:
+        a = _fake_module("a", ("a",), ("a_check",))
+        ctx = checks.Context(config_mod.Config({}), {}, {}, modules=(a,))
+        # Target "a" holds exactly two sample rows.
+        exact = module_view.ModuleView(
+            conn, a, ctx, {}, {"observe": True, "budget": {"rows": 2}},
+            now=now)
+        rows = exact.samples(now - 7 * 86400)
+        results.check(
+            "a merged read exactly at the budget is not marked truncated",
+            len(rows) == 2 and "samples" not in exact.truncated,
+            "rows=%d truncated=%r. An exact fit dropped nothing, and a false "
+            "truncation is indistinguishable from a real one to an analyzer."
+            % (len(rows), exact.truncated))
+        tight = module_view.ModuleView(
+            conn, a, ctx, {}, {"observe": True, "budget": {"rows": 1}},
+            now=now)
+        rows = tight.samples(now - 7 * 86400)
+        results.check(
+            "a merged read that drops rows is marked truncated",
+            len(rows) == 1 and tight.truncated.get("samples") is True,
+            "rows=%d truncated=%r" % (len(rows), tight.truncated))
     finally:
         conn.close()
         shutil.rmtree(tmp)
@@ -687,4 +802,8 @@ TESTS = (
     test_a_view_reads_only_its_own_rows,
     test_a_new_modules_window_is_its_own_history,
     test_logs_are_scoped_to_declared_targets_and_secrets_are_absent,
+    test_a_view_without_an_observe_grant_is_refused,
+    test_a_key_list_over_the_budget_is_marked_truncated,
+    test_the_row_budget_does_not_shrink_the_per_series_cap,
+    test_a_merged_sample_read_is_marked_only_when_rows_are_dropped,
 )

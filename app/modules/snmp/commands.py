@@ -68,6 +68,41 @@ def _device(cfg, name):
         % (name, ", ".join(d["name"] for d in cfg.devices) or "(none)"))
 
 
+def _refusal(ctx, args):
+    """A bad discover request, refused before the handler runs; None when usable.
+
+    It lives HERE, on the command, because the platform may not import a module
+    to check that module's arguments -- and because a handler exception is
+    audited as a FAILED run (a 500 at the HTTP boundary), while "that device
+    does not exist" is the request being wrong (422). No I/O: `SnmpConfig` only
+    parses the effective settings.
+    """
+    try:
+        cfg = _config(ctx)
+    except ValueError as exc:
+        return "the snmp settings cannot be read: %s" % exc
+    dev = next((d for d in cfg.devices if d["name"] == args.get("device")), None)
+    if dev is None:
+        return ("device %r is not configured; configured devices: %s"
+                % (args.get("device"),
+                   ", ".join(d["name"] for d in cfg.devices) or "(none)"))
+    if not dev["enabled"]:
+        return "device %r is disabled" % dev["name"]
+    if not dev["community"]:
+        return ("device %r has no community in SNMP_COMMUNITIES" % dev["name"])
+    raw = args.get("max_oids")
+    if raw not in (None, ""):
+        try:
+            if isinstance(raw, bool):
+                raise ValueError
+            max_oids = int(raw)
+        except (TypeError, ValueError):
+            return "max_oids must be a positive integer, got %r" % (raw,)
+        if max_oids < 1:
+            return "max_oids must be a positive integer, got %r" % (raw,)
+    return None
+
+
 def discover(ctx, args, dry_run=False):
     cfg = _config(ctx)
     dev = _device(cfg, str(args.get("device") or ""))
@@ -104,6 +139,7 @@ def commands():
         args=(cmdlib.Arg("device"), cmdlib.Arg("max_oids", required=False,
                                                default="2000")),
         danger="read_only",
+        validate=_refusal,
         # The device is validated in the handler because `commands()` has no
         # Context to read the configured names from. The resource is static, so
         # it is the whole device lock scope: a second walk of any device waits,

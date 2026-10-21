@@ -1198,8 +1198,14 @@ class Handler(BaseHTTPRequestHandler):
         """POST /modules/snmp/discover: walk a configured device, write nothing.
 
         `dispatch`, not `run`, so the module-enabled gate and the audit row are
-        the same ones every other command gets. The walk's community never
-        appears here: it is read from the settings inside the handler.
+        the same ones every other command gets. A BAD REQUEST is refused by the
+        command's own `validate` hook BEFORE the handler runs, so it stays a
+        `CommandError` (422) instead of being audited as a failed walk (500): a
+        typo must not read as "the fleet could not do it". A transport failure
+        after the walk has started is still a `CommandFailed` (500).
+
+        The walk's community never appears here: it is read from the settings
+        inside the handler.
         """
         if not isinstance(body, dict):
             self._error(422, "invalid_body",
@@ -1244,10 +1250,15 @@ class Handler(BaseHTTPRequestHandler):
         mod = self._snmp_module()
         if mod is None:
             return
+        rows = body.get("rows", [])
+        if not isinstance(rows, list):
+            self._error(422, "invalid_value",
+                        "rows must be a list of candidate rows", "SNMP_CHECKS")
+            return
         try:
             out = settingsapi.apply_discovery(
                 cfg, conn, mod, str(body.get("device") or ""),
-                body.get("rows") or [], "operator")
+                rows, "operator")
         except settingsapi.SettingsError as exc:
             self._error(422, exc.code, exc.message, exc.field)
             return

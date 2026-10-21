@@ -78,7 +78,7 @@ class Result:
 
 class Command:
     def __init__(self, id, title, handler, args=(), danger="read_only",
-                 resources=(), timeout_s=60):
+                 resources=(), timeout_s=60, validate=None):
         if danger not in ("read_only", "state_changing", "destructive"):
             raise ValueError("unknown danger %r" % danger)
         self.id = id
@@ -88,6 +88,13 @@ class Command:
         self.danger = danger
         self.resources = tuple(resources)
         self.timeout_s = timeout_s
+        # A REQUEST refused before the handler runs, `(ctx, args) -> why or None`.
+        # The handler cannot express this distinction: `dispatch` audits every
+        # handler exception as a FAILED run (500 at the HTTP boundary), so a
+        # request the operator merely mistyped would read as "the fleet did not
+        # do it". A validator lives on the COMMAND, in the module that knows what
+        # its arguments mean, so the platform never imports a module to check one.
+        self.validate = validate
 
 
 def call_bounded(fn, timeout_s):
@@ -204,6 +211,13 @@ def dispatch(module, cmd, argv, actor="operator", dry_run=False, conn=None,
     if not module_enabled:
         raise CommandError("module is disabled; command %r refused" % cmd.id)
     args = _validated(cmd, argv)
+    # BEFORE the try and before any audit row: a bad request is a refusal, not
+    # a handler failure. OUTSIDE the `reserve` lock, because refusing needs no
+    # resource -- a mistyped device must not wait behind a running walk.
+    if cmd.validate is not None:
+        why = cmd.validate(ctx, args)
+        if why:
+            raise CommandError(why)
     t0 = time.time()
     # THE HANDLER RUNS INSIDE THE LOCK'S try, so a handler exception propagates
     # through reserve and its `finally` is what releases the resource. (Caught

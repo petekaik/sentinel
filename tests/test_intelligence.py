@@ -1443,16 +1443,22 @@ def test_discover_refuses_an_unknown_device_and_never_walks(results):
     mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
     cfg = config_mod.Config({"SNMP_DEVICES": "[]", "SNMP_TIMEOUT_S": "1"})
     ctx = checks.Context(cfg, {}, {}, modules=(mod,))
-    try:
-        cmdlib.run(mod, "discover", {"device": "ghost"}, ctx=ctx)
-    except cmdlib.CommandError as exc:
-        results.check(
-            "an unconfigured device is refused before any walk",
-            "ghost" in str(exc) and "configured" in str(exc),
-            "got %r" % (exc,))
-    else:
-        results.check("an unconfigured device is refused", False,
-                      "discover accepted a device that is not configured")
+    with mock.patch("modules.snmp.snmp.walk") as walk:
+        try:
+            cmdlib.run(mod, "discover", {"device": "ghost"}, ctx=ctx)
+        except cmdlib.CommandError as exc:
+            results.check(
+                "an unconfigured device is refused before any walk",
+                "ghost" in str(exc) and "configured" in str(exc),
+                "got %r" % (exc,))
+        else:
+            results.check("an unconfigured device is refused", False,
+                          "discover accepted a device that is not configured")
+    results.check(
+        "the refused device is never walked",
+        not walk.called,
+        "walk called %d time(s) for an unconfigured device"
+        % (walk.call_count,))
 
 
 def test_discover_labels_an_interface_from_the_walk(results):
@@ -1548,6 +1554,19 @@ def test_the_discover_routes_walk_and_refuse_an_unknown_device(results):
             "POST /modules/snmp/discover returns labelled candidates",
             status == 200 and "Interface lan1" in labels,
             "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "POST", "/api/v1/modules/snmp/discover",
+                             {"device": "typo"}, token="tok")
+        results.check(
+            "a misspelt device is a 422 at the route, not a 500",
+            status == 422 and "configured" in json.dumps(body),
+            "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "POST", "/api/v1/modules/snmp/discover",
+                             {"device": "sw1", "max_oids": "abc"},
+                             token="tok")
+        results.check(
+            "a non-numeric max_oids is a 422, not a 500",
+            status == 422 and "max_oids" in json.dumps(body),
+            "status=%r body=%r" % (status, body))
         status, body = _http(cfg, "POST",
                              "/api/v1/modules/snmp/discover/apply",
                              {"device": "ghost", "rows": []}, token="tok")
@@ -1555,6 +1574,15 @@ def test_the_discover_routes_walk_and_refuse_an_unknown_device(results):
             "an apply against an unconfigured device is a 422, not a 500",
             status == 422
             and (body.get("error") or {}).get("code") == "invalid_value",
+            "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "POST",
+                             "/api/v1/modules/snmp/discover/apply",
+                             {"device": "sw1", "rows": 5}, token="tok")
+        results.check(
+            "a non-list rows value is a 422 naming the field, not a 500",
+            status == 422
+            and (body.get("error") or {}).get("code") == "invalid_value"
+            and (body.get("error") or {}).get("field") == "SNMP_CHECKS",
             "status=%r body=%r" % (status, body))
     finally:
         shutil.rmtree(tmp)

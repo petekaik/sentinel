@@ -2769,11 +2769,23 @@ def test_an_enabled_detector_emits_only_insights(results):
         evidence = json.loads(conn.execute(
             "SELECT evidence_json FROM insight WHERE kind='anomaly'"
         ).fetchone()[0])
+        window = evidence.get("window") or {}
         results.check(
             "the insight states the statistic, the window and the sample count",
             evidence.get("statistic", {}).get("samples") == 46
-            and "window" in evidence,
+            and "span_days" in window,
             "evidence=%r" % (evidence,))
+        results.check(
+            "the window falls back to a fixed 7 days with no advisor ask",
+            window.get("requested_days") == 7
+            and window.get("available_days") is not None,
+            "window=%r" % (window,))
+        usage = [dict(r) for r in conn.execute(
+            "SELECT module, insights FROM intelligence_usage")]
+        results.check(
+            "the anomaly is counted in the cycle's usage",
+            any(r["module"] == "fleet" and r["insights"] >= 1 for r in usage),
+            "usage=%r" % (usage,))
     finally:
         conn.close()
         shutil.rmtree(tmp)
@@ -2825,6 +2837,159 @@ def test_a_truncated_series_is_skipped_and_counted(results):
         results.check(
             "the skipped series is counted, not silently dropped",
             any("skipped 1 truncated series" in n for n in ctx.notes),
+            "notes=%r" % (ctx.notes,))
+        evidence = json.loads(conn.execute(
+            "SELECT evidence_json FROM insight WHERE kind='anomaly'"
+        ).fetchone()[0])
+        results.check(
+            "the complete series' insight carries none of the skipped "
+            "series' truncation flags",
+            evidence.get("truncated") == {},
+            "evidence=%r" % (evidence,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_anomaly_pass_is_capped_and_says_so(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+        specs = harness.load_specs(cfg)
+        # The `fleet` target is declared by the fleet module alone, so these
+        # synthetic metrics are owned by it and each is its own series.
+        for i in range(25):
+            store.record_sample(conn, 1, "fleet", "probe_metric_%02d" % i,
+                                value=1.0)
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, specs, {}, modules=mods)
+        seen = []
+        real_detect = intelligence_layer.anomaly.detect
+
+        def _spy(points, *args, **kwargs):
+            seen.append(len(points))
+            return real_detect(points, *args, **kwargs)
+
+        with mock.patch.object(intelligence_layer.anomaly, "detect", _spy):
+            intelligence_layer.run_cycle(cfg, conn, ctx, now=time.time())
+        results.check(
+            "the anomaly pass stops at the series cap",
+            len(seen) == intelligence_layer.ANOMALY_MAX_SERIES,
+            "detect ran for %d series" % (len(seen),))
+        results.check(
+            "the capped pass is recorded, not silent",
+            any("capped at %d series" % intelligence_layer.ANOMALY_MAX_SERIES
+                in n for n in ctx.notes),
+            "notes=%r" % (ctx.notes,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_anomaly_row_cap_stops_the_pass(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+        specs = harness.load_specs(cfg)
+        for name in ("probe_a", "probe_b", "probe_c"):
+            for i in range(21):
+                store.record_sample(conn, 1, "fleet", name, value=float(i))
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, specs, {}, modules=mods)
+        seen = []
+        real_detect = intelligence_layer.anomaly.detect
+
+        def _spy(points, *args, **kwargs):
+            seen.append(len(points))
+            return real_detect(points, *args, **kwargs)
+
+        with mock.patch.object(intelligence_layer, "ANOMALY_MAX_ROWS", 25), \
+                mock.patch.object(intelligence_layer.anomaly, "detect", _spy):
+            intelligence_layer.run_cycle(cfg, conn, ctx, now=time.time())
+        results.check(
+            "the anomaly pass stops at the row cap",
+            len(seen) == 2, "detect ran for %d series" % (len(seen),))
+        results.check(
+            "the row-capped pass is recorded, not silent",
+            any("capped at 25 rows" in n for n in ctx.notes),
+            "notes=%r" % (ctx.notes,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_truncated_key_list_skips_the_pass_with_a_reason(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+        specs = harness.load_specs(cfg)
+        for name in ("probe_a", "probe_b"):
+            store.record_sample(conn, 1, "fleet", name, value=1.0)
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, specs, {}, modules=mods)
+        real_init = module_view.ModuleView.__init__
+        seen = []
+        real_detect = intelligence_layer.anomaly.detect
+
+        def _cap_one_key(self, *args, **kwargs):
+            real_init(self, *args, **kwargs)
+            self.caps["rows"] = 1
+
+        def _spy(points, *args, **kwargs):
+            seen.append(list(points))
+            return real_detect(points, *args, **kwargs)
+
+        with mock.patch.object(module_view.ModuleView, "__init__",
+                               _cap_one_key), \
+                mock.patch.object(intelligence_layer.anomaly, "detect", _spy):
+            intelligence_layer.run_cycle(cfg, conn, ctx, now=time.time())
+        results.check(
+            "a truncated key list reads no series at all",
+            seen == [], "detect saw %r series" % (len(seen),))
+        results.check(
+            "the skipped pass names the truncated key list",
+            any("sample key list is truncated" in n for n in ctx.notes),
+            "notes=%r" % (ctx.notes,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_one_unscorable_series_does_not_abort_the_pass(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_ANOMALY="1")
+        specs = harness.load_specs(cfg)
+        for i in range(22):
+            store.record_sample(conn, 1, "fleet", "probe_bad", value=7.0)
+        for i in range(22):
+            store.record_sample(conn, 1, "fleet", "probe_good", value=10.0)
+        store.record_sample(conn, 1, "fleet", "probe_good", value=99.0)
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, specs, {}, modules=mods)
+        real_detect = intelligence_layer.anomaly.detect
+
+        def _flaky(points, *args, **kwargs):
+            if points[0][1] == 7.0:
+                raise ValueError("a value the detector cannot read")
+            return real_detect(points, *args, **kwargs)
+
+        with mock.patch.object(intelligence_layer.anomaly, "detect", _flaky):
+            out = intelligence_layer.run_cycle(cfg, conn, ctx, now=time.time())
+        titles = [r["title"] for r in conn.execute(
+            "SELECT title FROM insight WHERE kind='anomaly'")]
+        results.check(
+            "one unscorable series is counted, not a cycle error",
+            out["status"] == "ok" and len(titles) == 1
+            and "probe_good" in titles[0],
+            "status=%r titles=%r" % (out["status"], titles))
+        results.check(
+            "the unscorable series is reported",
+            any("could not score 1 series" in n for n in ctx.notes),
             "notes=%r" % (ctx.notes,))
     finally:
         conn.close()
@@ -2882,6 +3047,10 @@ TESTS = (
     test_anomaly_detection_is_off_by_default,
     test_an_enabled_detector_emits_only_insights,
     test_a_truncated_series_is_skipped_and_counted,
+    test_the_anomaly_pass_is_capped_and_says_so,
+    test_the_anomaly_row_cap_stops_the_pass,
+    test_a_truncated_key_list_skips_the_pass_with_a_reason,
+    test_one_unscorable_series_does_not_abort_the_pass,
     test_the_global_switch_stops_the_cycle,
     test_a_second_skipped_cycle_inside_the_interval_returns_none,
     test_each_granted_modules_report_survives_the_dedupe,

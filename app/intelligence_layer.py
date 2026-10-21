@@ -32,6 +32,13 @@ import store
 INSIGHT_KINDS = ("anomaly", "diagnosis", "threshold_suggestion", "report")
 # Kinds that carry a CHANGE, so they must name values a human could approve.
 AUTHOR_KINDS = ("check_set", "settings_change", "threshold_change")
+# THE ANOMALY PASS IS BOUNDED LIKE EVERY OTHER READ IN THIS LAYER. One series
+# can be 20,000 rows (two weeks of minute samples); materialising 200 of them
+# as Python dicts measured 43.5 s for ~40 series against a 30 s cycle budget.
+# The pass stops at 20 series or 10,000 rows read, whichever comes first, and
+# says so -- a capped pass is not "no anomalies in the fleet".
+ANOMALY_MAX_SERIES = 20
+ANOMALY_MAX_ROWS = 10000
 
 
 def resolve_grants(cfg, modules):
@@ -708,17 +715,42 @@ def run_cycle(cfg, conn, ctx, now=None):
         # 2026-10-21-anomaly-result.md). It writes insights only: no check
         # status, no incident, no threshold changes.
         if getattr(cfg, "intelligence_anomaly", False):
+            series_read = rows_read = 0
+            capped = ""
             for mod in modules:
+                if capped:
+                    break
                 view = views.get(mod.id)
                 if view is None:
                     continue
-                since = view.now - min(view.requested_days or 7,
-                                       max_days) * advisors.DAY
-                skipped = 0
-                for target, metric in view.sample_keys(since)[:200]:
+                # THE WINDOW DOES NOT DEPEND ON WHETHER AN ADVISOR RAN FIRST:
+                # `requested_days` is 0 when no advisor set it, and the fixed
+                # fallback is 7 days -- never the whole store. The span cited
+                # below is the SERIES' own span, measured from its points, so
+                # the evidence states what was read rather than what was asked.
+                days = min(view.requested_days or 7, max_days)
+                since = view.now - days * advisors.DAY
+                keys = view.sample_keys(since)
+                # A TRUNCATED KEY LIST IS NOT THE WHOLE MODULE. The read
+                # dropped pairs, so a pass over it could only report "no
+                # anomaly" about a list nobody saw.
+                if view.truncated.get("sample_keys"):
+                    ctx.note("anomaly: skipped %s, its sample key list is "
+                             "truncated" % mod.id)
+                    continue
+                skipped = unscorable = 0
+                for target, metric in keys:
+                    if series_read >= ANOMALY_MAX_SERIES:
+                        capped = "capped at %d series" % ANOMALY_MAX_SERIES
+                        break
+                    if rows_read >= ANOMALY_MAX_ROWS:
+                        capped = "capped at %d rows" % ANOMALY_MAX_ROWS
+                        break
                     series = view.sample_series(
                         since, target, metric,
                         limit=view.caps["sample_rows"])
+                    series_read += 1
+                    rows_read += len(series)
                     # NEVER REASON FROM A TRUNCATED SERIES. A read that hit
                     # `sample_rows` is a slice with its oldest rows dropped, so
                     # it is not the window the insight would claim. Count it
@@ -728,9 +760,17 @@ def run_cycle(cfg, conn, ctx, now=None):
                         skipped += 1
                         continue
                     points = [(r["ts"], r["value"]) for r in series]
-                    found = anomaly.detect(points)
+                    try:
+                        found = anomaly.detect(points)
+                    except Exception:              # noqa: BLE001 - one series
+                        # ONE UNSCORABLE SERIES IS NOT THE PASS. A bad value
+                        # must not abort the rest before the model call.
+                        unscorable += 1
+                        continue
                     if found is None:
                         continue
+                    span = round((points[-1][0] - points[0][0])
+                                 / advisors.DAY, 2)
                     insight = advisors.Insight(
                         module=mod.id, kind="anomaly",
                         title="%s %s: %s" % (target, metric, found["kind"]),
@@ -748,12 +788,27 @@ def run_cycle(cfg, conn, ctx, now=None):
                         evidence={
                             "statistic": found,
                             "window": {
-                                "requested_days": view.requested_days,
-                                "available_days": view.available_days}})
+                                "requested_days": days,
+                                # The history this series actually covers,
+                                # not the ask and not a check-run window.
+                                "available_days": span,
+                                "span_days": span},
+                            # NAMED (EMPTY) FOR THIS SERIES, so `_record`'s
+                            # setdefault cannot attach every truncation in the
+                            # module to this insight.
+                            "truncated": {}})
                     advisors.record(conn, "anomaly", insight, view)
+                    row = usage.setdefault(mod.id, {})
+                    row["insights"] = int(row.get("insights") or 0) + 1
                 if skipped:
                     ctx.note("anomaly: skipped %d truncated series for %s"
                              % (skipped, mod.id))
+                if unscorable:
+                    ctx.note("anomaly: could not score %d series for %s"
+                             % (unscorable, mod.id))
+            if capped:
+                ctx.note("anomaly pass %s; the rest of the fleet's series "
+                         "were not scored" % capped)
         proposals = propose_thresholds(cfg, conn, ctx, runs)
     except Exception as exc:
         ctx.note("intelligence cycle failed: %s" % exc)

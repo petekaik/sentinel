@@ -111,7 +111,18 @@ unmeasured detector must not ship enabled.
 A series whose read hit `sample_rows` is recorded in `view.truncated` and is
 **skipped and counted** (the cycle note names the module and the count), never
 scored: a slice with its oldest rows dropped is not the window an insight would
-claim.
+claim. The same rule skips a module whose **sample key list** was truncated —
+that read dropped pairs, so a pass over it could only report "no anomaly" about
+a list nobody saw.
+
+The pass is **bounded per cycle** at 20 series or 10,000 rows read, whichever
+comes first, and the cycle note says which cap stopped it. One series can be
+20,000 rows (two weeks of minute samples); materialising 200 of them measured
+43.5 s for ~40 series against a 30 s cycle budget. One series the detector
+cannot read is counted and skipped rather than aborting the pass, and every
+insight counts in `intelligence_usage.insights`. The window falls back to a
+fixed 7 days when no advisor resolved one, and the evidence cites the series'
+own measured span rather than the ask.
 
 ## Verification
 
@@ -121,17 +132,20 @@ claim.
 ./test.sh           -> 1196 checks, 0 failed (baseline was 1187; +9 from this suite)
 ```
 
-Task 22 added the switch and its seven checks to the intelligence suite:
+Task 22 added the switch and its checks to the intelligence suite:
 
 ```text
-./test.sh intelligence -> 197 checks, 0 failed
-./test.sh              -> 1203 checks, 0 failed (1196 + 7)
+./test.sh intelligence -> 208 checks, 0 failed
+./test.sh              -> 1214 checks, 0 failed (1196 + 18)
 ```
 
-The three truncation-guard checks (`a truncated series never reaches detect`,
-`only the complete series produced an anomaly`, `the skipped series is counted`)
-all go red when the guard is disabled, so they pin the behaviour rather than
-re-describe it.
+The truncation-guard checks go red when the guard is disabled; the cap and
+key-list checks go red when their bounds are removed; the evidence check goes
+red when the per-series `truncated` map is not pre-set (the module-wide map is
+attached instead); the isolation check goes red when `detect` is not wrapped
+(a bad series turns the whole cycle into `error`); the usage check goes red
+when the insight counter is dropped. Each guard's test has been mutation-run,
+so they pin behaviour rather than re-describe it.
 
 The harness run itself writes nothing: the suite compares the store's bytes
 before and after `score_store`. Usage errors (missing `--db`, non-positive

@@ -172,6 +172,46 @@ class ModuleView(advisors.Snapshot):
                 % (target, self.module_id))
         return super().logs(target, since, limit)
 
+    def summaries(self, since, max_rows=200):
+        """One bounded, JSON-ready pack for the model: evidence, no secrets.
+
+        `max_rows` bounds the check-run and incident reads. The window fields
+        are whatever `window()` last resolved -- the pack reports the history
+        that exists, not the history the model would like.
+        """
+        runs = self.check_runs(since, limit=max_rows)
+        incidents = self.incidents(since, limit=max_rows)
+        series = []
+        for target, metric in self.sample_keys(since)[:max_rows]:
+            stats = self.sample_stats(since, target, metric)
+            if stats:
+                series.append({"target": target, "metric": metric,
+                               "count": stats["count"],
+                               "percentile": stats["percentile"],
+                               "span_days": round(
+                                   (stats["max_ts"] - stats["min_ts"])
+                                   / advisors.DAY, 2)})
+        payload = {"module": self.module_id, "targets": list(self.targets),
+                   "window": {"requested_days": self.requested_days,
+                              "available_days": self.available_days},
+                   "checks": [dict(r) for r in runs],
+                   "series": series,
+                   "incidents": incidents,
+                   "settings": dict(self.module_settings),
+                   "specs": {sid: {"metric": s.metric, "unit": s.unit,
+                                  "direction": s.direction, "green": s.green,
+                                  "amber": s.amber}
+                             for sid, s in self.specs.items()}}
+        logs = []
+        for target in self.targets:
+            try:
+                logs.extend(self.logs(target, since, limit=200))
+            except KeyError:
+                continue
+        if logs:
+            payload["logs"] = logs
+        return payload
+
 
 def _settings_for(mod, ctx):
     """The module's non-secret settings, typed. Secrets never enter a view."""

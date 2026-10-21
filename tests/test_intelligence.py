@@ -25,6 +25,7 @@ import config as config_mod                       # noqa: E402
 import ctl                                        # noqa: E402
 import heal                                       # noqa: E402
 import intelligence_layer                         # noqa: E402
+import llm_advisor                                # noqa: E402
 import main as main_mod                           # noqa: E402
 import module                                     # noqa: E402
 import module_view                                # noqa: E402
@@ -1732,6 +1733,430 @@ def test_the_discover_routes_walk_and_refuse_an_unknown_device(results):
         shutil.rmtree(tmp)
 
 
+class _FakeModel:
+    """The one transport the advisor may use, replaced for the offline suite."""
+
+    calls = []
+    content = "{}"
+    error = None
+
+    def __init__(self, endpoint, key="", model="", timeout_s=30):
+        self.endpoint = endpoint
+
+    def complete(self, system, user):
+        _FakeModel.calls.append({"system": system, "user": user})
+        if _FakeModel.error is not None:
+            raise _FakeModel.error
+        return (_FakeModel.content, 11, 7)
+
+
+# Present in the journal line `_model_views` records and in the secret
+# SNMP_COMMUNITIES map, so a request that carries either is a leak.
+MODEL_CANARY = "comm-canary-77"
+
+
+def _model_views(selector="llm", **env):
+    tmp, conn = _grant_store()
+    # A check row first: a view's window starts at its module's oldest row,
+    # and with none `since` is `now` -- which would put a journal line
+    # recorded a moment earlier OUTSIDE the pack and make every canary check
+    # pass because the secret was never sent.
+    store.record_check(conn, 1, "cubox-1", "host_unreachable", "ok",
+                       "reachable", subject="cubox-1")
+    for _ in range(2):
+        store.record_check(conn, 1, "cubox-1", "host_unreachable", "ok",
+                           "reachable", subject="cubox-1")
+    store.record_journal(conn, "cubox-1", "cursor-1", time.time(),
+                         "worker", 6,
+                         "worker read community %s" % MODEL_CANARY)
+    base = dict(
+        FLEET_INTELLIGENCE='{"observe": true, "author": "auto", '
+                           '"remediate": true}',
+        SNMP_INTELLIGENCE='{"observe": true, "author": "auto"}',
+        SNMP_COMMUNITIES=json.dumps({"sw1": MODEL_CANARY}),
+        SENTINEL_ADVISORS=selector,
+        SENTINEL_LLM_PROVIDER="openai",
+        SENTINEL_LLM_ENDPOINT="http://127.0.0.1:1",
+        SENTINEL_LLM_KEY="canary-key-123",
+        SENTINEL_LLM_MODEL="probe")
+    base.update(env)
+    cfg = _cycle_cfg(**base)
+    mods = tuple(module_loader.discover())
+    ctx = checks.Context(cfg, {}, {}, modules=mods)
+    views = {}
+    for mod in mods:
+        if mod.id not in ("fleet", "snmp"):
+            continue
+        grant, _ = cfg.intelligence_grant(mod.id, tuple(mod.intelligence))
+        views[mod.id] = module_view.ModuleView(conn, mod, ctx, {}, grant,
+                                              now=time.time())
+    return tmp, conn, cfg, ctx, views
+
+
+def _reset_model(content="{}", error=None):
+    _FakeModel.calls = []
+    _FakeModel.content = content
+    _FakeModel.error = error
+
+
+def test_the_pack_is_one_request_and_never_leaks_a_secret(results):
+    # Build two views over a store with a canary secret in a journal line and
+    # in the SNMP community map.
+    tmp, conn = _grant_store()
+    try:
+        canary = "comm-canary-42"
+        store.record_check(conn, 1, "cubox-1", "host_unreachable", "ok",
+                           "reachable", subject="cubox-1")
+        # `time.time()`, not `int(...)`: the check row above sets the view's
+        # `since` to its float timestamp, and an integer-truncated journal ts
+        # can fall a fraction of a second BEFORE it -- putting the canary line
+        # outside the pack and making the secret check vacuous.
+        store.record_journal(conn, "cubox-1", "cursor-1", time.time(),
+                             "worker", 6,
+                             "worker read community %s" % canary)
+        cfg = _cycle_cfg(
+            FLEET_INTELLIGENCE='{"observe": true}',
+            SNMP_INTELLIGENCE='{"observe": true}',
+            SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+            SNMP_COMMUNITIES=json.dumps({"sw1": canary}),
+            SENTINEL_LLM_PROVIDER="openai",
+            SENTINEL_LLM_ENDPOINT="http://127.0.0.1:1",
+            SENTINEL_LLM_KEY="canary-key-123",
+            SENTINEL_LLM_MODEL="probe")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        views, used = {}, []
+        for mod in mods:
+            if mod.id not in ("fleet", "snmp"):
+                continue
+            grant, _ = cfg.intelligence_grant(mod.id, tuple(mod.intelligence))
+            views[mod.id] = module_view.ModuleView(
+                conn, mod, ctx, {}, grant, now=time.time())
+            used.append(mod.id)
+        system, user, usage = intelligence_layer.pack_views(
+            views, {m: cfg.intelligence_grant(m, ())[0] for m in used}, 16000)
+        text = system + "\n" + user
+        results.check(
+            "the pack names every granted module",
+            all(m in user for m in used) and "ghost" not in user,
+            "user=%r" % (user[:500],))
+        results.check(
+            "the canary line reached the pack and was redacted",
+            "[redacted]" in user,
+            "the journal line never reached the pack, so the check below "
+            "would pass vacuously. user=%r" % (user[:500],))
+        results.check(
+            "the canary community and key are absent from the request",
+            canary not in text and "canary-key-123" not in text,
+            "a secret reached the request body")
+        results.check(
+            "the request reports a per-module token estimate",
+            all(m in (usage or {}) for m in used),
+            "usage=%r" % (usage,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_model_output_naming_an_ungranted_module_is_dropped(results):
+    # One granted view; the output also names "ghost". The validator must drop
+    # the ghost item and count it, not silently store it.
+    payload = {"insights": [
+        {"module": "fleet", "kind": "report", "title": "t", "body": "b"},
+        {"module": "ghost", "kind": "report", "title": "t", "body": "b"}],
+        "proposals": []}
+    kept, props, dropped = intelligence_layer.validate_model_output(
+        payload, {"fleet": object()}, {"fleet": {"observe": True}})
+    results.check("an ungranted module's item is dropped and counted",
+                  len(kept) == 1 and dropped["ghost"] == 1,
+                  "kept=%r dropped=%r" % (kept, dropped))
+
+
+def test_advise_views_makes_one_request_and_counts_tokens(results):
+    tmp, conn, cfg, ctx, views = _model_views()
+    try:
+        _reset_model(json.dumps({"insights": [], "proposals": []}))
+        adv = llm_advisor.LlmAdvisor("openai", cfg.llm_endpoint,
+                                     cfg.llm_key, cfg.llm_model)
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            out = adv.advise_views(ctx, views, cfg)
+        results.check(
+            "one request carries every granted view",
+            len(_FakeModel.calls) == 1
+            and all(m in _FakeModel.calls[0]["user"] for m in views),
+            "calls=%r" % (_FakeModel.calls,))
+        results.check(
+            "the token counts are the response's, not an estimate",
+            out["tokens_in"] == 11 and out["tokens_out"] == 7,
+            "out=%r" % (out,))
+        results.check(
+            "the key and the canary community are in no request field",
+            "canary-key-123" not in json.dumps(_FakeModel.calls)
+            and MODEL_CANARY not in json.dumps(_FakeModel.calls)
+            and "[redacted]" in _FakeModel.calls[0]["user"],
+            "calls=%r. The redaction marker proves the journal line was "
+            "sent, so the absence above is not a vacuous pass."
+            % (_FakeModel.calls,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_non_openai_provider_is_a_model_error(results):
+    tmp, conn, cfg, ctx, views = _model_views()
+    try:
+        _reset_model()
+        adv = llm_advisor.LlmAdvisor("anthropic", cfg.llm_endpoint,
+                                     cfg.llm_key, cfg.llm_model)
+        try:
+            with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+                adv.advise_views(ctx, views, cfg)
+        except llm_advisor.ModelError as exc:
+            results.check(
+                "a provider this transport cannot speak is refused, naming it",
+                "anthropic" in str(exc) and not _FakeModel.calls,
+                "error=%r calls=%r" % (exc, _FakeModel.calls))
+        else:
+            results.check("a non-openai provider is refused", False,
+                          "advise_views returned without calling anything")
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_transport_failure_raises_model_error(results):
+    tmp, conn, cfg, ctx, views = _model_views()
+    try:
+        _reset_model(error=llm_advisor.ModelError(
+            "the model endpoint timed out or was unreachable"))
+        adv = llm_advisor.LlmAdvisor("openai", cfg.llm_endpoint,
+                                     cfg.llm_key, cfg.llm_model)
+        try:
+            with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+                adv.advise_views(ctx, views, cfg)
+        except llm_advisor.ModelError as exc:
+            results.check(
+                "a transport failure is a ModelError the cycle can record",
+                "timed out" in str(exc) and "canary-key-123" not in str(exc),
+                "error=%r" % (exc,))
+        else:
+            results.check("a transport failure raises", False,
+                          "advise_views swallowed the failure")
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_validation_resolves_citations_lanes_and_live_incidents(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        key = store.incident_key("cubox-1", "state_dir_tmpfs", "cubox-1")
+        store.sync_incident(conn, 1, "cubox-1", "state_dir_tmpfs", "cubox-1",
+                            store.Status.FAIL, "state dir on tmpfs")
+        grants = {"fleet": {"observe": True, "author": "off",
+                            "remediate": False},
+                  "snmp": {"observe": True, "author": "off",
+                           "remediate": False}}
+        payload = {
+            "insights": [
+                {"module": "fleet", "kind": "diagnosis", "title": "t",
+                 "body": "b", "target": "cubox-1",
+                 "check_id": "host_unreachable", "subject": "cubox-1"},
+                {"module": "fleet", "kind": "diagnosis", "title": "t",
+                 "body": "b", "target": "elsewhere"},
+                {"module": "fleet", "kind": "diagnosis", "title": "t",
+                 "body": "b", "check_id": "not_mine"},
+                {"module": "fleet", "kind": "diagnosis", "title": "t",
+                 "body": "b", "subject": "nobody"},
+                {"module": "snmp", "kind": "report", "title": "t",
+                 "body": "b", "target": "snmp"}],
+            "proposals": [
+                {"module": "fleet", "kind": "settings_change",
+                 "payload": {"CUBOX_IDS": "cubox-1"}},
+                {"module": "fleet", "kind": "action",
+                 "payload": {"action_id": "state_mount_cycle",
+                             "incident_key": key}},
+                {"module": "fleet", "kind": "action",
+                 "payload": {"action_id": "no_such_action",
+                             "incident_key": key}},
+                {"module": "ghost", "kind": "settings_change",
+                 "payload": {}}]}
+        kept, props, dropped = intelligence_layer.validate_model_output(
+            payload, views, grants, conn=conn)
+        results.check(
+            "a citation outside the view is dropped: target, check and subject",
+            [i.get("target") or i.get("check_id") or i.get("subject")
+             for i in kept] == ["cubox-1", "snmp"],
+            "kept=%r dropped=%r" % (kept, dropped))
+        results.check(
+            "the lane decides: author off drops a settings change, "
+            "remediate off drops an action",
+            props == [] and dropped.get("fleet") == 6,
+            "props=%r dropped=%r" % (props, dropped))
+        results.check("the ungranted module is counted, not stored",
+                      dropped.get("ghost") == 1,
+                      "dropped=%r" % (dropped,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_cycle_makes_one_model_call_and_stores_proposals(results):
+    tmp, conn, cfg, ctx, views = _model_views()
+    try:
+        key = store.incident_key("cubox-1", "state_dir_tmpfs", "cubox-1")
+        store.sync_incident(conn, 1, "cubox-1", "state_dir_tmpfs", "cubox-1",
+                            store.Status.FAIL, "state dir on tmpfs")
+        _reset_model(json.dumps({
+            "insights": [
+                {"module": "fleet", "kind": "diagnosis",
+                 "title": "State mount", "body": "The state dir is tmpfs.",
+                 "target": "cubox-1", "check_id": "state_dir_tmpfs",
+                 "subject": "cubox-1"},
+                {"module": "fleet", "kind": "diagnosis", "title": "t",
+                 "body": "b", "target": "elsewhere"},
+                {"module": "ghost", "kind": "report", "title": "t",
+                 "body": "b"}],
+            "proposals": [
+                {"module": "snmp", "kind": "settings_change",
+                 "payload": {"SNMP_TIMEOUT_S": 5},
+                 "rationale": "raise the per-request timeout"},
+                {"module": "fleet", "kind": "action",
+                 "payload": {"action_id": "state_mount_cycle",
+                             "incident_key": key, "auto_execute": True},
+                 "rationale": "cycle the state mount"}]}))
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        row = store.last_intelligence_cycle(conn)
+        results.check(
+            "the cycle records exactly one model call and its tokens",
+            out["status"] == "ok" and row["model_calls"] == 1
+            and row["tokens_in"] == 11 and row["tokens_out"] == 7,
+            "out=%r row=%r" % (out, row and dict(row)))
+        stored = [dict(r) for r in conn.execute(
+            "SELECT target, body FROM insight WHERE advisor = 'llm'")]
+        results.check(
+            "only the cited insight is stored",
+            [r["target"] for r in stored] == ["cubox-1"],
+            "stored=%r" % (stored,))
+        usage = {r["module"]: r for r in
+                 store.list_intelligence_usage(conn, out["cycle_id"])}
+        results.check(
+            "invalid items are dropped and counted per module",
+            usage.get("fleet", {}).get("dropped") == 1
+            and usage.get("ghost", {}).get("dropped") == 1,
+            "usage=%r" % (usage,))
+        props = [store.get_proposal(conn, pid) for pid in out["proposals"]]
+        settings = [p for p in props if p and p["kind"] == "settings_change"]
+        actions = [p for p in props if p and p["kind"] == "action"]
+        sp = json.loads(settings[0]["payload_json"]) if settings else {}
+        ap = json.loads(actions[0]["payload_json"]) if actions else {}
+        results.check(
+            "a settings change is a pending human proposal with its diff",
+            len(settings) == 1 and settings[0]["state"] == "pending"
+            and sp.get("classification") == "modification"
+            and sp.get("requires_human") is True and sp.get("diff"),
+            "payload=%r" % (sp,))
+        results.check(
+            "an action is a pending proposal and NEVER auto-executed",
+            len(actions) == 1 and actions[0]["state"] == "pending"
+            and ap.get("requires_human") is True
+            and ap.get("action_id") == "state_mount_cycle"
+            and "auto_execute" not in ap,
+            "payload=%r" % (ap,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_model_failure_keeps_the_deterministic_runs_and_is_red(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="reference,llm")
+    try:
+        _reset_model(error=llm_advisor.ModelError(
+            "the model endpoint timed out or was unreachable"))
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        row = store.last_intelligence_cycle(conn)
+        results.check(
+            "an unreachable model is an error cycle, never an empty green one",
+            out["status"] == "error" and row["status"] == "error"
+            and row["model_calls"] == 1
+            and "timed out" in ctx.module_errors.get("intelligence", ""),
+            "out=%r row=%r errors=%r"
+            % (out, row and dict(row), ctx.module_errors))
+        results.check(
+            "the deterministic runs are kept",
+            conn.execute("SELECT COUNT(*) FROM advisor_run WHERE "
+                         "advisor = 'reference' AND status = 'ok'"
+                         ).fetchone()[0] >= 1,
+            "the model failure must not discard what the advisors found")
+        results.check(
+            "the key is in no cycle row and no error text",
+            "canary-key-123" not in (row["detail"] or "")
+            and "canary-key-123" not in json.dumps(ctx.module_errors),
+            "the credential reached the store")
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_selector_accepts_the_configured_llm_advisor(results):
+    tmp, conn, cfg, ctx, views = _model_views()
+    try:
+        _reset_model(json.dumps({"insights": [], "proposals": []}))
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            intelligence_layer.run_cycle(cfg, conn, ctx)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT advisor, status FROM advisor_run")]
+        results.check(
+            "a configured platform advisor is not a selector typo",
+            rows == [] and not any("selector names no advisor" in n
+                                   for n in ctx.notes),
+            "rows=%r notes=%r. `declared` must be seeded from the platform "
+            "advisors, or every cycle writes a false error row." % (
+                rows, ctx.notes))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_the_pack_obeys_the_row_budget_and_reduces_deterministically(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        grants = {m: cfg.intelligence_grant(m, ())[0] for m in views}
+        _, full, usage_full = intelligence_layer.pack_views(
+            views, grants, 16000)
+        tight = {m: {"observe": True, "author": "off", "remediate": False,
+                     "budget": {"rows": 1, "bytes": 32768, "tokens": 2000}}
+                 for m in views}
+        _, bounded, _ = intelligence_layer.pack_views(views, tight, 16000)
+        fleet_json = bounded.split("MODULE fleet\n", 1)[1].split(
+            "\n\nMODULE ", 1)[0]
+        results.check(
+            "the grant's row budget bounds the summary",
+            len(json.loads(fleet_json)["checks"]) == 1
+            and full.count('"check_id"') > 1,
+            "bounded=%r. Without the budget the pack carries every row."
+            % (fleet_json[:300],))
+        target = sum(v for v in usage_full.values()
+                     if isinstance(v, int)) - 10
+        _, small, usage_small = intelligence_layer.pack_views(
+            views, grants, target)
+        _, again, usage_again = intelligence_layer.pack_views(
+            views, grants, target)
+        results.check(
+            "an oversized pack is cut, says which module was cut, "
+            "and cuts the same way twice",
+            usage_small.get("_reduced")
+            and sum(v for v in usage_small.values() if isinstance(v, int))
+            <= target
+            and small == again and usage_small == usage_again,
+            "usage=%r target=%r" % (usage_small, target))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -1796,4 +2221,14 @@ TESTS = (
     test_add_device_merges_communities_and_redacts_them,
     test_the_add_device_route_is_token_gated_and_refuses_a_duplicate,
     test_the_discover_routes_walk_and_refuse_an_unknown_device,
+    test_the_pack_is_one_request_and_never_leaks_a_secret,
+    test_a_model_output_naming_an_ungranted_module_is_dropped,
+    test_advise_views_makes_one_request_and_counts_tokens,
+    test_a_non_openai_provider_is_a_model_error,
+    test_a_transport_failure_raises_model_error,
+    test_validation_resolves_citations_lanes_and_live_incidents,
+    test_the_cycle_makes_one_model_call_and_stores_proposals,
+    test_a_model_failure_keeps_the_deterministic_runs_and_is_red,
+    test_the_selector_accepts_the_configured_llm_advisor,
+    test_the_pack_obeys_the_row_budget_and_reduces_deterministically,
 )

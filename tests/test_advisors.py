@@ -1845,8 +1845,9 @@ def test_selecting_the_llm_advisor_runs_it_and_errors_loudly(results):
             conn.execute("DELETE FROM advisor_run")
             cfg = config_mod.Config(env=dict(env, SENTINEL_ADVISORS=selector))
             ctx = _FakeCtx([])
-            # NO NETWORK: transport is unimplemented, so any attempt is a
-            # defect. This makes one fail loudly instead of reaching out.
+            # NO NETWORK: the advisor's entry point is the cycle's
+            # `advise_views`, so this per-snapshot call must refuse rather than
+            # reach out. This makes one fail loudly instead of sending.
             real_socket = socket.socket
             socket.socket = lambda *a, **k: (_ for _ in ()).throw(
                 AssertionError("the LLM advisor tried to open a socket"))
@@ -1862,12 +1863,12 @@ def test_selecting_the_llm_advisor_runs_it_and_errors_loudly(results):
                 len(out) == 1 and out[0]["advisor"] == "llm"
                 and out[0]["module"] == "platform"
                 and out[0]["status"] == "error" and out[0]["ok"] is False
-                and "not implemented" in out[0]["detail"]
+                and "advise_views" in out[0]["detail"]
                 and row is not None and row["status"] == "error"
-                and "not implemented" in (row["detail"] or ""),
-                "out=%r row=%r notes=%r. An unimplemented transport must not "
-                "read as a green run that found nothing; the error is the "
-                "honest answer until the provider client exists."
+                and "advise_views" in (row["detail"] or ""),
+                "out=%r row=%r notes=%r. The per-snapshot runner has no "
+                "fleet-wide pack; it must name the cycle's entry point and "
+                "error, never read as a green run that found nothing."
                 % (out, dict(row) if row else None, ctx.notes))
     finally:
         _close(tmp, conn)

@@ -11,12 +11,12 @@ never written to an insight, an advisor run's detail, a log line or the config
 summary. A traceback from this module must not carry it either, which is why the
 error below names the missing transport and nothing else in the configuration.
 
-TRANSPORT IS NOT WIRED INTO THE ADVISOR IN THIS DELIVERY. `OpenAIClient` makes
-one OpenAI-compatible chat-completions request and is the cycle's transport;
-`LlmAdvisor` does not call it yet. A configured advisor RAISES rather than
-returning an empty list: the runner records the error row, so an operator who
-selects it sees "not implemented" instead of a silent green epoch that looks
-like a clean diagnosis of nothing.
+TRANSPORT: `advise_views` IS THE ONE ENTRY POINT. The intelligence cycle packs
+every granted module's view into ONE request and calls `advise_views` once;
+`OpenAIClient` is that request and there is no retry -- the next cycle is the
+retry. `advise()` is not the path: the per-epoch advisor runner hands an advisor
+a single snapshot, and a model that saw one module at a time would be N calls
+and N leaks instead of one bounded pack.
 """
 
 import http.client
@@ -126,5 +126,53 @@ class LlmAdvisor(advisors.Advisor):
         if not self.configured:
             return []                    # unconfigured is not an insight
         raise RuntimeError(
-            "the LLM transport via OpenAIClient is not implemented in this "
-            "delivery; the advisor's advise_views entry point is not wired up")
+            "the LLM advisor runs through the intelligence cycle's single "
+            "advise_views call, which packs every granted module into one "
+            "request; this per-snapshot entry point has no fleet-wide pack to "
+            "send")
+
+    def advise_views(self, ctx, views, cfg):
+        """The cycle's ONE model call. Returns validated insights and proposals.
+
+        A failure RAISES `ModelError` (or lets a `ModelError` through) so the
+        cycle can record an error row; an empty result here always means the
+        model answered, never that it could not be asked.
+        """
+        if not self.configured:
+            return {"insights": [], "proposals": [], "tokens_in": None,
+                    "tokens_out": None, "dropped": {}, "usage": {}}
+        if self.provider != "openai":
+            raise ModelError(
+                "provider %r is not supported; this delivery speaks the "
+                "OpenAI-compatible wire format" % (self.provider,))
+        import intelligence_layer
+        grants = {}
+        for mid, view in views.items():
+            mod = getattr(view, "mod", None)
+            if mod is None:
+                mod = next((m for m in getattr(ctx, "modules", ())
+                            if m.id == mid), None)
+            supported = (tuple(mod.intelligence) if mod is not None
+                         else ("observe",))
+            grants[mid] = cfg.intelligence_grant(mid, supported)[0]
+        system, user, usage = intelligence_layer.pack_views(
+            views, grants, cfg.intelligence_model_max_tokens)  # secretscan:ignore -- identifier
+        # The pack redacts where it is built; this is the second pass, on the
+        # exact text that leaves the box, because that is where the promise is.
+        user = intelligence_layer.redact(
+            user, intelligence_layer._secret_values(cfg))
+        client = OpenAIClient(
+            self.endpoint, self.api_key, self.model,
+            timeout_s=max(1, cfg.intelligence_budget_ms // 1000))
+        content, tin, tout = client.complete(system, user)
+        try:
+            payload = json.loads(content)
+        except ValueError:
+            raise ModelError(
+                "the model returned content that is not JSON") from None
+        kept, proposals, dropped = intelligence_layer.validate_model_output(
+            payload, views, grants,
+            conn=intelligence_layer._conn_from_views(views))
+        return {"insights": kept, "proposals": proposals,
+                "tokens_in": tin, "tokens_out": tout,
+                "dropped": dropped, "usage": usage}

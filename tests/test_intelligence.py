@@ -31,6 +31,7 @@ import modules as module_loader                   # noqa: E402
 import settingsapi                                # noqa: E402
 import store                                      # noqa: E402
 import thresholds                                 # noqa: E402
+from modules.snmp import discovery                # noqa: E402
 
 
 def test_every_module_declares_its_intelligence_lanes(results):
@@ -1327,6 +1328,56 @@ def test_the_startup_banner_reads_the_stored_grant(results):
         shutil.rmtree(tmpdir)
 
 
+def test_interface_status_becomes_a_state_check_expecting_up(results):
+    cands, notes = discovery.candidates(
+        "sw1", [("1.3.6.1.2.1.2.2.1.8.1", 2, "integer")],
+        names={"1": "lan1"})
+    row = [c for c in cands if c["oid"].endswith(".8.1")][0]
+    results.check(
+        "ifOperStatus expects 1 (up), not the observed down value",
+        row["kind"] == "state" and row["expected"] == 1,
+        "row=%r. Expecting the observed 2 would make a down port green."
+        % (row,))
+    results.check(
+        "the label is one a human can verify, not a bare index",
+        "lan1" in row["label"], "row=%r" % (row,))
+
+
+def test_an_unknown_oid_gets_no_band_and_low_confidence(results):
+    cands, notes = discovery.candidates(
+        "sw1", [("1.3.6.1.4.1.99999.1.0", 42, "integer")])
+    row = cands[0]
+    results.check(
+        "an unknown gauge has no invented band",
+        row["green"] is None and row["amber"] is None
+        and row["confidence"] == "low",
+        "row=%r" % (row,))
+
+
+def test_counters_are_named_as_not_checkable_not_given_a_gauge(results):
+    cands, notes = discovery.candidates(
+        "sw1", [("1.3.6.1.2.1.2.2.1.10.1", 123456, "integer")])
+    results.check(
+        "a monotonic counter is not proposed as a gauge",
+        cands == [] and any("counter" in n for n in notes),
+        "cands=%r notes=%r" % (cands, notes))
+
+
+def test_a_starting_band_is_never_loosened_to_fit_the_observation(results):
+    # hrProcessorLoad's starting band is green 70 / amber 90 (low_is_good).
+    cands, _ = discovery.candidates(
+        "sw1", [("1.3.6.1.2.1.25.3.3.1.2.1", 99, "integer")],
+        names={"1": "cpu0"})
+    row = cands[0]
+    results.check(
+        "the starting band stays 70/90 even when the observation is 99",
+        row["green"] == 70 and row["amber"] == 90,
+        "row=%r" % (row,))
+    results.check(
+        "the observation outside the band is flagged for review",
+        "outside" in row["note"], "row=%r" % (row,))
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -1377,4 +1428,8 @@ TESTS = (
     test_consider_proposes_a_destructive_action_at_full_and_never_runs_it,
     test_showconf_states_the_grant_and_never_the_key,
     test_the_startup_banner_reads_the_stored_grant,
+    test_interface_status_becomes_a_state_check_expecting_up,
+    test_an_unknown_oid_gets_no_band_and_low_confidence,
+    test_counters_are_named_as_not_checkable_not_given_a_gauge,
+    test_a_starting_band_is_never_loosened_to_fit_the_observation,
 )

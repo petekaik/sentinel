@@ -3175,6 +3175,32 @@ def test_a_propose_level_action_is_a_human_decision_not_a_nomination(results):
             payload["auto_execute"] is False and payload["ladder"] == "human"
             and ran == [] and row["state"] == "pending",
             "payload=%r ran=%r row=%r" % (payload, ran, row))
+        results.check(
+            "the marker records the declared action's danger",
+            payload.get("danger") == "state_changing",
+            "payload=%r" % (payload,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_propose_level_proposal_carries_the_declared_danger(results):
+    tmp, conn = _grant_store()
+    try:
+        action = _ladder_action(danger="state_changing")
+        for seq in range(1, store.CONFIRM_POLLS + 1):
+            store.sync_incident(conn, seq, "t", "c", "s", store.Status.FAIL,
+                                "bad", {"why": "fixture"})
+        key = store.incident_key("t", "c", "s")
+        incident = store.get_live_incident(conn, key)
+        pid = heal._propose(config_mod.Config({}), conn, "probe",
+                            action, incident, key)
+        row = store.get_proposal(conn, pid)
+        payload = json.loads(row["payload_json"])
+        results.check(
+            "the engine's proposal carries the declared action danger",
+            payload.get("danger") == "state_changing",
+            "payload=%r" % (payload,))
     finally:
         conn.close()
         shutil.rmtree(tmp)
@@ -3211,6 +3237,9 @@ def test_a_destructive_action_is_never_marked_for_auto_execution(results):
                 payload["auto_execute"] is False
                 and payload["ladder"] == "human",
                 "payload=%r" % (payload,))
+    results.check("the marker records the declared action danger",
+                  payload.get("danger") == "destructive",
+                  "payload=%r" % (payload,))
     results.check("marking a destructive action never runs it", ran == [],
                   "ran=%r" % (ran,))
 
@@ -3374,6 +3403,7 @@ TESTS = (
     test_a_nomination_without_fresh_evidence_is_expired,
     test_a_nomination_whose_incident_cleared_is_expired_not_executed,
     test_a_propose_level_action_is_a_human_decision_not_a_nomination,
+    test_a_propose_level_proposal_carries_the_declared_danger,
     test_a_destructive_action_is_never_marked_for_auto_execution,
     test_a_fabricated_incident_or_action_is_dropped_and_counted,
     test_a_model_cycle_never_calls_heal_attempt,

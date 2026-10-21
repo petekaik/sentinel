@@ -519,6 +519,10 @@ def mark_nomination(payload, mod, grant, incident, results, cfg):
     payload = dict(payload)
     payload["auto_execute"] = auto
     payload["ladder"] = ("allowed" if auto else "human")
+    if action is not None:
+        # THE DECLARATION, NOT THE MODEL'S CLAIM: the reader names the tier a
+        # destructive action needs, and the model never supplies this field.
+        payload["danger"] = action.danger
     return payload
 
 

@@ -250,7 +250,10 @@ def _propose(cfg, conn, module_id, action, inc, key):
     ttl_s = getattr(cfg, "proposal_ttl_s", 24 * 3600)
     payload = {"action_id": action.id, "incident_key": key,
                "target": inc.get("target"), "check_id": inc.get("check_id"),
-               "subject": inc.get("subject", "")}
+               "subject": inc.get("subject", ""),
+               # The DECLARED danger, so the reader can name the tier a
+               # destructive action needs instead of inferring it.
+               "danger": action.danger}
     rationale = (inc.get("last_detail")
                  or "incident %s matches action %s" % (key, action.id))
     return store.record_proposal(

@@ -177,6 +177,7 @@ it("shows an action without auto_execute as a human decision", async () => {
     await screen.findByText("Human approval required"),
   ).toBeInTheDocument();
   expect(screen.queryByText(/Ladder-approved/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/at every tier/)).not.toBeInTheDocument();
 });
 
 it("names the tier for a destructive action", async () => {

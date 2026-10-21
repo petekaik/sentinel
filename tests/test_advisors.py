@@ -2028,7 +2028,8 @@ def test_propose_writes_one_pending_proposal_and_never_runs(results):
             len(pending) == 1 and pending[0]["kind"] == "action"
             and pending[0]["module"] == "m"
             and payload == {"action_id": "a", "incident_key": "t|c|s",
-                            "target": "t", "check_id": "c", "subject": "s"}
+                            "target": "t", "check_id": "c", "subject": "s",
+                            "danger": "state_changing"}
             and pending[0]["expires_at"] > time.time(),
             "pending=%r payload=%r out=%r" % (pending, payload, out))
         results.check(

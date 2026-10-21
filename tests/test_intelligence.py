@@ -2057,10 +2057,12 @@ def test_the_cycle_makes_one_model_call_and_stores_proposals(results):
         sp = json.loads(settings[0]["payload_json"]) if settings else {}
         ap = json.loads(actions[0]["payload_json"]) if actions else {}
         results.check(
-            "a settings change is a pending human proposal with its diff",
+            "a settings change is a pending human proposal with its diff "
+            "and the before it was graded against",
             len(settings) == 1 and settings[0]["state"] == "pending"
             and sp.get("classification") == "modification"
-            and sp.get("requires_human") is True and sp.get("diff"),
+            and sp.get("requires_human") is True and sp.get("diff")
+            and sp.get("before") == {"SNMP_TIMEOUT_S": 3},
             "payload=%r" % (sp,))
         results.check(
             "an action is a pending proposal and NEVER auto-executed",
@@ -2358,6 +2360,7 @@ def test_a_human_approval_applies_a_model_settings_change(results):
         pid = store.record_proposal(
             conn, module="snmp", kind="settings_change",
             payload={"SNMP_CHECKS": [_uptime_check()],
+                     "before": {"SNMP_CHECKS": []},
                      "classification": "additive", "diff": "added 1 row",
                      "requires_human": True},
             rationale="model proposal", expires_at=time.time() + 3600)
@@ -2399,9 +2402,13 @@ def test_a_human_may_approve_a_change_auto_may_not(results):
             "SNMP_TIMEOUT_S": "1",
             "SNMP_INTELLIGENCE": '{"observe": true, "author": "auto"}'})
         mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        declared = settingsapi._declared(mod)
+        current = settingsapi._effective_values(cfg, conn, mod, {}, declared)
         pid = store.record_proposal(
             conn, module="snmp", kind="check_set",
-            payload={"SNMP_CHECKS": [], "classification": "silencing",
+            payload={"SNMP_CHECKS": [],
+                     "before": {"SNMP_CHECKS": current["SNMP_CHECKS"]},
+                     "classification": "silencing",
                      "diff": "removed 1 SNMP_CHECKS row(s)",
                      "requires_human": True},
             rationale="model proposal", expires_at=time.time() + 3600)
@@ -2427,10 +2434,18 @@ def test_a_revert_restores_the_recorded_before_and_is_audited(results):
     try:
         cfg = _authoring_cfg()
         mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
-        settingsapi.write_authoring_change(
-            cfg, conn, mod, {"settings": {"SNMP_CHECKS": [_uptime_check()]}},
-            "intelligence:auto")
-        pid = store.list_proposals(conn, state="executed")[0]["id"]
+
+        def auto_add(check):
+            declared = settingsapi._declared(mod)
+            current = settingsapi._effective_values(
+                cfg, conn, mod, {}, declared)["SNMP_CHECKS"]
+            settingsapi.write_authoring_change(
+                cfg, conn, mod,
+                {"settings": {"SNMP_CHECKS": list(current) + [check]}},
+                "intelligence:auto")
+            return store.list_proposals(conn, state="executed")[0]["id"]
+
+        pid = auto_add(_uptime_check())
         try:
             msg = ctl.revert_change(cfg, conn, pid)
         except ctl.ProposalRefused as exc:
@@ -2447,22 +2462,42 @@ def test_a_revert_restores_the_recorded_before_and_is_audited(results):
             "the revert is audited as an operator write",
             len(runs) == 1 and runs[0]["exit_status"] == 0
             and runs[0]["actor"] == "operator", "runs=%r" % (runs,))
+        applied = store.list_applied_changes(conn)
+        results.check(
+            "a reverted row stays in the applied history, marked reverted",
+            len(applied) == 1 and applied[0]["id"] == pid
+            and applied[0]["reverted_at"] and applied[0]["reverted_by"]
+            == "operator", "applied=%r" % (applied,))
+        try:
+            ctl.revert_change(cfg, conn, pid)
+        except ctl.ProposalRefused as exc:
+            already = str(exc)
+        else:
+            already = ""
+        results.check("a second revert of the same change is refused",
+                      "already reverted" in already.lower(),
+                      "got %r" % (already,))
+
         # EACH GUARD IS ISOLATED WITH A PAYLOAD THAT WOULD RESTORE, so a
-        # missing `before` cannot mask a broken state or actor check. `pid` is
-        # executed but relabelled a human decision; `pending` is an auto-actor
-        # row that was never applied.
+        # missing `before` cannot mask a broken state or actor check. `human`
+        # is a live, current auto change relabelled a human decision; `pending`
+        # is an auto-actor row that was never applied.
+        human = auto_add(dict(_uptime_check(), label="uptime2", oid=
+                              "1.3.6.1.2.1.1.5.0"))
         pending = store.record_proposal(
             conn, module="snmp", kind="settings_change",
-            payload={"SNMP_CHECKS": [_uptime_check()],
+            payload={"settings": {"SNMP_CHECKS": [dict(
+                _uptime_check(), label="uptime2",
+                oid="1.3.6.1.2.1.1.5.0")]},
                      "before": {"SNMP_CHECKS": []}},
             rationale="never applied", expires_at=time.time() + 3600)
         conn.execute("UPDATE proposal SET actor = 'intelligence:auto' "
                      "WHERE id = ?", (pending,))
         conn.execute("UPDATE proposal SET actor = 'operator' WHERE id = ?",
-                     (pid,))
+                     (human,))
         conn.commit()
         refused = []
-        for bad in (pid, pending):
+        for bad in (human, pending):
             try:
                 ctl.revert_change(cfg, conn, bad)
             except ctl.ProposalRefused:
@@ -2470,9 +2505,69 @@ def test_a_revert_restores_the_recorded_before_and_is_audited(results):
         results.check(
             "only an executed intelligence:auto change reverts: a human "
             "decision and a pending row are both refused",
-            refused == [pid, pending],
+            refused == [human, pending],
             "refused=%r -- a human-approved row is a decision, not a revert"
             % (refused,))
+
+        # A LATER WRITE IS NOT CLOBBERED. The change wrote one list; a human
+        # has since written another, so restoring its before would erase that.
+        changed = auto_add(dict(_uptime_check(), label="uptime3", oid=
+                                "1.3.6.1.2.1.1.7.0"))
+        later = [_uptime_check()]
+        settingsapi.write_settings(cfg, conn, mod, {"SNMP_CHECKS": later},
+                                   "operator")
+        try:
+            ctl.revert_change(cfg, conn, changed)
+        except ctl.ProposalRefused as exc:
+            clobber = str(exc)
+        else:
+            clobber = ""
+        cfg.reload_settings(conn)
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        results.check(
+            "a revert refuses when the settings changed since it was applied, "
+            "and leaves the later write in place",
+            "changed since this change was applied" in clobber.lower()
+            and len(view["SNMP_CHECKS"]["value"]) == 1,
+            "got %r checks=%r" % (clobber, view["SNMP_CHECKS"]["value"]))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_stale_proposal_is_refused_and_left_pending(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = config_mod.Config({
+            "SNMP_DEVICES": "[]", "SNMP_COMMUNITIES": "{}",
+            "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1",
+            "SNMP_INTELLIGENCE": '{"observe": true, "author": "auto"}'})
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        pid = store.record_proposal(
+            conn, module="snmp", kind="settings_change",
+            payload={"SNMP_TIMEOUT_S": 5, "before": {"SNMP_TIMEOUT_S": 1},
+                     "classification": "modification",
+                     "diff": "SNMP_TIMEOUT_S changed",
+                     "requires_human": True},
+            rationale="model proposal", expires_at=time.time() + 3600)
+        # A human moved the setting while the proposal sat in the queue.
+        settingsapi.write_settings(cfg, conn, mod, {"SNMP_TIMEOUT_S": 10},
+                                   "operator")
+        try:
+            ctl.approve_proposal(cfg, conn, {"snmp": mod}, pid, "operator")
+        except ctl.ProposalRefused as exc:
+            refusal = str(exc)
+        else:
+            refusal = ""
+        row = store.get_proposal(conn, pid)
+        stored = store.setting_rows(conn).get(("snmp", "SNMP_TIMEOUT_S"))
+        results.check(
+            "an approval refuses a proposal whose before no longer matches, "
+            "leaves it pending and writes nothing",
+            "changed since the proposal was written" in refusal.lower()
+            and row["state"] == "pending" and stored == 10,
+            "refusal=%r state=%r stored=%r"
+            % (refusal, row["state"], stored))
     finally:
         conn.close()
         shutil.rmtree(tmp)
@@ -2521,6 +2616,18 @@ def test_the_revert_route_needs_the_token_and_restores(results):
             status == 200 and body.get("ok") is True
             and not checks, "status=%s body=%r checks=%r"
             % (status, body, checks))
+        _, board = _http(cfg, "GET", "/api/v1/proposals")
+        applied = board.get("applied") or []
+        results.check(
+            "the applied history marks the row reverted",
+            len(applied) == 1 and applied[0].get("reverted_at")
+            and applied[0].get("reverted_by") == "operator",
+            "applied=%r" % (applied,))
+        status, _ = _http(cfg, "POST",
+                          "/api/v1/intelligence/revert/%d" % pid,
+                          token="tok")
+        results.check("a second revert over HTTP is a 409", status == 409,
+                      "status=%s" % (status,))
     finally:
         shutil.rmtree(tmp)
 
@@ -2530,6 +2637,7 @@ TESTS = (
     test_a_silencing_change_cannot_be_applied_by_the_auto_path,
     test_a_human_approval_applies_a_model_settings_change,
     test_a_human_may_approve_a_change_auto_may_not,
+    test_a_stale_proposal_is_refused_and_left_pending,
     test_a_revert_restores_the_recorded_before_and_is_audited,
     test_the_revert_route_needs_the_token_and_restores,
     test_every_module_declares_its_intelligence_lanes,

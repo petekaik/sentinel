@@ -21,6 +21,7 @@ import sys
 import time
 
 import actions
+import authorize
 import checks
 import commands
 import config as config_mod
@@ -312,6 +313,12 @@ def _approve_settings(cfg, conn, mods, row, payload, actor):
     `requires_human`; the auto path records `{"settings": {...}, "before": ...}`.
     Both are accepted, and the declared-setting check in
     `write_authoring_change` still refuses any other key.
+
+    A STALE DIFF IS REFUSED, NOT RE-CLASSIFIED INTO A NEW DECISION. The proposal
+    was written against a `before` the model saw; if the current settings no
+    longer match it, the human is approving a change to a world that no longer
+    exists. The row is left pending so it can be re-proposed against the current
+    values.
     """
     module_id = row["module"]
     mod = mods.get(module_id)
@@ -321,6 +328,22 @@ def _approve_settings(cfg, conn, mods, row, payload, actor):
     if not isinstance(settings, dict):
         settings = {k: v for k, v in payload.items()
                     if k != "settings" and k not in PROPOSAL_META}
+    declared = {s.key: s for s in mod.settings}
+    recorded = payload.get("before")
+    if not isinstance(recorded, dict):
+        raise ProposalRefused(
+            "the proposal recorded no before values, so a stale diff cannot "
+            "be told from a current one; it is left pending")
+    current = settingsapi._effective_values(cfg, conn, mod, {}, declared)
+    for key in settings:
+        try:
+            was = settingsapi.normalise_value(declared[key], recorded.get(key))
+        except (KeyError, TypeError, ValueError):
+            was = recorded.get(key)
+        if current.get(key) != was:
+            raise ProposalRefused(
+                "the settings changed since the proposal was written; the "
+                "proposal is left pending")
     # CLAIM BEFORE THE WRITE, exactly as the action and threshold paths do: two
     # concurrent approvals of one proposal must not both apply a change.
     if store.claim_proposal(conn, row["id"], actor) != 1:
@@ -456,38 +479,71 @@ def revert_change(cfg, conn, proposal_id, actor="operator"):
 
     ONLY an executed `intelligence:auto` row may be reverted: a pending row was
     never applied, and a human-approved one was a decision, which undoing is
-    another decision rather than a revert. The recorded `before` goes through
-    `write_settings`, so it is re-validated and audited like any operator write.
+    another decision rather than a revert.
+
+    A REVERT IS NOT A BLIND WRITE. It refuses when the row was already reverted
+    (`reverted_at`, or the values already equal what it replaced) and when the
+    current settings are no longer what the change wrote -- in the second case
+    something else has changed them, and restoring `before` would clobber that
+    change. The recorded `before` goes through `write_settings`, so it is
+    re-validated and audited like any operator write.
     """
     t0 = time.time()
     row = store.get_proposal(conn, proposal_id)
     module = (row or {}).get("module", "")
     try:
         if (row is None or row["state"] != "executed"
-                or row["actor"] != "intelligence:auto"):
+                or row["actor"] != authorize.AUTO_ACTOR):
             raise ProposalRefused(
                 "proposal %s is not an auto-applied change" % (proposal_id,))
-        before = _payload(row).get("before") or {}
+        payload = _payload(row)
+        before = payload.get("before") or {}
+        settings = payload.get("settings")
         if not before:
             raise ProposalRefused(
                 "proposal %s recorded no before values to restore"
+                % (proposal_id,))
+        if not isinstance(settings, dict):
+            raise ProposalRefused(
+                "proposal %s recorded no applied values to check"
                 % (proposal_id,))
         mod = next((m for m in module_loader.discover()
                     if m.id == row["module"]), None)
         if mod is None:
             raise ProposalRefused(
                 "module %r is not discovered" % (row["module"],))
+        declared = {s.key: s for s in mod.settings}
+        current = settingsapi._effective_values(cfg, conn, mod, {}, declared)
+        if payload.get("reverted_at") or all(
+                current.get(key) == value for key, value in before.items()):
+            raise ProposalRefused(
+                "proposal %s was already reverted" % (proposal_id,))
+        if any(current.get(key) != value for key, value in settings.items()):
+            raise ProposalRefused(
+                "the settings changed since this change was applied; restoring "
+                "its before would overwrite that change")
         try:
             settingsapi.write_settings(cfg, conn, mod, before, actor)
         except settingsapi.SettingsError as exc:
             raise ProposalRefused(
                 "the recorded settings no longer validate: %s" % exc)
+        store.mark_proposal_reverted(conn, proposal_id, actor)
         detail = ("proposal %d reverted: restored the recorded before"
                   % (proposal_id,))
     except ProposalRefused as exc:
         _audit_command(conn, module, "revert_change", actor,
                        {"proposal": proposal_id}, False, str(exc), t0)
         raise
+    except Exception as exc:                          # noqa: BLE001 - audited
+        # A store fault must leave an audit row and read as a refusal, not as a
+        # traceback out of the CLI or a 500 out of the API.
+        detail = "revert failed: %s: %s" % (type(exc).__name__, exc)
+        try:
+            _audit_command(conn, module, "revert_change", actor,
+                           {"proposal": proposal_id}, False, detail, t0)
+        except Exception:                              # noqa: BLE001 - best effort
+            pass
+        raise ProposalRefused(detail)
     _audit_command(conn, module, "revert_change", actor,
                    {"proposal": proposal_id}, True, detail, t0)
     return detail

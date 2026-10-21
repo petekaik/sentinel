@@ -991,16 +991,24 @@ def list_applied_changes(conn, limit=50):
     the surface that offers the undo reads the same record the undo restores.
     Only auto-applied rows are here -- an executed human approval is a decision,
     and it is read from the proposal queue, not from this list.
+
+    A row stays in this list after its revert; `reverted_at` is what tells the
+    reader it has been undone, so the history does not disappear.
     """
+    # Imported here, not at the top: `authorize` -> `thresholds` -> `store` is a
+    # cycle, and this module must stay importable before the classifier loads.
+    import authorize
     rows = conn.execute(
-        "SELECT * FROM proposal WHERE state = 'executed' "
-        "AND actor = 'intelligence:auto' "
+        "SELECT * FROM proposal WHERE state = 'executed' AND actor = ? "
         "ORDER BY COALESCE(executed_at, ts) DESC, id DESC LIMIT ?",
-        (limit,)).fetchall()
+        (authorize.AUTO_ACTOR, limit)).fetchall()
     out = []
     for row in rows:
         item = dict(row)
-        item["payload"] = _proposal_payload(row)
+        payload = _proposal_payload(row)
+        item["payload"] = payload
+        item["reverted_at"] = payload.get("reverted_at")
+        item["reverted_by"] = payload.get("reverted_by")
         out.append(item)
     return out
 
@@ -1075,6 +1083,32 @@ def mark_proposal_executed(conn, proposal_id):
         "UPDATE proposal SET state = 'executed', executed_at = ? "
         "WHERE id = ? AND state = 'approved'",
         (time.time(), proposal_id),
+    )
+    return cur.rowcount
+
+
+def mark_proposal_reverted(conn, proposal_id, actor):
+    """Merge `reverted_at`/`reverted_by` into an executed change's payload.
+
+    THE STATE STAYS `executed`: the platform did apply it, and that is history.
+    The marker is what says the application was undone, so the row remains in
+    `list_applied_changes` with its `before` for a reader (and a second revert
+    refuses on the marker rather than on a value that may match by chance).
+    Returns the rowcount; 0 means the row was absent, not executed, or already
+    marked.
+    """
+    row = get_proposal(conn, proposal_id)
+    if row is None or row["state"] != "executed":
+        return 0
+    payload = _proposal_payload(row)
+    if payload.get("reverted_at"):
+        return 0
+    payload["reverted_at"] = time.time()
+    payload["reverted_by"] = actor
+    cur = conn.execute(
+        "UPDATE proposal SET payload_json = ? "
+        "WHERE id = ? AND state = 'executed' AND payload_json = ?",
+        (json.dumps(payload), proposal_id, row["payload_json"]),
     )
     return cur.rowcount
 

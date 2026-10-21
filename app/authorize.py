@@ -22,6 +22,12 @@ MODIFICATION = "modification"
 SILENCING = "silencing"
 INVALID = "invalid"
 
+# The one actor string the auto-apply path is keyed on. It is defined once so
+# `settingsapi`, `store` and `ctl` cannot drift on its spelling: a typo in one
+# of them would either skip the additive-only gate or hide the change from the
+# revert list.
+AUTO_ACTOR = "intelligence:auto"
+
 _IDENTITY_FIELDS = ("label", "device", "oid", "name", "address")
 _BAND_FIELDS = ("green", "amber", "expected")
 

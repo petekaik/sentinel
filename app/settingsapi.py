@@ -540,6 +540,25 @@ def write_settings(cfg, conn, mod, body, actor):
     return settings_view(cfg, conn, [mod]).get(mod.id, {})
 
 
+def normalise_value(setting, value):
+    """One value in the shape `_effective_values`/`write_settings` store it.
+
+    A list row that omits an optional field is stored with that field present as
+    `None` (`Setting.parse_item`), so a recorded `before` taken from a view
+    would otherwise compare unequal to the current values for no real change.
+    Raises `TypeError`/`ValueError` for a value the setting refuses; the caller
+    decides whether that is a refusal. It is one function so the write path and
+    the stale-diff comparison cannot disagree about what a value is.
+    """
+    parsed = setting.parse(value)
+    if setting.kind == "list":
+        rows, why = setting.parse_item(parsed)
+        if rows is None:
+            raise ValueError(why)
+        return rows
+    return parsed
+
+
 def write_authoring_change(cfg, conn, mod, change, actor):
     """Apply a full-value settings change through the normal write path.
 
@@ -547,11 +566,10 @@ def write_authoring_change(cfg, conn, mod, change, actor):
     apply only `additive`; `modification` and `silencing` are refused here and
     belong in a pending proposal.
 
-    THE CLASSIFIER SEES THE NORMALISED VALUES. `write_settings` stores every
-    declared row field, so the `before` read back from `_effective_values`
-    carries an omitted field as `None`. Comparing that against a partial row
-    would call an untouched row a modification and refuse an addition that
-    changed nothing else.
+    THE CLASSIFIER SEES THE NORMALISED VALUES and the FULL effective map, so
+    the module's cross-field `validate_settings` has every side of its rule.
+    The `before` recorded on an applied change is the touched-key subset, which
+    is exactly what a revert restores.
     """
     import authorize
     settings = (change or {}).get("settings") or {}
@@ -563,29 +581,23 @@ def write_authoring_change(cfg, conn, mod, change, actor):
             raise SettingsError("invalid_value",
                                 "%r is not a declared setting" % key, key)
         try:
-            parsed = setting.parse(value)
-            if setting.kind == "list":
-                rows, why = setting.parse_item(parsed)
-                if rows is None:
-                    raise SettingsError("invalid_value", why, key)
-                parsed = rows
+            values[key] = normalise_value(setting, value)
         except (TypeError, ValueError) as exc:
             raise SettingsError("invalid_value", str(exc), key)
-        values[key] = parsed
     effective = _effective_values(cfg, conn, mod, {}, declared)
     before = {key: effective.get(key) for key in values}
     classification, detail = authorize.classify(
-        {"settings": values}, mod, before)
+        {"settings": values}, mod, effective)
     if classification == authorize.INVALID:
         raise SettingsError("invalid_value", detail)
-    if (str(actor) == "intelligence:auto"
-            and classification != authorize.ADDITIVE):
+    auto = str(actor) == authorize.AUTO_ACTOR
+    if auto and not authorize.may_auto_apply(classification, "auto"):
         raise SettingsError(
             "invalid_value",
             "refused: %s requires human approval (%s)"
             % (classification, detail))
     out = write_settings(cfg, conn, mod, values, actor)
-    if str(actor) == "intelligence:auto":
+    if auto:
         store.record_applied_change(
             conn, mod.id, "settings_change",
             {"settings": values, "before": before,

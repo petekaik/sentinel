@@ -528,6 +528,14 @@ def _record_model(cfg, conn, views, model_result):
             payload["classification"] = item.get("classification") or ""
             payload["diff"] = item.get("diff") or ""
             payload["requires_human"] = True
+            if item.get("kind") in ("check_set", "settings_change"):
+                # THE DIFF IS AGAINST THESE VALUES. An approval compares them
+                # with the settings NOW and refuses a proposal whose world has
+                # moved; without the record there is nothing to compare against.
+                view = views.get(mid)
+                seen = getattr(view, "module_settings", None) or {}
+                payload["before"] = {key: seen.get(key)
+                                     for key in (item.get("payload") or {})}
             signature = json.dumps({"module": mid, "kind": item.get("kind"),
                                     "payload": payload},
                                    sort_keys=True, default=str)

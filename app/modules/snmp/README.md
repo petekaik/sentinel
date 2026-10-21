@@ -5,10 +5,10 @@ with an SNMP agent. There is no per-device code: a device and each OID to poll
 are rows in the settings, and saving a row makes it appear on the next
 collection.
 
-**Read-only, v2c only.** The module issues `GET` requests and nothing else; it
-never writes to a device and never sends a `SET`. `GETNEXT` is used by exactly
-one thing -- the explicit `discover` operator command, which walks a subtree to
-propose candidate rows -- and a walk writes no setting by itself. SNMP v3
+**Read-only, v2c only.** The module issues `GET` requests for its checks, plus
+the `GETNEXT` walk that only the explicit `discover` operator command uses; it
+never writes to a device and never sends a `SET`. A walk only proposes
+candidate rows and writes no setting by itself. SNMP v3
 (USM/encryption) is not implemented, and a device configured with any version
 other than `v2c` is refused when the settings are parsed rather than silently
 polled with the wrong protocol.
@@ -94,9 +94,10 @@ add a device row (name, address, community)
 one validated write. The community is merged server-side into
 `SNMP_COMMUNITIES` (the browser cannot read that map), and it is never returned.
 
-**Discover.** `discover` walks the device's interface and host-resources
-subtrees and returns candidates. It writes nothing: a walk has no path to the
-settings, so reviewing is always a separate, explicit step.
+**Discover.** `discover` walks all of MIB-II (`1.3.6.1.2.1`) and the
+enterprises subtree (`1.3.6.1.4.1`), capped by `max_oids` with truncation
+reported in the result, and returns candidates. It writes nothing: a walk has
+no path to the settings, so reviewing is always a separate, explicit step.
 
 **Review.** Each candidate carries a checked-in starting band
 (`STARTING_BANDS`), never a band widened to fit the observation. The operator
@@ -206,7 +207,7 @@ SNMP_CHECKS='[{"device":"switch-1","oid":"1.3.6.1.2.1.2.2.1.8.1",
 | `settings.py` | parsing (`SnmpConfig`), the community map, and the save-time rules (`validate`) |
 | `preload.py` | one poll per enabled device per epoch; installs `ctx.snmp_facts` |
 | `checks.py` | `SnmpReachable` / `SnmpOid` and the dynamic `instances(ctx)` |
-| `discovery.py` | `walk()` rows -> candidate check rows: starting bands, counter/unnamed-row notes, and no invented value |
+| `discovery.py` | builds candidate check rows from rows returned by `snmp.walk()`: starting bands, counter/unnamed-row notes, and no invented value |
 | `commands.py` | the `discover` command: walks one configured device and returns candidates; writes no setting |
 | `thresholds.conf` | deliberately comment-only: bands live on the settings rows |
 

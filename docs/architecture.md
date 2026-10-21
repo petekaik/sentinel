@@ -720,10 +720,10 @@ The full model is
 
 `GETNEXT` exists in the module for exactly one job.
 `POST /api/v1/modules/snmp/discover` runs the `snmp.discover` command, which
-walks a configured device's interface and host-resources subtrees
-(`snmp.walk`, capped by `max_oids` and reporting whether the cap truncated it)
-and returns candidate check rows. The command writes nothing: applying a
-candidate is a separate `POST .../discover/apply`, which is
+walks all of MIB-II (`1.3.6.1.2.1`) and the enterprises subtree (`1.3.6.1.4.1`)
+with `snmp.walk`, capped by `max_oids` and reporting whether the cap truncated
+either walk, then returns candidate check rows. The command writes nothing:
+applying a candidate is a separate `POST .../discover/apply`, which is
 `settingsapi.apply_discovery` -- one validated `SNMP_CHECKS` write through the
 same path and token gate as every other settings write.
 

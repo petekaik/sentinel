@@ -1543,6 +1543,12 @@ def test_discovery_apply_never_writes_the_community(results):
               "unit": "", "direction": "high_is_good", "green": 1,
               "amber": 0, "kind": "gauge", "expected": None}],
             "operator")
+        rows = store.setting_rows(conn).get(("snmp", "SNMP_CHECKS")) or []
+        results.check(
+            "the apply actually landed, so the absence below is not a no-op",
+            any(isinstance(r, dict) and r.get("oid") == "1.3.6.1.2.1.1.3.0"
+                for r in rows),
+            "SNMP_CHECKS=%r" % (rows,))
         text = json.dumps(
             [{"%s/%s" % k: v for k, v in store.setting_rows(conn).items()}],
             default=str) + json.dumps(

@@ -397,7 +397,13 @@ def write_grant(cfg, conn, mod, body, actor):
         raise SettingsError("invalid_body", "the grant body must be an object")
     key = grant_key(mod)
     supported = tuple(getattr(mod, "intelligence", ("observe",)))
-    current, why = config_mod.parse_grant(cfg.env.get(key), key, supported)
+    # THE STORED ROW IS THE BASELINE. `cfg.env` is only in step with the store
+    # after `reload_settings`, and a partial body merged against the file alone
+    # would silently revoke every lane the operator did not repeat.
+    stored = store.setting_rows(conn)
+    row = (mod.id, key)
+    raw = stored[row] if row in stored else cfg.env.get(key)
+    current, why = config_mod.parse_grant(raw, key, supported)
     if why:
         # A stored/.env grant that cannot be parsed must be fixed, not
         # overwritten by a merge against a value nobody can read.

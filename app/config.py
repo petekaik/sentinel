@@ -146,6 +146,31 @@ def validate_grants(cfg, modules):
                 % (key, module_id, ", ".join(sorted(known))))
 
 
+def validate_grants_with_store(cfg, modules):
+    """Validate the grants that are IN FORCE: the store's overlay, then .env.
+
+    `validate_grants` reads `cfg.env`, and at startup that is the file alone --
+    a stored grant is only in it after `reload_settings`. Validating the file
+    alone therefore refuses a broken `.env` value a valid row overrides, and
+    accepts a stored grant whose lane the module no longer declares (both are
+    the effective value being different from the one graded).
+
+    A store that is absent or unreadable falls back to env-only: refusing to
+    start because a diagnostic cannot read a locked database would be worse
+    than the case this wrapper exists to catch.
+    """
+    if os.path.exists(cfg.db_path):
+        try:
+            conn = store.connect(cfg.db_path, read_only=True)
+            try:
+                cfg.reload_settings(conn)
+            finally:
+                conn.close()
+        except Exception:                  # noqa: BLE001 - fall back to .env
+            pass
+    validate_grants(cfg, modules)
+
+
 class Config:
     """Everything the collector needs that is not module-owned."""
 

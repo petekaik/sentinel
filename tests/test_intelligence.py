@@ -259,6 +259,105 @@ def test_the_intelligence_tables_round_trip(results):
         shutil.rmtree(tmp)
 
 
+def test_the_startup_validator_accepts_the_effective_grants(results):
+    """A validator that refused EVERY grant would pass a rejection-only suite.
+
+    Each case is a grant that is valid as it stands: the point is that startup
+    reads the stored overlay, so the EFFECTIVE value is what is graded.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "startup.sqlite")
+        conn = store.connect(path)
+        store.init(conn)
+        store.put_setting(conn, "fleet", "FLEET_INTELLIGENCE",
+                          {"observe": True, "author": "off",
+                           "remediate": True,
+                           "budget": {"rows": 500, "bytes": 32768,
+                                      "tokens": 2000}}, "operator")
+        conn.close()
+        cases = (
+            ("a valid .env grant is accepted",
+             {"SNMP_INTELLIGENCE": '{"observe": true}'}),
+            ("a valid stored grant is accepted", {}),
+            ("SENTINEL_INTELLIGENCE is exempt", {"SENTINEL_INTELLIGENCE": "1"}),
+            ("a valid grant for a disabled module is accepted",
+             {"SYSTEM_ENABLED": "0",
+              "SYSTEM_INTELLIGENCE": '{"observe": true}'}),
+            # The stored row overrides the file, so a broken .env value under a
+            # valid stored grant is not the grant in force.
+            ("a malformed .env value under a valid stored row is accepted",
+             {"FLEET_INTELLIGENCE": '{"author": "sometimes"}'}),
+        )
+        for name, env in cases:
+            full_env = {"MONITOR_DB": path}
+            full_env.update(env)
+            cfg = config_mod.Config(full_env)
+            try:
+                config_mod.validate_grants_with_store(
+                    cfg, module_loader.discover())
+            except ValueError as exc:
+                results.check(name, False, "refused with %r" % (exc,))
+            else:
+                results.check(name, True, "accepted")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_a_stored_grant_that_became_unsupported_refuses_startup(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "startup.sqlite")
+        conn = store.connect(path)
+        store.init(conn)
+        # Written directly: the row may predate the lane's removal from the
+        # module, and write_grant would refuse it today.
+        store.put_setting(conn, "system", "SYSTEM_INTELLIGENCE",
+                          {"observe": True, "remediate": True}, "operator")
+        conn.close()
+        cfg = config_mod.Config({"MONITOR_DB": path})
+        try:
+            config_mod.validate_grants_with_store(cfg, module_loader.discover())
+        except ValueError as exc:
+            results.check(
+                "a stored unsupported lane refuses startup",
+                "remediate" in str(exc),
+                "got %r; grading only cfg.env reads a removed lane as fine"
+                % (exc,))
+        else:
+            results.check("a stored unsupported lane refuses startup", False,
+                          "validate_grants_with_store ignored the store")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_a_partial_grant_write_preserves_the_stored_lanes(results):
+    tmp, conn = _grant_store()
+    try:
+        # An UNRELOADED Config is the point: the baseline must come from the
+        # store, not from cfg.env, or the partial body revokes the rest.
+        cfg = config_mod.Config({})
+        fleet = [m for m in module_loader.discover() if m.id == "fleet"][0]
+        store.put_setting(conn, "fleet", "FLEET_INTELLIGENCE",
+                          {"observe": True, "author": "off",
+                           "remediate": True,
+                           "budget": {"rows": 500, "bytes": 32768,
+                                      "tokens": 2000}}, "operator")
+        out = settingsapi.write_grant(cfg, conn, fleet,
+                                      {"budget": {"rows": 1000}}, "operator")
+        results.check(
+            "a partial budget write preserves the stored lanes",
+            out["grant"]["observe"] is True
+            and out["grant"]["remediate"] is True
+            and out["grant"]["budget"]["rows"] == 1000
+            and out["grant"]["budget"]["bytes"] == 32768,
+            "out=%r; merging against an unreloaded cfg.env would revoke every "
+            "lane the operator did not repeat" % (out,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -274,4 +373,7 @@ TESTS = (
     test_a_module_may_not_declare_a_grant_key,
     test_an_unknown_module_grant_key_is_a_startup_error,
     test_the_intelligence_tables_round_trip,
+    test_the_startup_validator_accepts_the_effective_grants,
+    test_a_stored_grant_that_became_unsupported_refuses_startup,
+    test_a_partial_grant_write_preserves_the_stored_lanes,
 )

@@ -798,18 +798,22 @@ def list_insights(conn, module=None, limit=100):
 
 
 def newest_insight(conn, advisor, kind, target="", check_id="", subject="",
-                   since=None):
+                   module="", since=None):
     """The newest insight for one identity, optionally no older than `since`.
 
-    The identity is `(advisor, kind, target, check_id, subject)` -- the same
-    four-part selection the runner uses to decide whether an epoch's advice is
-    new or a repeat. `since` is what turns that into a dedupe window: an advisor
-    that runs every minute must not write a row every minute.
+    The identity is `(advisor, kind, target, check_id, subject, module)` -- the
+    same selection the runner uses to decide whether an epoch's advice is new
+    or a repeat. `module` is part of it because ONE advisor now runs per
+    granted module: the reference report carries no target, check id or
+    subject, so without the module two modules' reports would share an identity
+    and the second would overwrite the first in place. `since` is what turns
+    that into a dedupe window: an advisor that runs every minute must not write
+    a row every minute.
     """
     sql = ("SELECT * FROM insight WHERE advisor = ? AND kind = ? AND target = ? "
-           "AND check_id = ? AND subject = ?")
+           "AND check_id = ? AND subject = ? AND module = ?")
     params = [advisor or "", kind or "", target or "", check_id or "",
-              subject or ""]
+              subject or "", module or ""]
     if since is not None:
         sql += " AND ts >= ?"
         params.append(since)
@@ -1637,13 +1641,30 @@ def db_summary(conn):
 # parameter because there is one caller and it has never passed one.
 KEEP_SAMPLES_EPOCHS = 10080
 
+# Intelligence history is an operational trace, not the record: a cycle writes
+# a row every epoch (including a recorded skip), so without an age bound the
+# table grows forever -- and skipped cycles no longer bypass the cadence, which
+# makes that one row per interval rather than per epoch.
+KEEP_INTELLIGENCE_DAYS = 30
+
 
 def prune(conn):
     """Bound growth without touching incident history.
 
     Samples are pruned by age; incidents, remedies and the journal are kept,
     because they are the record and the journal may be the only copy.
+    Intelligence cycles and their usage age out with the samples' rationale:
+    they answer "what did the layer do lately", not "what happened".
     """
+    # USAGE BEFORE ITS CYCLE. The rows are keyed by `cycle_id` and have no
+    # foreign key, so deleting the cycle first would orphan the usage rows,
+    # which nothing could then find and delete.
+    cutoff_ts = time.time() - KEEP_INTELLIGENCE_DAYS * 86400
+    conn.execute(
+        "DELETE FROM intelligence_usage WHERE cycle_id IN "
+        "(SELECT id FROM intelligence_cycle WHERE ts < ?)", (cutoff_ts,))
+    conn.execute("DELETE FROM intelligence_cycle WHERE ts < ?", (cutoff_ts,))
+
     row = conn.execute("SELECT MAX(epoch_seq) AS s FROM sample").fetchone()
     if not row or row["s"] is None:
         return 0

@@ -305,7 +305,8 @@ def _record(conn, advisor_id, insight, snap):
         existing = store.newest_insight(
             conn, advisor=advisor_id, kind=insight.kind,
             target=insight.target, check_id=insight.check_id,
-            subject=insight.subject, since=time.time() - INSIGHT_DEDUPE_S)
+            subject=insight.subject, module=insight.module,
+            since=time.time() - INSIGHT_DEDUPE_S)
         if existing is not None:
             store.update_insight(
                 conn, existing["id"], module=insight.module,
@@ -319,6 +320,32 @@ def _record(conn, advisor_id, insight, snap):
 def record(conn, advisor_id, insight, snapshot):
     """Store one insight through the same dedupe/window path the runner uses."""
     return _record(conn, advisor_id, insight, snapshot)
+
+
+def note_advisor_problem(conn, ctx, advisor, module, detail):
+    """Record a selection failure as loudly as a run failure.
+
+    A selector that names nothing, or an advisor object that cannot be called,
+    would otherwise be a green no-op -- the platform's oldest failure shape. It
+    gets the same `advisor_run` row an exception gets, so a count of runs is a
+    count of what was CONFIGURED as well as what executed.
+
+    THE ONE HOME for that rule: the collector's ungated runner and the
+    intelligence cycle both consult it, and two retypings of one rule is how
+    they drift apart (item 84).
+    """
+    ctx.note(detail)
+    if conn is None:
+        return
+    try:
+        store.record_advisor_run(
+            conn, advisor=advisor, module=module, status="error",
+            duration_ms=0, window_requested_days=0,
+            window_available_days=0.0, detail=detail)
+    except Exception:                              # noqa: BLE001 - reported
+        line = traceback.format_exc().strip().splitlines()
+        ctx.note("could not record an advisor problem for %r: %s"
+                 % (advisor, line[-1] if line else "unknown"))
 
 
 def run_advisor(adv, conn, ctx, snapshot, budget_ms=5000, history_cap_days=30):

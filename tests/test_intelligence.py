@@ -1029,8 +1029,10 @@ def test_a_granted_module_is_read_and_recorded(results):
             "last=%r" % (last,))
         results.check(
             "the reference analyzer ran and recorded its run",
-            conn.execute("SELECT COUNT(*) FROM advisor_run WHERE advisor='reference'")
-            .fetchone()[0] == 1,
+            [dict(r) for r in conn.execute(
+                "SELECT module, status FROM advisor_run "
+                "WHERE advisor='reference'")] == [
+                    {"module": "fleet", "status": "ok"}],
             "out=%r" % (out,))
     finally:
         conn.close()
@@ -1075,6 +1077,121 @@ def test_the_global_switch_stops_the_cycle(results):
         shutil.rmtree(tmp)
 
 
+def test_a_second_skipped_cycle_inside_the_interval_returns_none(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(SENTINEL_INTELLIGENCE_INTERVAL_S="300")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        first = intelligence_layer.run_cycle(cfg, conn, ctx)
+        second = intelligence_layer.run_cycle(cfg, conn, ctx)
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM intelligence_cycle").fetchone()[0]
+        results.check(
+            "a skip is subject to the cadence, not written every epoch",
+            first is not None and first["status"] == "skipped"
+            and second is None and rows == 1,
+            "first=%r second=%r rows=%r" % (first, second, rows))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_each_granted_modules_report_survives_the_dedupe(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SNMP_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_INTELLIGENCE_INTERVAL_S="60")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        first = {}
+        for mid in ("fleet", "snmp"):
+            mod = next(m for m in mods if m.id == mid)
+            owned = sorted(module.owned_check_ids(mod, ctx))
+            first[mid] = owned[0]
+            # A check_run row gives the view the history its window starts
+            # from; without one the window begins at "now" and the incident
+            # recorded microseconds earlier falls outside it.
+            store.record_check(conn, 1, first[mid], owned[0],
+                               store.Status.FAIL, "simulated failure")
+            store.sync_incident(
+                conn, 1, first[mid], owned[0], "", store.Status.FAIL,
+                "simulated failure for %s" % mid)
+        intelligence_layer.run_cycle(cfg, conn, ctx)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT module, body FROM insight WHERE kind = 'report' "
+            "ORDER BY module")]
+        results.check(
+            "both granted modules keep their own report row",
+            [r["module"] for r in rows] == ["fleet", "snmp"],
+            "rows=%r. The report carries no target/check_id/subject, so "
+            "without `module` in the dedupe identity the second module "
+            "overwrites the first." % (rows,))
+        results.check(
+            "neither report was overwritten by the other",
+            all(mid in row["body"] for mid, row in
+                zip((r["module"] for r in rows), rows)),
+            "rows=%r first=%r" % (rows, first))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_selector_that_names_nothing_is_an_error_not_a_green_noop(results):
+    tmp, conn = _grant_store()
+    try:
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}',
+                         SENTINEL_ADVISORS="typo",
+                         SENTINEL_INTELLIGENCE_INTERVAL_S="60")
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        intelligence_layer.run_cycle(cfg, conn, ctx)
+        rows = [dict(r) for r in conn.execute(
+            "SELECT advisor, status FROM advisor_run")]
+        results.check(
+            "a selector typo is an error row, never a green no-op",
+            len(rows) == 1 and rows[0]["advisor"] == "typo"
+            and rows[0]["status"] == "error"
+            and any("typo" in note for note in ctx.notes),
+            "rows=%r notes=%r" % (rows, ctx.notes))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_broken_cadence_read_is_a_recorded_cycle_error(results):
+    tmp, conn = _grant_store()
+    saved = store.last_intelligence_cycle
+
+    def boom(conn_):
+        raise RuntimeError("store unavailable")
+
+    store.last_intelligence_cycle = boom
+    try:
+        # A GRANTED MODULE, so the failure is the cadence read rather than the
+        # no-grant skip that precedes it.
+        cfg = _cycle_cfg(FLEET_INTELLIGENCE='{"observe": true}')
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        out = intelligence_layer.run_cycle(cfg, conn, ctx)
+    finally:
+        store.last_intelligence_cycle = saved
+    row = conn.execute(
+        "SELECT status, detail FROM intelligence_cycle "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    results.check(
+        "a cadence read failure is an error cycle row, not an escape",
+        out is not None and out["status"] == "error"
+        and row is not None and row["status"] == "error"
+        and "store unavailable" in row["detail"]
+        and "intelligence" in ctx.module_errors,
+        "out=%r row=%r errors=%r"
+        % (out, row and dict(row), ctx.module_errors))
+    conn.close()
+    shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -1117,4 +1234,8 @@ TESTS = (
     test_a_granted_module_is_read_and_recorded,
     test_the_cadence_skips_a_second_cycle,
     test_the_global_switch_stops_the_cycle,
+    test_a_second_skipped_cycle_inside_the_interval_returns_none,
+    test_each_granted_modules_report_survives_the_dedupe,
+    test_a_selector_that_names_nothing_is_an_error_not_a_green_noop,
+    test_a_broken_cadence_read_is_a_recorded_cycle_error,
 )

@@ -8,9 +8,10 @@ THE CYCLE NEVER RAISES INTO THE EPOCH: a failure becomes an `error` row plus a
 `ctx.module_errors` entry. ONE OUTCOME deliberately returns WITHOUT recording:
 a second cycle inside `SENTINEL_INTELLIGENCE_INTERVAL_S`, because the previous
 row is the evidence of when the cycle last ran. Every other outcome IS
-recorded -- including "disabled" and "no modules granted", because an operator
-looking at the dashboard must be able to tell a quiet fleet from a switched-off
-layer.
+recorded, once per interval -- including "disabled" and "no modules granted",
+because an operator looking at the dashboard must be able to tell a quiet fleet
+from a switched-off layer, and a skip per epoch would be noise in a table
+`store.prune` now ages out.
 """
 
 import time
@@ -122,6 +123,22 @@ def propose_thresholds(cfg, conn, ctx, runs):
 def run_cycle(cfg, conn, ctx, now=None):
     now = time.time() if now is None else now
     started = time.time()
+    # THE CADENCE COMES FIRST, ABOVE BOTH SKIP RETURNS. A skip is a recorded
+    # outcome like any other, so it obeys the same interval -- otherwise an
+    # ungranted fleet writes one row every epoch into a table nobody reads.
+    # The read is guarded here because this is the cycle's only store access
+    # outside `_finish`'s own try: a failing store must become an error cycle
+    # row, not an exception escaping into the epoch.
+    try:
+        last = (store.last_intelligence_cycle(conn) if conn is not None
+                else None)
+    except Exception as exc:                       # noqa: BLE001 - isolated
+        ctx.note("intelligence cycle failed: %s" % exc)
+        return _finish(conn, ctx, "error", started, [], [],
+                       traceback.format_exc()[-2000:])
+    interval = int(getattr(cfg, "intelligence_interval_s", 300))
+    if last is not None and (now - float(last["ts"])) < interval:
+        return None
     if not getattr(cfg, "intelligence_enabled", True):
         return _finish(conn, ctx, "skipped", started, [], [],
                        "disabled by SENTINEL_INTELLIGENCE")
@@ -133,10 +150,6 @@ def run_cycle(cfg, conn, ctx, now=None):
     if not granted:
         return _finish(conn, ctx, "skipped", started, [], [],
                        "no modules granted")
-    last = store.last_intelligence_cycle(conn) if conn is not None else None
-    interval = int(getattr(cfg, "intelligence_interval_s", 300))
-    if last is not None and (now - float(last["ts"])) < interval:
-        return None
 
     specs = getattr(ctx, "specs", {}) or {}
     max_days = getattr(cfg, "advisor_max_history_days", 30)
@@ -157,6 +170,21 @@ def run_cycle(cfg, conn, ctx, now=None):
     selected = tuple(getattr(cfg, "advisor_ids", ()))
     reference_selected = ("reference" in selected
                           or "platform.reference" in selected)
+    # WHICH SELECTOR ENTRIES NAME SOMETHING THAT EXISTS is answered from the
+    # modules' DECLARATIONS, not from what ran: an advisor declared by an
+    # ungranted module exists and is simply not read, so it must not be
+    # reported as a typo (and no `advisor_run` row may be written for that
+    # module). Declarations are metadata, not evidence.
+    declared = set()
+    if reference_selected:
+        declared.update(("reference", "platform.reference"))
+    for mod in modules:
+        try:
+            for adv in mod.advisors():
+                adv_id = str(getattr(adv, "id", ""))
+                declared.update((adv_id, "%s.%s" % (mod.id, adv_id)))
+        except Exception:                          # noqa: BLE001 - isolated
+            continue
     try:
         for mod in modules:
             view = views.get(mod.id)
@@ -173,8 +201,9 @@ def run_cycle(cfg, conn, ctx, now=None):
                 usage.setdefault(mod.id, {})["insights"] = len(
                     run.get("insights") or ())
             for adv in getattr(mod, "advisors", lambda: [])():
-                if str(getattr(adv, "id", "")) not in selected \
-                        and "%s.%s" % (mod.id, getattr(adv, "id", "")) not in selected:
+                adv_id = str(getattr(adv, "id", ""))
+                qualified = "%s.%s" % (mod.id, adv_id)
+                if adv_id not in selected and qualified not in selected:
                     continue
                 try:
                     adv.module = mod.id
@@ -184,6 +213,17 @@ def run_cycle(cfg, conn, ctx, now=None):
                     adv, conn, ctx, view,
                     budget_ms=getattr(cfg, "intelligence_budget_ms", 30000),
                     history_cap_days=max_days))
+        # EVERY SELECTED ID THAT NAMES NOTHING IS A CONFIGURATION DEFECT, not
+        # an empty result. Without this a typo in SENTINEL_ADVISORS produced a
+        # green cycle with no run and no error -- the green no-op this platform
+        # exists to prevent.
+        for want in selected:
+            if want in declared:
+                continue
+            module = want.rsplit(".", 1)[0] if "." in want else ""
+            advisors.note_advisor_problem(
+                conn, ctx, want, module,
+                "selector names no advisor: %r" % want)
         proposals = propose_thresholds(cfg, conn, ctx, runs)
     except Exception as exc:
         ctx.note("intelligence cycle failed: %s" % exc)

@@ -453,28 +453,6 @@ def freeze_disabled_modules(conn, seq, enabled, all_modules=None, cfg=None):
                                   "module %r is disabled" % mod.id)
 
 
-def _note_advisor_problem(conn, ctx, advisor, module, detail):
-    """Record a selection failure as loudly as a run failure.
-
-    A selector that names nothing, or an advisor object that cannot be called,
-    would otherwise be a green no-op -- the platform's oldest failure shape. It
-    gets the same `advisor_run` row an exception gets, so a count of runs is a
-    count of what was CONFIGURED as well as what executed.
-    """
-    ctx.note(detail)
-    if conn is None:
-        return
-    try:
-        store.record_advisor_run(
-            conn, advisor=advisor, module=module, status="error",
-            duration_ms=0, window_requested_days=0,
-            window_available_days=0.0, detail=detail)
-    except Exception:                              # noqa: BLE001 - reported
-        line = traceback.format_exc().strip().splitlines()
-        ctx.note("could not record an advisor problem for %r: %s"
-                 % (advisor, line[-1] if line else "unknown"))
-
-
 def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
     """Run the selected advisors of the enabled modules. NEVER raises.
 
@@ -517,7 +495,7 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
                 name = type(adv).__name__
                 ctx.module_errors["platform:advisors:%s" % name] = \
                     traceback.format_exc()
-                _note_advisor_problem(
+                advisors.note_advisor_problem(
                     conn, ctx, name, "platform",
                     "advisor object %s has no readable id; skipped" % name)
                 continue
@@ -543,7 +521,7 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
                     name = type(adv).__name__
                     ctx.module_errors["%s:advisors:%s" % (mod.id, name)] = \
                         traceback.format_exc()
-                    _note_advisor_problem(
+                    advisors.note_advisor_problem(
                         conn, ctx, name, mod.id,
                         "advisor object %s has no readable id; skipped"
                         % name)
@@ -558,7 +536,7 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
                 except Exception:                  # noqa: BLE001 - isolated
                     ctx.module_errors["%s:advisors:%s" % (mod.id, adv_id)] = \
                         traceback.format_exc()
-                    _note_advisor_problem(
+                    advisors.note_advisor_problem(
                         conn, ctx, adv_id, mod.id,
                         "advisor %r could not be attributed to module %r; "
                         "skipped" % (adv_id, mod.id))
@@ -571,7 +549,7 @@ def run_advisors_for_epoch(cfg, conn, ctx, enforce_cadence=False):
             if want in matched:
                 continue
             module = want.rsplit(".", 1)[0] if "." in want else ""
-            _note_advisor_problem(
+            advisors.note_advisor_problem(
                 conn, ctx, want, module,
                 "selector names no advisor: %r" % want)
 

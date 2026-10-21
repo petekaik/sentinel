@@ -39,4 +39,5 @@ MODULE = Module(
     # the row that reports the monitor itself.
     extra_check_ids=("host_unreachable", "host_auth_failed", "monitor_config",
                      "journal_capture"),
+    intelligence=("observe", "author", "remediate"),
 )

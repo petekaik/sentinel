@@ -1,5 +1,8 @@
 """The module contract: what a module declares, and nothing it implements."""
 
+INTELLIGENCE_LANES = ("observe", "author", "remediate")
+AUTHOR_LEVELS = ("off", "propose", "auto")
+
 
 class Setting:
     """One env-backed setting a module owns."""
@@ -142,7 +145,8 @@ class Module:
                  threshold_file="thresholds.conf", context=None, preload=None,
                  checks=(), commands=None, actions=None, advisors=None,
                  after_epoch=None, extra_check_ids=(), check_instances=None,
-                 validate_settings=None, owned_check_ids=None):
+                 validate_settings=None, intelligence=("observe",),
+                 owned_check_ids=None):
         for value, want, name in ((id, str, "id"), (title, str, "title"),
                                   (order, int, "order")):
             if not isinstance(value, want):
@@ -165,6 +169,21 @@ class Module:
         self._check_instances = check_instances
         self._validate_settings = validate_settings
         self._owned_check_ids = owned_check_ids
+
+        self.intelligence = tuple(intelligence)
+        for lane in self.intelligence:
+            if lane not in INTELLIGENCE_LANES:
+                raise ValueError(
+                    "module %r declares unknown intelligence lane %r; "
+                    "expected one of %r"
+                    % (id, lane, list(INTELLIGENCE_LANES)))
+        if "remediate" in self.intelligence and not list(self._actions()):
+            # A grant that can never do anything reads on the dashboard as a
+            # working grant. Refuse the declaration rather than accept it.
+            raise ValueError(
+                "module %r declares the remediate intelligence lane but has "
+                "no actions; a remediate grant could never execute anything"
+                % id)
 
         # CHECK IDS THE MODULE OWNS THAT ARE NOT Check CLASSES. The collector
         # emits a few incidents itself (`host_unreachable`, `journal_capture`),

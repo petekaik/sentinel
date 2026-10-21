@@ -25,4 +25,5 @@ MODULE = Module(
     context=context,
     preload=preload,
     checks=(system_checks,),
+    intelligence=("observe", "author"),
 )

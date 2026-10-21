@@ -28,6 +28,7 @@ import test_commands as command_tests           # noqa: E402
 import test_dashboard as dash_tests             # noqa: E402
 import test_dynamic_checks as dynamic_tests     # noqa: E402
 import test_incident_lifecycle as incident_tests  # noqa: E402
+import test_intelligence as intelligence_tests       # noqa: E402
 import test_modules as module_tests                # noqa: E402
 import test_proxy_config as proxy_tests         # noqa: E402
 import test_remediation as remediation_tests    # noqa: E402
@@ -74,6 +75,9 @@ SUITES = (
     ("advisors -- the read-only snapshot (honest history windows, bounded "
      "reads, no write path) and the bounded, isolated runner",
      advisor_tests.TESTS),
+    ("intelligence -- grants, scoped views, both invariants, discovery and "
+     "the one-call cycle",
+     intelligence_tests.TESTS),
     ("system -- the local host's own resources: load, memory, disk, mdstat, "
      "thermal and uptime, with absent figures UNKNOWN rather than green",
      system_tests.TESTS),

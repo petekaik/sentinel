@@ -77,4 +77,5 @@ MODULE = Module(
     # `check_instances`), so the static half of the ownership rule names it.
     extra_check_ids=("snmp_reachable",),
     owned_check_ids=preload.owned_ids,
+    intelligence=("observe", "author"),
 )

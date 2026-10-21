@@ -62,7 +62,7 @@ class OpenAIClient:
         self.model = model or ""
         self.timeout_s = timeout_s
 
-    def complete(self, system, user):
+    def complete(self, system, user, max_tokens=32000):
         if not self.endpoint or not self.model:
             raise ModelError(
                 "the model backend needs an endpoint and a model") from None
@@ -71,10 +71,10 @@ class OpenAIClient:
             "model": self.model,
             "temperature": 0,
             # The answer is one small JSON object, but a REASONING model spends
-            # this budget on its chain of thought before the answer. 2,000 was
-            # enough to starve deepseek-v4-flash into content=null; 8,000 leaves
-            # room for the reasoning and the JSON while still bounding cost.
-            "max_tokens": 8000,
+            # this budget on its chain of thought before the answer. 2,000 and
+            # then 8,000 both starved deepseek-v4-flash into content=null; the
+            # caller supplies the configured completion budget.
+            "max_tokens": int(max_tokens),
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
         }).encode()
@@ -190,8 +190,9 @@ class LlmAdvisor(advisors.Advisor):
         # slow-drip endpoint can hold the call far past `timeout_s`, so the
         # cycle gets a hard wall-clock bound and then moves on. The abandoned
         # thread is the platform's documented `call_bounded` behaviour.
+        limit = int(getattr(cfg, "intelligence_max_output_tokens", 32000))
         state, value = command_lib.call_bounded(
-            lambda: client.complete(system, user), budget_s)
+            lambda: client.complete(system, user, limit), budget_s)
         if state == "timeout":
             raise ModelError(
                 "the model call exceeded its %ss budget" % budget_s) from None

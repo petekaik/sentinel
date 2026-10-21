@@ -320,6 +320,18 @@ class Config:
                 "SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS must be > 0, got %d"
                 % max_tokens)
         self.intelligence_model_max_tokens = max_tokens  # secretscan:ignore -- identifier
+        # The COMPLETION budget in the request, distinct from the prompt-pack
+        # cap above. A reasoning model spends this on its chain of thought
+        # before it writes the answer: the hardcoded 8,000 that preceded this
+        # key starved deepseek-v4-flash into content=null with
+        # finish_reason=length on a three-module pack.
+        output = int(_env("SENTINEL_INTELLIGENCE_MAX_OUTPUT_TOKENS",
+                          "32000", e))
+        if output <= 0:
+            raise ValueError(
+                "SENTINEL_INTELLIGENCE_MAX_OUTPUT_TOKENS must be > 0, got %d"
+                % output)
+        self.intelligence_max_output_tokens = output
         # THE ANOMALY DETECTOR IS OFF UNTIL THE REPLAY HARNESS SHOWS IT WINS.
         # The live comparison is pending (docs/superpowers/plans/
         # 2026-10-21-anomaly-result.md); an unmeasured detector emitting advice

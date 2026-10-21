@@ -1762,8 +1762,9 @@ class _FakeModel:
     def __init__(self, endpoint, key="", model="", timeout_s=30):
         self.endpoint = endpoint
 
-    def complete(self, system, user):
-        _FakeModel.calls.append({"system": system, "user": user})
+    def complete(self, system, user, max_tokens=None):
+        _FakeModel.calls.append({"system": system, "user": user,
+                                 "max_tokens": max_tokens})
         if _FakeModel.error is not None:
             raise _FakeModel.error
         return (_FakeModel.content, 11, 7)
@@ -2220,7 +2221,7 @@ def test_a_model_call_over_the_budget_is_a_model_error(results):
         def __init__(self, *a, **k):
             pass
 
-        def complete(self, system, user):
+        def complete(self, system, user, max_tokens=None):
             time.sleep(2)
             return ("{}", 1, 1)
 
@@ -3782,6 +3783,35 @@ def test_a_lost_claim_never_executes_and_preserves_the_human_decision(results):
         shutil.rmtree(tmp)
 
 
+def test_the_completion_budget_is_configurable(results):
+    """The pack cap and the completion budget are different limits.
+
+    The request's max_tokens was hardcoded, so a reasoning model that spent
+    its budget on chain-of-thought returned content=null and no knob changed
+    it. This pins the key that now does.
+    """
+    cfg = config_mod.Config({})
+    results.check(
+        "the completion budget defaults to 32000",
+        cfg.intelligence_max_output_tokens == 32000,
+        "got %r" % (cfg.intelligence_max_output_tokens,))
+    cfg = config_mod.Config(
+        {"SENTINEL_INTELLIGENCE_MAX_OUTPUT_TOKENS": "48000"})
+    results.check(
+        "the completion budget is read from .env",
+        cfg.intelligence_max_output_tokens == 48000,
+        "got %r" % (cfg.intelligence_max_output_tokens,))
+    try:
+        config_mod.Config({"SENTINEL_INTELLIGENCE_MAX_OUTPUT_TOKENS": "0"})
+    except ValueError as exc:
+        results.check(
+            "a zero completion budget refuses rather than clamping",
+            "MAX_OUTPUT_TOKENS" in str(exc), "error=%r" % (exc,))
+    else:
+        results.check("a zero completion budget refuses rather than clamping",
+                      False, "accepted")
+
+
 TESTS = (
     test_author_auto_is_reserved_and_startup_refuses_it,
     test_a_model_widening_over_a_failing_reading_is_silencing_on_both_paths,
@@ -3837,6 +3867,7 @@ TESTS = (
     test_the_modules_own_validation_can_refuse_an_additive_edit,
     test_a_warn_that_stays_warn_is_a_modification,
     test_no_grant_reads_nothing_and_says_so,
+    test_the_completion_budget_is_configurable,
     test_a_granted_module_is_read_and_recorded,
     test_the_cadence_skips_a_second_cycle,
     test_anomaly_detection_is_off_by_default,

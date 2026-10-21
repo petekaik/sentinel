@@ -241,8 +241,23 @@ def test_a_reasoning_model_with_no_content_names_the_cause(results):
         httpd.server_close()
 
 
+def test_the_completion_budget_reaches_the_request(results):
+    httpd, base = _serve()
+    try:
+        client = llm_advisor.OpenAIClient(base, "", "probe")
+        client.complete("sys", "user", max_tokens=1234)
+        results.check(
+            "the request carries the caller's completion budget",
+            _Handler.requests[0]["body"].get("max_tokens") == 1234,
+            "body=%r" % (_Handler.requests[0]["body"],))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 TESTS = (
     test_one_request_with_the_key_only_in_the_header,
+    test_the_completion_budget_reaches_the_request,
     test_a_reasoning_model_with_no_content_names_the_cause,
     test_a_failing_request_never_names_the_key,
     test_a_slow_endpoint_times_out_and_says_so,

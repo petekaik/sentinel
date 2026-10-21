@@ -915,7 +915,11 @@ dropped, before anything is concatenated. Every summary carries its own `truncat
 and the effective `budget` (rows, bytes, tokens, per-series sample cap), so a cut pack can
 say what cut it. The joined pack is then held to
 `SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS` (default 16000) by shrinking the largest module —
-journals first, then lists and maps halved — until it fits.
+journals first, then lists and maps halved — until it fits. That key bounds the **prompt**;
+the request's completion budget is a separate key, `SENTINEL_INTELLIGENCE_MAX_OUTPUT_TOKENS`
+(default 32000), because a reasoning model spends completion tokens on its chain of thought
+before it writes the answer — 8,000 returned `content=null` with `finish_reason=length` on a
+three-module pack.
 The cut is deterministic for the same input, and the cycle records
 `model pack reduced for <modules>`; `usage._reduced_bytes` records the before/after byte
 size per reduced module, so a pack shrunk by `budget.bytes` is as visible as one shrunk by

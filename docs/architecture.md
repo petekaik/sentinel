@@ -688,7 +688,8 @@ the two shell probes and its `thresholds.conf`.
 ### SNMP — the first settings-driven module
 
 `app/modules/snmp/` monitors switches, PDUs, UPSes and anything else with an
-agent, over **SNMP v2c, read-only**: it sends `GET` requests and nothing else.
+agent, over **SNMP v2c, read-only**: it sends `GET` requests for its checks
+and, for `discover` only, `GETNEXT`; it never sends `SET`.
 There is no per-device code; devices and OID rows are settings rows.
 
 | Setting | Kind | Meaning |

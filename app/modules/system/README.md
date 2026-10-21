@@ -57,6 +57,26 @@ On the dashboard the spec-graded checks appear in the module's own
 "System resources" section; the spec-less RAID check is listed in the
 all-checks-by-target table, and uptime is in the informational section.
 
+## Intelligence and remediation
+
+`system` declares `observe` and `author` — **no `remediate`**, because it
+declares no actions. The grant is `SYSTEM_INTELLIGENCE` (JSON, `.env` fallback)
+or the SPA grant, which wins; a lane the module does not declare, including
+`remediate`, is refused at startup rather than ignored.
+
+`SYSTEM_AUTHORITY` is accepted but inert: there is nothing for the ladder to
+execute. Authoring is proposal-only in this delivery (`auto` is reserved), and
+a model-authored change may only be additive — a new check or threshold row —
+never a removal, a disablement, or a band widened past a failing value.
+
+```bash
+SYSTEM_INTELLIGENCE={"observe": true, "author": "propose"}
+```
+
+The optional per-module budget is `{"rows": 500, "bytes": 32768, "tokens": 2000}`.
+A malformed grant refuses rather than granting anything. See
+`docs/architecture.md` ("Module intelligence options") for the full matrix.
+
 ## Adding remote hosts later
 
 Not implemented in v1, deliberately: this module watches only the host the

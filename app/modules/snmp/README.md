@@ -118,6 +118,27 @@ currently down is proposed as a `state` row expecting `up`, so it reports
 **observed-down** (FAIL) -- the truth about the device. Discovery never makes a
 down interface green.
 
+## Intelligence and remediation
+
+`snmp` declares `observe` and `author` — **no `remediate`**: the module never
+writes to a device and declares no actions. The grant is `SNMP_INTELLIGENCE`
+(JSON, `.env` fallback) or the SPA grant, which wins; a `remediate` grant is
+refused at startup. `SNMP_AUTHORITY` is accepted but inert.
+
+Discovery stays the deterministic path: `discover` proposes candidates with
+checked-in starting bands, and the operator reviews them. A model may author
+additive rows as proposals (`auto` is reserved) — a new device or check row,
+never a removal or a band widened past a failing value — and a proposal is
+still reviewed before it is applied.
+
+```bash
+SNMP_INTELLIGENCE={"observe": true, "author": "propose"}
+```
+
+The optional per-module budget is `{"rows": 500, "bytes": 32768, "tokens": 2000}`.
+A malformed grant refuses rather than granting anything. See
+`docs/architecture.md` ("Module intelligence options") for the full matrix.
+
 ## Grading
 
 `kind` is one of:

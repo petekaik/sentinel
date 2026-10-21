@@ -824,6 +824,33 @@ or approval-time option waives them:
    `<MODULE>_ALLOW_DESTRUCTIVE` switch grants nothing; `--showconf` warns if it is still
    set.
 
+### Module intelligence options
+
+Every module declares its lanes in `MODULE.intelligence`; the SPA's manifest shows the
+same set and disables an unsupported lane. The `.env` key is the fallback for a module
+with no stored grant; the SPA grant wins. Each module's `README.md` repeats its own row.
+
+| Module | Declared lanes | Grant key (`.env` fallback) | Remediation authority | Declared actions and triggers |
+|---|---|---|---|---|
+| `fleet` | `observe`, `author`, `remediate` | `FLEET_INTELLIGENCE` | `FLEET_AUTHORITY` (`off` / `advisory` / `propose` / `scoped` / `full`), `FLEET_ALLOW` for `scoped`, `FLEET_ACTION_<ID>_AUTHORITY` overrides | `state_mount_cycle` — `state_dir_tmpfs`, `state_save_age_min`; `transcode_restart` — `heartbeat_age_min`, `pass_cadence_min`; both `state_changing` |
+| `system` | `observe`, `author` | `SYSTEM_INTELLIGENCE` | `SYSTEM_AUTHORITY` accepted but inert (no actions) | none |
+| `snmp` | `observe`, `author` | `SNMP_INTELLIGENCE` | `SNMP_AUTHORITY` accepted but inert (no actions) | none; `discover` is a read-only operator command |
+
+A grant is a JSON object; the optional per-module budget is
+`{"rows": 500, "bytes": 32768, "tokens": 2000}`. `author` is `off` / `propose` / `auto`,
+and `auto` is reserved in this delivery. A module that does not declare `remediate`
+refuses a `remediate` grant at startup; the SPA disables the control.
+
+**Remediation is three separate switches, and the intelligence grant is a fourth.**
+`MONITOR_REMEDIES` is the process kill switch (`0` by default); `SENTINEL_REMEDIATION` is
+the engine master (on by default); `<MODULE>_AUTHORITY` is the module's ladder (`off` by
+default). The SPA's `remediate` grant only decides whether the **model** may nominate an
+action; it cannot execute anything without the ladder and both engine switches. At
+`propose` a nomination is a pending proposal; at `scoped` the action must also be in
+`<MODULE>_ALLOW`; at `full` any declared non-destructive action is eligible. A destructive
+action is always a human proposal, at every level. `fleet` declares no destructive action;
+`serial_break` is an operator command, not an engine action.
+
 ---
 
 ## Intelligence — advisors that can only propose

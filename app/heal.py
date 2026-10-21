@@ -482,8 +482,15 @@ def consider_nominations(cfg, conn, seq, results, ctx):
     A nomination whose incident is gone, or whose triple this epoch did not
     observe, is EXPIRED rather than executed -- a decision made on stale
     evidence is the false-green this platform exists to prevent. A nomination
-    the ladder now refuses (the grant narrowed, the incident is latched) is left
-    PENDING for a human: the diagnosis is still worth a decision.
+    the ladder now refuses (the authority narrowed, the incident is latched) is
+    left PENDING for a human: the diagnosis is still worth a decision. A
+    nomination whose intelligence grant lost `observe` or `remediate` is
+    EXPIRED -- the module may no longer read the evidence or run the action.
+
+    THE ROW IS CLAIMED BEFORE THE ATTEMPT. The list was read as `pending`; a
+    human may have rejected it in between, and only the conditional UPDATE can
+    say which process owns the decision. A lost claim is a refusal, and nothing
+    runs. A refusal after the claim releases the row back to pending.
 
     `cfg.authority` and never `actions.approval_policy`: the latter is a human's
     approval, and this path is not a human.
@@ -524,6 +531,18 @@ def consider_nominations(cfg, conn, seq, results, ctx):
             store.decide_proposal(conn, row["id"], "expired", "ladder")
             out.append((row["id"], "expired: action no longer declared"))
             continue
+        # THE GRANT IS RE-RESOLVED AT EXECUTION. A nomination is durable data
+        # about a decision made under the authority in force THEN; `observe`
+        # (may this module's evidence be read at all) and `remediate` (may its
+        # actions run) are re-asked HERE, before the ladder and the attempt.
+        # A withdrawal is a decision about the nomination, so the row is
+        # EXPIRED rather than left for an approval that would resurrect it.
+        grant, _why = cfg.intelligence_grant(
+            mod.id, tuple(getattr(mod, "intelligence", ("observe",))))
+        if grant.get("observe") is not True or grant.get("remediate") is not True:
+            store.decide_proposal(conn, row["id"], "expired", "ladder")
+            out.append((row["id"], "expired: intelligence grant withdrawn"))
+            continue
         policy = cfg.authority(mod.id)
         ok, why = actions.allowed(action, incident, policy)
         if not ok:
@@ -531,9 +550,21 @@ def consider_nominations(cfg, conn, seq, results, ctx):
             # Leave it pending for a human rather than discard the diagnosis.
             out.append((row["id"], "refused: %s" % why))
             continue
+        # CLAIM BEFORE THE ATTEMPT. The row was read as `pending`; a human may
+        # have rejected it in between, and only the conditional UPDATE can say
+        # which process owns the decision. A lost claim is a refusal -- the
+        # human decided first -- and nothing runs.
+        if store.claim_proposal(conn, row["id"], "ladder") != 1:
+            out.append((row["id"],
+                        "refused: proposal is no longer pending"))
+            continue
         res = attempt(action, incident, ctx, policy, conn, seq,
                       module_id=mod.id)
         if res.get("executed"):
-            store.mark_ladder_executed(conn, row["id"])
+            # `approved` -> `executed`; the claim recorded the actor.
+            store.mark_proposal_executed(conn, row["id"])
+        else:
+            # A refusal is not a decision about the proposal.
+            store.release_proposal(conn, row["id"])
         out.append((row["id"], res.get("why", "")))
     return out

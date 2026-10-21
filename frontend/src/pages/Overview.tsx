@@ -162,7 +162,10 @@ export default function Overview() {
           either leaves the deterministic evidence intact, so this sits above
           the cards rather than replacing them. The detail is the server's,
           already redacted -- never the model key. */}
-      {cycle && (cycle.status === "error" || cycle.status === "budget") && (
+      {cycle
+        && (cycle.status === "error"
+          || cycle.status === "budget"
+          || cycle.status === "partial") && (
         <div
           className={`banner ${cycle.status === "error" ? "red" : "amber"}`}
           role="alert"
@@ -170,7 +173,9 @@ export default function Overview() {
           <strong>
             {cycle.status === "error"
               ? "The last intelligence cycle failed."
-              : "The last intelligence cycle exceeded its budget."}
+              : cycle.status === "budget"
+                ? "The last intelligence cycle exceeded its budget."
+                : "The last intelligence cycle was partial."}
           </strong>{" "}
           {cycle.detail || "No detail was recorded."} The fleet below is still
           the last measured state.

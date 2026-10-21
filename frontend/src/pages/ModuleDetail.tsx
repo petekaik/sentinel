@@ -335,6 +335,34 @@ export default function ModuleDetail() {
         {mod.checks.length === 1 ? "" : "s"}
         {mod.enabled ? "" : " · collection is stopped while disabled"}
       </p>
+      {mod.intelligence && (
+        <p className="sub">
+          intelligence:{" "}
+          <span
+            className={`pill ${
+              mod.intelligence.grant.observe ? "green" : "grey"
+            }`}
+          >
+            observe {mod.intelligence.grant.observe ? "on" : "off"}
+          </span>{" "}
+          <span className="pill grey">
+            author {mod.intelligence.grant.author}
+            {(mod.intelligence.reserved_author_levels ?? []).includes("auto")
+              ? " (auto reserved)"
+              : ""}
+          </span>{" "}
+          <span
+            className={`pill ${
+              mod.intelligence.grant.remediate ? "amber" : "grey"
+            }`}
+          >
+            remediate {mod.intelligence.grant.remediate ? "on" : "off"}
+          </span>
+          {mod.intelligence.error && (
+            <> — grant error: {mod.intelligence.error}</>
+          )}
+        </p>
+      )}
       <div className="setting-actions">
         {writesDisabled ? (
           <span className="badge source">writes disabled on the server</span>

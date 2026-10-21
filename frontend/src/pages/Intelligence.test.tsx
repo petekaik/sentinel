@@ -15,12 +15,16 @@ function moduleFixture(over: Record<string, unknown> = {}) {
   };
 }
 
-function stateWith(modules: unknown[]) {
+function stateWith(modules: unknown[]): Record<string, unknown> {
   return {
     enabled: true,
     interval_s: 300,
     backend: { provider: "openai", configured: false, model: "" },
     last_cycle: null,
+    modules_granted: [],
+    modules_read: [],
+    granted_not_read: [],
+    unattributed: {},
     usage: [],
     modules,
   };
@@ -197,5 +201,66 @@ describe("Intelligence", () => {
       screen.getByText(/write token is required to save a grant/i),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /save fleet/i })).toBeDisabled();
+  });
+
+  it("shows a stored author=auto as reserved, not as a usable level", async () => {
+    stubReads(
+      stateWith([
+        moduleFixture({
+          grant: { observe: true, author: "auto", remediate: false, budget },
+        }),
+        moduleFixture({
+          id: "system", title: "System resources", order: 20,
+          supported: ["observe", "author"],
+        }),
+      ]),
+    );
+    render(<Intelligence />);
+    const select = (await screen.findByLabelText(
+      "fleet author",
+    )) as HTMLSelectElement;
+    expect(select.value).toBe("auto");
+    expect(
+      screen.getByRole("option", {
+        name: /auto — reserved — no unattended producer/i,
+      }),
+    ).toBeDisabled();
+  });
+
+  it("shows a partial cycle and the granted-but-not-read modules", async () => {
+    const state = stateWith([
+      moduleFixture({
+        grant: { observe: true, author: "off", remediate: false, budget },
+      }),
+      moduleFixture({
+        id: "system", title: "System resources", order: 20,
+        supported: ["observe", "author"],
+      }),
+    ]);
+    state.last_cycle = {
+      id: 7,
+      ts: 1760000000,
+      status: "partial",
+      duration_ms: 12,
+      model_calls: 0,
+      detail: "granted but not read: system",
+      modules_granted: ["fleet", "system"],
+      modules_read: ["fleet"],
+      notes: ["could not build a view for system: boom"],
+    };
+    state.modules_granted = ["fleet", "system"];
+    state.modules_read = ["fleet"];
+    state.granted_not_read = ["system"];
+    state.unattributed = { fleet: { "cpu.metric": "cubox-1" } };
+    stubReads(state);
+    render(<Intelligence />);
+    expect(
+      await screen.findByText(/The last intelligence cycle was partial/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/could not build a view for system/i))
+      .toBeInTheDocument();
+    expect(screen.getByText(/Granted but not read:/))
+      .toBeInTheDocument();
+    expect(screen.getByText("cubox-1/cpu.metric")).toBeInTheDocument();
   });
 });

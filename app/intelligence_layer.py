@@ -42,6 +42,20 @@ AUTHOR_KINDS = ("check_set", "settings_change", "threshold_change")
 ANOMALY_MAX_SERIES = 20
 ANOMALY_MAX_ROWS = 10000
 
+# THE MODEL'S REPLY IS UNTRUSTED INPUT. A valid reply can still be arbitrarily
+# large, so every list and every string has a bound that the VALIDATOR applies.
+# The counts are deliberately generous against a real cycle (a fleet this size
+# produces a handful) and tight against a model that echoes its whole context.
+MAX_INSIGHTS_PER_MODULE = 20
+MAX_PROPOSALS_PER_MODULE = 10
+MAX_INSIGHTS_TOTAL = 100
+MAX_PROPOSALS_TOTAL = 50
+MAX_TITLE = 200
+MAX_BODY = 4000
+MAX_RATIONALE = 1000
+MAX_EVIDENCE_BYTES = 8 * 1024
+INSIGHT_SEVERITIES = ("info", "notable", "actionable")
+
 
 def resolve_grants(cfg, modules):
     grants, errors = {}, {}
@@ -259,6 +273,7 @@ def pack_views(views, grants, max_tokens, cfg=None):
     cfg = cfg if cfg is not None else _cfg_from_views(views)
     secrets = _secret_values(cfg)  # secretscan:ignore -- a redaction list, never logged
     per_module = {}
+    before_bytes = {}
     for mid, view in views.items():
         # THE GRANT IS CHECKED HERE TOO. The cycle only passes observing views
         # today, but a pack that trusted its caller would send another module's
@@ -274,12 +289,17 @@ def pack_views(views, grants, max_tokens, cfg=None):
         except Exception:                      # noqa: BLE001 - isolated
             since = view.now - days * advisors.DAY
         pack = view.summaries(since, max_rows=max_rows)
+        # MEASURED BEFORE THE MODULE'S BYTE CAP, so the marker below can show a
+        # pack that was shrunk by `budget.bytes` as well as by tokens.
+        before_bytes[mid] = len(json.dumps(
+            pack, sort_keys=True, default=str).encode())
         per_module[mid] = _cap_pack(pack, budget.get("bytes"))
 
     def dump(pack):
         return redact(json.dumps(pack, sort_keys=True, default=str), secrets)
 
     texts, usage, reduced = {}, {}, []
+    reduced_bytes = {}
     for mid, pack in per_module.items():
         # THE MODULE'S OWN TOKEN BUDGET, before the global one: a grant of
         # `tokens` is a promise about this module's share of the request, and
@@ -296,6 +316,12 @@ def pack_views(views, grants, max_tokens, cfg=None):
             text = dump(pack)
         texts[mid] = text
         usage[mid] = max(1, len(text.encode()) // 4)
+        after = len(text.encode())
+        if after < before_bytes.get(mid, after):
+            # THE BYTE REDUCTION IS RECORDED BESIDE THE TOKEN ONE. A pack shrunk
+            # by `budget.bytes` or by the global cap must not read as whole just
+            # because its token estimate still fits.
+            reduced_bytes[mid] = {"before": before_bytes[mid], "after": after}
         if cut:
             reduced.append(mid)
     while sum(usage.values()) > int(max_tokens):
@@ -309,8 +335,13 @@ def pack_views(views, grants, max_tokens, cfg=None):
             break
         texts[mid] = dump(per_module[mid])
         usage[mid] = max(1, len(texts[mid].encode()) // 4)
+        after = len(texts[mid].encode())
+        if after < before_bytes.get(mid, after):
+            reduced_bytes[mid] = {"before": before_bytes[mid], "after": after}
     if reduced:
         usage["_reduced"] = sorted(reduced)
+    if reduced_bytes:
+        usage["_reduced_bytes"] = reduced_bytes
     system = (
         "You are Sentinel's intelligence analyst. You never grade checks, "
         "never resolve incidents, never claim an action succeeded, and never "
@@ -369,6 +400,178 @@ def _subjects_for(mid, view, cache):
     return out
 
 
+def _settings_map(value):
+    """The settings map, accepting the wrapped and flat documented shapes."""
+    if not isinstance(value, dict):
+        return {}
+    inner = value.get("settings")
+    return inner if isinstance(inner, dict) else value
+
+
+def _check_row_identity(row):
+    return (str(row.get("device") or ""), str(row.get("oid") or ""),
+            str(row.get("label") or ""))
+
+
+def _changed_check_rows(change, before):
+    """The SNMP_CHECKS row identities a proposal changes, not adds.
+
+    An ADDED row has no instance and no history yet, so it has no observation
+    to widen past; `authorize.classify` already treats it as additive. A
+    REMOVED row is absent from the new list and is silencing by removal.
+    """
+    change, before = _settings_map(change), _settings_map(before)
+    new_rows = change.get("SNMP_CHECKS")
+    if not isinstance(new_rows, list):
+        return []
+    old_by = {_check_row_identity(r): r
+              for r in (before.get("SNMP_CHECKS") or ())
+              if isinstance(r, dict)}
+    out = []
+    for row in new_rows:
+        if not isinstance(row, dict):
+            continue
+        identity = _check_row_identity(row)
+        if old_by.get(identity) == row:
+            continue
+        out.append(identity)
+    return out
+
+
+def _row_instances(mod, ctx):
+    """{(device, oid, label): (check_id, target, spec_id)}.
+
+    THE MAPPING COMES FROM THE MODULE'S OWN `check_instances`, the same hook the
+    collector uses to build the rows. A settings row has no check id in it, and
+    re-deriving the slug rule here would be a second implementation that drifts
+    from the one that names the check and its spec.
+    """
+    out = {}
+    if mod is None:
+        return out
+    try:
+        instances = mod.check_instances(ctx)
+    except Exception:                          # noqa: BLE001 - best effort
+        return out
+    for inst in instances or ():
+        row = getattr(inst, "row", None)
+        device = getattr(inst, "device", None)
+        spec_id = getattr(inst, "spec", None)
+        if device is None or not isinstance(row, dict) or not spec_id:
+            continue
+        out[(str(device), str(row.get("oid") or ""),
+             str(row.get("label") or ""))] = (
+            str(getattr(inst, "id", "") or ""),
+            str(getattr(inst, "target", "") or ""),
+            str(spec_id))
+    return out
+
+
+def _observations(change, before, mod, ctx, reader):
+    """Build `{identity: [(value, status)]}` through one bounded reader."""
+    identities = _changed_check_rows(change, before)
+    if not identities:
+        return None
+    mapped = _row_instances(mod, ctx)
+    out = {}
+    for identity in identities:
+        info = mapped.get(identity)
+        if info is None:
+            continue
+        pairs = reader(*info)
+        if pairs:
+            out[identity] = pairs
+    return out or None
+
+
+def _observations_from_view(view, change, before, mod):
+    """The current evidence a model change is graded against, read THROUGH the
+    scoped view -- so the grant that let the model see the module bounds this
+    read too."""
+    days = max(1, min(7, int(getattr(view, "max_days", None) or 7)))
+    since = view.now - days * advisors.DAY
+    try:
+        runs = list(view.check_runs(since, limit=200))
+    except Exception:                          # noqa: BLE001 - fail closed
+        return None
+    newest = {}
+    for run in runs:
+        newest[run.get("check_id")] = run.get("status")
+
+    def reader(check_id, target, metric):
+        try:
+            series = view.sample_series(since, target, metric, limit=200)
+        except Exception:                      # noqa: BLE001 - one series
+            return []
+        # The spec id IS the sample metric for a settings-driven instance
+        # (`checks.instances` registers `spec.metric = spec_id`).
+        status = newest.get(check_id, "")
+        return [(row.get("value"), status) for row in series
+                if row.get("value") is not None]
+    return _observations(change, before, mod, getattr(view, "ctx", None),
+                         reader)
+
+
+def observations_from_store(conn, mod, ctx, change, before, now=None):
+    """The same pairs for an OPERATOR APPROVAL, from the raw store.
+
+    THE GRANT GOVERNS THE INTELLIGENCE, NOT THE OPERATOR. An approval is a human
+    decision, so it may read the affected rows even when the module's observe
+    grant has since been withdrawn -- which is exactly the state an approval of
+    a silenced change is most likely to meet.
+    """
+    if conn is None:
+        return None
+    now = time.time() if now is None else now
+    since = now - 7 * advisors.DAY
+
+    def reader(check_id, target, metric):
+        series = conn.execute(
+            "SELECT value FROM sample WHERE ts >= ? AND target = ? AND "
+            "metric = ? ORDER BY id DESC LIMIT 200",
+            (since, target, metric)).fetchall()
+        row = conn.execute(
+            "SELECT status FROM check_run WHERE check_id = ? "
+            "ORDER BY id DESC LIMIT 1", (check_id,)).fetchone()
+        state = row["status"] if row is not None else ""
+        return [(r["value"], state) for r in series if r["value"] is not None]
+    return _observations(change, before, mod, ctx, reader)
+
+
+def _sanitize_insight(item, mid, dropped):
+    """Bound one insight's strings and fields, or None when it cannot be stored."""
+    out = dict(item)
+    out["title"] = str(item.get("title") or "")[:MAX_TITLE]
+    out["body"] = str(item.get("body") or "")[:MAX_BODY]
+    try:
+        confidence = float(item.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    # NaN clamps to 0 through max()'s comparison; infinities clamp at the ends.
+    out["confidence"] = min(1.0, max(0.0, confidence))
+    severity = str(item.get("severity") or "info").strip().lower()
+    # An unknown severity is NORMALISED to `info`, never stored as a value no
+    # reader knows. The insight itself is still worth keeping.
+    out["severity"] = severity if severity in INSIGHT_SEVERITIES else "info"
+    evidence = item.get("evidence", {})
+    if evidence is None:
+        # An explicit null is an empty evidence object, not a malformed item.
+        evidence = {}
+    if not isinstance(evidence, dict):
+        _bump(dropped, mid)
+        return None
+    try:
+        size = len(json.dumps(evidence, default=str).encode())
+    except (TypeError, ValueError):
+        _bump(dropped, mid)
+        return None
+    if size > MAX_EVIDENCE_BYTES:
+        _bump(dropped, mid)
+        return None
+    out["evidence"] = evidence
+    return out
+
+
 def validate_model_output(payload, views, grants, conn=None):
     """(insights, proposals, dropped). Invalid items are DROPPED and counted.
 
@@ -388,6 +591,7 @@ def validate_model_output(payload, views, grants, conn=None):
     views = views or {}
     grants = grants or {}
     subjects = {}
+    per_insight, per_proposal = {}, {}
     for item in payload.get("insights") or ():
         if not isinstance(item, dict):
             _bump(dropped, "_unknown")
@@ -416,7 +620,17 @@ def validate_model_output(payload, views, grants, conn=None):
             if not allowed or subject not in allowed:
                 _bump(dropped, mid)
                 continue
+        # A FLOOD IS NOT EVIDENCE. The per-module and total caps are applied
+        # before sanitising, and the dropped item is counted like any other.
+        if (per_insight.get(mid, 0) >= MAX_INSIGHTS_PER_MODULE
+                or len(kept) >= MAX_INSIGHTS_TOTAL):
+            _bump(dropped, mid)
+            continue
+        item = _sanitize_insight(item, mid, dropped)
+        if item is None:
+            continue
         kept.append(item)
+        per_insight[mid] = per_insight.get(mid, 0) + 1
 
     for item in payload.get("proposals") or ():
         if not isinstance(item, dict):
@@ -433,6 +647,12 @@ def validate_model_output(payload, views, grants, conn=None):
         if not isinstance(body, dict):
             _bump(dropped, mid)
             continue
+        if (per_proposal.get(mid, 0) >= MAX_PROPOSALS_PER_MODULE
+                or len(proposals) >= MAX_PROPOSALS_TOTAL):
+            _bump(dropped, mid)
+            continue
+        item = dict(item)
+        item["rationale"] = str(item.get("rationale") or "")[:MAX_RATIONALE]
         if kind == "action":
             if grant.get("remediate") is not True:
                 _bump(dropped, mid)
@@ -457,6 +677,7 @@ def validate_model_output(payload, views, grants, conn=None):
             out["classification"] = "action"
             out["diff"] = "action %s on %s" % (action_id, key)
             proposals.append(out)
+            per_proposal[mid] = per_proposal.get(mid, 0) + 1
             continue
         if kind in AUTHOR_KINDS:
             if grant.get("author") in (None, "off"):
@@ -471,13 +692,21 @@ def validate_model_output(payload, views, grants, conn=None):
                 out["classification"] = "threshold_change"
                 out["diff"] = "threshold_change on %s" % spec_id
                 proposals.append(out)
+                per_proposal[mid] = per_proposal.get(mid, 0) + 1
                 continue
             module = getattr(view, "mod", None)
             before = getattr(view, "module_settings", None)
             if module is None or not isinstance(before, dict):
                 _bump(dropped, mid)
                 continue
-            classification, detail = authorize.classify(body, module, before)
+            # THE OBSERVATIONS COME THROUGH THE SAME VIEW. Without them a
+            # band widening over a currently failing reading classified as a
+            # bare `modification`; with them it is `silencing`, which is what
+            # `authorize.classify` is for.
+            classification, detail = authorize.classify(
+                body, module, before,
+                observations=_observations_from_view(view, body, before,
+                                                     module))
             if classification == authorize.INVALID:
                 _bump(dropped, mid)
                 continue
@@ -485,6 +714,7 @@ def validate_model_output(payload, views, grants, conn=None):
             out["classification"] = classification
             out["diff"] = detail
             proposals.append(out)
+            per_proposal[mid] = per_proposal.get(mid, 0) + 1
             continue
         _bump(dropped, mid)
     return kept, proposals, dropped
@@ -635,7 +865,7 @@ def _record_model(cfg, conn, views, model_result, ctx=None, grants=None):
                                     or "model proposal for %s" % mid), secrets)
             pid = store.record_proposal(
                 conn, module=mid, kind=str(item.get("kind") or ""),
-                payload=payload, rationale=rationale[:2000],
+                payload=payload, rationale=rationale[:MAX_RATIONALE],
                 expires_at=time.time() + ttl_s)
         except Exception:                      # noqa: BLE001 - one item only
             bump(mid)
@@ -649,6 +879,13 @@ def _record_model(cfg, conn, views, model_result, ctx=None, grants=None):
 def run_cycle(cfg, conn, ctx, now=None):
     now = time.time() if now is None else now
     started = time.time()
+    # THE CYCLE'S OWN NOTES. `ctx.notes` is the collector's shared list; the
+    # slice keeps this cycle's account of itself, which is what the Intelligence
+    # page needs to explain a partial or failed pass.
+    note_start = len(getattr(ctx, "notes", ()) or ())
+
+    def notes():
+        return list(getattr(ctx, "notes", ()))[note_start:]
     # THE CADENCE COMES FIRST, ABOVE BOTH SKIP RETURNS. A skip is a recorded
     # outcome like any other, so it obeys the same interval -- otherwise an
     # ungranted fleet writes one row every epoch into a table nobody reads.
@@ -661,13 +898,13 @@ def run_cycle(cfg, conn, ctx, now=None):
     except Exception as exc:                       # noqa: BLE001 - isolated
         ctx.note("intelligence cycle failed: %s" % exc)
         return _finish(conn, ctx, "error", started, [], [],
-                       traceback.format_exc()[-2000:])
+                       traceback.format_exc()[-2000:], notes=notes())
     interval = int(getattr(cfg, "intelligence_interval_s", 300))
     if last is not None and (now - float(last["ts"])) < interval:
         return None
     if not getattr(cfg, "intelligence_enabled", True):
         return _finish(conn, ctx, "skipped", started, [], [],
-                       "disabled by SENTINEL_INTELLIGENCE")
+                       "disabled by SENTINEL_INTELLIGENCE", notes=notes())
     modules = tuple(getattr(ctx, "modules", ()) or ())
     grants, errors = resolve_grants(cfg, modules)
     for mid, why in errors.items():
@@ -675,11 +912,11 @@ def run_cycle(cfg, conn, ctx, now=None):
     granted = [m.id for m in modules if grants[m.id]["observe"]]
     if not granted:
         return _finish(conn, ctx, "skipped", started, [], [],
-                       "no modules granted")
+                       "no modules granted", notes=notes())
 
     specs = getattr(ctx, "specs", {}) or {}
     max_days = getattr(cfg, "advisor_max_history_days", 30)
-    views, read = {}, []
+    views, read, failed_views = {}, [], []
     for mod in modules:
         if mod.id not in granted:
             continue
@@ -689,8 +926,16 @@ def run_cycle(cfg, conn, ctx, now=None):
                 max_days=max_days)
             read.append(mod.id)
         except Exception:
-            ctx.module_errors["intelligence:%s" % mod.id] = \
-                traceback.format_exc()
+            # A GRANTED MODULE WITH NO VIEW IS NOT A HEALTHY CYCLE. The
+            # module is named here, the cycle is finished as `partial`, and
+            # `modules_read` (not `modules_granted`) is what says which views
+            # the model actually saw.
+            failed_views.append(mod.id)
+            tb = traceback.format_exc()
+            line = tb.strip().splitlines()
+            ctx.note("could not build a view for %s: %s"
+                     % (mod.id, line[-1] if line else "unknown error"))
+            ctx.module_errors["intelligence:%s" % mod.id] = tb
 
     runs, usage = [], {}
     selected = tuple(getattr(cfg, "advisor_ids", ()))
@@ -871,7 +1116,7 @@ def run_cycle(cfg, conn, ctx, now=None):
     except Exception as exc:
         ctx.note("intelligence cycle failed: %s" % exc)
         return _finish(conn, ctx, "error", started, granted, read,
-                       traceback.format_exc()[-2000:])
+                       traceback.format_exc()[-2000:], notes=notes())
 
     # ONE MODEL CALL FOR THE WHOLE FLEET. The pack is every granted view at
     # once -- a call per module would be N requests, N bills and N chances to
@@ -896,7 +1141,7 @@ def run_cycle(cfg, conn, ctx, now=None):
                 ctx.module_errors["intelligence"] = traceback.format_exc()[-2000:]
                 return _finish(conn, ctx, "error", started, granted, read,
                                "model call failed", runs=runs, usage=usage,
-                               model_calls=model_calls)
+                               model_calls=model_calls, notes=notes())
             try:
                 ids, counts = _record_model(cfg, conn, views, model_result,
                                             ctx, grants)
@@ -919,16 +1164,35 @@ def run_cycle(cfg, conn, ctx, now=None):
                         estimates["_reduced"])
             except Exception as exc:           # noqa: BLE001 - isolated
                 ctx.note("could not record the model's output: %s" % exc)
-    return _finish(conn, ctx, "ok", started, granted, read, detail,
+    # A SERIES THE VIEW COULD NOT ATTRIBUTE IS NOT A SERIES NOBODY HAS. The
+    # module's samples can name a target/metric pair owned by another module
+    # (or by none); counting it per module is what stops a pack that dropped it
+    # from reading as a complete module.
+    for mid, view in views.items():
+        if not view.unattributed:
+            continue
+        usage.setdefault(mid, {})["unattributed"] = dict(view.unattributed)
+        ctx.note("unattributed series for %s: %s"
+                 % (mid, ", ".join(sorted(view.unattributed))))
+    if any(view.unattributed for view in views.values()):
+        detail = ("%s; " % detail if detail else "") + (
+            "unattributed series: %s" % ", ".join(
+                "%s (%d)" % (mid, len(view.unattributed))
+                for mid, view in sorted(views.items()) if view.unattributed))
+    status = "partial" if failed_views else "ok"
+    if failed_views:
+        detail = ("%s " % detail if detail else "") + (
+            "granted but not read: %s" % ", ".join(failed_views))
+    return _finish(conn, ctx, status, started, granted, read, detail,
                    runs=runs, usage=usage, proposals=proposals,
-                   model_calls=model_calls,
+                   model_calls=model_calls, notes=notes(),
                    tokens_in=model_result.get("tokens_in"),  # secretscan:ignore -- identifier
                    tokens_out=model_result.get("tokens_out"))  # secretscan:ignore -- identifier
 
 
 def _finish(conn, ctx, status, started, granted, read, detail, runs=(),
             usage=None, proposals=(), model_calls=0, tokens_in=None,
-            tokens_out=None):
+            tokens_out=None, notes=()):
     duration_ms = int((time.time() - started) * 1000)
     if (status == "ok"
             and duration_ms > int(getattr(ctx.cfg, "intelligence_budget_ms",
@@ -943,7 +1207,8 @@ def _finish(conn, ctx, status, started, granted, read, detail, runs=(),
             cid = store.record_intelligence_cycle(
                 conn, status, duration_ms, granted, read,
                 model_calls=model_calls, tokens_in=tokens_in,  # secretscan:ignore -- identifier
-                tokens_out=tokens_out, detail=detail)  # secretscan:ignore -- identifier
+                tokens_out=tokens_out, detail=detail,  # secretscan:ignore -- identifier
+                notes=list(notes))
             for module_id, counts in (usage or {}).items():
                 store.record_intelligence_usage(
                     conn, cid, module_id,
@@ -951,7 +1216,8 @@ def _finish(conn, ctx, status, started, granted, read, detail, runs=(),
                     proposals=counts.get("proposals", 0),
                     dropped=counts.get("dropped", 0),
                     rows_read=counts.get("rows_read", 0),
-                    bytes_read=counts.get("bytes_read", 0))
+                    bytes_read=counts.get("bytes_read", 0),
+                    unattributed=counts.get("unattributed"))
         except Exception:
             ctx.note("could not record the intelligence cycle: %s"
                      % traceback.format_exc().strip().splitlines()[-1])

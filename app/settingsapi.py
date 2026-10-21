@@ -50,8 +50,12 @@ RESERVED_KEYS = frozenset((
     "SENTINEL_INTELLIGENCE", "SENTINEL_INTELLIGENCE_INTERVAL_S",
     "SENTINEL_INTELLIGENCE_BUDGET_MS",
     "SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS",
+    "SENTINEL_INTELLIGENCE_ANOMALY",
 ))
-RESERVED_PREFIXES = ("SENTINEL_ADVISOR_", "SENTINEL_LLM_")
+# The whole `SENTINEL_INTELLIGENCE_*` family is platform-owned: a module must
+# not be able to declare a knob the intelligence cycle reads.
+RESERVED_PREFIXES = ("SENTINEL_ADVISOR_", "SENTINEL_LLM_",
+                     "SENTINEL_INTELLIGENCE_")
 
 
 def check_declarations(modules):
@@ -218,6 +222,8 @@ def module_manifests(cfg, conn, modules, specs):
     values = store.setting_rows(conn)
     out = []
     for mod in modules:
+        supported = tuple(getattr(mod, "intelligence", ("observe",)))
+        grant, grant_why = cfg.intelligence_grant(mod.id, supported)
         settings = []
         for setting in mod.settings:
             item = setting.schema()
@@ -250,10 +256,14 @@ def module_manifests(cfg, conn, modules, specs):
             "actions": [{"id": a.id, "title": a.title, "danger": a.danger}
                         for a in mod.actions()],
             "intelligence": {
-                "supported": list(getattr(mod, "intelligence", ("observe",))),
-                "grant": cfg.intelligence_grant(
-                    mod.id, tuple(getattr(mod, "intelligence",
-                                          ("observe",))))[0],
+                "supported": list(supported),
+                "grant": grant,
+                # THE PARSE REASON, so a reader can tell a deliberate `off`
+                # from a value nobody could read. `grants_view` already carries
+                # it; the manifest must not be the quieter surface.
+                "error": grant_why,
+                "reserved_author_levels": list(
+                    config_mod.RESERVED_AUTHOR_LEVELS),
             },
         })
     return out
@@ -390,6 +400,10 @@ def grants_view(cfg, conn, modules):
             "supported": list(getattr(mod, "intelligence", ("observe",))),
             "grant": grant,
             "error": why,
+            # `auto` parses but has no unattended producer here. Named on the
+            # read surface so the SPA can disable it rather than offer it.
+            "reserved_author_levels": list(
+                config_mod.RESERVED_AUTHOR_LEVELS),
             "source": ("db" if row in stored
                        else "env" if raw not in (None, "") else "default"),
         }
@@ -431,6 +445,15 @@ def write_grant(cfg, conn, mod, body, actor):
         budget = dict(current.get("budget") or {})
         budget.update(body["budget"])
         merged["budget"] = budget
+    # AUTO IS RESERVED, AND THE REFUSAL IS EXPLICIT. Checked on the MERGED body
+    # before the general validator, so a partial body cannot leave an existing
+    # `auto` in force and the operator is told the level to change rather than a
+    # downstream symptom (for example "author is auto while observe is off",
+    # which is true but not the thing to fix).
+    if str(merged.get("author") or "").strip().lower() \
+            in config_mod.RESERVED_AUTHOR_LEVELS:
+        raise SettingsError("invalid_value", config_mod.AUTO_RESERVED_MESSAGE,
+                            "intelligence")
     grant, why = config_mod.validate_grant(merged, key, supported)
     if why:
         raise SettingsError("invalid_value", why, "intelligence")
@@ -559,7 +582,7 @@ def normalise_value(setting, value):
     return parsed
 
 
-def write_authoring_change(cfg, conn, mod, change, actor):
+def write_authoring_change(cfg, conn, mod, change, actor, observations=None):
     """Apply a full-value settings change through the normal write path.
 
     THE CLASSIFIER DECIDES, NOT THE CALLER. An `intelligence:auto` actor may
@@ -570,6 +593,12 @@ def write_authoring_change(cfg, conn, mod, change, actor):
     the module's cross-field `validate_settings` has every side of its rule.
     The `before` recorded on an applied change is the touched-key subset, which
     is exactly what a revert restores.
+
+    `observations` carries the current evidence for changed SNMP rows (the
+    `{identity: [(value, status)]}` map `authorize.classify` understands). The
+    model path reads it through its scoped view; an operator approval reads it
+    from the store. Without it a widening past a failing reading is only a
+    `modification`, not the `silencing` it actually is.
     """
     import authorize
     settings = (change or {}).get("settings") or {}
@@ -587,7 +616,7 @@ def write_authoring_change(cfg, conn, mod, change, actor):
     effective = _effective_values(cfg, conn, mod, {}, declared)
     before = {key: effective.get(key) for key in values}
     classification, detail = authorize.classify(
-        {"settings": values}, mod, effective)
+        {"settings": values}, mod, effective, observations=observations)
     if classification == authorize.INVALID:
         raise SettingsError("invalid_value", detail)
     auto = str(actor) == authorize.AUTO_ACTOR

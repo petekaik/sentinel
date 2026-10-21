@@ -205,6 +205,14 @@ export type ModuleManifest = {
   settings: SettingField[];
   commands: CommandField[];
   actions: { id: string; title: string; danger?: string | null }[];
+  /* The module's intelligence contract. `reserved_author_levels` names the
+     levels the server parses but refuses to write (`auto` in this delivery). */
+  intelligence?: {
+    supported: string[];
+    grant: IntelligenceGrant;
+    error?: string;
+    reserved_author_levels?: string[];
+  };
 };
 
 /* The machine-readable change record stored beside a proposal. `settings` is
@@ -431,16 +439,29 @@ export type IntelligenceModule = {
   id: string; title: string; order: number;
   supported: string[]; grant: IntelligenceGrant;
   error: string; source: "db" | "env" | "default";
+  reserved_author_levels?: string[];
+};
+
+export type IntelligenceCycle = {
+  id: number; ts: number; status: string;
+  duration_ms: number; model_calls: number; detail: string;
+  modules_granted: string[]; modules_read: string[]; notes: string[];
 };
 
 export type IntelligenceState = {
   enabled: boolean; interval_s: number;
   backend: { provider: string; configured: boolean; model: string };
-  last_cycle: null | { id: number; ts: number; status: string;
-                        duration_ms: number; modules_read: string;
-                        model_calls: number; detail: string };
+  last_cycle: null | IntelligenceCycle;
+  /* What the last cycle was allowed to read, what it did read, and what it
+     read without being able to attribute. `granted_not_read` is the gap that
+     must not hide behind a green status. */
+  modules_granted: string[];
+  modules_read: string[];
+  granted_not_read: string[];
+  unattributed: Record<string, Record<string, string>>;
   usage: Array<{ module: string; rows_read: number; bytes_read: number;
-                  insights: number; proposals: number; dropped: number }>;
+                  insights: number; proposals: number; dropped: number;
+                  unattributed?: Record<string, string> }>;
   modules: IntelligenceModule[];
 };
 
@@ -448,7 +469,7 @@ export type IntelligenceState = {
    carries no id/title/order -- the caller already knows which module it wrote. */
 export type IntelligenceGrantView = Pick<
   IntelligenceModule,
-  "supported" | "grant" | "error" | "source"
+  "supported" | "grant" | "error" | "source" | "reserved_author_levels"
 >;
 
 export const getIntelligence = () =>

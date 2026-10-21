@@ -49,6 +49,17 @@ const modules = [
     settings: [],
     commands: [],
     actions: [],
+    intelligence: {
+      supported: ["observe", "author", "remediate"],
+      grant: {
+        observe: true,
+        author: "propose",
+        remediate: false,
+        budget: { rows: 500, bytes: 32768, tokens: 2000 },
+      },
+      error: "",
+      reserved_author_levels: ["auto"],
+    },
   },
   {
     id: "system",
@@ -247,6 +258,12 @@ it("renders one check row per target and attributes rows by check ownership", as
   expect(
     screen.queryByRole("heading", { name: "Discover checks" }),
   ).toBeNull();
+
+  // The manifest's intelligence contract is surfaced, and `auto` is named as
+  // reserved rather than offered as a working level.
+  expect(screen.getByText("observe on")).toBeInTheDocument();
+  expect(screen.getByText("author propose (auto reserved)")).toBeInTheDocument();
+  expect(screen.getByText("remediate off")).toBeInTheDocument();
 });
 
 it("offers the discovery sheet the configured devices on the snmp page", async () => {

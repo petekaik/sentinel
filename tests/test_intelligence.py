@@ -174,13 +174,13 @@ def test_a_grant_write_is_validated_audited_and_readable(results):
         fleet = [m for m in module_loader.discover() if m.id == "fleet"][0]
         out = settingsapi.write_grant(
             cfg, conn, fleet,
-            {"observe": True, "author": "auto", "remediate": True}, "operator")
+            {"observe": True, "author": "propose", "remediate": True}, "operator")
         cfg.reload_settings(conn)
         view = settingsapi.grants_view(cfg, conn, [fleet])["fleet"]
         results.check(
             "the written grant is returned and stored",
             out["grant"]["observe"] is True
-            and view["grant"]["author"] == "auto"
+            and view["grant"]["author"] == "propose"
             and view["source"] == "db",
             "out=%r view=%r" % (out, view))
         changes = [dict(r) for r in conn.execute(
@@ -461,15 +461,29 @@ def test_grant_writes_need_the_token_and_validate(results):
             status == 422 and "remediate" in json.dumps(body),
             "status=%r body=%r" % (status, body))
         status, body = _http(cfg, "PUT", "/api/v1/modules/fleet/intelligence",
-                             {"observe": True, "author": "auto"}, token="tok")
+                             {"observe": True, "author": "propose"}, token="tok")
         results.check("a valid grant write is 200", status == 200,
                       "status=%r body=%r" % (status, body))
+        status, body = _http(cfg, "PUT", "/api/v1/modules/fleet/intelligence",
+                             {"observe": True, "author": "auto"}, token="tok")
+        results.check(
+            "author=auto is reserved: a 422 naming the missing producer and "
+            "the usable level",
+            status == 422 and "reserved" in json.dumps(body).lower()
+            and "propose" in json.dumps(body),
+            "status=%r body=%r" % (status, body))
         status, body = _http(cfg, "GET", "/api/v1/modules")
         fleet = [m for m in body if m.get("id") == "fleet"][0]
         results.check(
             "the module manifest carries the grant",
             fleet.get("intelligence", {}).get("grant", {}).get("author")
-            == "auto",
+            == "propose",
+            "manifest=%r" % (fleet.get("intelligence"),))
+        results.check(
+            "the manifest marks auto reserved and carries the parse reason",
+            fleet.get("intelligence", {}).get("reserved_author_levels")
+            == ["auto"]
+            and fleet.get("intelligence", {}).get("error") == "",
             "manifest=%r" % (fleet.get("intelligence"),))
     finally:
         shutil.rmtree(tmp)
@@ -491,7 +505,7 @@ def test_a_deleted_grant_reports_the_layer_that_now_applies(results):
         store.init(conn)
         conn.close()
         status, _ = _http(cfg, "PUT", "/api/v1/modules/snmp/intelligence",
-                          {"observe": True, "author": "auto"}, token="tok")
+                          {"observe": True, "author": "propose"}, token="tok")
         results.check("the grant to be deleted is in force", status == 200,
                       "status=%r" % (status,))
         status, body = _http(cfg, "DELETE",
@@ -2482,8 +2496,10 @@ def test_a_modification_cannot_be_applied_by_the_auto_path(results):
             # THE MESSAGE CARRIES THE CLASSIFICATION THE WRITE PATH COMPUTED,
             # against its OWN cfg-derived effective map -- not this test's
             # hand-built `before`. Requiring "modification" is what proves the
-            # write path classified it so; an INVALID refusal would pass a
-            # bare "human" test while never reaching the additive-only gate.
+            # write path classified it so; a SILENCING refusal from a different
+            # cause would pass a bare "human" test while never reaching the
+            # additive-only gate (an INVALID refusal carries no "human" and
+            # would not).
             results.check(
                 "the auto path refuses a modification",
                 "modification" in message and "human" in message,
@@ -3144,7 +3160,9 @@ def test_a_nomination_executes_on_the_next_epoch(results):
         action = _ladder_action(ran=ran)
         mod = _ladder_module(action)
         cfg = config_mod.Config({"PROBE_AUTHORITY": "full",
-                                 "MONITOR_REMEDIES": "1"})
+                                 "MONITOR_REMEDIES": "1",
+                                 "PROBE_INTELLIGENCE":
+                                     '{"observe": true, "remediate": true}'})
         key, pid = _open_and_nominate(conn, action)
         ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
                                 "attempt_factory": None})()
@@ -3169,7 +3187,9 @@ def test_a_nomination_without_fresh_evidence_is_expired(results):
         action = _ladder_action()
         mod = _ladder_module(action)
         cfg = config_mod.Config({"PROBE_AUTHORITY": "full",
-                                 "MONITOR_REMEDIES": "1"})
+                                 "MONITOR_REMEDIES": "1",
+                                 "PROBE_INTELLIGENCE":
+                                     '{"observe": true, "remediate": true}'})
         _, pid = _open_and_nominate(conn, action)
         ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
                                 "attempt_factory": None})()
@@ -3189,7 +3209,9 @@ def test_a_nomination_whose_incident_cleared_is_expired_not_executed(results):
         action = _ladder_action(ran=ran)
         mod = _ladder_module(action)
         cfg = config_mod.Config({"PROBE_AUTHORITY": "full",
-                                 "MONITOR_REMEDIES": "1"})
+                                 "MONITOR_REMEDIES": "1",
+                                 "PROBE_INTELLIGENCE":
+                                     '{"observe": true, "remediate": true}'})
         _, pid = _open_and_nominate(conn, action)
         # The condition cleared between the cycle that nominated and this one.
         store.sync_incident(conn, 4, "t", "c", "s", store.Status.OK, "back")
@@ -3382,7 +3404,323 @@ def test_a_model_cycle_never_calls_heal_attempt(results):
         shutil.rmtree(tmp)
 
 
+def test_author_auto_is_reserved_and_startup_refuses_it(results):
+    cfg = config_mod.Config({"FLEET_INTELLIGENCE":
+                             '{"observe": true, "author": "auto"}'})
+    try:
+        config_mod.validate_grants(cfg, module_loader.discover())
+    except ValueError as exc:
+        results.check(
+            "startup refuses a stored/.env author=auto, naming the reason",
+            "reserved" in str(exc) and "propose" in str(exc),
+            "got %r" % (exc,))
+    else:
+        results.check(
+            "startup refuses a stored/.env author=auto, naming the reason",
+            False, "validate_grants accepted author=auto")
+    tmp, conn = _grant_store()
+    try:
+        fleet = [m for m in module_loader.discover() if m.id == "fleet"][0]
+        try:
+            settingsapi.write_grant(config_mod.Config({}), conn, fleet,
+                                    {"author": "auto"}, "operator")
+        except settingsapi.SettingsError as exc:
+            results.check(
+                "write_grant refuses author=auto with the reserved message",
+                exc.code == "invalid_value" and "reserved" in exc.message
+                and "propose" in exc.message,
+                "got code=%r message=%r" % (exc.code, exc.message))
+        else:
+            results.check(
+                "write_grant refuses author=auto with the reserved message",
+                False, "write_grant stored author=auto")
+        results.check(
+            "and nothing was written",
+            store.setting_rows(conn) == {}, "rows=%r" % (store.setting_rows(conn),))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def _model_band_change(amber):
+    return {"settings": {"SNMP_CHECKS": [
+        _check("sw1", "1.3.6.1.2.1.1", "cpu", green=70, amber=amber)]}}
+
+
+def test_a_model_widening_over_a_failing_reading_is_silencing_on_both_paths(results):
+    """A model and an approval must reach the SAME classification.
+
+    The classifier's `observations` argument is the only thing that turns a
+    band widening into `silencing`; the model path reads them through its
+    scoped view, the approval path from the store. If either reader is missing,
+    a widening over a failing reading is stored as a bare modification.
+    """
+    current = _check("sw1", "1.3.6.1.2.1.1", "cpu", green=70, amber=90)
+    tmp, conn, cfg, ctx, views = _model_views(
+        SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+        SNMP_CHECKS=json.dumps([current]),
+        SNMP_TIMEOUT_S="3",
+        SNMP_INTELLIGENCE='{"observe": true, "author": "propose"}')
+    try:
+        snmp = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        # `check_instances` needs the module's config-only state, which the
+        # collector installs before the cycle runs.
+        snmp.context(ctx)
+        store.record_sample(conn, 1, "snmp", "snmp.sw1.cpu", 100.0, "%", "100")
+        store.record_check(conn, 1, "snmp", "snmp_sw1_cpu", "fail",
+                           "cpu over band", subject="sw1:cpu")
+        _reset_model(json.dumps({"proposals": [
+            {"module": "snmp", "kind": "settings_change",
+             "payload": _model_band_change(130),
+             "rationale": "widen the band"}]}))
+        with mock.patch.object(llm_advisor, "OpenAIClient", _FakeModel):
+            out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        pid = out["proposals"][0]
+        payload = json.loads(store.get_proposal(conn, pid)["payload_json"])
+        results.check(
+            "a model band widening over a failing observation is silencing",
+            payload.get("classification") == authorize.SILENCING
+            and "widened" in (payload.get("diff") or ""),
+            "payload=%r" % (payload,))
+
+        calls = []
+        real = authorize.classify
+
+        def spy(change, mod, before, specs=None, observations=None):
+            cls, detail = real(change, mod, before, specs=specs,
+                               observations=observations)
+            calls.append((cls, observations))
+            return cls, detail
+
+        with mock.patch.object(authorize, "classify", spy):
+            ctl.approve_proposal(cfg, conn, {"snmp": snmp}, pid, "operator")
+        results.check(
+            "approval re-classifies against the store's evidence the same way",
+            calls and calls[-1][0] == authorize.SILENCING
+            and bool(calls[-1][1]),
+            "calls=%r" % (calls,))
+        value = settingsapi.settings_view(cfg, conn, [snmp])["snmp"][
+            "SNMP_CHECKS"]["value"]
+        results.check(
+            "the approved widening is applied",
+            value and value[0].get("amber") == 130,
+            "value=%r" % (value,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_model_output_is_bounded_before_it_is_stored(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        grants = {m: cfg.intelligence_grant(m, tuple(v.mod.intelligence))[0]
+                  for m, v in views.items()}
+        payload = {"insights": [
+            {"module": "fleet", "kind": "report", "title": "t" * 500,
+             "body": "b" * 5000, "confidence": 9,
+             "severity": "loud", "evidence": None},
+            {"module": "fleet", "kind": "report", "title": "t", "body": "b",
+             "evidence": {"x": "y" * 9000}}],
+            "proposals": [
+                {"module": "snmp", "kind": "settings_change",
+                 "payload": {"SNMP_TIMEOUT_S": 5},
+                 "rationale": "r" * 5000}]}
+        kept, proposals, dropped = intelligence_layer.validate_model_output(
+            payload, views, grants, conn=conn)
+        first = kept[0] if kept else {}
+        results.check(
+            "long insight strings are bounded and confidence is clamped",
+            len(kept) == 1 and len(first.get("body", "")) == 4000
+            and len(first.get("title", "")) == 200
+            and first.get("confidence") == 1.0,
+            "kept=%r" % (kept,))
+        results.check(
+            "an invalid severity is `info`; an explicit null evidence is `{}`",
+            first.get("severity") == "info" and first.get("evidence") == {},
+            "kept=%r" % (kept,))
+        results.check(
+            "an oversized evidence object is dropped and counted",
+            dropped.get("fleet") == 1, "dropped=%r" % (dropped,))
+        results.check(
+            "a proposal rationale is bounded",
+            bool(proposals) and len(proposals[0].get("rationale", "")) == 1000,
+            "proposals=%r" % (proposals,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_model_flood_is_capped_per_module_and_in_total(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        grants = {m: cfg.intelligence_grant(m, tuple(v.mod.intelligence))[0]
+                  for m, v in views.items()}
+
+        def item(mid):
+            return {"module": mid, "kind": "report", "title": "t", "body": "b"}
+
+        kept, _, dropped = intelligence_layer.validate_model_output(
+            {"insights": [item("fleet") for _ in range(1000)]},
+            views, grants, conn=conn)
+        cap = intelligence_layer.MAX_INSIGHTS_PER_MODULE
+        results.check(
+            "insights are capped per module and the rest are counted",
+            len(kept) == cap and dropped.get("fleet") == 1000 - cap,
+            "kept=%d dropped=%r" % (len(kept), dropped))
+        with mock.patch.object(intelligence_layer, "MAX_INSIGHTS_TOTAL", 5):
+            total, _, _ = intelligence_layer.validate_model_output(
+                {"insights": [item(mid) for mid in ("fleet", "snmp")
+                              for _ in range(100)]},
+                views, grants, conn=conn)
+        results.check("the total cap holds across modules", len(total) == 5,
+                      "kept=%d" % len(total))
+        _, proposals, _ = intelligence_layer.validate_model_output(
+            {"proposals": [
+                {"module": "snmp", "kind": "settings_change",
+                 "payload": {"SNMP_TIMEOUT_S": 5}, "rationale": "r"}
+                for _ in range(1000)]},
+            views, grants, conn=conn)
+        results.check(
+            "proposals are capped per module",
+            len(proposals) == intelligence_layer.MAX_PROPOSALS_PER_MODULE,
+            "proposals=%d" % len(proposals))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_pack_states_its_truncation_budget_and_byte_reduction(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        fleet = views["fleet"]
+        since = fleet.now - 7 * 86400
+        summary = fleet.summaries(since, max_rows=1)
+        results.check(
+            "a summary names its truncations and the effective grant budget",
+            summary.get("truncated", {}).get("check_runs") is True
+            and summary.get("budget", {}).get("rows") == 1
+            and summary.get("budget", {}).get("tokens") == 2000,
+            "truncated=%r budget=%r" % (summary.get("truncated"),
+                                        summary.get("budget")))
+        grants = {m: dict(cfg.intelligence_grant(
+                        m, tuple(v.mod.intelligence))[0],
+                        budget={"rows": 200, "bytes": 200, "tokens": 2000})
+                  for m, v in views.items()}
+        _, _, usage = intelligence_layer.pack_views(views, grants, 16000)
+        results.check(
+            "a byte-capped pack records the per-module byte reduction",
+            isinstance(usage.get("_reduced_bytes"), dict)
+            and "fleet" in usage["_reduced_bytes"],
+            "usage=%r" % (usage,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_broken_view_is_a_visible_partial_cycle(results):
+    tmp, conn, cfg, ctx, views = _model_views(selector="none")
+    try:
+        real = module_view.ModuleView
+
+        def broken(*args, **kwargs):
+            if args[1].id == "snmp":
+                raise RuntimeError("view exploded")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(module_view, "ModuleView", side_effect=broken):
+            out = intelligence_layer.run_cycle(cfg, conn, ctx)
+        row = store.last_intelligence_cycle(conn)
+        results.check(
+            "a view that cannot be built is a partial cycle naming the module",
+            out["status"] == "partial" and row["status"] == "partial"
+            and "snmp" in out["modules_granted"]
+            and "snmp" not in out["modules_read"]
+            and "snmp" in out["detail"],
+            "out=%r row=%r" % (out, row and dict(row)))
+        results.check(
+            "the failure is recorded as a cycle note",
+            any("could not build a view for snmp" in n for n in ctx.notes)
+            and any("snmp" in n for n in json.loads(row["notes"])),
+            "notes=%r row notes=%r" % (ctx.notes, row and row["notes"]))
+        api_cfg = make_cfg(os.path.join(tmp, "grants.sqlite"))
+        status, body = _http(api_cfg, "GET", "/api/v1/intelligence")
+        results.check(
+            "the API exposes granted-but-not-read and the partial status",
+            status == 200 and body.get("granted_not_read") == ["snmp"]
+            and "snmp" in body.get("modules_granted", [])
+            and body.get("last_cycle", {}).get("status") == "partial"
+            and body.get("last_cycle", {}).get("notes"),
+            "status=%r body=%r" % (status, body))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_nomination_whose_remediate_grant_was_withdrawn_does_not_run(results):
+    tmp, conn = _grant_store()
+    try:
+        ran = []
+        action = _ladder_action(ran=ran)
+        mod = _ladder_module(action)
+        cfg = config_mod.Config({
+            "PROBE_AUTHORITY": "full", "MONITOR_REMEDIES": "1",
+            "PROBE_INTELLIGENCE":
+                '{"observe": true, "remediate": false}'})
+        _, pid = _open_and_nominate(conn, action)
+        ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
+                                "attempt_factory": None})()
+        heal.consider_nominations(cfg, conn, 99, [_ran()], ctx)
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "a withdrawn remediate grant expires the nomination and runs "
+            "nothing",
+            ran == [] and row["state"] == "expired",
+            "ran=%r row=%r" % (ran, row))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_a_lost_claim_never_executes_and_preserves_the_human_decision(results):
+    tmp, conn = _grant_store()
+    try:
+        ran = []
+        action = _ladder_action(ran=ran)
+        mod = _ladder_module(action)
+        cfg = config_mod.Config({
+            "PROBE_AUTHORITY": "full", "MONITOR_REMEDIES": "1",
+            "PROBE_INTELLIGENCE":
+                '{"observe": true, "remediate": true}'})
+        _, pid = _open_and_nominate(conn, action)
+        # The row the executor read as pending, before a human rejected it.
+        stale = store.get_proposal(conn, pid)
+        store.decide_proposal(conn, pid, "rejected", "operator")
+        ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg,
+                                "attempt_factory": None})()
+        with mock.patch.object(store, "list_pending_nominations",
+                               return_value=[stale]), \
+                mock.patch.object(heal, "attempt") as attempted:
+            heal.consider_nominations(cfg, conn, 99, [_ran()], ctx)
+        row = store.get_proposal(conn, pid)
+        results.check(
+            "a lost claim performs no attempt and keeps the human's decision",
+            attempted.call_count == 0 and row["state"] == "rejected"
+            and row["actor"] == "operator",
+            "attempts=%r row=%r" % (attempted.call_count, row))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
+    test_author_auto_is_reserved_and_startup_refuses_it,
+    test_a_model_widening_over_a_failing_reading_is_silencing_on_both_paths,
+    test_model_output_is_bounded_before_it_is_stored,
+    test_a_model_flood_is_capped_per_module_and_in_total,
+    test_a_pack_states_its_truncation_budget_and_byte_reduction,
+    test_a_broken_view_is_a_visible_partial_cycle,
+    test_a_nomination_whose_remediate_grant_was_withdrawn_does_not_run,
+    test_a_lost_claim_never_executes_and_preserves_the_human_decision,
     test_additive_auto_applies_and_the_proposal_records_it,
     test_a_silencing_change_cannot_be_applied_by_the_auto_path,
     test_a_modification_cannot_be_applied_by_the_auto_path,

@@ -35,10 +35,13 @@ class ModuleView(advisors.Snapshot):
         self.targets = tuple(getattr(mod, "targets", ()))
         self.module_settings = _settings_for(mod, ctx)
         self.unattributed = {}
+        # The grant's own budget, reported in every summary: a pack that was
+        # cut must be able to say what cut it.
+        self.grant_budget = dict((grant or {}).get("budget") or {})
         # spec id -> metric; a module may name its metric differently.
         self.metrics = {spec.metric or sid
                         for sid, spec in owned_specs.items()}
-        budget = (grant or {}).get("budget") or {}
+        budget = self.grant_budget
         if budget.get("rows"):
             # `rows` bounds the merged reads. `sample_rows` stays the
             # platform's 20000: it is two weeks of minute samples, and
@@ -194,6 +197,15 @@ class ModuleView(advisors.Snapshot):
         payload = {"module": self.module_id, "targets": list(self.targets),
                    "window": {"requested_days": self.requested_days,
                               "available_days": self.available_days},
+                   # THE PACK SAYS WHAT WAS CUT AND WHAT BOUND IT. A summary
+                   # that silently omitted rows or a truncation read exactly
+                   # like a complete, quiet module -- the false-green shape
+                   # this layer exists to prevent.
+                   "truncated": dict(self.truncated),
+                   "budget": {"rows": max_rows,
+                              "bytes": self.grant_budget.get("bytes"),
+                              "tokens": self.grant_budget.get("tokens"),
+                              "sample_rows": self.caps["sample_rows"]},
                    "checks": [dict(r) for r in runs],
                    "series": series,
                    "incidents": incidents,

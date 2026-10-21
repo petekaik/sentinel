@@ -174,7 +174,11 @@ export default function Intelligence() {
           <p className="sub">
             <span
               className={`pill ${
-                data.last_cycle.status === "ok" ? "green" : "amber"
+                data.last_cycle.status === "ok"
+                  ? "green"
+                  : data.last_cycle.status === "error"
+                    ? "red"
+                    : "amber"
               }`}
             >
               {data.last_cycle.status}
@@ -186,6 +190,63 @@ export default function Intelligence() {
           </p>
         ) : (
           <p className="sub">No intelligence cycle has run yet.</p>
+        )}
+        {data.last_cycle &&
+          (data.last_cycle.status === "partial" ||
+            data.last_cycle.status === "error") && (
+            <div
+              className={`banner ${
+                data.last_cycle.status === "error" ? "red" : "amber"
+              }`}
+              role="alert"
+            >
+              <strong>
+                The last intelligence cycle was {data.last_cycle.status}.
+              </strong>{" "}
+              It did not read every granted module; the named modules were not
+              analysed, so their absence below is not a clean result.
+              {(data.last_cycle.notes ?? []).length > 0 && (
+                <ul>
+                  {data.last_cycle.notes.map((n) => (
+                    <li key={n}>{n}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        {(data.granted_not_read ?? []).length > 0 && (
+          <p className="notice">
+            Granted but not read: {(data.granted_not_read ?? []).join(", ")}.
+            The grant says these may be observed; no view was built for them in
+            the last cycle.
+          </p>
+        )}
+        {Object.keys(data.unattributed ?? {}).length > 0 && (
+          <div className="scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Module</th>
+                  <th>Unattributed series</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(data.unattributed ?? {}).flatMap(([mid, series]) =>
+                  Object.entries(series).map(([metric, target]) => (
+                    <tr key={`${mid}|${metric}|${target}`}>
+                      <td>{mid}</td>
+                      <td>
+                        {`${target}/${metric}`}{" "}
+                        <span className="sub">
+                          — no spec this module owns
+                        </span>
+                      </td>
+                    </tr>
+                  )),
+                )}
+              </tbody>
+            </table>
+          </div>
         )}
         {data.usage.length > 0 && (
           <div className="scroll">
@@ -288,7 +349,14 @@ export default function Intelligence() {
                 >
                   <option value="off">off</option>
                   <option value="propose">propose</option>
-                  <option value="auto">auto</option>
+                  {/* `auto` parses but has no unattended producer in this
+                      delivery. It is shown only to name the stored value, and
+                      it cannot be chosen. */}
+                  {g.author === "auto" && (
+                    <option value="auto" disabled>
+                      auto — reserved — no unattended producer in this delivery
+                    </option>
+                  )}
                 </select>
               </label>
             </p>

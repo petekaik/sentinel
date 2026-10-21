@@ -23,7 +23,7 @@ reader must be able to tell which half of it exists today.
 | `app/commands.py`, `app/ctl.py` — operator commands, cross-process locks, audit | **built** |
 | `app/actions.py`, `app/heal.py` — action declarations, authority ladder and the remedy engine | **built; no live remedy has executed** |
 | `app/advisors.py`, `app/intelligence.py` — the snapshot, runner and reference advisor | **built; reference advisor on by default** |
-| `app/llm_advisor.py` — the LLM seam | **registered only when configured; transport NOT implemented** |
+| `app/llm_advisor.py` — the LLM backend | **built (OpenAI-compatible); registered only when configured** |
 | `app/dismiss.py` — the operator's exit for an incident no check can close | **built** 2026-10-04 |
 | `app/web.py` — the SPA shell and hashed assets, `/api/v1`, the legacy `/api/status.json` / `/api/state.json`, `/healthz` | **built** |
 | `app/settingsapi.py` — manifests, effective settings views, the one settings writer and the constant-time token check | **built** |
@@ -62,10 +62,10 @@ is quoted in each correction:
   callable engine still makes the process refuse to start rather than pretend. `dismiss`
   (below) is not a remedy: it is an operator verb, and it changes nothing about
   the fleet.
-- **The LLM advisor's transport is absent on purpose.** Configuring a provider and
-  endpoint makes it *selectable*; selecting it records an explicit "not
-  implemented" error row and makes no network call. Configuration alone never
-  puts it on the default path.
+- **The LLM advisor is built and off by default.** Configuring a provider and endpoint
+  registers it and makes it *selectable*; naming it in `SENTINEL_ADVISORS` is the separate
+  egress decision. When selected it sends one bounded, redacted pack per cycle over the
+  OpenAI-compatible wire format. The default selector never includes it.
 
 ### The monitor's ssh credential — what was decided, and why not the alternatives
 
@@ -800,17 +800,24 @@ write only proposals. The remediation engine remains the only executor.
 through the Settings/Intelligence page (stored in the DB), with
 `<MODULE>_INTELLIGENCE` in `.env` as the fallback for a module with no stored grant. An
 ungranted module reads nothing. A grant naming a lane the module does not declare
-refuses startup, and a malformed grant grants nothing and says why. `--showconf` prints
-the effective matrix and never the model key.
+refuses startup, and a malformed grant grants nothing and says why. **`author=auto` is
+reserved in this delivery:** the level parses for forward compatibility, but no
+unattended producer exists, so startup refuses a stored/`.env` `auto` and the settings
+API refuses to write one. The SPA offers `off` and `propose` and shows a stored `auto`
+as disabled with the reason. `--showconf` prints the effective matrix and never the
+model key.
 
 Two invariants hold **above** the matrix; no grant, authority level, per-action override
 or approval-time option waives them:
 
 1. **The intelligence may never silence its own evidence.** Every authoring change is
    classified (`app/authorize.py`) as additive, modification, silencing or invalid. Only
-   additive changes may apply at `author=auto`; removals, disablings, identity changes
-   and any widening past a failing observation are always a human proposal. The layer
-   has no write path to incidents, check results, thresholds or grants.
+   additive changes are *eligible* for `author=auto`; removals, disablings, identity
+   changes and any widening past a failing observation are always a human proposal. In
+   this delivery `auto` is reserved (see above), so every model-authored change is a
+   proposal and the apply/revert path is exercised by its tests rather than by a
+   production producer. The layer has no write path to incidents, check results,
+   thresholds or grants.
 2. **Destructive actions are human-approved at every tier.** `actions.allowed()` refuses
    a destructive action without `approved=True`, and `actions.approval_policy()` — called
    only on a human approval path — is the only constructor that sets it. The retired
@@ -877,14 +884,17 @@ re-checks the grant it is passed rather than trusting its caller.
 **Per-module budgets, then one global cap.** A grant's `budget.rows` bounds each module's
 summary, `budget.bytes` bounds that module's JSON, and `budget.tokens` bounds that module's
 own estimated size — each module is shrunk on its own until it fits or nothing more can be
-dropped, before anything is concatenated. The joined pack is then held to
+dropped, before anything is concatenated. Every summary carries its own `truncated` flags
+and the effective `budget` (rows, bytes, tokens, per-series sample cap), so a cut pack can
+say what cut it. The joined pack is then held to
 `SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS` (default 16000) by shrinking the largest module —
 journals first, then lists and maps halved — until it fits.
 The cut is deterministic for the same input, and the cycle records
-`model pack reduced for <modules>` instead of truncating silently. The whole cycle is
-measured against `SENTINEL_INTELLIGENCE_BUDGET_MS` (default 30000), which also sets the
-request timeout; an overrun is recorded as `budget`, not killed, because killing an
-advisor would leave a half-written insight.
+`model pack reduced for <modules>`; `usage._reduced_bytes` records the before/after byte
+size per reduced module, so a pack shrunk by `budget.bytes` is as visible as one shrunk by
+tokens. The whole cycle is measured against `SENTINEL_INTELLIGENCE_BUDGET_MS` (default
+30000), which also sets the request timeout; an overrun is recorded as `budget`, not killed,
+because killing an advisor would leave a half-written insight.
 
 **Redaction happens where the text is built, and again where it leaves.** `pack_views`
 replaces with `[redacted]` every secret the platform knows — the write token, the model
@@ -896,27 +906,46 @@ The key reaches no insight, advisor-run detail, cycle row or traceback.
 
 **A failure is visible, never an empty green cycle.** A configured, selected model that
 cannot be reached records `status=error` with the detail `model call failed`, keeps
-`model_calls = 1`, and leaves the deterministic advisors' rows in place. The SPA shows the
-last cycle's status and detail on the Intelligence page, and the Overview raises its own
-banner when the last cycle is `error` or `budget`, naming the redacted detail; the
-Overview re-reads `/api/v1/intelligence` on every poll, so a cycle that fails after the
-page loaded is still shown. A failed intelligence read renders no banner at all — "we do
-not know" is never an all-clear — and cannot affect the fleet board's own refresh. An
-unreachable backend therefore reads as a failed cycle rather than "the intelligence found
-nothing". The traceback stays in the
-collector's `ctx.module_errors["intelligence"]` and is not persisted, so the transport's
-own words cannot carry a credential into the store. An HTTP error, a refused redirect, a
-malformed body and a non-JSON reply are all failures; a malformed item inside a valid
-reply is dropped and counted instead of discarding the rest.
+`model_calls = 1`, and leaves the deterministic advisors' rows in place. A granted module
+whose view cannot be built is recorded as `status=partial`, with the module named in the
+detail and in the cycle's `notes`; the cycle still runs every module it could read. The
+Intelligence page shows the last cycle's status, detail and notes, the
+**granted-but-not-read** modules and the series that were read but could not be attributed
+to a spec the module owns. The Overview raises its own banner when the last cycle is
+`error`, `budget` or `partial`, naming the redacted detail; it re-reads
+`/api/v1/intelligence` on every poll, so a cycle that fails after the page loaded is still
+shown. A failed intelligence read renders no banner at all — "we do not know" is never an
+all-clear — and cannot affect the fleet board's own refresh. An unreachable backend
+therefore reads as a failed cycle rather than "the intelligence found nothing". The
+traceback stays in the collector's `ctx.module_errors["intelligence"]` and is not
+persisted, so the transport's own words cannot carry a credential into the store. An HTTP
+error, a refused redirect, a malformed body and a non-JSON reply are all failures; a
+malformed item inside a valid reply is dropped and counted instead of discarding the rest.
 
 **Model-authored changes are always proposals.** Nothing the model returns is applied in
 the cycle, whatever grant or authority it runs under. A proposed setting change is
-classified by `app/authorize.py`; only an **additive** change may auto-apply, and only
-when the module's grant says `author=auto`. A modification, a silencing, an identity
-change or any widening past a failing observation is a human proposal. The model has no
-write path to incidents, check results, thresholds or grants, and an action it nominates
-is executed — if ever — by the remediation engine in the **next** epoch's post-evidence
-seam. The model is in neither the poll path nor the execution path.
+classified by `app/authorize.py` against the module's current full values **and its
+current observations**: a changed SNMP row is mapped through the module's own
+`check_instances` to its spec and check id, and the view's samples plus the newest
+check-run status are passed to the classifier. A widening that would turn a failing
+reading OK is therefore `silencing`, not a cosmetic `modification`; an approval re-reads
+the same evidence from the store and classifies it the same way. A modification, a
+silencing, an identity change or any widening past a failing observation is a human
+proposal. In this delivery `author=auto` is reserved, so even an additive change is a
+proposal; the additive-only apply/revert substrate and its tests remain for the
+follow-up. The model has no write path to incidents, check results, thresholds or
+grants, and an action it nominates is executed — if ever — by the remediation engine in
+the **next** epoch's post-evidence seam. The model is in neither the poll path nor the
+execution path.
+
+**Model output is bounded before it is stored.** The response read stops at 1 MB
+(`ModelError("response too large")`); insights and proposals are capped per module
+(20/10) and in total (100/50); `title`, `body`, `rationale` and `evidence` are bounded
+(200 chars, 4000 chars, 1000 chars, 8 KB of JSON); `confidence` is clamped to 0..1; and
+an unknown `severity` is normalised to `info`. An explicit `evidence: null` becomes `{}`
+rather than dropping the insight; a non-object or oversized evidence field is dropped
+and counted. Every drop is counted per module, so a capped batch does not read as a
+small one.
 
 ---
 
@@ -1343,26 +1372,36 @@ says “Human approval required at every tier” for such a row.
 force now, would allow a non-destructive action at the next epoch's post-evidence seam.
 The executor then re-asks every gate: it runs the action only while its incident is still
 `open` and its `(target, check_id, subject)` was observed by the epoch that just finished.
-An incident that is gone, or evidence this epoch did not collect, **expires** the
-nomination rather than executing it. A grant withdrawn in between leaves it pending for a
-human. So “Ladder-approved” in the SPA means scheduled, not guaranteed: it still has to
-survive every gate. A refused nomination stays pending for the proposal TTL and is shown
-as “Human approval required”, never as approved.
+It also re-resolves the module's intelligence grant, so a withdrawn `observe` or
+`remediate` **expires** the nomination instead of executing it. Before the attempt it
+**claims** the pending row with a conditional update; a lost claim (a human rejected or
+another process approved it first) is a refusal that runs nothing and leaves the human's
+decision intact. A refusal after the claim releases it back to pending. An incident that
+is gone, or evidence this epoch did not collect, **expires** the nomination rather than
+executing it. So “Ladder-approved” in the SPA means scheduled, not guaranteed: it still
+has to survive every gate. A refused nomination stays pending for the proposal TTL and is
+shown as “Human approval required”, never as approved.
 
 ### The two invariants
 
 1. **The intelligence may never silence its own evidence.** Every authoring change is
-   classified additive, modification, silencing or invalid. Only additive changes may
-   apply unattended; removals, disablings, identity changes and any widening past a
-   failing observation are always a human proposal. The layer has no write path to
-   incidents, results, thresholds or grants.
+   classified additive, modification, silencing or invalid. Only additive changes are
+   eligible to apply unattended; removals, disablings, identity changes and any widening
+   past a failing observation are always a human proposal. In this delivery `author=auto`
+   is **reserved** — no unattended producer exists — so every model change is a proposal.
+   The layer has no write path to incidents, results, thresholds or grants.
 2. **Destructive actions are human-approved at every tier.** No grant, level, per-action
    override or approval-time option waives it.
 
 ### Reversing an auto-applied additive change
 
-An automatically applied change is history, not a queue. In the SPA open **Proposals →
-Automatic changes** and press **Revert**, or call
+**There is no production producer for these rows in this delivery.** `author=auto` is
+reserved: no unattended path applies an additive change, so the history below is normally
+empty. The apply/revert substrate and its tests remain in place for the follow-up; the
+operator-visible revert is exercised by tests, not by a live producer.
+
+When such a row exists, an applied change is history, not a queue. In the SPA open
+**Proposals → Automatic changes** and press **Revert**, or call
 `POST /api/v1/intelligence/revert/<id>` with the write token, or run `ctl.py
 --revert-change <id>`. The revert restores the `before` recorded with the change, through
 the same validating settings writer as any operator edit, and is audited. It refuses when

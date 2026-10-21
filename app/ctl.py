@@ -345,13 +345,22 @@ def _approve_settings(cfg, conn, mods, row, payload, actor):
             raise ProposalRefused(
                 "the settings changed since the proposal was written; the "
                 "proposal is left pending")
+    # THE OBSERVATIONS ARE RE-READ FOR THE APPROVAL. The proposal was graded
+    # against the evidence the model saw; a human approving it now must be
+    # graded against the evidence the store holds NOW, or a band widened over a
+    # failing reading approves as a bare modification. Reading them is a
+    # platform query -- the grant governs the intelligence, not the operator.
+    import intelligence_layer
+    observations = intelligence_layer.observations_from_store(
+        conn, mod, _context(cfg, mods), {"settings": settings}, current)
     # CLAIM BEFORE THE WRITE, exactly as the action and threshold paths do: two
     # concurrent approvals of one proposal must not both apply a change.
     if store.claim_proposal(conn, row["id"], actor) != 1:
         raise ProposalRefused("proposal %s is no longer pending" % row["id"])
     try:
         settingsapi.write_authoring_change(
-            cfg, conn, mod, {"settings": settings}, actor)
+            cfg, conn, mod, {"settings": settings}, actor,
+            observations=observations)
     except BaseException:
         # A failed apply is not a decision; leave the proposal pending for a
         # corrected retry. The claim is released, the write is all-or-nothing.

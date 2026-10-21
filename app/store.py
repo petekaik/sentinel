@@ -427,7 +427,11 @@ CREATE TABLE IF NOT EXISTS intelligence_cycle (
     model_calls     INTEGER NOT NULL DEFAULT 0,
     tokens_in       INTEGER,
     tokens_out      INTEGER,
-    detail          TEXT    NOT NULL DEFAULT ''
+    detail          TEXT    NOT NULL DEFAULT '',
+    -- The cycle's own notes. A `partial` cycle names the modules whose view
+    -- could not be built; keeping them here is what lets the page explain the
+    -- status instead of only colouring it.
+    notes           TEXT    NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS intelligence_cycle_ts ON intelligence_cycle (ts);
 
@@ -439,6 +443,9 @@ CREATE TABLE IF NOT EXISTS intelligence_usage (
     insights   INTEGER NOT NULL DEFAULT 0,
     proposals  INTEGER NOT NULL DEFAULT 0,
     dropped    INTEGER NOT NULL DEFAULT 0,
+    -- Series the view read but could not attribute to an owned spec, as JSON
+    -- {metric: target}. A pack that dropped them must not read as complete.
+    unattributed TEXT  NOT NULL DEFAULT '{}',
     PRIMARY KEY (cycle_id, module)
 );
 """
@@ -517,6 +524,18 @@ def _migrate(conn):
     if "secret" not in have:
         conn.execute("ALTER TABLE setting ADD COLUMN secret INTEGER NOT NULL "
                      "DEFAULT 0")
+    # The intelligence cycle's notes and the per-module unattributed series
+    # arrived with the review of the whole branch. An older database gets the
+    # empty default, which reads as "the cycle wrote no notes" -- true for every
+    # row recorded before the column existed.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(intelligence_cycle)")}
+    if "notes" not in have:
+        conn.execute("ALTER TABLE intelligence_cycle ADD COLUMN notes TEXT "
+                     "NOT NULL DEFAULT '[]'")
+    have = {r[1] for r in conn.execute("PRAGMA table_info(intelligence_usage)")}
+    if "unattributed" not in have:
+        conn.execute("ALTER TABLE intelligence_usage ADD COLUMN unattributed "
+                     "TEXT NOT NULL DEFAULT '{}'")
 
 
 def _ensure_live_index(conn):
@@ -694,29 +713,31 @@ def record_advisor_run(conn, advisor, module, status, duration_ms,
 
 def record_intelligence_cycle(conn, status, duration_ms, granted, read,
                               model_calls=0, tokens_in=None, tokens_out=None,
-                              detail=""):
+                              detail="", notes=()):
     cur = conn.execute(
         "INSERT INTO intelligence_cycle (ts, status, duration_ms, "
         "modules_granted, modules_read, model_calls, tokens_in, tokens_out, "
-        "detail) VALUES (?,?,?,?,?,?,?,?,?)",
+        "detail, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
         (time.time(), status, int(duration_ms), json.dumps(list(granted)),
          json.dumps(list(read)), int(model_calls), tokens_in, tokens_out,
-         detail))
+         detail, json.dumps(list(notes or ()))))
     return cur.lastrowid
 
 
 def record_intelligence_usage(conn, cycle_id, module, rows_read=0,
                               bytes_read=0, insights=0, proposals=0,
-                              dropped=0):
+                              dropped=0, unattributed=None):
     conn.execute(
         "INSERT INTO intelligence_usage (cycle_id, module, rows_read, "
-        "bytes_read, insights, proposals, dropped) VALUES (?,?,?,?,?,?,?) "
+        "bytes_read, insights, proposals, dropped, unattributed) "
+        "VALUES (?,?,?,?,?,?,?,?) "
         "ON CONFLICT(cycle_id, module) DO UPDATE SET "
         "rows_read=excluded.rows_read, bytes_read=excluded.bytes_read, "
         "insights=excluded.insights, proposals=excluded.proposals, "
-        "dropped=excluded.dropped",
+        "dropped=excluded.dropped, unattributed=excluded.unattributed",
         (cycle_id, module, int(rows_read), int(bytes_read), int(insights),
-         int(proposals), int(dropped)))
+         int(proposals), int(dropped),
+         json.dumps(dict(unattributed or {}))))
 
 
 def last_intelligence_cycle(conn):

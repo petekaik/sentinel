@@ -387,17 +387,51 @@ def build_state(cfg, conn, now=None):
     }
 
 
+def _json_list(value):
+    """A stored JSON list, or [] for a row written before the field existed."""
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _json_map(value):
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def build_intelligence(cfg, conn):
     """The Intelligence page's whole read contract.
 
     THE KEY AND EVERY SECRET ARE ABSENT BY CONSTRUCTION: this function reads
     grant values and config booleans, never `cfg.llm_key`, and never a secret
     setting's value.
+
+    GRANTED AND READ ARE TWO FACTS. `modules_granted` says what the last cycle
+    was allowed to read, `modules_read` what it actually built a view for, and
+    `granted_not_read` is the difference -- the one that must not disappear
+    behind a green status. `unattributed` names series that were read but
+    belonged to no spec the module owns.
     """
     modules = module_loader.discover()
     grants = settingsapi.grants_view(cfg, conn, modules)
     last = store.last_intelligence_cycle(conn)
     usage = store.list_intelligence_usage(conn, last["id"]) if last else []
+    for row in usage:
+        row["unattributed"] = _json_map(row.get("unattributed"))
+    granted = _json_list(last.get("modules_granted")) if last else []
+    read = _json_list(last.get("modules_read")) if last else []
+    if last is not None:
+        last = dict(last)
+        last["modules_granted"] = granted
+        last["modules_read"] = read
+        last["notes"] = _json_list(last.get("notes"))
+    unattributed = {row["module"]: row["unattributed"] for row in usage
+                    if row["unattributed"]}
     return {
         "enabled": bool(cfg.intelligence_enabled),
         "interval_s": cfg.intelligence_interval_s,
@@ -409,6 +443,10 @@ def build_intelligence(cfg, conn):
         "modules": [dict(grants[m.id], id=m.id, title=m.title, order=m.order)
                     for m in modules],
         "last_cycle": last,
+        "modules_granted": granted,
+        "modules_read": read,
+        "granted_not_read": [m for m in granted if m not in read],
+        "unattributed": unattributed,
         "usage": usage,
     }
 

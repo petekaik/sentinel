@@ -26,6 +26,13 @@ import urllib.request
 
 import advisors
 
+# A RESPONSE IS MODEL-CONTROLLED INPUT. The endpoint can stream for as long as
+# it likes inside the request timeout, so the read is capped rather than
+# accumulated: a 1 MB reply is already far past the largest valid pack of
+# twenty insights and ten proposals, and everything beyond it is bytes nobody
+# will parse. Refused before `json.loads` rather than after.
+MAX_RESPONSE_BYTES = 1024 * 1024
+
 
 class ModelError(RuntimeError):
     """A model call failed. The message never contains the key."""
@@ -72,7 +79,7 @@ class OpenAIClient:
                                      method="POST")
         try:
             with _OPENER.open(req, timeout=self.timeout_s) as resp:
-                raw = resp.read()
+                raw = resp.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as exc:
             raise ModelError("the model endpoint answered HTTP %s"
                              % exc.code) from None
@@ -87,6 +94,8 @@ class OpenAIClient:
             # a header, and no client stack should leak.
             raise ModelError(
                 "the model endpoint timed out or was unreachable") from None
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ModelError("response too large")
         try:
             payload = json.loads(raw.decode())
             content = payload["choices"][0]["message"]["content"]

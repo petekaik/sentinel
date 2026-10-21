@@ -34,6 +34,15 @@ def _bool(name, default, env):
 
 INTELLIGENCE_LANES = ("observe", "author", "remediate")
 AUTHOR_LEVELS = ("off", "propose", "auto")
+# RESERVED, NOT IMPLEMENTED. `auto` stays in the parser so a stored or
+# environment value written for the follow-up parses, but no unattended
+# producer exists in this delivery: startup refuses it and `write_grant`
+# refuses to write it. Keeping the level out of the grammar would make the
+# refusal an "unknown value" that could not name the reason.
+RESERVED_AUTHOR_LEVELS = ("auto",)
+AUTO_RESERVED_MESSAGE = (
+    "author=auto is reserved in this delivery; no unattended producer "
+    "exists — use propose")
 DEFAULT_BUDGET = {"rows": 500, "bytes": 32768, "tokens": 2000}
 
 
@@ -132,9 +141,15 @@ def validate_grants(cfg, modules):
         raw = cfg.env.get(key)
         if raw in (None, ""):
             continue
-        _, why = parse_grant(raw, key, tuple(mod.intelligence))
+        grant, why = parse_grant(raw, key, tuple(mod.intelligence))
         if why:
             raise ValueError(why)
+        # A STORED/.env AUTO GRANT HAS NO PRODUCER IN THIS DELIVERY. Parsing it
+        # is kept for forward compatibility, but starting with it in force
+        # would advertise an unattended author path that cannot run; the
+        # operator has to pick `propose` explicitly.
+        if grant["author"] in RESERVED_AUTHOR_LEVELS:
+            raise ValueError("%s: %s" % (key, AUTO_RESERVED_MESSAGE))
     for key in cfg.env:
         if key == "SENTINEL_INTELLIGENCE" or not key.endswith("_INTELLIGENCE"):
             continue

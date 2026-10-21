@@ -185,7 +185,7 @@ thing.
 | remediation engine and the authority ladder (`app/heal.py`, `app/actions.py`) | **built; off by default** |
 | advisors (`app/advisors.py`, `app/intelligence.py`) | **built; the reference advisor runs by default** |
 | proposal queue and live threshold overrides (`app/ctl.py`, `store.py`) | **built** |
-| LLM advisor seam (`app/llm_advisor.py`) | **registered only when configured; transport intentionally NOT implemented** |
+| LLM advisor (`app/llm_advisor.py`) | **built; OpenAI-compatible transport, registered only when configured** |
 
 **No remedy has executed on the live fleet.** The engine exists, but it is off in two
 independent places: `MONITOR_REMEDIES=0` is the process kill switch, and the fleet module
@@ -193,10 +193,12 @@ ships at authority `off`. Both are deliberate defaults. Enabling remedies withou
 callable engine makes the process refuse to start rather than pretend. `dismiss` is not a
 remedy — it is an operator verb and it changes nothing about the fleet.
 
-**The LLM advisor's transport is intentionally absent.** Configuring `SENTINEL_LLM_*`
-registers a selectable advisor and, when selected, records an explicit "not implemented"
-error row. It never makes a network call, and configuration alone never puts it on the
-default path — the default selector is `reference`.
+**The LLM advisor has a real transport and is still off by default.** Configuring
+`SENTINEL_LLM_*` (provider **and** endpoint) makes the advisor selectable; naming it in
+`SENTINEL_ADVISORS` is a separate, explicit egress decision. It then sends one bounded,
+redacted pack per intelligence cycle and never joins the default selector. `author=auto`
+is **reserved** in this delivery: the model may propose an additive change, but no
+unattended producer applies it — every model change is a proposal for a human.
 
 ## Layout
 
@@ -219,7 +221,7 @@ app/           the platform + the adapters (see CLAUDE.md for the seam)
   heal.py      the remedy engine: the only code that executes an action
   advisors.py  advisor types and the read-only, windowed Snapshot
   intelligence.py  the reference statistical advisor
-  llm_advisor.py   the optional LLM seam (transport deliberately absent)
+  llm_advisor.py   the optional LLM backend (OpenAI-compatible; off unless selected)
   ctl.py       the operator CLI behind the command/proposal/insight verbs
 tests/         the offline suite (no network, enforced)
   fixtures/    captured fleet artifacts -- see the provenance README
@@ -332,7 +334,13 @@ approval flow are in [`docs/architecture.md`](docs/architecture.md).
 | `SENTINEL_ADVISORS` | `reference` | comma-separated `module.advisor` / bare advisor ids; `none` is the explicit off switch |
 | `SENTINEL_ADVISOR_MAX_HISTORY_DAYS` | `30` | the cap on history any advisor may read; negative refuses to start |
 | `SENTINEL_PROPOSAL_TTL_H` | `24` | hours an operator has to decide a proposal; zero or negative refuses to start |
-| `SENTINEL_LLM_PROVIDER`, `SENTINEL_LLM_ENDPOINT`, `SENTINEL_LLM_KEY`, `SENTINEL_LLM_MODEL` | empty | the LLM seam. Configuring provider **and** endpoint makes it selectable; it never joins the default selector. No transport ships in this delivery |
+| `SENTINEL_INTELLIGENCE` | `1` | the intelligence cycle's master switch; off records a `skipped` cycle and reads nothing |
+| `SENTINEL_INTELLIGENCE_INTERVAL_S` | advisor interval | minimum seconds between cycles; a second cycle inside it returns no row |
+| `SENTINEL_INTELLIGENCE_BUDGET_MS` | `30000` | measured cycle budget (also the model request timeout); an overrun is recorded, not killed |
+| `SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS` | `16000` | the global cap on one model request after per-module budgets |
+| `SENTINEL_INTELLIGENCE_ANOMALY` | `0` | the anomaly detector; off until its replay harness shows a measured win |
+| `<MODULE>_INTELLIGENCE` | no lanes | per-module grant JSON: `{"observe": true, "author": "propose", "remediate": false, "budget": {...}}`. `author=auto` parses but is reserved: startup and writes refuse it |
+| `SENTINEL_LLM_PROVIDER`, `SENTINEL_LLM_ENDPOINT`, `SENTINEL_LLM_KEY`, `SENTINEL_LLM_MODEL` | empty | the LLM backend. Configuring provider **and** endpoint registers it and makes it selectable (`SENTINEL_ADVISORS=llm`); the default selector is still `reference` |
 
 A destructive action is never executed by an automatic path, at any level: only an
 approved proposal runs it, and at `scoped` the current allow-list must still name it.

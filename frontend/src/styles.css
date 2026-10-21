@@ -152,6 +152,20 @@ select:focus-visible, textarea:focus-visible {
 .badge { display:inline-block; border-radius:3px; padding:0 5px;
          font-size:10px; font-weight:600; background:#12351d; color:#7ee08f; }
 .badge.source { background:#272c34; color:var(--dim); }
+.badge.human { background:#3a2f10; color:#e8c46a; margin-left:6px; }
+
+/* A proposal diff. Removed is not "dim": the row stops existing, so it is red
+   and struck through. Added is green, changed is amber, and the Before/After
+   columns put the two values side by side. */
+.diff { margin-top:6px; }
+.diff-notes { margin:4px 0; padding-left:18px; font-size:11.5px;
+              color:var(--dim); }
+.diff tr.removed td { background:rgba(248,81,73,.10); }
+.diff tr.removed td:first-child { text-decoration:line-through;
+                                  color:#ff9d99; }
+.diff tr.added td { background:rgba(63,185,80,.10); }
+.diff tr.changed td { background:rgba(227,179,65,.08); }
+.diff td { font-size:11.5px; }
 
 .switch { min-width:84px; font-size:11.5px; font-weight:600; }
 .switch.on { background:#12351d; border-color:#245c33; color:#7ee08f; }

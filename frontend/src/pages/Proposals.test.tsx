@@ -121,6 +121,158 @@ it("shows a refusal, keeps it visible, and reloads the queue", async () => {
   expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(2);
 });
 
+/* --- authoring diffs and the automatic-change history ------------------- */
+
+const checkSet = {
+  ...pending,
+  id: 3,
+  module: "snmp",
+  kind: "check_set",
+  payload_json: JSON.stringify({
+    settings: { SNMP_CHECKS: [] },
+    before: {
+      SNMP_CHECKS: [
+        {
+          device: "sw1",
+          oid: "1.3.6.1.2.1.1",
+          label: "cpu",
+          green: 70,
+          amber: 90,
+        },
+      ],
+    },
+    classification: "silencing",
+    diff: "removed 1 SNMP_CHECKS row(s)",
+    requires_human: true,
+  }),
+  rationale: "Drop the CPU check",
+};
+
+it("renders an authoring diff with the removed row, the badge and the marker", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => respond(200, {
+      pending: [checkSet], expired: [], applied: [],
+    })),
+  );
+  const { container } = render(<Proposals />);
+
+  expect(await screen.findByText("Drop the CPU check")).toBeInTheDocument();
+  // The classification is a pill of its own word, and modification/silencing
+  // carry the marker that says no code path may apply them unattended.
+  expect(screen.getByText("silencing")).toBeInTheDocument();
+  expect(screen.getByText("requires human")).toBeInTheDocument();
+  // The machine-readable diff is rendered as a list, not a run-on line.
+  expect(
+    screen.getByText("removed 1 SNMP_CHECKS row(s)"),
+  ).toBeInTheDocument();
+  const removed = container.querySelector("tr.removed");
+  expect(removed).not.toBeNull();
+  expect(removed?.textContent).toContain("cpu");
+});
+
+const autoChange = {
+  ...pending,
+  id: 4,
+  module: "snmp",
+  kind: "settings_change",
+  rationale: "Add an uptime check",
+  state: "executed",
+  actor: "intelligence:auto",
+  executed_at: 1760000100,
+  payload_json: JSON.stringify({
+    settings: { SNMP_CHECKS: [{ device: "sw1", oid: "1.3.6.1.2.1.1.3.0" }] },
+    before: { SNMP_CHECKS: [] },
+    classification: "additive",
+    diff: "added 1 SNMP_CHECKS row(s)",
+    requires_human: false,
+  }),
+  payload: {
+    settings: { SNMP_CHECKS: [{ device: "sw1", oid: "1.3.6.1.2.1.1.3.0" }] },
+    before: { SNMP_CHECKS: [] },
+    classification: "additive",
+    diff: "added 1 SNMP_CHECKS row(s)",
+    requires_human: false,
+    reverted_at: null,
+    reverted_by: null,
+  },
+  reverted_at: null,
+  reverted_by: null,
+};
+
+function mockBoard(applied: unknown[], post: () => Response) {
+  const calls: { url: string; method?: string }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url: String(url), method: init?.method });
+      if (url === "/api/v1/proposals") {
+        return respond(200, { pending: [], expired: [], applied });
+      }
+      if (url.startsWith("/api/v1/intelligence/revert/")) return post();
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+  return calls;
+}
+
+it("reverts an automatic change through the revert route and refreshes", async () => {
+  const calls = mockBoard([autoChange], () =>
+    respond(200, { ok: true, message: "proposal 4 reverted" }),
+  );
+  render(<Proposals />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Revert" }));
+
+  expect(await screen.findByText("proposal 4 reverted")).toBeInTheDocument();
+  expect(
+    calls.filter((c) => c.url === "/api/v1/intelligence/revert/4"),
+  ).toEqual([{ url: "/api/v1/intelligence/revert/4", method: "POST" }]);
+  // The initial read plus the refresh after the revert.
+  expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(2);
+});
+
+it("shows a reverted change as reverted and offers no revert", async () => {
+  const reverted = {
+    ...autoChange,
+    id: 5,
+    rationale: "Add a different check",
+    payload: {
+      ...autoChange.payload,
+      reverted_at: 1760000200,
+      reverted_by: "operator",
+    },
+    reverted_at: 1760000200,
+    reverted_by: "operator",
+  };
+  mockBoard([autoChange, reverted], () => respond(200, {}));
+  render(<Proposals />);
+
+  expect(await screen.findByText("Add an uptime check")).toBeInTheDocument();
+  // History keeps the row; the marker says it was undone, and only the
+  // still-applied change may be reverted.
+  expect(screen.getByText(/reverted/)).toBeInTheDocument();
+  expect(screen.getAllByRole("button", { name: "Revert" })).toHaveLength(1);
+});
+
+it("shows a refused revert as a message and reloads the history", async () => {
+  const calls = mockBoard([autoChange], () =>
+    respond(409, {
+      error: {
+        code: "refused",
+        message: "proposal 4 was already reverted",
+      },
+    }),
+  );
+  render(<Proposals />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Revert" }));
+
+  expect(await screen.findByText(/already reverted/)).toBeInTheDocument();
+  expect(screen.getByText("Add an uptime check")).toBeInTheDocument();
+  expect(calls.filter((c) => c.url === "/api/v1/proposals")).toHaveLength(2);
+});
+
 it("moves a proposal out of Pending when a 409 says it is no longer pending", async () => {
   // The whole-branch review's finding: an approval the engine expired answered
   // 409, and the row stayed in Pending forever -- the queue was never re-read.

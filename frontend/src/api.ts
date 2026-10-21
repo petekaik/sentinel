@@ -207,6 +207,21 @@ export type ModuleManifest = {
   actions: { id: string; title: string; danger?: string | null }[];
 };
 
+/* The machine-readable change record stored beside a proposal. `settings` is
+   the full proposed value map and `before` the values it replaces; the model
+   path stores the change body flat beside the metadata instead, so a reader
+   must accept both (the server's `ctl._approve_settings` does the same). */
+export type ProposalPayload = {
+  settings?: Record<string, unknown>;
+  before?: Record<string, unknown>;
+  classification?: string;
+  diff?: string;
+  requires_human?: boolean;
+  reverted_at?: number | null;
+  reverted_by?: string | null;
+  [key: string]: unknown;
+};
+
 /* An approval asks for a change; it cannot act until a human decides it. The
    server returns pending and expired as two lists because a lapsed row may not
    be decided and must not be offered beside a live one. */
@@ -224,9 +239,19 @@ export type Proposal = {
   executed_at?: number | null;
 };
 
+/* An executed `intelligence:auto` change: already applied, so it is history
+   rather than a decision, and the only kind of row a revert may undo. Its
+   payload is parsed here (the queue rows carry only `payload_json`). */
+export type AppliedProposal = Proposal & {
+  payload: ProposalPayload;
+  reverted_at?: number | null;
+  reverted_by?: string | null;
+};
+
 export type ProposalsPayload = {
   pending: Proposal[];
   expired: Proposal[];
+  applied?: AppliedProposal[];
 };
 
 export type ProposalDecision = { ok: boolean; message: string };
@@ -314,6 +339,11 @@ export const api = {
     req<ProposalDecision>("POST", `/api/v1/proposals/${id}/approve`),
   rejectProposal: (id: number) =>
     req<ProposalDecision>("POST", `/api/v1/proposals/${id}/reject`),
+  /* Undo one automatically applied change. A 401 needs the write token; a 409
+     means the row was already reverted or its settings have moved, and the
+     message is the whole answer. */
+  revertChange: (id: number) =>
+    req<ProposalDecision>("POST", `/api/v1/intelligence/revert/${id}`),
   runCommand: (
     module: string,
     id: string,

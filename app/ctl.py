@@ -6,10 +6,11 @@ The platform never imports a module. The enabled modules are discovered through
 contract, so building a Context here performs no I/O against the fleet.
 
 AN APPROVAL IS AUTHORITY, NOT A BYPASS. `--approve` asks the ladder with the
-one action's level set to `full`, which is exactly what a human saying yes
-means -- and it still goes through every engine gate in `heal.attempt()` plus
-the module, engine and incident checks below. A refusal leaves the proposal
-PENDING, because a failed approval is not a decision about it.
+one action's level set to `full` and `approved` set, which is exactly what a
+human saying yes means -- and it still goes through every engine gate in
+`heal.attempt()` plus the module, engine and incident checks below. A refusal
+leaves the proposal PENDING, because a failed approval is not a decision about
+it.
 """
 
 import argparse
@@ -136,21 +137,28 @@ def _approve_action(cfg, conn, mod, payload, row, actor, ctx):
     # that check here is deliberate -- one gate, one home.
     policy = cfg.authority(mod.id)
 
-    # AN APPROVAL GRANTS `propose`, IT DOES NOT RESURRECT A WITHDRAWN GRANT.
-    # The operator approved a proposal written while the level was `propose`;
-    # if the module has since been set to off/advisory/scoped (or the action
-    # dropped from an allow-list), the authority to act is gone and approving
-    # the old row must not recreate it.
+    # AN APPROVAL GRANTS THE LEVEL THAT WROTE THE PROPOSAL, IT DOES NOT
+    # RESURRECT A WITHDRAWN GRANT. The operator approved a proposal written
+    # while the level was `propose` or, for a destructive action, `scoped`/
+    # `full`; if the module has since been set to off or advisory, the
+    # authority to act is gone and approving the old row must not recreate it.
     level = actions.effective_level(action, policy)
-    if level != "propose":
+    if level == "propose":
+        pass
+    elif action.danger == "destructive" and level in ("scoped", "full"):
+        # The proposal exists because invariant 2 converted an unattended
+        # destructive execution into a human decision. Approving it is that
+        # decision; the ladder still applies every other gate.
+        pass
+    else:
         raise ProposalRefused(
-            "the action's authority is now %r, not propose; the grant was "
-            "withdrawn" % (level,))
+            "the action's authority is now %r, not a level that could have "
+            "produced this proposal" % (level,))
     approval = actions.approval_policy(policy, action.id)
     ok, why = actions.allowed(action, incident, approval)
     if not ok:
-        # The destructive switch and the confirmed-incident rule live here, and
-        # an approval deliberately cannot lift either of them.
+        # The confirmed-incident rule and the engine switch live here, and an
+        # approval deliberately cannot lift either of them.
         raise ProposalRefused("the ladder refuses this action: %s" % why)
 
     # CLAIM, THEN EXECUTE. The conditional UPDATE is what stops two concurrent

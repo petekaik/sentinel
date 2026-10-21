@@ -8,9 +8,10 @@ tested without a fleet, a store or a clock.
 THE ORDER IS THE CONTRACT. An unconfirmed incident refuses first -- before any
 authority is read -- because "this is not a fact yet" outranks "an operator
 granted permission". After that: the trigger, the engine master switch, the
-level, the scoped allow-list, and finally the destructive switch. A destructive
-action needs BOTH a level above scoped and its own switch; `full` is authority to
-act, not authority to break.
+level, the scoped allow-list, and finally human approval. A destructive action
+is NEVER run by an unattended path, at any level: `full` is authority to act,
+not authority to break. Only a policy built by `approval_policy` -- i.e. one a
+human approved -- carries `approved`.
 """
 
 LEVELS = ("off", "advisory", "propose", "scoped", "full")
@@ -44,10 +45,15 @@ class Authority(dict):
     """
 
     def __init__(self, authority="off", allow=(), destructive=False,
-                 enabled=True, overrides=None):
+                 enabled=True, overrides=None, approved=False):
         super().__init__(authority=authority, allow=tuple(allow),
                          destructive=bool(destructive), enabled=bool(enabled))
         self.overrides = dict(overrides or {})
+        # THE ONE ATTRIBUTE AN AUTOMATIC PATH CANNOT SET. It is not a dict key
+        # because it is not operator configuration: only `approval_policy`
+        # (a human decision) creates a policy with it, and `allowed()` defaults
+        # it to False for every plain dict.
+        self.approved = bool(approved)
 
 
 class Action:
@@ -107,12 +113,13 @@ def effective_level(action, policy):
 
 
 def approval_policy(policy, action_id):
-    """A policy whose effective level for ONE action is `full`.
+    """A policy whose effective level for ONE action is `full` and approved.
 
     This is how an approved proposal becomes authority: the human decision is
-    the grant. It is not a bypass -- `enabled` and `destructive` are carried
-    over untouched, so an approval still cannot run while the engine is off or
-    a destructive action has lost ALLOW_DESTRUCTIVE.
+    the grant -- and the only grant that admits a destructive action. It is not
+    a bypass of the engine: `enabled` is carried over untouched, and every
+    other gate (latched incident, attempt budget, cooldown, resource lock,
+    dry run) lives in `heal.attempt`.
     """
     policy = policy or {}
     overrides = dict(getattr(policy, "overrides", None)
@@ -123,7 +130,8 @@ def approval_policy(policy, action_id):
         allow=policy.get("allow", ()),
         destructive=policy.get("destructive", False),
         enabled=policy.get("enabled", True),
-        overrides=overrides)
+        overrides=overrides,
+        approved=True)
 
 
 def allowed(action, incident, policy=None, module_id=None):
@@ -159,6 +167,6 @@ def allowed(action, incident, policy=None, module_id=None):
     if level == "scoped" and action.id.lower() not in tuple(
             str(a).lower() for a in policy.get("allow", ())):
         return False, "scoped: %r is not in the allow-list" % action.id
-    if action.danger == "destructive" and not policy.get("destructive"):
-        return False, "destructive action requires ALLOW_DESTRUCTIVE"
+    if action.danger == "destructive" and not getattr(policy, "approved", False):
+        return False, "destructive action requires human approval at every tier"
     return True, "allowed by %s" % level

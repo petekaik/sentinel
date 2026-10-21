@@ -395,12 +395,20 @@ def consider(cfg, conn, seq, results, ctx):
                     advisory_for = cand
                 # A `propose`-level action passes every OTHER gate. Asking the
                 # ladder with the level forced to `full` is the same question
-                # an approval will ask, so the destructive switch and the
-                # engine switch still refuse here -- a proposal nobody could
-                # approve must not be written. With MONITOR_REMEDIES off an
-                # approval could not execute either, so no proposal is written.
+                # an approval will ask, so the engine switch still refuses here
+                # -- a proposal nobody could approve must not be written. With
+                # MONITOR_REMEDIES off an approval could not execute either, so
+                # no proposal is written.
+                #
+                # A DESTRUCTIVE ACTION IS PROPOSED AT `scoped`/`full` TOO: it
+                # is never executed by this path, so the proposal is the only
+                # way invariant 2 lets it happen at all. The approval carries
+                # `approved`, which is what the ladder requires.
+                level = actions.effective_level(cand, policy)
                 if (proposal_for is None and can_execute
-                        and actions.effective_level(cand, policy) == "propose"
+                        and (level == "propose"
+                             or (cand.danger == "destructive"
+                                 and level in ("scoped", "full")))
                         and actions.allowed(
                             cand, inc, actions.approval_policy(policy,
                                                                cand.id))[0]):

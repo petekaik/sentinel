@@ -1976,16 +1976,14 @@ class _ActMod:
 
 class _ProposalCfg:
     def __init__(self, authority="propose", remedies=True, ttl_h=24,
-                 destructive=False, enabled=True, advisor_ids=(),
-                 max_history_days=30):
+                 enabled=True, advisor_ids=(), max_history_days=30):
         self.remedies_enabled = remedies
         self.dry_run = False
         self.proposal_ttl_s = ttl_h * 3600
         self.advisor_ids = tuple(advisor_ids)
         self.advisor_max_history_days = max_history_days
         self._policy = actions.Authority(
-            authority=authority, allow=(), destructive=destructive,
-            enabled=enabled)
+            authority=authority, allow=(), enabled=enabled)
 
     def authority(self, module_id):
         return self._policy
@@ -2306,13 +2304,36 @@ def test_an_approval_refuses_every_unsafe_state(results):
                     "operator", ctx=object()),
                 "SENTINEL_REMEDIATION")
 
-        # A destructive action still needs its own switch.
-        dmod = _ActMod([_action(danger="destructive", ran=ran)])
-        refused("an approval cannot lift ALLOW_DESTRUCTIVE",
-                lambda: ctl.approve_proposal(
-                    _ProposalCfg(destructive=False), conn, {"m": dmod}, pid,
-                    "operator", ctx=object()),
-                "destructive")
+        # INVARIANT 2: a destructive action is never run by an unattended
+        # path. The proposal is the question; the approval is the human
+        # decision, and `heal.attempt` still applies every other gate.
+        dran = []
+        dmod = _ActMod([_action(danger="destructive", ran=dran)])
+        dpid = _action_proposal(conn, inc, expires_at=time.time() + 3600)
+        msg = ctl.approve_proposal(_ProposalCfg(), conn, {"m": dmod}, dpid,
+                                   "operator", ctx=object())
+        results.check(
+            "an approval is the human decision a destructive action needs",
+            dran == [1] and "executed" in msg
+            and store.get_proposal(conn, dpid)["state"] == "executed",
+            "ran=%r msg=%r row=%r"
+            % (dran, msg, store.get_proposal(conn, dpid)))
+
+        # And at `full`, where the proposal exists only because invariant 2
+        # converted the unattended execution into a human decision.
+        dran2 = []
+        dmod2 = _ActMod([_action(danger="destructive", ran=dran2)])
+        inc2 = _open_incident(conn, subject="s2")
+        dpid2 = _action_proposal(conn, inc2, expires_at=time.time() + 3600)
+        msg = ctl.approve_proposal(_ProposalCfg(authority="full"), conn,
+                                   {"m": dmod2}, dpid2, "operator",
+                                   ctx=object())
+        results.check(
+            "an approved full-level destructive action executes",
+            dran2 == [1] and "executed" in msg
+            and store.get_proposal(conn, dpid2)["state"] == "executed",
+            "ran=%r msg=%r row=%r"
+            % (dran2, msg, store.get_proposal(conn, dpid2)))
 
         # The action is re-resolved from the module loaded now.
         empty = _ActMod([])
@@ -2378,7 +2399,7 @@ def test_an_approval_refuses_a_withdrawn_propose_grant(results):
                 got = str(exc)
             results.check(
                 "an approval refuses when the authority is now %s" % level,
-                "withdrawn" in got and ran == []
+                "could have produced" in got and ran == []
                 and store.get_proposal(conn, pid)["state"] == "pending",
                 "refusal=%r ran=%r -- forcing `full` without checking the "
                 "current level turns an old proposal into a permission that "

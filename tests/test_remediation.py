@@ -3,7 +3,7 @@
 The default is not "safe because nobody enabled it" -- it is safe because every
 gate is a refusal until an operator names it. This suite exercises each refusal
 on its own (off, advisory, propose, scoped without a grant, destructive without
-its switch, an unconfirmed incident, an unmatched trigger) and then checks that
+an approval, an unconfirmed incident, an unmatched trigger) and then checks that
 the one path which should allow really does. A test that only proved "off says
 off" would pass with the whole ladder deleted.
 """
@@ -43,15 +43,14 @@ def _act(**kw):
 
 
 def _policy(**kw):
-    base = dict(authority="full", allow=(), destructive=True)
+    base = dict(authority="full", allow=())
     base.update(kw)
     return base
 
 
 def test_off_by_default(results):
     ok, why = actions.allowed(_act(), OPEN,
-                              {"authority": "off", "allow": (),
-                               "destructive": False})
+                              {"authority": "off", "allow": ()})
     results.check("authority off never executes", not ok and "off" in why, why)
 
     ok, why = actions.allowed(_act(), OPEN, {})
@@ -62,14 +61,12 @@ def test_off_by_default(results):
 def test_scoped_requires_allowlist(results):
     a = _act()
     ok, why = actions.allowed(a, OPEN,
-                              {"authority": "scoped", "allow": ("b",),
-                               "destructive": False})
+                              {"authority": "scoped", "allow": ("b",)})
     results.check("scoped refuses an action not in the allow-list",
                   not ok and "allow" in why, why)
 
     ok, why = actions.allowed(a, OPEN,
-                              {"authority": "scoped", "allow": ("a",),
-                               "destructive": False})
+                              {"authority": "scoped", "allow": ("a",)})
     results.check("scoped allows the action it names",
                   ok and "scoped" in why, why)
 
@@ -87,20 +84,19 @@ def test_an_unknown_level_is_a_refusal(results):
                   not ok and "authority" in why, why)
 
 
-def test_destructive_needs_its_own_switch(results):
+def test_destructive_needs_human_approval(results):
     a = _act(danger="destructive")
-    ok, why = actions.allowed(a, OPEN,
-                              {"authority": "full", "allow": (),
-                               "destructive": False})
+    ok, why = actions.allowed(a, OPEN, _policy())
     results.check("full authority alone cannot run a destructive action",
-                  not ok and "destructive" in why, why)
+                  not ok and "human approval" in why, why)
 
-    ok, why = actions.allowed(a, OPEN, _policy(destructive=True))
-    results.check("the destructive switch admits a destructive action",
-                  ok, why)
+    approved = actions.approval_policy(_policy(authority="propose"), "a")
+    ok, why = actions.allowed(a, OPEN, approved)
+    results.check("an approved proposal admits a destructive action",
+                  ok and "allowed" in why, why)
 
-    ok, why = actions.allowed(_act(), OPEN, _policy(destructive=False))
-    results.check("a state-changing action does not need the destructive switch",
+    ok, why = actions.allowed(_act(), OPEN, _policy())
+    results.check("a state-changing action does not need human approval",
                   ok, why)
 
 
@@ -131,19 +127,16 @@ def test_the_engine_master_switch_is_a_gate(results):
 
 def test_action_level_authority_overrides_the_module(results):
     a = _act(id="a")
-    policy = {"authority": "full", "allow": (), "destructive": True,
-              "overrides": {"a": "off"}}
+    policy = {"authority": "full", "allow": (), "overrides": {"a": "off"}}
     ok, why = actions.allowed(a, OPEN, policy)
     results.check("an action-level off overrides a module-level full",
                   not ok and "off" in why, why)
 
-    policy = {"authority": "off", "allow": (), "destructive": True,
-              "overrides": {"a": "full"}}
+    policy = {"authority": "off", "allow": (), "overrides": {"a": "full"}}
     ok, why = actions.allowed(a, OPEN, policy)
     results.check("an action-level full overrides a module-level off", ok, why)
 
-    policy = {"authority": "scoped", "allow": (), "destructive": True,
-              "overrides": {"b": "full"}}
+    policy = {"authority": "scoped", "allow": (), "overrides": {"b": "full"}}
     ok, why = actions.allowed(a, OPEN, policy)
     results.check("an override for another action does not leak", not ok, why)
 
@@ -155,8 +148,13 @@ def test_config_authority_defaults_are_off(results):
                   policy["authority"] == "off", repr(policy))
     results.check("with no allow-list", tuple(policy["allow"]) == (),
                   repr(policy))
-    results.check("and no destructive switch",
-                  policy["destructive"] is False, repr(policy))
+    results.check("and no deprecated destructive switch",
+                  cfg.deprecated_destructive_keys == [],
+                  repr(cfg.deprecated_destructive_keys))
+    ok, why = actions.allowed(_act(danger="destructive"), OPEN,
+                              {"authority": "full", "allow": ()})
+    results.check("a destructive action is still refused without approval",
+                  not ok and "human approval" in why, why)
     results.check("the engine master switch defaults to on",
                   policy["enabled"] is True, repr(policy))
     results.check("the process kill switch defaults to off",
@@ -176,8 +174,13 @@ def test_config_authority_reads_the_module_env(results):
                   policy["authority"] == "scoped", repr(policy))
     results.check("the allow-list is a comma list",
                   tuple(policy["allow"]) == ("a", "b"), repr(policy))
-    results.check("the destructive switch is read",
-                  policy["destructive"] is True, repr(policy))
+    results.check("the legacy destructive switch is named as deprecated",
+                  "FLEET_ALLOW_DESTRUCTIVE" in cfg.deprecated_destructive_keys,
+                  repr(cfg.deprecated_destructive_keys))
+    ok, why = actions.allowed(_act(danger="destructive"), OPEN,
+                              dict(policy, enabled=True))
+    results.check("and it no longer grants a destructive action",
+                  not ok and "human approval" in why, why)
     results.check("SENTINEL_REMEDIATION=0 disables the engine",
                   policy["enabled"] is False, repr(policy))
     results.check("MONITOR_REMEDIES is still a separate process switch",
@@ -323,8 +326,7 @@ def test_authority_off_never_executes(results):
     a = _act(run=lambda ctx, inc: (ran.append(1)
                                    or actions.Result(True, "done")))
     out = heal.attempt(a, _inc(), None,
-                       {"authority": "off", "allow": (),
-                        "destructive": False}, None, 1)
+                       {"authority": "off", "allow": ()}, None, 1)
     results.check("authority off refuses before the dry-run",
                   not out["executed"] and "off" in out["why"] and ran == [],
                   "out=%r ran=%r" % (out, ran))
@@ -332,7 +334,7 @@ def test_authority_off_never_executes(results):
     with tempfile.TemporaryDirectory() as tmp:
         conn = _fresh_conn(tmp)
         _open_row(conn)
-        cfg = _Cfg({"authority": "off", "allow": (), "destructive": False})
+        cfg = _Cfg({"authority": "off", "allow": ()})
         out = heal.consider(cfg, conn, 4, [_Ran()], _Ctx([_Mod([a])]))
         results.check("consider executes nothing when the module is off",
                       out == [] and ran == [],
@@ -348,7 +350,7 @@ def test_an_action_override_lifts_a_module_out_of_off(results):
     with tempfile.TemporaryDirectory() as tmp:
         conn = _fresh_conn(tmp)
         _open_row(conn)
-        cfg = _Cfg({"authority": "off", "allow": (), "destructive": False,
+        cfg = _Cfg({"authority": "off", "allow": (),
                     "overrides": {"a": "full"}})
         out = heal.consider(cfg, conn, 4, [_Ran()], _Ctx([_Mod([a])]))
         results.check("a per-action full override runs despite a module-level off",
@@ -361,7 +363,7 @@ def test_both_engine_switches_are_gates(results):
     ran = []
     a = _act(run=lambda ctx, inc: (ran.append(1)
                                    or actions.Result(True, "done")))
-    policy = {"authority": "full", "allow": (), "destructive": True}
+    policy = {"authority": "full", "allow": ()}
     with tempfile.TemporaryDirectory() as tmp:
         conn = _fresh_conn(tmp)
         _open_row(conn)
@@ -448,7 +450,7 @@ def test_a_permitting_nothing_module_does_not_spend_the_budget(results):
     a = _act(run=lambda ctx, inc: (ran.append(1)
                                    or actions.Result(True, "done")),
              limits=actions.Limits(max_attempts=2))
-    policy = {"authority": "full", "allow": (), "destructive": True}
+    policy = {"authority": "full", "allow": ()}
     with tempfile.TemporaryDirectory() as tmp:
         conn = _fresh_conn(tmp)
         row = _open_row(conn)
@@ -856,7 +858,7 @@ def test_an_advisory_authority_surfaces_an_insight_and_never_executes(results):
     ran = []
     a = _act(run=lambda ctx, inc: (ran.append(1)
                                    or actions.Result(True, "done")))
-    policy = {"authority": "advisory", "allow": (), "destructive": False}
+    policy = {"authority": "advisory", "allow": ()}
     with tempfile.TemporaryDirectory() as tmp:
         conn = _fresh_conn(tmp)
         _open_row(conn)
@@ -1113,7 +1115,7 @@ def test_transcode_restart_ignores_historical_and_capability_signals(results):
     """
     from modules.fleet import actions as fleet_actions
     action = {a.id: a for a in fleet_actions.actions_list()}["transcode_restart"]
-    policy = {"authority": "full", "allow": (), "destructive": True}
+    policy = {"authority": "full", "allow": ()}
     for check_id in ("deadlock_kills", "stall_watch"):
         ok, why = actions.allowed(
             action, {"state": "open", "target": "cubox-1",
@@ -1479,7 +1481,7 @@ TESTS = (test_off_by_default,
          test_scoped_requires_allowlist,
          test_advisory_and_propose_never_execute,
          test_an_unknown_level_is_a_refusal,
-         test_destructive_needs_its_own_switch,
+         test_destructive_needs_human_approval,
          test_pending_incidents_are_not_actionable,
          test_triggers_must_match,
          test_the_engine_master_switch_is_a_gate,

@@ -185,6 +185,14 @@ class Config:
         self.env = dict(e)
         e = self.env
 
+        # THE LEGACY DESTRUCTIVE SWITCH IS NO LONGER HONOURED. A destructive
+        # action always requires human approval (invariant 2), so an operator
+        # who still has `<MODULE>_ALLOW_DESTRUCTIVE=1` is warned by name rather
+        # than left believing it does something. Collected from the file/env
+        # side only: nothing may store a new one.
+        self.deprecated_destructive_keys = sorted(
+            k for k in e if k.endswith("_ALLOW_DESTRUCTIVE"))
+
         # ssh material. One key for everything, one known_hosts file. Both are
         # mounted read-only into the container. The fleet module builds its
         # Host objects from these.
@@ -381,6 +389,11 @@ class Config:
         `<MODULE>_ACTION_<ID>_AUTHORITY` overrides one action's level in either
         direction. That is not a second switch -- it is how an operator grants
         `full` to one action, or withdraws it, without widening the module.
+
+        `<MODULE>_ALLOW_DESTRUCTIVE` is deliberately NOT read any more: a
+        destructive action needs human approval at every level (invariant 2).
+        `deprecated_destructive_keys` names any that are still set so
+        `describe()` can warn about them.
         """
         import actions
         prefix = module_id.upper()
@@ -402,8 +415,6 @@ class Config:
                 x.strip()
                 for x in _env("%s_ALLOW" % prefix, "", self.env).split(",")
                 if x.strip()),
-            destructive=_bool("%s_ALLOW_DESTRUCTIVE" % prefix, False,
-                              self.env),
             enabled=_bool("SENTINEL_REMEDIATION", True, self.env),
             overrides=overrides)
 
@@ -428,4 +439,8 @@ class Config:
                   self.llm_model or "default")
                if self.llm_provider and self.llm_endpoint else "not configured")
         lines.append("llm advisor        : %s" % llm)
+        for key in self.deprecated_destructive_keys:
+            lines.append(
+                "warning            : %s is no longer honoured; destructive "
+                "actions always require human approval" % key)
         return "\n".join(lines)

@@ -13,10 +13,13 @@ import harness                                    # noqa: E402
 from harness import Results                       # noqa: E402
 from test_dashboard import _serve, make_cfg       # noqa: E402
 
+import actions                                    # noqa: E402
 import advisors                                   # noqa: E402
 import authorize                                  # noqa: E402
 import checks                                     # noqa: E402
 import config as config_mod                       # noqa: E402
+import ctl                                        # noqa: E402
+import heal                                       # noqa: E402
 import intelligence_layer                         # noqa: E402
 import module                                     # noqa: E402
 import module_view                                # noqa: E402
@@ -1192,6 +1195,66 @@ def test_a_broken_cadence_read_is_a_recorded_cycle_error(results):
     shutil.rmtree(tmp)
 
 
+def test_a_destructive_action_is_refused_at_full_without_approval(results):
+    a = actions.Action(
+        id="break", title="Break", triggers=[("c", "*")],
+        danger="destructive",
+        dry_run=lambda ctx, inc: actions.Result(True, "ok"),
+        run=lambda ctx, inc: actions.Result(True, "ran"),
+        verify=("c", "*"))
+    incident = {"state": "open", "check_id": "c", "subject": "s"}
+    ok, why = actions.allowed(
+        a, incident,
+        {"authority": "full", "allow": (), "destructive": True})
+    results.check(
+        "full plus the legacy switch cannot run a destructive action",
+        not ok and "human approval" in why, why)
+    approved = actions.approval_policy(
+        {"authority": "propose", "allow": (), "destructive": False}, "break")
+    ok, why = actions.allowed(a, incident, approved)
+    results.check(
+        "an approved proposal can run it, exactly once, through the ladder",
+        ok and "allowed" in why, why)
+
+
+def test_consider_proposes_a_destructive_action_at_full_and_never_runs_it(results):
+    tmp, conn = _grant_store()
+    try:
+        seq = store.next_epoch_seq(conn)
+        # A single FAIL is PENDING; the incident is confirmed only at
+        # CONFIRM_POLLS, and `consider` reads confirmed incidents.
+        for _ in range(store.CONFIRM_POLLS):
+            store.sync_incident(conn, seq, "t", "c", "s", store.Status.FAIL,
+                                "down")
+        called = []
+        a = actions.Action(
+            id="break", title="Break", triggers=[("c", "*")],
+            danger="destructive",
+            dry_run=lambda ctx, inc: called.append("dry") or actions.Result(True, "ok"),
+            run=lambda ctx, inc: called.append("run") or actions.Result(True, "ran"),
+            verify=("c", "*"))
+        mod = module.Module(id="probe", title="Probe",
+                            intelligence=("observe", "author", "remediate"),
+                            actions=lambda: [a], extra_check_ids=("c",))
+        cfg = config_mod.Config({"PROBE_AUTHORITY": "full",
+                                 "PROBE_ALLOW_DESTRUCTIVE": "1",
+                                 "MONITOR_REMEDIES": "1"})
+        ctx = type("_Ctx", (), {"modules": (mod,), "cfg": cfg})()
+        result = type("_R", (), {"target": "t", "check_id": "c", "subject": "s"})()
+        heal.consider(cfg, conn, seq, [result], ctx)
+        results.check(
+            "the engine never ran the destructive action",
+            called == [], "called=%r" % (called,))
+        rows = store.list_proposals(conn, state="pending")
+        results.check(
+            "it wrote a pending proposal instead",
+            any(r["kind"] == "action" for r in rows),
+            "proposals=%r" % (rows,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -1238,4 +1301,6 @@ TESTS = (
     test_each_granted_modules_report_survives_the_dedupe,
     test_a_selector_that_names_nothing_is_an_error_not_a_green_noop,
     test_a_broken_cadence_read_is_a_recorded_cycle_error,
+    test_a_destructive_action_is_refused_at_full_without_approval,
+    test_consider_proposes_a_destructive_action_at_full_and_never_runs_it,
 )

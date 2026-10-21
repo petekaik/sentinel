@@ -2134,12 +2134,21 @@ def test_a_model_failure_keeps_the_deterministic_runs_and_is_red(results):
             and "timed out" in ctx.module_errors.get("intelligence", ""),
             "out=%r row=%r errors=%r"
             % (out, row and dict(row), ctx.module_errors))
+        # ONE ROW PER MODULE READ, not `>= 1`: the reference advisor runs once
+        # per granted module, so this fixture (fleet and snmp granted) has two
+        # and a subset means the model failure discarded some evidence. The
+        # `reads > 0` keeps an empty read list from making the equality
+        # vacuous. `status = 'ok'` keeps a failed advisor row from standing in
+        # for the deterministic evidence.
+        reads = len(out["modules_read"])
+        kept = conn.execute("SELECT COUNT(*) FROM advisor_run WHERE "
+                            "advisor = 'reference' AND status = 'ok'"
+                            ).fetchone()[0]
         results.check(
             "the deterministic runs are kept",
-            conn.execute("SELECT COUNT(*) FROM advisor_run WHERE "
-                         "advisor = 'reference' AND status = 'ok'"
-                         ).fetchone()[0] >= 1,
-            "the model failure must not discard what the advisors found")
+            reads > 0 and kept == reads,
+            "kept=%d reads=%d: the model failure must not discard what the "
+            "advisors found" % (kept, reads))
         results.check(
             "the key is in no cycle row and no error text",
             "canary-key-123" not in (row["detail"] or "")

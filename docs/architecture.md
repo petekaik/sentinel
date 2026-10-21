@@ -852,14 +852,63 @@ collector translates a stored suggestion into a pending proposal.
 **The LLM advisor** (`app/llm_advisor.py`) is registered only when provider **and**
 endpoint are set, and runs only when named in the selector. Configuring it is the
 operator's egress decision; the default selector never includes it. The API key is a
-credential and never reaches the store, a log line or `--showconf`. **The transport is not
-implemented in this delivery**: a selected, configured advisor raises an explicit "not
-implemented" error instead of making a silent network call.
+credential and never reaches the store, a log line or `--showconf`. Its contract is the
+model-backend subsection below.
 
 **Hard limits.** An advisor can never resolve or dismiss an incident, change a check
 result, apply a threshold or execute an action. Even under `full` authority it emits a
 proposal; the remediation engine is the only executor. It runs after evidence is durable,
 cannot alter the epoch, and gets one queue slot per epoch — not an unbounded backlog.
+
+### The model backend
+
+The model is one backend among the advisors: same grant, same scoped pack, no extra
+authority. It speaks the OpenAI-compatible chat-completions wire format, so a local Ollama
+and a hosted endpoint are the same client with a different URL.
+
+**One call, every granted module.** `run_cycle` packs every module holding an `observe`
+grant into a single request and calls `advise_views` once; the cycle records
+`model_calls = 1`. A call per module would be N requests, N bills and N chances to leak,
+and a model handed one snapshot at a time could not see the fleet. There is no retry — the
+next cycle is the retry. The model never sees a module it was not granted: `pack_views`
+re-checks the grant it is passed rather than trusting its caller.
+
+**Per-module budgets, then one global cap.** A grant's `budget.rows` bounds each module's
+summary and `budget.bytes` bounds that module's JSON before anything is concatenated. The
+joined pack is then held to `SENTINEL_INTELLIGENCE_MODEL_MAX_TOKENS` (default 16000) by
+shrinking the largest module — journals first, then lists and maps halved — until it fits.
+The cut is deterministic for the same input, and the cycle records
+`model pack reduced for <modules>` instead of truncating silently. The whole cycle is
+measured against `SENTINEL_INTELLIGENCE_BUDGET_MS` (default 30000), which also sets the
+request timeout; an overrun is recorded as `budget`, not killed, because killing an
+advisor would leave a half-written insight.
+
+**Redaction happens where the text is built, and again where it leaves.** `pack_views`
+replaces with `[redacted]` every secret the platform knows — the write token, the model
+key, and every setting a module marks `secret` (`SNMP_COMMUNITIES` included, value by
+value) — in both the raw and the JSON-escaped form, so a secret containing a quote or a
+non-ASCII character cannot slip through the serialization. The advisor redacts the exact
+user text a second time before sending it, because that is the text the promise is about.
+The key reaches no insight, advisor-run detail, cycle row or traceback.
+
+**A failure is visible, never an empty green cycle.** A configured, selected model that
+cannot be reached records `status=error` with the detail `model call failed`, keeps
+`model_calls = 1`, and leaves the deterministic advisors' rows in place. The SPA shows the
+last cycle's status and detail on the Intelligence page, so an unreachable backend reads
+as a failed cycle rather than "the intelligence found nothing". The traceback stays in the
+collector's `ctx.module_errors["intelligence"]` and is not persisted, so the transport's
+own words cannot carry a credential into the store. An HTTP error, a refused redirect, a
+malformed body and a non-JSON reply are all failures; a malformed item inside a valid
+reply is dropped and counted instead of discarding the rest.
+
+**Model-authored changes are always proposals.** Nothing the model returns is applied in
+the cycle, whatever grant or authority it runs under. A proposed setting change is
+classified by `app/authorize.py`; only an **additive** change may auto-apply, and only
+when the module's grant says `author=auto`. A modification, a silencing, an identity
+change or any widening past a failing observation is a human proposal. The model has no
+write path to incidents, check results, thresholds or grants, and an action it nominates
+is executed — if ever — by the remediation engine in the **next** epoch's post-evidence
+seam. The model is in neither the poll path nor the execution path.
 
 ---
 

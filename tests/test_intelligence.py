@@ -899,6 +899,87 @@ def test_a_secret_or_undeclared_key_is_invalid(results):
                       "got %s: %s" % (cls, detail))
 
 
+def _state_check(device, oid, label, expected):
+    return {"device": device, "oid": oid, "label": label, "unit": "",
+            "direction": None, "green": None, "amber": None,
+            "kind": "state", "expected": expected}
+
+
+def test_before_may_use_the_documented_wrapped_shape(results):
+    mod = _snmp_mod()
+    current = _snmp_before(
+        [_device("sw1"), _device("sw2")],
+        [_check("sw1", "1.3.6.1.2.1.1", "cpu"),
+         _check("sw2", "1.3.6.1.2.1.2", "mem")])
+    after = _snmp_before([_device("sw1")],
+                         [_check("sw1", "1.3.6.1.2.1.1", "cpu")])
+    cls, detail = authorize.classify({"settings": after}, mod,
+                                     {"settings": current})
+    results.check("a removal with before in the documented shape is silencing",
+                  cls == authorize.SILENCING, "got %s: %s" % (cls, detail))
+    results.check("and it is never auto-applicable",
+                  not authorize.may_auto_apply(cls, "auto"),
+                  "a fail-open here auto-applies the removal")
+    missing = {"SNMP_DEVICES": [_device("sw1")]}
+    cls, detail = authorize.classify(
+        {"settings": _snmp_before([_device("sw1")],
+                                  [_check("sw1", "1.3.6.1.2.1.1", "cpu")])},
+        mod, missing)
+    results.check("a changed list with no before value is invalid",
+                  cls == authorize.INVALID and "SNMP_CHECKS" in detail,
+                  "got %s: %s" % (cls, detail))
+
+
+def test_a_state_rows_expected_moved_onto_a_failing_value_is_silencing(results):
+    mod = _snmp_mod()
+    oid = "1.3.6.1.2.1.2.2.1.8.1"
+    before = _snmp_before([_device("sw1")],
+                          [_state_check("sw1", oid, "ifOperStatus", 1)])
+    after = _snmp_before([_device("sw1")],
+                         [_state_check("sw1", oid, "ifOperStatus", 2)])
+    identity = ("sw1", oid, "ifOperStatus")
+    cls, detail = authorize.classify(
+        {"settings": after}, mod, before,
+        observations={identity: [(2.0, "fail")]})
+    results.check(
+        "a state expected moved onto a failing value is silencing",
+        cls == authorize.SILENCING, "got %s: %s" % (cls, detail))
+    results.check("and it is never auto-applicable",
+                  not authorize.may_auto_apply(cls, "auto"),
+                  "a state row's expected is evidence too")
+
+
+def test_the_modules_own_validation_can_refuse_an_additive_edit(results):
+    mod = _snmp_mod()
+    before = _snmp_before([_device("sw1")], [])
+    after = _snmp_before([_device("sw1")],
+                         [_check("sw1", "not-an-oid", "cpu")])
+    cls, detail = authorize.classify({"settings": after}, mod, before)
+    results.check("an additive row the module refuses is invalid",
+                  cls == authorize.INVALID, "got %s: %s" % (cls, detail))
+    results.check("the refusal names the offending OID",
+                  "oid" in detail, "got %s" % (detail,))
+
+
+def test_a_warn_that_stays_warn_is_a_modification(results):
+    mod = _snmp_mod()
+    oid = "1.3.6.1.2.1.1"
+    before = _snmp_before([_device("sw1")],
+                          [_check("sw1", oid, "cpu", green=70, amber=90)])
+    widened = _snmp_before([_device("sw1")],
+                           [_check("sw1", oid, "cpu", green=70, amber=130)])
+    identity = ("sw1", oid, "cpu")
+    cls, detail = authorize.classify(
+        {"settings": widened}, mod, before,
+        observations={identity: [(85.0, "warn")]})
+    results.check(
+        "a widening that leaves a WARN a WARN is a modification",
+        cls == authorize.MODIFICATION, "got %s: %s" % (cls, detail))
+    results.check("and it is never auto-applied",
+                  not authorize.may_auto_apply(cls, "auto"),
+                  "a band change is never additive")
+
+
 TESTS = (
     test_every_module_declares_its_intelligence_lanes,
     test_an_unknown_intelligence_lane_is_refused_at_declaration,
@@ -933,4 +1014,8 @@ TESTS = (
     test_a_label_or_oid_change_is_an_identity_change,
     test_a_band_widened_past_a_failing_observation_is_silencing,
     test_a_secret_or_undeclared_key_is_invalid,
+    test_before_may_use_the_documented_wrapped_shape,
+    test_a_state_rows_expected_moved_onto_a_failing_value_is_silencing,
+    test_the_modules_own_validation_can_refuse_an_additive_edit,
+    test_a_warn_that_stays_warn_is_a_modification,
 )

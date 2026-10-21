@@ -30,6 +30,20 @@ def _declared(mod):
     return {s.key: s for s in getattr(mod, "settings", ())}
 
 
+def _settings_map(value):
+    """The settings map, accepting BOTH documented shapes.
+
+    `change` is `{"settings": {...}}` and `before` is documented as the same
+    shape; the tests also pass the inner map directly. Accepting only the inner
+    map is a FAIL-OPEN on invariant 1: every key looks absent from `before`, the
+    list fallback is `[]`, and a removal or a band widening classifies ADDITIVE
+    and may auto-apply.
+    """
+    value = value or {}
+    inner = value.get("settings")
+    return inner if isinstance(inner, dict) else value
+
+
 def _row_identity(key, row):
     if not isinstance(row, dict):
         return None
@@ -48,22 +62,30 @@ def _ids(key, rows):
     return {_row_identity(key, row) for row in (rows or [])}
 
 
-def _grade(value, spec):
-    status, _ = thresholds.evaluate(value, spec)
+def _status_text(status):
+    """The string form of a Status (or of a plain stored status string)."""
     return str(getattr(status, "value", status)).lower()
 
 
-def _widens(key, before_row, after_row, observations):
-    """True when the new band stops a non-OK observation from failing.
+def _grade(value, spec):
+    status, _ = thresholds.evaluate(value, spec)
+    return _status_text(status)
 
-    `observations` is keyed by the ROW IDENTITY the interface documents -- an
-    OID row is `(device, oid, label)` -- not by the internal namespaced tuple
+
+def _widens(key, before_row, after_row, observations):
+    """True when the new row stops a CURRENTLY FAILING observation failing.
+
+    `observations` is keyed by the documented row identity -- an OID row is
+    `(device, oid, label)` -- not by the internal namespaced tuple
     `_row_identity` uses for set algebra.
 
-    Graded by the SAME `thresholds.evaluate` the check uses. Any change that
-    takes a currently-failing value out of FAIL is silencing, whether it lands
-    in WARN or OK: the incident the operator was watching leaves the board
-    either way.
+    A recorded WARN or UNKNOWN is NOT evidence of a silenced failure: a band
+    change under which it stays WARN must read as a modification, not as
+    "widened past a failing value". Only a recorded FAIL counts.
+
+    A state row is graded by equality with `expected`, so a moved `expected`
+    that now matches a currently non-OK value turns that row OK -- the same
+    silencing, through the row's own evaluator rather than `thresholds`.
     """
     if key != "SNMP_CHECKS":
         return False
@@ -73,6 +95,15 @@ def _widens(key, before_row, after_row, observations):
     pairs = (observations or {}).get(identity)
     if not pairs:
         return False
+
+    if (after_row.get("kind") or before_row.get("kind") or "gauge") == "state":
+        old_expected = before_row.get("expected")
+        new_expected = after_row.get("expected", old_expected)
+        if old_expected == new_expected:
+            return False
+        return any(_status_text(status) != "ok" and value == new_expected
+                   for value, status in pairs)
+
     probe = thresholds.Spec(
         "probe", metric="probe", unit=before_row.get("unit") or "",
         direction=before_row.get("direction") or "high_is_good",
@@ -81,12 +112,12 @@ def _widens(key, before_row, after_row, observations):
     new.green = after_row.get("green", probe.green)
     new.amber = after_row.get("amber", probe.amber)
     if new.green is None or new.amber is None:
-        # A state row, or a row whose numeric band was removed, cannot be
-        # graded by `evaluate`; it cannot be called a widening. The change
-        # stays a modification, which is never auto-applied.
+        # A row whose numeric band was removed cannot be graded by `evaluate`;
+        # it cannot be called a widening. The change stays a modification,
+        # which is never auto-applied.
         return False
     for value, status in pairs:
-        if str(status).lower() == "ok":
+        if _status_text(status) != "fail":
             continue
         if _grade(value, new) != "fail":
             return True
@@ -95,8 +126,8 @@ def _widens(key, before_row, after_row, observations):
 
 def classify(change, mod, before, specs=None, observations=None):
     """(classification, detail) for one proposed full-value settings change."""
-    change = (change or {}).get("settings") or {}
-    before = before or {}
+    change = _settings_map(change)
+    before = _settings_map(before)
     declared = _declared(mod)
     for key, value in change.items():
         setting = declared.get(key)
@@ -115,17 +146,35 @@ def classify(change, mod, before, specs=None, observations=None):
         except (TypeError, ValueError) as exc:
             return INVALID, "%s: %s" % (key, exc)
 
+    # THE MODULE'S OWN RULES ARE PART OF `invalid`. A non-dotted OID, a state row
+    # with no expected, or an inverted band is refused at save time by
+    # `validate_settings`; without this call an addition carrying any of them
+    # classifies ADDITIVE and auto-applies. The merge is the same one
+    # `settingsapi.write_settings` uses: the proposed values over the current
+    # ones, so a checks-only change is still validated against its device list.
+    merged = dict(before)
+    merged.update(change)
+    why = mod.validate_settings(merged)
+    if why:
+        return INVALID, why
+
     worst = ADDITIVE
     details = []
     for key, after_value in change.items():
         setting = declared[key]
-        old_value = before.get(key, setting.default)
         if setting.kind != "list":
+            old_value = before.get(key, setting.default)
             if old_value == after_value:
                 continue
             worst = _worse(worst, MODIFICATION)
             details.append("%s changed" % key)
             continue
+        if key not in before:
+            # No fallback to `setting.default` here: an empty old list makes
+            # every new row look additive, which is the fail-open this guard
+            # exists to prevent.
+            return INVALID, "before is missing the current value for %s" % key
+        old_value = before[key]
         old_rows = old_value if isinstance(old_value, list) else []
         new_rows = after_value if isinstance(after_value, list) else []
         old_ids = _ids(key, old_rows)

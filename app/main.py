@@ -113,8 +113,6 @@ def should_stop(th):
 def main():
     cfg = config_mod.Config()
 
-    print("sentinel starting\n%s" % cfg.describe(), flush=True)
-
     # THE SCHEMA BEFORE THE PAGE. A brand-new database has no tables, and the
     # dashboard renders a store it cannot query as a 503 -- correct, but it would
     # be showing that on a first boot that is proceeding exactly as designed. The
@@ -122,6 +120,13 @@ def main():
     # because the page opens read-only.
     conn = store.connect(cfg.db_path)
     store.init(conn)
+
+    # THE BANNER AFTER THE STORE. Per-module grants are written to the DB, and a
+    # banner printed before `reload_settings` would log the .env fallback as if
+    # it were the effective matrix. No refusal here on a bad stored grant: the
+    # page has to stay up to show it; `collect`/`ctl` are the paths that refuse.
+    cfg.reload_settings(conn)
+    print("sentinel starting\n%s" % cfg.describe(), flush=True)
 
     _install_signals()
     th = start_dashboard(cfg)

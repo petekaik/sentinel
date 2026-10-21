@@ -1,12 +1,15 @@
 """Intelligence layer: grants, scoped views, invariants, discovery, authoring."""
 
+import contextlib
 import http.client
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
 import time
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness                                    # noqa: E402
@@ -21,6 +24,7 @@ import config as config_mod                       # noqa: E402
 import ctl                                        # noqa: E402
 import heal                                       # noqa: E402
 import intelligence_layer                         # noqa: E402
+import main as main_mod                           # noqa: E402
 import module                                     # noqa: E402
 import module_view                                # noqa: E402
 import modules as module_loader                   # noqa: E402
@@ -1261,9 +1265,19 @@ def test_showconf_states_the_grant_and_never_the_key(results):
         "SENTINEL_LLM_KEY": "canary-key-123",
         "FLEET_ALLOW_DESTRUCTIVE": "1"})
     text = cfg.describe()
+    lines = text.splitlines()
+    missing = [m.id for m in module_loader.discover()
+               if not any(ln.strip().startswith(m.id + " ") and "grant" in ln
+                          for ln in lines)]
+    # EVERY discovered module, not just the granted one: a summary that
+    # silently omits a module reads as a module with no grant line at all.
+    results.check("showconf names every module's grant",
+                  not missing, "missing=%r describe=%r" % (missing, text))
+    fleet = [ln for ln in lines
+             if ln.strip().startswith("fleet ") and "grant" in ln]
     results.check(
-        "showconf names the grant and its lanes",
-        "fleet" in text and "observe" in text and "propose" in text,
+        "the fleet grant line carries its configured level",
+        fleet and "observe=True" in fleet[0] and "author=propose" in fleet[0],
         "describe=%r" % (text,))
     results.check(
         "showconf warns that the destructive switch is no longer honoured",
@@ -1271,6 +1285,46 @@ def test_showconf_states_the_grant_and_never_the_key(results):
         "describe=%r" % (text,))
     results.check("showconf never prints the key",
                   "canary-key-123" not in text, "describe=%r" % (text,))
+
+
+def test_the_startup_banner_reads_the_stored_grant(results):
+    """The banner is printed AFTER the store, so it states the grant in force.
+
+    A stored grant is what the cycle honours; a banner printed before
+    `reload_settings` logs the .env fallback as if it were the matrix.
+    """
+    tmpdir = tempfile.mkdtemp()
+    db = os.path.join(tmpdir, "banner.sqlite")
+    try:
+        conn = store.connect(db)
+        store.init(conn)
+        try:
+            store.put_setting(conn, "fleet", "FLEET_INTELLIGENCE",
+                              {"observe": True, "author": "propose"},
+                              "operator")
+        finally:
+            conn.close()
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ,
+                             {"MONITOR_DB": db,
+                              "FLEET_INTELLIGENCE": '{"observe": false}'},
+                             clear=True):
+            with mock.patch.object(main_mod, "start_dashboard",
+                                   lambda cfg: None), \
+                    mock.patch.object(main_mod, "_install_signals",
+                                      lambda: None), \
+                    mock.patch.object(main_mod.collect, "run_forever",
+                                      lambda *a, **kw: None), \
+                    contextlib.redirect_stdout(buf):
+                main_mod.main()
+        out = buf.getvalue()
+        results.check(
+            "the startup banner states the stored grant, not the .env fallback",
+            "fleet" in out and "observe=True" in out
+            and "author=propose" in out,
+            "banner=%r" % (out,))
+    finally:
+        shutil.rmtree(tmpdir)
 
 
 TESTS = (
@@ -1322,4 +1376,5 @@ TESTS = (
     test_a_destructive_action_is_refused_at_full_without_approval,
     test_consider_proposes_a_destructive_action_at_full_and_never_runs_it,
     test_showconf_states_the_grant_and_never_the_key,
+    test_the_startup_banner_reads_the_stored_grant,
 )

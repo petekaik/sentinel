@@ -98,10 +98,16 @@ it("lists candidates without inventing a band and applies the edited checked row
   expect(within(lowRow).getByText("low")).toBeInTheDocument();
   expect(within(lowRow).getByText("gauge")).toBeInTheDocument();
 
-  // An unknown/low-confidence row has NO band: no green, no amber, no
-  // `state == expected`. The cell says so rather than inventing a threshold.
-  expect(within(lowRow).queryByText(/green|amber|state ==/)).toBeNull();
-  expect(within(lowRow).getByText("—")).toBeInTheDocument();
+  // An unknown/low-confidence row has NO invented band: the inputs are blank
+  // and the row cannot be added until the operator enters one.
+  expect(
+    (screen.getByLabelText(`Green for ${candidate.oid}`) as HTMLInputElement)
+      .value,
+  ).toBe("");
+  expect(
+    (screen.getByLabelText(`Amber for ${candidate.oid}`) as HTMLInputElement)
+      .value,
+  ).toBe("");
 
   // A known gauge row renders its checked-in band in its own direction and the
   // unit the server supplied.
@@ -113,14 +119,26 @@ it("lists candidates without inventing a band and applies the edited checked row
       .value,
   ).toBe("Processor 1");
   expect(
-    within(bandRow).getByText("green ≤ 70 %, amber ≤ 90 %"),
-  ).toBeInTheDocument();
+    (screen.getByLabelText(`Green for ${processor.oid}`) as HTMLInputElement)
+      .value,
+  ).toBe("70");
+  expect(
+    (screen.getByLabelText(`Amber for ${processor.oid}`) as HTMLInputElement)
+      .value,
+  ).toBe("90");
   expect(within(bandRow).getByText("99 %")).toBeInTheDocument();
   expect(within(bandRow).getByText("high")).toBeInTheDocument();
 
-  // The label is editable before the row is added.
+  // The label and the band are editable before the row is added. A gauge
+  // without a band would be refused by the API; the form asks for one first.
   fireEvent.change(screen.getByLabelText(`Label for ${candidate.oid}`), {
     target: { value: "Mystery object" },
+  });
+  fireEvent.change(screen.getByLabelText(`Green for ${candidate.oid}`), {
+    target: { value: "100" },
+  });
+  fireEvent.change(screen.getByLabelText(`Amber for ${candidate.oid}`), {
+    target: { value: "80" },
   });
 
   fireEvent.click(screen.getByLabelText(`Add ${candidate.oid}`));
@@ -140,9 +158,45 @@ it("lists candidates without inventing a band and applies the edited checked row
     method: "POST",
     body: {
       device: "sw1",
-      rows: [{ ...candidate, label: "Mystery object" }, processor],
+      rows: [
+        {
+          ...candidate,
+          label: "Mystery object",
+          direction: "high_is_good",
+          green: 100,
+          amber: 80,
+        },
+        processor,
+      ],
     },
   });
+});
+
+it("refuses to add a gauge with no band, and sends nothing", async () => {
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      record(calls, String(url), init);
+      if (url === "/api/v1/modules/snmp/discover") return respond(200, discovery);
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+
+  render(
+    <DiscoverySheet moduleId="snmp" devices={["sw1"]} readOnly={false} />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Discover" }));
+  await screen.findByLabelText(`Add ${candidate.oid}`);
+  fireEvent.click(screen.getByLabelText(`Add ${candidate.oid}`));
+  fireEvent.click(screen.getByRole("button", { name: "Add selected" }));
+
+  expect(
+    await screen.findByText(/Set a numeric green and amber band/),
+  ).toBeInTheDocument();
+  expect(
+    calls.filter((c) => c.url === "/api/v1/modules/snmp/discover/apply"),
+  ).toHaveLength(0);
 });
 
 it("fails closed: with no readOnly prop the apply is locked", async () => {
@@ -271,6 +325,12 @@ it("opens the shared token dialog on a 401 apply", async () => {
   const row = (
     await screen.findByLabelText(`Label for ${candidate.oid}`)
   ).closest("tr") as HTMLElement;
+  fireEvent.change(screen.getByLabelText(`Green for ${candidate.oid}`), {
+    target: { value: "100" },
+  });
+  fireEvent.change(screen.getByLabelText(`Amber for ${candidate.oid}`), {
+    target: { value: "80" },
+  });
   fireEvent.click(within(row).getByLabelText(`Add ${candidate.oid}`));
   fireEvent.click(screen.getByRole("button", { name: "Add selected" }));
 

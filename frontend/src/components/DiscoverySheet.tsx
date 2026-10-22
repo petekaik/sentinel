@@ -26,22 +26,6 @@ function observed(row: DiscoveryRow): string {
   return `${String(row.observed)}${row.unit ? ` ${row.unit}` : ""}`;
 }
 
-/* A band is the checked-in suggestion, never a threshold fitted to this one
-   reading. A state row compares to `expected`; a gauge row is written in its
-   own direction (low_is_good: green means at or below its green value). A
-   null band renders as "—", because an invented one is how a broken device
-   becomes green. */
-function band(row: DiscoveryRow): string {
-  if (row.kind === "state") {
-    return row.expected == null ? "—" : `state == ${row.expected}`;
-  }
-  if (row.green == null && row.amber == null) return "—";
-  const cmp = row.direction === "low_is_good" ? "≤" : "≥";
-  const unit = row.unit ? ` ${row.unit}` : "";
-  const n = (v: number | null) => (v == null ? "—" : `${v}${unit}`);
-  return `green ${cmp} ${n(row.green)}, amber ${cmp} ${n(row.amber)}`;
-}
-
 export default function DiscoverySheet({
   moduleId,
   devices,
@@ -80,6 +64,13 @@ export default function DiscoverySheet({
   const [truncated, setTruncated] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(() => new Set());
   const [labels, setLabels] = useState<Record<string, string>>({});
+  // A gauge is added with a band the operator confirmed. The walk's suggestion
+  // is the starting point; an object with no suggested band starts blank and
+  // cannot be added until one is entered (the API correctly refuses a gauge
+  // without green/amber, so the form refuses first and says which row).
+  const [bands, setBands] = useState<
+    Record<string, { green: string; amber: string }>
+  >({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -114,6 +105,17 @@ export default function DiscoverySheet({
       setLabels(
         Object.fromEntries(out.candidates.map((c) => [c.oid, c.label])),
       );
+      setBands(
+        Object.fromEntries(
+          out.candidates.map((c) => [
+            c.oid,
+            {
+              green: c.green == null ? "" : String(c.green),
+              amber: c.amber == null ? "" : String(c.amber),
+            },
+          ]),
+        ),
+      );
     } catch (e) {
       if (!auth(e, () => void walk())) setError(message(e));
     } finally {
@@ -125,9 +127,33 @@ export default function DiscoverySheet({
     const name = device.trim();
     const rows = (candidates ?? [])
       .filter((c) => checked.has(c.oid))
-      .map((c) => ({ ...c, label: labels[c.oid] ?? c.label }));
+      .map((c) => {
+        const band = bands[c.oid] ?? { green: "", amber: "" };
+        const green = band.green.trim() === "" ? null : Number(band.green);
+        const amber = band.amber.trim() === "" ? null : Number(band.amber);
+        return {
+          ...c,
+          label: labels[c.oid] ?? c.label,
+          direction:
+            c.kind === "gauge" ? (c.direction ?? "high_is_good") : c.direction,
+          green: c.kind === "gauge" ? green : null,
+          amber: c.kind === "gauge" ? amber : null,
+        };
+      });
     if (rows.length === 0) {
       setError("Check at least one candidate to add.");
+      return;
+    }
+    const missing = rows.find(
+      (r) =>
+        r.kind === "gauge" &&
+        (r.green == null || r.amber == null
+          || !Number.isFinite(r.green) || !Number.isFinite(r.amber)),
+    );
+    if (missing) {
+      setError(
+        `Set a numeric green and amber band for "${missing.label}" before adding it.`,
+      );
       return;
     }
     setBusy(true);
@@ -374,7 +400,51 @@ export default function DiscoverySheet({
                   </td>
                   <td>{observed(row)}</td>
                   <td>{row.kind}</td>
-                  <td>{band(row)}</td>
+                  <td>
+                    {row.kind === "state" ? (
+                      row.expected == null ? "—" : `state == ${row.expected}`
+                    ) : (
+                      <span className="band-edit">
+                        <label>
+                          green {row.direction === "low_is_good" ? "≤" : "≥"}
+                          <input
+                            type="number"
+                            aria-label={`Green for ${row.oid}`}
+                            value={bands[row.oid]?.green ?? ""}
+                            disabled={busy}
+                            onChange={(e) =>
+                              setBands((prev) => ({
+                                ...prev,
+                                [row.oid]: {
+                                  green: e.target.value,
+                                  amber: prev[row.oid]?.amber ?? "",
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          amber {row.direction === "low_is_good" ? "≤" : "≥"}
+                          <input
+                            type="number"
+                            aria-label={`Amber for ${row.oid}`}
+                            value={bands[row.oid]?.amber ?? ""}
+                            disabled={busy}
+                            onChange={(e) =>
+                              setBands((prev) => ({
+                                ...prev,
+                                [row.oid]: {
+                                  green: prev[row.oid]?.green ?? "",
+                                  amber: e.target.value,
+                                },
+                              }))
+                            }
+                          />
+                        </label>
+                        {row.unit && <small>{row.unit}</small>}
+                      </span>
+                    )}
+                  </td>
                   <td>{row.confidence}</td>
                   <td>{row.note || "—"}</td>
                 </tr>

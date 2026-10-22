@@ -122,7 +122,9 @@ SEMANTICS = {
                             "label": "Interface {name} description"},
     "1.3.6.1.2.1.2.2.1.3": {"kind": "inventory",
                             "label": "Interface {name} type"},
-    "1.3.6.1.2.1.2.2.1.4": {"kind": "gauge", "unit": "bytes",
+    # MTU is static configuration, not a health signal: naming it in notes is
+    # useful inventory, proposing it as a check is noise on every port.
+    "1.3.6.1.2.1.2.2.1.4": {"kind": "inventory",
                             "label": "Interface {name} MTU"},
     "1.3.6.1.2.1.2.2.1.5": {"kind": "gauge", "unit": "bit/s",
                             "label": "Interface {name} speed"},
@@ -219,14 +221,17 @@ NAME_SOURCES = (
         "columns": ("1.3.6.1.2.1.31.1.1.1.1",     # ifName
                     "1.3.6.1.2.1.2.2.1.2",        # ifDescr
                     "1.3.6.1.2.1.31.1.1.1.18"),   # ifAlias
-        "targets": ("1.3.6.1.2.1.2.2.1.4",
-                    "1.3.6.1.2.1.2.2.1.5",
+        "targets": ("1.3.6.1.2.1.2.2.1.5",
                     "1.3.6.1.2.1.2.2.1.7",
                     "1.3.6.1.2.1.2.2.1.8",
                     "1.3.6.1.2.1.2.2.1.21",
                     "1.3.6.1.2.1.31.1.1.1.15",
                     "1.3.6.1.2.1.17.2.15.1.3",
                     "1.3.6.1.2.1.17.2.15.1.4"),
+    },
+    {
+        "columns": ("1.3.6.1.2.1.25.3.2.1.3",),   # hrDeviceDescr
+        "targets": ("1.3.6.1.2.1.25.3.3.1.2",),
     },
     {
         "columns": ("1.3.6.1.2.1.47.1.1.1.7",),   # entPhysicalName

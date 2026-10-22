@@ -1509,8 +1509,10 @@ def test_name_families_do_not_borrow_each_others_index(results):
     """ifIndex 1 and entPhysicalIndex 1 are different objects."""
     rows = [("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string"),
             ("1.3.6.1.2.1.47.1.1.1.7.1", "ps1", "string"),
+            ("1.3.6.1.2.1.25.3.2.1.3.196608", "cpu0", "string"),
             ("1.3.6.1.2.1.2.2.1.8.1", 1, "integer"),
-            ("1.3.6.1.2.1.99.1.1.1.4.1", 450, "integer")]
+            ("1.3.6.1.2.1.99.1.1.1.4.1", 450, "integer"),
+            ("1.3.6.1.2.1.25.3.3.1.2.196608", 42, "integer")]
     cands, _ = discovery.candidates(
         "sw1", rows, names=discovery.name_map(rows))
     by_oid = {c["oid"]: c for c in cands}
@@ -1523,6 +1525,10 @@ def test_name_families_do_not_borrow_each_others_index(results):
         "Sensor ps1 value" in by_oid["1.3.6.1.2.1.99.1.1.1.4.1"]["label"]
         and "lan1" not in by_oid["1.3.6.1.2.1.99.1.1.1.4.1"]["label"],
         "row=%r" % (by_oid.get("1.3.6.1.2.1.99.1.1.1.4.1"),))
+    results.check(
+        "the processor takes hrDeviceDescr, not its raw device index",
+        "Processor cpu0" in by_oid["1.3.6.1.2.1.25.3.3.1.2.196608"]["label"],
+        "row=%r" % (by_oid.get("1.3.6.1.2.1.25.3.3.1.2.196608"),))
 
 
 def test_the_discover_command_walks_the_device_reported_vendor_root(results):

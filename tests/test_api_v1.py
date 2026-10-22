@@ -19,6 +19,7 @@ suite's `_serve`/`make_cfg` so there is one test server class, not two.
 import http.client
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -272,6 +273,67 @@ def test_strict_booleans_at_the_write_boundary(results):
         enabled_refused and ("probe", "PROBE_ENABLED") not in store.setting_rows(conn),
         "rows=%r -- bool('false') is True" % (store.setting_rows(conn),))
     conn.close()
+
+
+def test_a_secret_map_is_edited_by_entry_not_retyped(results):
+    """MEASURED 2026-10-21: the Communities box was blank (a secret never
+    returns a value) and the write replaced the whole map -- changing one
+    device's community silently dropped every other device's.
+
+    The read surface now names the entries, the write merges a patch, and a
+    null removes one entry (paired here with removing its device, because a
+    configured device without a community is correctly refused).
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        conn = _store(tmp)
+        cfg = _cfg(
+            tmp,
+            SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"},'
+                         '{"name":"sw2","address":"192.0.2.11"}]',
+            SNMP_COMMUNITIES='{"sw1":"comm-a","sw2":"comm-b"}')
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        results.check(
+            "a secret map exposes its entry NAMES and never its values",
+            view["SNMP_COMMUNITIES"].get("secret_keys") == ["sw1", "sw2"]
+            and view["SNMP_COMMUNITIES"]["value"] is None
+            and "comm-a" not in json.dumps(view)
+            and "comm-b" not in json.dumps(view),
+            "view=%r" % (view["SNMP_COMMUNITIES"],))
+
+        settingsapi.write_settings(
+            cfg, conn, mod, {"SNMP_COMMUNITIES": {"sw1": "new-a"}}, "op")
+        stored = store.setting_rows(conn)[("snmp", "SNMP_COMMUNITIES")]
+        results.check(
+            "editing one entry keeps every untouched one",
+            stored == {"sw1": "new-a", "sw2": "comm-b"},
+            "stored=%r -- a replacement map loses every other credential"
+            % (stored,))
+
+        settingsapi.write_settings(
+            cfg, conn, mod, {"SNMP_COMMUNITIES": {"sw1": ""}}, "op")
+        results.check(
+            "a blank entry means unchanged, not erase",
+            store.setting_rows(conn)[("snmp", "SNMP_COMMUNITIES")] == stored,
+            "stored=%r" % (store.setting_rows(conn),))
+
+        settingsapi.write_settings(
+            cfg, conn, mod,
+            {"SNMP_DEVICES": [{"name": "sw1", "address": "192.0.2.10"}],
+             "SNMP_COMMUNITIES": {"sw2": None}}, "op")
+        stored = store.setting_rows(conn)[("snmp", "SNMP_COMMUNITIES")]
+        results.check(
+            "null removes that entry, and only that entry",
+            stored == {"sw1": "new-a"}, "stored=%r" % (stored,))
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        results.check(
+            "the removed name disappears from the read surface",
+            view["SNMP_COMMUNITIES"]["secret_keys"] == ["sw1"],
+            "view=%r" % (view["SNMP_COMMUNITIES"],))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
 
 
 def test_a_secret_never_survives_a_read(results):
@@ -1320,6 +1382,7 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_duplicate_setting_keys_are_refused,
          test_write_validation_and_audit,
          test_strict_booleans_at_the_write_boundary,
+         test_a_secret_map_is_edited_by_entry_not_retyped,
          test_a_secret_never_survives_a_read,
          test_a_disabled_modules_broken_thresholds_do_not_break_the_manifest,
          test_a_secret_value_is_masked_in_validation_errors,

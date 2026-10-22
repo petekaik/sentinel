@@ -308,6 +308,35 @@ def _typed_value(setting, raw):
         return raw
 
 
+def _secret_map_keys(setting, raw):
+    """The KEYS of a secret map, never its values. A broken value has none."""
+    try:
+        value = setting.parse(raw) if isinstance(raw, (str, bytes)) else raw
+    except (TypeError, ValueError):
+        return []
+    return sorted(str(k) for k in value) if isinstance(value, dict) else []
+
+
+def _merge_secret_map(current, patch):
+    """Apply a secret-map PATCH over the effective map.
+
+    ABSENT OR BLANK KEEPS, A VALUE REPLACES, NULL REMOVES. The read surface
+    never returns the values, so a form cannot echo them back; replacing the
+    whole map with what the form shows would erase every entry it did not
+    touch. That is exactly what the empty Communities box did.
+    """
+    merged = dict(current) if isinstance(current, dict) else {}
+    for name, value in (patch or {}).items():
+        name = str(name)
+        if value is None:
+            merged.pop(name, None)
+        elif isinstance(value, str) and value.strip() == "":
+            continue
+        else:
+            merged[name] = value
+    return merged
+
+
 def settings_view(cfg, conn, modules):
     """Effective values per module: `{key: {value, source, secret_set}}`.
 
@@ -334,6 +363,16 @@ def settings_view(cfg, conn, modules):
                 view[setting.key] = {"value": None,
                                      "secret_set": key in values,
                                      "source": source}
+                if setting.kind == "json":
+                    # THE KEYS OF A SECRET MAP ARE NOT THE SECRET. A blank map
+                    # editor asks the operator to retype every entry to change
+                    # one; naming which entries exist lets the form show one
+                    # row each, and the values stay write-only.
+                    raw = values[key] if key in values else (
+                        base[setting.key] if setting.key in base
+                        else setting.default)
+                    view[setting.key]["secret_keys"] = _secret_map_keys(
+                        setting, raw)
                 continue
             if key in values:
                 value = values[key]                     # stored typed value
@@ -534,6 +573,9 @@ def write_settings(cfg, conn, mod, body, actor):
     """
     check_declarations([mod])
     declared = _declared(mod)
+    # The effective map a secret patch merges over. Read once, before any
+    # write, so the validation hook sees the merged configuration.
+    current = _effective_values(cfg, conn, mod, {}, declared)
     values = {}
     for key, value in (body or {}).items():
         if key not in declared:
@@ -554,6 +596,12 @@ def write_settings(cfg, conn, mod, body, actor):
             if parsed is None:
                 raise SettingsError("invalid_value", why, key)
             values[key] = parsed
+        if declared[key].secret and declared[key].kind == "json":
+            if not isinstance(values[key], dict):
+                raise SettingsError(
+                    "invalid_value",
+                    "%s must be a JSON object" % declared[key].label, key)
+            values[key] = _merge_secret_map(current.get(key), values[key])
     effective = _effective_values(cfg, conn, mod, values, declared)
     why = mod.validate_settings(effective)
     if why:

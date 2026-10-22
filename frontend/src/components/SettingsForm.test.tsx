@@ -365,6 +365,90 @@ it("blocks an empty number instead of storing zero", async () => {
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
+it("edits one entry of a write-only map without retyping the others", async () => {
+  // MEASURED 2026-10-21: the Communities box rendered blank because a secret
+  // never returns a value, and the write replaced the WHOLE map -- so changing
+  // one device's community silently dropped every other device's.
+  const settings: SettingField[] = [
+    {
+      key: "SNMP_COMMUNITIES",
+      label: "Communities",
+      kind: "json",
+      secret: true,
+      set: true,
+    },
+  ];
+  const view = {
+    SNMP_COMMUNITIES: {
+      value: null,
+      secret_set: true,
+      source: "db",
+      secret_keys: ["sw1", "sw2"],
+    },
+  };
+  const fetchMock = vi.fn(async () => respond(200, view));
+  vi.stubGlobal("fetch", fetchMock);
+
+  render(
+    <SettingsForm
+      moduleId="snmp"
+      settings={settings}
+      values={view}
+    />,
+  );
+
+  expect(screen.getByText("sw1")).toBeInTheDocument();
+  expect(screen.getByText("sw2")).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("community for sw1"), {
+    target: { value: "newcom" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(writeBodies(fetchMock)).toHaveLength(1));
+  expect(writeBodies(fetchMock)[0]).toEqual({
+    SNMP_COMMUNITIES: { sw1: "newcom" },
+  });
+});
+
+it("Remove sends null for that entry, and untouched rows stay out", async () => {
+  const settings: SettingField[] = [
+    {
+      key: "SNMP_COMMUNITIES",
+      label: "Communities",
+      kind: "json",
+      secret: true,
+      set: true,
+    },
+  ];
+  const view = {
+    SNMP_COMMUNITIES: {
+      value: null,
+      secret_set: true,
+      source: "db",
+      secret_keys: ["sw1", "sw2"],
+    },
+  };
+  const fetchMock = vi.fn(async () => respond(200, view));
+  vi.stubGlobal("fetch", fetchMock);
+
+  render(
+    <SettingsForm
+      moduleId="snmp"
+      settings={settings}
+      values={view}
+    />,
+  );
+
+  const row = screen.getByText("sw2").closest(".secret-row") as HTMLElement;
+  fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+  await waitFor(() => expect(writeBodies(fetchMock)).toHaveLength(1));
+  expect(writeBodies(fetchMock)[0]).toEqual({
+    SNMP_COMMUNITIES: { sw2: null },
+  });
+});
+
 it("a refused save says so in a box and scrolls it into view", async () => {
   // MEASURED 2026-10-20: an atomic 422 (a band rule on one row) refused a whole
   // settings save, the message rendered as one line of <em> at the bottom of a

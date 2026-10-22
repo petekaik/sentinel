@@ -7,6 +7,7 @@ import {
   type SettingField,
   type SettingState,
 } from "../api";
+import SecretMapEditor from "./SecretMapEditor";
 import SettingList from "./SettingList";
 
 /* The settings form, rendered from the manifest schema. It never guesses a
@@ -24,7 +25,9 @@ function asBool(value: unknown): boolean {
 }
 
 function shown(field: SettingField, value: unknown): any {
-  if (field.secret) return "";
+  // A secret MAP is edited row by row; its draft starts empty and the keys
+  // come from `secret_keys`. A scalar secret starts blank.
+  if (field.secret) return field.kind === "json" ? {} : "";
   if (field.kind === "bool") return asBool(value);
   if (field.kind === "int") {
     if (value === "" || value == null) return "";
@@ -56,12 +59,14 @@ function Control({
   field,
   id,
   value,
+  secretKeys,
   readOnly,
   onChange,
 }: {
   field: SettingField;
   id: string;
   value: any;
+  secretKeys?: string[];
   readOnly?: boolean;
   onChange: (value: any) => void;
 }) {
@@ -98,6 +103,16 @@ function Control({
       <SettingList
         field={field}
         value={value}
+        readOnly={readOnly}
+        onChange={onChange}
+      />
+    );
+  }
+  if (field.secret && field.kind === "json") {
+    return (
+      <SecretMapEditor
+        keys={secretKeys ?? []}
+        value={value ?? {}}
         readOnly={readOnly}
         onChange={onChange}
       />
@@ -163,6 +178,12 @@ export default function SettingsForm({
   const [setFlags, setSetFlags] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(settings.map((f) => [f.key, isSet(f, values?.[f.key])])),
   );
+  // The NAMES of a write-only map's entries. Values never arrive.
+  const [secretKeys, setSecretKeys] = useState<Record<string, string[]>>(() =>
+    Object.fromEntries(
+      settings.map((f) => [f.key, values?.[f.key]?.secret_keys ?? []]),
+    ),
+  );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState<string | null>(null);
   // A REFUSED SAVE MUST NOT LOOK LIKE A SAVED ONE. The form-level error renders
@@ -208,6 +229,13 @@ export default function SettingsForm({
       for (const f of settings) next[f.key] = isSet(f, view[f.key]);
       return next;
     });
+    setSecretKeys((prev) => {
+      const next = { ...prev };
+      for (const f of settings) {
+        next[f.key] = view[f.key]?.secret_keys ?? [];
+      }
+      return next;
+    });
   }
 
   function fail(e: unknown, retry: () => void) {
@@ -230,6 +258,24 @@ export default function SettingsForm({
     for (const field of settings) {
       if (!dirty.has(field.key)) continue;
       const value = draft[field.key];
+      // A SECRET MAP IS A PATCH, not a replacement: only the rows the operator
+      // touched travel, a null removes that entry, and a blank row is omitted
+      // so the stored value stays. The API merges it over the effective map.
+      if (field.secret && field.kind === "json") {
+        const patch =
+          value && typeof value === "object"
+            ? (value as Record<string, unknown>)
+            : {};
+        const out: Record<string, unknown> = {};
+        for (const [name, entry] of Object.entries(patch)) {
+          if (entry === null) out[name] = null;
+          else if (typeof entry === "string" && entry.trim() !== "") {
+            out[name] = entry;
+          }
+        }
+        if (Object.keys(out).length > 0) body[field.key] = out;
+        continue;
+      }
       // A blank secret is "unchanged", never "erase". Reset is the erase. A
       // whitespace-only secret is blank too; sending it would store a value the
       // operator cannot see and did not mean.
@@ -369,6 +415,7 @@ export default function SettingsForm({
               field={field}
               id={id}
               value={draft[field.key]}
+              secretKeys={secretKeys[field.key]}
               readOnly={readOnly}
               onChange={(v) => update(field.key, v)}
             />

@@ -270,6 +270,8 @@ export type SettingState = {
   value: any;
   source?: string;
   secret_set?: boolean;
+  /** For a write-only map: which entry NAMES exist. Never their values. */
+  secret_keys?: string[];
 };
 
 export type ModuleSettingsView = Record<string, SettingState>;

@@ -722,18 +722,23 @@ The full model is
 
 `GETNEXT` exists in the module for exactly one job.
 `POST /api/v1/modules/snmp/discover` runs the `snmp.discover` command, which
-walks all of MIB-II (`1.3.6.1.2.1`) and the enterprises subtree (`1.3.6.1.4.1`)
-with `snmp.walk`, capped by `max_oids` and reporting whether the cap truncated
-either walk, then returns candidate check rows. The command writes nothing:
+walks MIB-II (`1.3.6.1.2.1`) and then the vendor root the device reports in
+`sysObjectID` (falling back to the whole enterprises subtree, or to an explicit
+`root` argument) with `snmp.walk`, capped by `max_oids` and reporting whether
+the cap truncated either walk, then returns candidate check rows. The command
+writes nothing:
 applying a candidate is a separate `POST .../discover/apply`, which is
 `settingsapi.apply_discovery` -- one validated `SNMP_CHECKS` write through the
 same path and token gate as every other settings write.
 
-A candidate is reviewed before it lands. It carries a checked-in starting band
-and the observed value, never a band widened to fit that observation; a counter
-is named in the notes and not proposed (a monotonic value has no band that
-describes the device), and an unnameable interface row is reported rather than
-invented. The community is read from the settings inside the walk handler and
+A candidate is reviewed before it lands. `discovery.SEMANTICS` translates the
+standard tables and the measured vendor branches: a known status becomes a
+`state` check, a known gauge keeps its unit, and a band is a reviewed starting
+point, never one widened to fit the observation. Counters and inventory strings
+are named in notes and not proposed; an object with no bundled semantics is
+counted under its vendor/MIB group instead of dumped into the sheet; an
+unnameable interface row is reported rather than invented. The band is editable
+in the review sheet, and a gauge cannot be applied without one. The community is read from the settings inside the walk handler and
 is not an argument, a result field, an audit value or a log line.
 
 ---

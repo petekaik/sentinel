@@ -1106,7 +1106,7 @@ def test_snmp_discover_is_declared_read_only_under_the_device_lock(results):
         % (cmd.danger, cmd.resources, cmd.timeout_s))
     results.check(
         "the device argument is required and carries no static choices",
-        [a.name for a in cmd.args] == ["device", "max_oids"]
+        [a.name for a in cmd.args] == ["device", "max_oids", "root"]
         and cmd.args[0].required and cmd.args[0].choices is None,
         "args=%r" % ([(a.name, a.required, a.choices) for a in cmd.args],))
 

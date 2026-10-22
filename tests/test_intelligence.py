@@ -1364,15 +1364,23 @@ def test_interface_status_becomes_a_state_check_expecting_up(results):
         "lan1" in row["label"], "row=%r" % (row,))
 
 
-def test_an_unknown_oid_gets_no_band_and_low_confidence(results):
+def test_an_unknown_oid_is_counted_not_proposed(results):
+    """The switch's vendor branch is 1651 objects nobody has described.
+
+    A walk is not a review sheet: an object with no bundled semantics is
+    counted under its vendor/group and left out of the candidates, so the
+    operator sees a dozen proposals instead of three thousand.
+    """
     cands, notes = discovery.candidates(
         "sw1", [("1.3.6.1.4.1.99999.1.0", 42, "integer")])
-    row = cands[0]
     results.check(
-        "an unknown gauge has no invented band",
-        row["green"] is None and row["amber"] is None
-        and row["confidence"] == "low",
-        "row=%r" % (row,))
+        "an unclassified numeric object is not proposed",
+        cands == [] and any("unclassified numeric" in n for n in notes),
+        "cands=%r notes=%r" % (cands, notes))
+    results.check(
+        "the note names the vendor branch it belongs to",
+        any("enterprise 99999" in n for n in notes),
+        "notes=%r" % (notes,))
 
 
 def test_counters_are_named_as_not_checkable_not_given_a_gauge(results):
@@ -1410,7 +1418,7 @@ def test_an_oid_component_boundary_keeps_a_lookalike_out_of_the_counter_table(re
         "sw1", [("1.3.6.1.2.1.2.2.1.100.1", 5, "integer")])
     results.check(
         "a numeric prefix is not a string prefix",
-        len(cands) == 1 and cands[0]["confidence"] == "low"
+        cands == [] and any("unclassified numeric" in n for n in notes)
         and not any("counter" in n for n in notes),
         "cands=%r notes=%r" % (cands, notes))
 
@@ -1457,6 +1465,127 @@ def test_an_unnamed_interface_row_is_reported_not_invented(results):
                 for n in notes),
         "cands=%r notes=%r. A row against a stale ifIndex fails loudly; a "
         "label a human cannot verify is worse than no row." % (cands, notes))
+
+
+def test_semantics_classifies_each_kind_of_object(results):
+    """A state, a gauge, an inventory string and a counter are not one list."""
+    names = {"1.3.6.1.2.1.2.2.1.8.1": "lan1",
+             "1.3.6.1.2.1.31.1.1.1.15.1": "lan1"}
+    cands, notes = discovery.candidates(
+        "sw1",
+        [("1.3.6.1.2.1.2.2.1.8.1", 1, "integer"),
+         ("1.3.6.1.2.1.31.1.1.1.15.1", 1000, "integer"),
+         ("1.3.6.1.2.1.1.1.0", "switch", "string"),
+         ("1.3.6.1.2.1.2.2.1.10.1", 123, "integer"),
+         ("1.3.6.1.4.1.4413.1.1.1.1.1", 5, "integer")],
+        names=names)
+    by_oid = {c["oid"]: c for c in cands}
+    state = by_oid["1.3.6.1.2.1.2.2.1.8.1"]
+    speed = by_oid["1.3.6.1.2.1.31.1.1.1.15.1"]
+    results.check(
+        "a status object is a state check expecting up",
+        state["kind"] == "state" and state["expected"] == 1
+        and state["label"] == "Interface lan1",
+        "row=%r" % (state,))
+    results.check(
+        "a known gauge keeps its unit, with no invented band",
+        speed["kind"] == "gauge" and speed["unit"] == "Mbit/s"
+        and speed["green"] is None and speed["confidence"] == "low"
+        and speed["label"] == "Interface lan1 speed",
+        "row=%r" % (speed,))
+    results.check(
+        "the inventory string is a note, not a check",
+        len(cands) == 2 and any("text/inventory" in n for n in notes),
+        "cands=%r notes=%r" % (cands, notes))
+    results.check(
+        "the counter and the unclassified vendor row are notes",
+        any("ifInOctets" in n and "counter" in n for n in notes)
+        and any("Broadcom (PEN 4413)" in n and "unclassified" in n
+                for n in notes),
+        "notes=%r" % (notes,))
+
+
+def test_name_families_do_not_borrow_each_others_index(results):
+    """ifIndex 1 and entPhysicalIndex 1 are different objects."""
+    rows = [("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string"),
+            ("1.3.6.1.2.1.47.1.1.1.7.1", "ps1", "string"),
+            ("1.3.6.1.2.1.2.2.1.8.1", 1, "integer"),
+            ("1.3.6.1.2.1.99.1.1.1.4.1", 450, "integer")]
+    cands, _ = discovery.candidates(
+        "sw1", rows, names=discovery.name_map(rows))
+    by_oid = {c["oid"]: c for c in cands}
+    results.check(
+        "the interface row takes the ifName",
+        "Interface lan1" in by_oid["1.3.6.1.2.1.2.2.1.8.1"]["label"],
+        "row=%r" % (by_oid.get("1.3.6.1.2.1.2.2.1.8.1"),))
+    results.check(
+        "the sensor row takes entPhysicalName, not the interface's name",
+        "Sensor ps1 value" in by_oid["1.3.6.1.2.1.99.1.1.1.4.1"]["label"]
+        and "lan1" not in by_oid["1.3.6.1.2.1.99.1.1.1.4.1"]["label"],
+        "row=%r" % (by_oid.get("1.3.6.1.2.1.99.1.1.1.4.1"),))
+
+
+def test_the_discover_command_walks_the_device_reported_vendor_root(results):
+    mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+    cfg = config_mod.Config({
+        "SNMP_DEVICES": '[{"name":"ap1","address":"192.0.2.20"}]',
+        "SNMP_COMMUNITIES": '{"ap1":"public"}',
+        "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1"})
+    ctx = checks.Context(cfg, {}, {}, modules=(mod,))
+    seen = []
+
+    def fake_walk(host, community, root, **kwargs):
+        seen.append(root)
+        if root == "1.3.6.1.2.1":
+            return ([("1.3.6.1.2.1.1.1.0", "UniFi AP", "string"),
+                     ("1.3.6.1.2.1.1.2.0", "1.3.6.1.4.1.41112.1.6.3", "oid"),
+                     ("1.3.6.1.2.1.1.5.0", "ap1", "string")], False)
+        if root == "1.3.6.1.4.1.41112":
+            return ([("1.3.6.1.4.1.41112.1.6.1.1.1.2.0", "wlan0", "string"),
+                     ("1.3.6.1.4.1.41112.1.6.1.1.1.6.0", 72, "integer")], False)
+        return [], False
+
+    with mock.patch("modules.snmp.snmp.walk", side_effect=fake_walk):
+        res = cmdlib.run(mod, "discover", {"device": "ap1"}, ctx=ctx)
+    payload = json.loads(res.output)
+    labels = [c["label"] for c in payload["candidates"]]
+    results.check(
+        "sysObjectID selects the vendor root instead of all enterprises",
+        seen == ["1.3.6.1.2.1", "1.3.6.1.4.1.41112"],
+        "walk roots=%r" % (seen,))
+    results.check(
+        "the vendor identity is translated, not left as a PEN",
+        payload["identity"].get("vendor") == "Ubiquiti"
+        and payload["identity"].get("sysName") == "ap1",
+        "identity=%r" % (payload.get("identity"),))
+    results.check(
+        "the radio row is labelled from the vendor name column",
+        "Radio wlan0 channel utilization" in labels,
+        "labels=%r" % (labels,))
+
+
+def test_an_explicit_root_overrides_the_derived_vendor_root(results):
+    mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+    cfg = config_mod.Config({
+        "SNMP_DEVICES": '[{"name":"ap1","address":"192.0.2.20"}]',
+        "SNMP_COMMUNITIES": '{"ap1":"public"}',
+        "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1"})
+    ctx = checks.Context(cfg, {}, {}, modules=(mod,))
+    seen = []
+
+    def fake_walk(host, community, root, **kwargs):
+        seen.append(root)
+        return [], False
+
+    with mock.patch("modules.snmp.snmp.walk", side_effect=fake_walk):
+        res = cmdlib.run(mod, "discover",
+                         {"device": "ap1",
+                          "root": "1.3.6.1.4.1.99999"}, ctx=ctx)
+    results.check(
+        "a requested root is walked as given",
+        seen == ["1.3.6.1.2.1", "1.3.6.1.4.1.99999"]
+        and json.loads(res.output)["roots"]["why"] == "requested",
+        "roots=%r" % (seen,))
 
 
 def test_discover_refuses_an_unknown_device_and_never_walks(results):
@@ -3888,12 +4017,16 @@ TESTS = (
     test_showconf_states_the_grant_and_never_the_key,
     test_the_startup_banner_reads_the_stored_grant,
     test_interface_status_becomes_a_state_check_expecting_up,
-    test_an_unknown_oid_gets_no_band_and_low_confidence,
+    test_an_unknown_oid_is_counted_not_proposed,
     test_counters_are_named_as_not_checkable_not_given_a_gauge,
     test_a_starting_band_is_never_loosened_to_fit_the_observation,
     test_an_oid_component_boundary_keeps_a_lookalike_out_of_the_counter_table,
     test_names_are_keyed_by_full_oid_so_one_index_cannot_leak_across_tables,
     test_an_unnamed_interface_row_is_reported_not_invented,
+    test_semantics_classifies_each_kind_of_object,
+    test_name_families_do_not_borrow_each_others_index,
+    test_the_discover_command_walks_the_device_reported_vendor_root,
+    test_an_explicit_root_overrides_the_derived_vendor_root,
     test_discover_refuses_an_unknown_device_and_never_walks,
     test_discover_labels_an_interface_from_the_walk,
     test_discovery_apply_writes_once_and_refuses_a_partial_bad_body,

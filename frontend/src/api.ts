@@ -406,6 +406,16 @@ export type DiscoveryResult = {
   candidates: DiscoveryRow[];
   notes: string[];
   truncated: boolean;
+  /** Translated device identity the walk itself carried. */
+  identity?: {
+    sysDescr?: string;
+    sysObjectID?: string;
+    sysName?: string;
+    sysLocation?: string;
+    vendor?: string;
+    enterprise?: string;
+  };
+  roots?: { mib2: string; vendor: string; why: string };
 };
 
 export const discover = (id: string, device: string) =>

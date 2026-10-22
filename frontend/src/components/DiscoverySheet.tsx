@@ -4,6 +4,7 @@ import {
   applyDiscovery,
   discover,
   isUnauthorized,
+  type DiscoveryResult,
   type DiscoveryRow,
 } from "../api";
 
@@ -74,6 +75,8 @@ export default function DiscoverySheet({
   const [saving, setSaving] = useState(false);
   const [candidates, setCandidates] = useState<DiscoveryRow[] | null>(null);
   const [notes, setNotes] = useState<string[]>([]);
+  const [identity, setIdentity] =
+    useState<DiscoveryResult["identity"] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(() => new Set());
   const [labels, setLabels] = useState<Record<string, string>>({});
@@ -105,6 +108,7 @@ export default function DiscoverySheet({
       const out = await discover(moduleId, name);
       setCandidates(out.candidates);
       setNotes(out.notes ?? []);
+      setIdentity(out.identity ?? null);
       setTruncated(Boolean(out.truncated));
       setChecked(new Set());
       setLabels(
@@ -307,6 +311,13 @@ export default function DiscoverySheet({
         </p>
       )}
 
+      {identity && (identity.sysDescr || identity.vendor) && (
+        <p className="sub">
+          {identity.sysDescr}
+          {identity.vendor ? ` · ${identity.vendor}` : ""}
+          {identity.sysName ? ` · ${identity.sysName}` : ""}
+        </p>
+      )}
       {candidates && candidates.length === 0 && (
         <p className="sub">The walk proposed no candidates.</p>
       )}

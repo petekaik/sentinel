@@ -10,39 +10,34 @@ and not in a log line.
 """
 
 import json
+import re
 
 import commands as cmdlib
 from modules.snmp import discovery, snmp
 from modules.snmp.settings import SnmpConfig
 
-# The name columns, in preference order. A later column fills only an index
-# the earlier ones did not name, so `setdefault` is what preserves the order.
-NAME_COLUMNS = (
-    "1.3.6.1.2.1.31.1.1.1.1",     # ifName
-    "1.3.6.1.2.1.2.2.1.2",        # ifDescr
-    "1.3.6.1.2.1.31.1.1.1.18",    # ifAlias
-)
-IF_OPER_STATUS = "1.3.6.1.2.1.2.2.1.8"
-IF_ADMIN_STATUS = "1.3.6.1.2.1.2.2.1.7"
+MIB2 = "1.3.6.1.2.1"
+SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0"
 
 
-def _names(rows):
-    """{full row OID: name} for the interface tables, built from a walk.
+def _vendor_root(rows, explicit=""):
+    """(root, why) for the vendor branch worth walking.
 
-    `discovery.candidates` keys names by the FULL OID so `ifOperStatus.1` and
-    `hrProcessorLoad.1` cannot share one name. An index is not a key.
+    `sysObjectID` IS THE DEVICE TELLING US WHERE ITS VENDOR DATA LIVES. The
+    whole enterprises tree is 41112 for an AP but starts at Broadcom's 4413 for
+    a switch, and a 2000-object cap spent on the first branch never reaches the
+    second. Using the device's own answer costs no extra request: `sysObjectID`
+    is already in the MIB-II walk.
     """
-    by_index = {}
-    for prefix in NAME_COLUMNS:
-        for oid, value, _kind in rows:
-            if oid.startswith(prefix + "."):
-                if value not in (None, ""):
-                    by_index.setdefault(oid.rsplit(".", 1)[-1], str(value))
-    names = {}
-    for index, name in by_index.items():
-        names["%s.%s" % (IF_OPER_STATUS, index)] = name
-        names["%s.%s" % (IF_ADMIN_STATUS, index)] = name
-    return names
+    if explicit:
+        return explicit, "requested"
+    sys_oid = next((value for oid, value, _kind in rows
+                    if oid == SYS_OBJECT_ID), None)
+    if isinstance(sys_oid, str) and sys_oid.startswith("1.3.6.1.4.1."):
+        parts = sys_oid.split(".")
+        if len(parts) > 6 and parts[6].isdigit():
+            return ".".join(parts[:7]), "sysObjectID %s" % sys_oid
+    return "1.3.6.1.4.1", "no sysObjectID -- walked enterprises"
 
 
 def _config(ctx):
@@ -90,6 +85,10 @@ def _refusal(ctx, args):
         return "device %r is disabled" % dev["name"]
     if not dev["community"]:
         return ("device %r has no community in SNMP_COMMUNITIES" % dev["name"])
+    root = args.get("root")
+    if root not in (None, ""):
+        if not re.match(r"^\.?\d+(\.\d+)+$", str(root).strip()):
+            return "root must be a dotted-numeric OID, got %r" % (root,)
     raw = args.get("max_oids")
     if raw not in (None, ""):
         try:
@@ -113,17 +112,24 @@ def discover(ctx, args, dry_run=False):
             "max_oids must be an integer, got %r" % (args.get("max_oids"),))
     if dry_run:
         return cmdlib.Result(True, "would walk %s" % dev["name"])
+    explicit = str(args.get("root") or "").strip().lstrip(".")
     rows, truncated = snmp.walk(
-        dev["address"], dev["community"], "1.3.6.1.2.1",
+        dev["address"], dev["community"], MIB2,
         port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
-    ent, ent_truncated = snmp.walk(
-        dev["address"], dev["community"], "1.3.6.1.4.1",
-        port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
+    root, why = _vendor_root(rows, explicit)
+    ent, ent_truncated = ([], False)
+    if root != MIB2:
+        ent, ent_truncated = snmp.walk(
+            dev["address"], dev["community"], root,
+            port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
     all_rows = rows + ent
     candidates, notes = discovery.candidates(
-        dev["name"], all_rows, names=_names(all_rows))
+        dev["name"], all_rows, names=discovery.name_map(all_rows))
+    notes.insert(0, "vendor root %s (%s)" % (root, why))
     payload = {"device": dev["name"], "candidates": candidates,
                "notes": notes,
+               "identity": discovery.identity(all_rows),
+               "roots": {"mib2": MIB2, "vendor": root, "why": why},
                "truncated": bool(truncated or ent_truncated)}
     return cmdlib.Result(
         True, "%d candidate(s) from %s%s" % (
@@ -136,8 +142,11 @@ def commands():
     return [cmdlib.Command(
         "discover", "Walk an SNMP device and propose check rows",
         discover,
-        args=(cmdlib.Arg("device"), cmdlib.Arg("max_oids", required=False,
-                                               default="2000")),
+        args=(cmdlib.Arg("device"),
+              cmdlib.Arg("max_oids", required=False, default="2000"),
+              # An explicit vendor root overrides the sysObjectID derivation;
+              # the default (empty) walks what the device says it is.
+              cmdlib.Arg("root", required=False)),
         danger="read_only",
         validate=_refusal,
         # The device is validated in the handler because `commands()` has no

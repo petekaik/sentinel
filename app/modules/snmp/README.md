@@ -94,20 +94,42 @@ add a device row (name, address, community)
 one validated write. The community is merged server-side into
 `SNMP_COMMUNITIES` (the browser cannot read that map), and it is never returned.
 
-**Discover.** `discover` walks all of MIB-II (`1.3.6.1.2.1`) and the
-enterprises subtree (`1.3.6.1.4.1`), capped by `max_oids` with truncation
-reported in the result, and returns candidates. It writes nothing: a walk has
-no path to the settings, so reviewing is always a separate, explicit step.
+**Discover.** `discover` walks MIB-II (`1.3.6.1.2.1`) first, then the **vendor
+root the device reports** in `sysObjectID` (for `1.3.6.1.4.1.41112.1.6.3` that
+is `1.3.6.1.4.1.41112`). Without a usable `sysObjectID` it walks the whole
+enterprises tree (`1.3.6.1.4.1`), as before. Both walks are capped by
+`max_oids`, with truncation reported. An optional `root` argument overrides the
+derivation. It writes nothing: a walk has no path to the settings, so reviewing
+is always a separate, explicit step.
 
-**Review.** Each candidate carries a checked-in starting band
-(`STARTING_BANDS`), never a band widened to fit the observation. The operator
-edits labels and bands here; an unwanted row is simply not selected.
+The derivation matters because the enterprises tree is ordered: a 2000-object
+cap spent on Broadcom's `4413` branch never reaches Ubiquiti's `41112`, so an
+AP's own objects would be missing from its discovery.
 
-**What is not proposed.** Counters (`ifInOctets`, ...) are not proposed yet:
-they are monotonic, so any band over one describes the sampling interval rather
-than the device. They are named in the response's notes, and so is an interface
-row whose index has no `ifName` -- a label a human cannot verify is not
-invented.
+**Review.** `discovery.SEMANTICS` is the checked-in translation table: standard
+tables (system, IF-MIB, BRIDGE-MIB, HOST-RESOURCES, ENTITY-SENSOR, PoE) and the
+vendor branches measured so far. A row is classified, not dumped:
+
+| What the object is | What discovery does |
+|---|---|
+| a known status (`ifOperStatus`, sensor status, bridge port state) | proposes a `state` check with the expected value |
+| a known gauge (`hrProcessorLoad`, link speed, PoE watts, radio utilization) | proposes a gauge with its unit and, where defensible, a starting band |
+| a counter (`ifInOctets`, dot3 errors, vendor byte counters) | names it in `notes`; never proposes a gauge |
+| a string/OID/inventory value (serial, model, description) | names it in `notes`; never proposes a check |
+| an object with no bundled semantics | counts it under its vendor/MIB group in `notes`; proposes nothing |
+
+The result is a review sheet of meaningful rows, not a dump of the walk.
+`ENTERPRISE_NAMES` translates the IANA PEN (`4413` → Broadcom, `41112` →
+Ubiquiti) so a note names the vendor; an unknown PEN keeps its number. The
+device identity (`sysDescr`, `sysName`, `sysLocation`, `sysObjectID`, vendor) is
+returned alongside the candidates.
+
+Starting bands are reviewed values: `STARTING_BANDS` is the gauge/state subset
+of `SEMANTICS`, and a band is never widened to fit the observation. An interface
+row whose index has no name from `ifName`/`ifDescr`/`ifAlias` is reported, not
+proposed -- a label a human cannot verify is not invented. Name columns are
+applied per table family (`ifIndex`, `entPhysicalIndex`, radio/VAP/unifiIf
+indices), so one family's index cannot label another's row.
 
 **Add selected.** One `apply_discovery` call validates the whole merged
 `SNMP_CHECKS` list before writing, so a bad selected row refuses the entire
@@ -228,8 +250,8 @@ SNMP_CHECKS='[{"device":"switch-1","oid":"1.3.6.1.2.1.2.2.1.8.1",
 | `settings.py` | parsing (`SnmpConfig`), the community map, and the save-time rules (`validate`) |
 | `preload.py` | one poll per enabled device per epoch; installs `ctx.snmp_facts` |
 | `checks.py` | `SnmpReachable` / `SnmpOid` and the dynamic `instances(ctx)` |
-| `discovery.py` | builds candidate check rows from rows returned by `snmp.walk()`: starting bands, counter/unnamed-row notes, and no invented value |
-| `commands.py` | the `discover` command: walks one configured device and returns candidates; writes no setting |
+| `discovery.py` | the translation table and classifier: `SEMANTICS`, `ENTERPRISE_NAMES`, per-family `name_map`, `identity`, and candidates with counter/inventory/unclassified notes and no invented value |
+| `commands.py` | the `discover` command: walks MIB-II plus the device-reported vendor root (or an explicit `root`), returns candidates and identity; writes no setting |
 | `thresholds.conf` | deliberately comment-only: bands live on the settings rows |
 
 The module opens no platform attempt row: an SNMP device is not an ssh host, so

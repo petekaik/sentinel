@@ -73,6 +73,25 @@ def parse_int(v):
     return int.from_bytes(v, "big", signed=True)
 
 
+def parse_uint(v):
+    """Counter32, Gauge32, TimeTicks, Counter64 and Uinteger32 are UNSIGNED.
+
+    Parsing them signed turns any value with the top bit set into a negative
+    number -- a Counter64 at 2^63 reads as -2^63, which is a reading no check
+    can grade and no operator can believe.
+    """
+    if not v:
+        raise ValueError("empty unsigned integer")
+    return int.from_bytes(v, "big")
+
+
+def parse_ip(v):
+    """IpAddress is four octets, dotted on the wire and on the screen."""
+    if len(v) != 4:
+        raise ValueError("IpAddress is not four octets")
+    return ".".join(str(b) for b in v)
+
+
 def parse_oid(v):
     first = v[0]
     parts = [first // 40, first % 40]

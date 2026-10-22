@@ -157,8 +157,12 @@ def _agent(tree):
         if not later:
             return _reply_with(ber.tlv(0x82, b""), vb_oid=oid)(request)
         value, kind = tree[later[0]]
-        value_tlv = (ber.integer(value) if kind == "integer"
-                     else ber.octet(value))
+        if kind == "integer":
+            value_tlv = ber.integer(value)
+        elif kind == "oid":
+            value_tlv = ber.oid(value)
+        else:
+            value_tlv = ber.octet(value)
         return _reply_with(value_tlv, vb_oid=later[0])(request)
 
     with FakeAgent(reply) as agent:
@@ -527,7 +531,9 @@ def test_timeout_after_one_retry(results):
 
 def test_an_unsupported_value_tag_is_an_error(results):
     got = None
-    with FakeAgent(_reply_with(ber.tlv(0x40, b"\x0a\x00\x00\x01"))) as agent:
+    # 0x45 (NsapAddress) is the one standard SNMP v2c value type this client
+    # still refuses; 0x40 is now decoded (IpAddress).
+    with FakeAgent(_reply_with(ber.tlv(0x45, b"\x00"))) as agent:
         try:
             got = snmp.get("127.0.0.1", "public", OID, port=agent.port,
                            timeout=2)
@@ -536,9 +542,55 @@ def test_an_unsupported_value_tag_is_an_error(results):
             text = str(exc)
     results.check(
         "an unsupported value tag raises SnmpError naming the tag",
-        text is not None and "0x40" in text,
+        text is not None and "0x45" in text,
         "got=%r exception=%r -- returning the raw bytes of a type the checks "
         "cannot grade would be a value nothing understands" % (got, text))
+
+
+def test_standard_snmp_value_types_decode(results):
+    """A walk meets OIDs, addresses and 64-bit counters, not just integers.
+
+    The first real switch walked returned an OBJECT IDENTIFIER (0x06) and the
+    client refused it with "unsupported value tag 0x06", aborting the whole
+    walk -- every object after the first OID-valued one was lost.
+    """
+    high = 2**63 + 5
+    cases = (
+        ("an OBJECT IDENTIFIER",
+         ber.oid("1.3.6.1.4.1.41112.1.6"),
+         ("1.3.6.1.4.1.41112.1.6", "oid")),
+        ("an IpAddress",
+         ber.tlv(0x40, bytes([192, 0, 2, 1])), ("192.0.2.1", "string")),
+        ("a Counter64 above 2^63",
+         ber.tlv(0x46, high.to_bytes(8, "big")), (high, "integer")),
+        ("a Counter32 above 2^31",
+         ber.tlv(0x41, (2**31 + 7).to_bytes(4, "big")),
+         (2**31 + 7, "integer")),
+        ("an Opaque",
+         ber.tlv(0x44, b"\xde\xad\xbe\xef"), ("deadbeef", "opaque")),
+    )
+    for name, value_tlv, want in cases:
+        with FakeAgent(_reply_with(value_tlv)) as agent:
+            got = snmp.get("127.0.0.1", "public", OID, port=agent.port,
+                           timeout=2)
+        results.check(
+            "%s decodes" % name, got == want,
+            "got=%r want=%r -- refusing a standard type aborts the walk that "
+            "met it" % (got, want))
+
+
+def test_a_walk_crosses_an_oid_valued_object(results):
+    tree = {"1.3.6.1.2.1.1.1.0": ("switch", "string"),
+            "1.3.6.1.2.1.1.2.0": ("1.3.6.1.4.1.41112.1.6", "oid"),
+            "1.3.6.1.2.1.1.3.0": (1234, "integer")}
+    with _agent(tree) as (host, port):
+        rows, truncated = snmp.walk(host, "public", "1.3.6.1.2.1.1",
+                                    port=port, max_oids=10)
+    results.check(
+        "the walk continues past an OBJECT IDENTIFIER row",
+        [r[0] for r in rows] == sorted(tree, key=_oid_key) and not truncated,
+        "rows=%r truncated=%r -- the OID row must not cost the objects after "
+        "it" % (rows, truncated))
 
 
 def test_an_unresolvable_host_is_an_snmp_error(results):
@@ -572,7 +624,7 @@ def test_the_community_never_reaches_an_exception(results):
         ("noSuchObject", _reply_with(ber.tlv(0x80, b""))),
         ("noSuchInstance", _reply_with(ber.tlv(0x81, b""))),
         ("error-status", _reply_with(ber.octet(""), status=2, index=1)),
-        ("unsupported tag", _reply_with(ber.tlv(0x40, b"\x0a\x00\x00\x01"))),
+        ("unsupported tag", _reply_with(ber.tlv(0x45, b"\x00"))),
         ("malformed", _reply_with(b"\x02\x04\x00\x00")),
     )
     for name, reply in replies:
@@ -687,6 +739,8 @@ TESTS = (
     test_a_malformed_reply_is_an_snmp_error,
     test_a_reply_to_another_request_is_ignored,
     test_an_unsupported_value_tag_is_an_error,
+    test_standard_snmp_value_types_decode,
+    test_a_walk_crosses_an_oid_valued_object,
     test_an_unresolvable_host_is_an_snmp_error,
     test_timeout_after_one_retry,
     test_the_community_never_reaches_an_exception,

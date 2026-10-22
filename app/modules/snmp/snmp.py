@@ -90,10 +90,26 @@ def _decode(data, rid, host):
             raise SnmpError("no such instance: %s" % name_text)
         if vtag == 0x82:
             raise SnmpEndOfMib("end of MIB view at %s" % name_text)
-        if vtag in (0x02, 0x41, 0x42, 0x43):     # integer/counter/gauge/ticks
+        # EVERY STANDARD SNMP v2c VALUE TYPE, because a WALK meets all of them:
+        # a subtree contains OBJECT IDENTIFIERs (sysObjectID), IpAddresses
+        # (ipAdEntAddr), Counter64s (ifHCInOctets) and the occasional Opaque.
+        # Refusing a type does not skip that row -- it aborts the whole walk,
+        # which on a switch hid every object after the first OID-valued one
+        # ("unsupported value tag 0x06").
+        if vtag == 0x02:                          # INTEGER, signed
             return name_text, ber.parse_int(value), "integer"
+        if vtag in (0x41, 0x42, 0x43, 0x46, 0x47):
+            # Counter32 / Gauge32 / TimeTicks / Counter64 / Uinteger32
+            return name_text, ber.parse_uint(value), "integer"
         if vtag == 0x04:
             return name_text, ber.parse_string(value), "string"
+        if vtag == 0x06:
+            return name_text, ber.parse_oid(value), "oid"
+        if vtag == 0x40:
+            return name_text, ber.parse_ip(value), "string"
+        if vtag == 0x44:
+            # Opaque is agent-defined bytes, not text: hex is the honest form.
+            return name_text, value.hex(), "opaque"
         raise SnmpError("unsupported value tag 0x%02x" % vtag)
     except (IndexError, ValueError):
         raise SnmpError("malformed response from %s" % host)

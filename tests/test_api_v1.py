@@ -275,6 +275,27 @@ def test_strict_booleans_at_the_write_boundary(results):
     conn.close()
 
 
+def test_a_stored_device_row_reads_with_its_declared_defaults(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        conn = _store(tmp)
+        cfg = _cfg(tmp,
+                   SNMP_COMMUNITIES='{"sw1":"public"}')
+        store.put_setting(conn, "snmp", "SNMP_DEVICES", [
+            {"name": "sw1", "address": "192.0.2.10", "port": 161,
+             "version": None, "enabled": True}], "operator")
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        results.check(
+            "a stored device row's omitted version reads as v2c",
+            view["SNMP_DEVICES"]["value"][0]["version"] == "v2c",
+            "row=%r -- the runtime used v2c while the form showed '--'"
+            % (view["SNMP_DEVICES"]["value"][0],))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 def test_a_secret_map_is_edited_by_entry_not_retyped(results):
     """MEASURED 2026-10-21: the Communities box was blank (a secret never
     returns a value) and the write replaced the whole map -- changing one
@@ -1443,6 +1464,7 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_duplicate_setting_keys_are_refused,
          test_write_validation_and_audit,
          test_strict_booleans_at_the_write_boundary,
+         test_a_stored_device_row_reads_with_its_declared_defaults,
          test_a_secret_map_is_edited_by_entry_not_retyped,
          test_a_secret_never_survives_a_read,
          test_a_disabled_modules_broken_thresholds_do_not_break_the_manifest,

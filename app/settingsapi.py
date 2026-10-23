@@ -376,7 +376,12 @@ def settings_view(cfg, conn, modules):
                         setting, raw)
                 continue
             if key in values:
-                value = values[key]                     # stored typed value
+                # A STORED LIST ROW IS NORMALISED ON READ, exactly as an
+                # env/default one is. A row written before a field gained a
+                # default still carries None; without this the SPA showed "--"
+                # for a device's version while the runtime used v2c.
+                value = (_typed_value(setting, values[key])
+                         if setting.kind == "list" else values[key])
             elif setting.key in base:
                 value = _typed_value(setting, base[setting.key])
             else:

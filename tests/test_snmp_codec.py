@@ -137,35 +137,82 @@ def _oid_key(oid):
     return tuple(int(x) for x in oid.split("."))
 
 
-@contextlib.contextmanager
-def _agent(tree):
-    """The loopback agent above, answering GetNext against `tree`.
+def _encode(value, kind):
+    if kind == "integer":
+        return ber.integer(value)
+    if kind == "oid":
+        return ber.oid(value)
+    return ber.octet(value)
 
-    A GetNext names the next OID in NUMERIC order, or carries the v2c
-    endOfMibView (0x82) when there is none -- the two things a walk must tell
-    apart. A request that is not a GetNext is answered with noSuchObject so a
-    client that sends the wrong PDU tag fails the test instead of silently
-    walking a tree that answers anything.
-    """
+
+def _bulk_parts(data):
+    """(request_id, oid, max_repetitions) from a GetBulk request."""
+    _, msg, _ = ber.parse(data, 0)
+    _, _, i = ber.parse(msg, 0)
+    _, _, i = ber.parse(msg, i)
+    _, pdu, _ = ber.parse(msg, i)
+    _, rid, j = ber.parse(pdu, 0)
+    _, _nonrepeaters, j = ber.parse(pdu, j)
+    _, max_reps, j = ber.parse(pdu, j)
+    _, varbinds, j = ber.parse(pdu, j)
+    _, vb, _ = ber.parse(varbinds, 0)
+    _, name, _ = ber.parse(vb, 0)
+    return ber.parse_int(rid), ber.parse_oid(name), ber.parse_int(max_reps)
+
+
+def _reply_bulk(entries, rid=None):
+    """A GetResponse carrying SEVERAL varbinds, as a GetBulk reply does."""
+    def build(request):
+        got_rid, _, _ = _bulk_parts(request)
+        vbs = b"".join(ber.sequence(ber.oid(oid) + value)
+                       for oid, value in entries)
+        return ber.sequence(
+            ber.integer(1),
+            ber.octet("public"),
+            ber.tlv(0xA2,
+                    (ber.integer(rid) if rid is not None else ber.integer(got_rid))
+                    + ber.integer(0) + ber.integer(0)
+                    + ber.sequence(vbs)))
+    return build
+
+
+def _agent_reply(tree, refuse_bulk=False):
+    """A reply function answering GetNext and GetBulk against `tree`."""
     ordered = sorted(tree, key=_oid_key)
 
     def reply(request):
         _, _, pdu_tag, _, oid = _request_parts(request)
+        if pdu_tag == 0xA5:
+            if refuse_bulk:
+                return _reply_with(ber.tlv(0x05, b""), status=5)(request)
+            _, bulk_oid, reps = _bulk_parts(request)
+            later = [o for o in ordered
+                     if _oid_key(o) > _oid_key(bulk_oid)][:max(1, reps)]
+            if not later:
+                return _reply_bulk([(bulk_oid, ber.tlv(0x82, b""))])(request)
+            return _reply_bulk([(o, _encode(*tree[o])) for o in later])(request)
         if pdu_tag != 0xA1:
             return _reply_with(ber.tlv(0x80, b""), vb_oid=oid)(request)
         later = [o for o in ordered if _oid_key(o) > _oid_key(oid)]
         if not later:
             return _reply_with(ber.tlv(0x82, b""), vb_oid=oid)(request)
         value, kind = tree[later[0]]
-        if kind == "integer":
-            value_tlv = ber.integer(value)
-        elif kind == "oid":
-            value_tlv = ber.oid(value)
-        else:
-            value_tlv = ber.octet(value)
-        return _reply_with(value_tlv, vb_oid=later[0])(request)
+        return _reply_with(_encode(value, kind), vb_oid=later[0])(request)
 
-    with FakeAgent(reply) as agent:
+    return reply
+
+
+@contextlib.contextmanager
+def _agent(tree):
+    """The loopback agent above, answering GetNext/GetBulk against `tree`.
+
+    A GetNext names the next OID in NUMERIC order, or carries the v2c
+    endOfMibView (0x82) when there is none -- the two things a walk must tell
+    apart. A request that is neither is answered with noSuchObject so a client
+    that sends the wrong PDU tag fails the test instead of silently walking a
+    tree that answers anything.
+    """
+    with FakeAgent(_agent_reply(tree)) as agent:
         yield "127.0.0.1", agent.port
 
 
@@ -678,6 +725,37 @@ def test_walk_follows_getnext_and_stops_cleanly(results):
         "rows=%r truncated=%r" % (rows, truncated))
 
 
+def test_a_walk_uses_bulk_and_reads_many_per_request(results):
+    """34,000 objects at one round trip each is minutes; GetBulk is the fix."""
+    tree = {"1.3.6.1.2.1.1.%d.0" % i: (i, "integer") for i in range(1, 61)}
+    with FakeAgent(_agent_reply(tree)) as agent:
+        rows, truncated = snmp.walk("127.0.0.1", "public",
+                                    "1.3.6.1.2.1.1", port=agent.port,
+                                    max_oids=60)
+        seen = list(agent.seen)
+    _, _, first_tag, _, _ = _request_parts(seen[0])
+    results.check(
+        "a walk asks with GetBulk, not one GetNext per object",
+        first_tag == 0xA5 and len(rows) == 60 and not truncated
+        and len(seen) <= 6,
+        "rows=%d requests=%d first_pdu=0x%02x -- a per-object walk would "
+        "send 60 datagrams" % (len(rows), len(seen), first_tag))
+
+
+def test_a_walk_falls_back_to_getnext_when_bulk_is_refused(results):
+    """A non-compliant agent that ignores/refuses 0xA5 still gets walked."""
+    tree = {"1.3.6.1.2.1.1.%d.0" % i: (i, "integer") for i in range(1, 31)}
+    with FakeAgent(_agent_reply(tree, refuse_bulk=True)) as agent:
+        rows, truncated = snmp.walk("127.0.0.1", "public",
+                                    "1.3.6.1.2.1.1", port=agent.port,
+                                    max_oids=5)
+        tags = [_request_parts(x)[2] for x in agent.seen]
+    results.check(
+        "a refused GetBulk falls back to GetNext and still returns rows",
+        len(rows) == 5 and 0xA5 in tags and 0xA1 in tags,
+        "rows=%r tags=%r" % (rows, tags))
+
+
 def test_walk_reports_truncation_instead_of_pretending_it_ended(results):
     tree = {"1.3.6.1.2.1.1.%d.0" % i: (i, "integer") for i in range(1, 6)}
     with _agent(tree) as (host, port):
@@ -746,6 +824,8 @@ TESTS = (
     test_the_community_never_reaches_an_exception,
     test_the_client_holds_no_logger,
     test_walk_follows_getnext_and_stops_cleanly,
+    test_a_walk_uses_bulk_and_reads_many_per_request,
+    test_a_walk_falls_back_to_getnext_when_bulk_is_refused,
     test_walk_reports_truncation_instead_of_pretending_it_ended,
     test_walk_does_not_escape_the_root,
     test_a_walk_that_ends_exactly_at_the_cap_is_not_truncated,

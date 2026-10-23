@@ -513,6 +513,67 @@ def _req(url, method="GET", body=None, token=None):
         return e.code, dict(e.headers), json.loads(e.read() or b"null")
 
 
+def test_a_mib_upload_is_stored_per_device_and_token_gated(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = _cfg(
+            tmp,
+            SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+            SNMP_COMMUNITIES='{"sw1":"public"}')
+        conn = _store(tmp)
+        conn.close()
+        httpd, base = _serve(cfg)
+        try:
+            body = {"device": "sw1", "filename": "UBNT-Combined-MIB.txt",
+                    "content": "UBNT-MIB DEFINITIONS ::= BEGIN\nEND\n"}
+            status, _, _ = _req(base + "/api/v1/modules/snmp/mibs", "POST",
+                                body)
+            results.check(
+                "a MIB upload without the write token is refused",
+                status == 401, "status=%r" % (status,))
+
+            status, _, out = _req(base + "/api/v1/modules/snmp/mibs", "POST",
+                                  body, token="tok")
+            path = os.path.join(tmp, "mibs", "sw1", "UBNT-Combined-MIB.txt")
+            mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0
+            results.check(
+                "an uploaded MIB lands under the data volume, mode 600",
+                status == 200 and out.get("file", {}).get("name")
+                == "UBNT-Combined-MIB.txt" and mode == 0o600,
+                "status=%r out=%r mode=%o path=%r"
+                % (status, out, mode, path))
+
+            status, _, listing = _req(base + "/api/v1/modules/snmp/mibs")
+            results.check(
+                "the list names the file under its configured device",
+                status == 200
+                and [f["name"] for f in listing.get("sw1", [])]
+                == ["UBNT-Combined-MIB.txt"],
+                "listing=%r" % (listing,))
+
+            for name, why in (("../evil.mib", "traversal"),
+                              ("evil.exe", "extension")):
+                status, _, _ = _req(
+                    base + "/api/v1/modules/snmp/mibs", "POST",
+                    {"device": "sw1", "filename": name, "content": "x"},
+                    token="tok")
+                results.check(
+                    "a %s file name is refused" % why, status == 422,
+                    "name=%r status=%r" % (name, status))
+            status, _, _ = _req(
+                base + "/api/v1/modules/snmp/mibs", "POST",
+                {"device": "ghost", "filename": "a.mib", "content": "x"},
+                token="tok")
+            results.check(
+                "an upload for an unconfigured device is refused",
+                status == 422, "status=%r" % (status,))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_a_write_with_an_unopenable_store_is_a_json_503(results):
     """`store.connect` outside the try raised out of the handler.
 
@@ -1391,6 +1452,7 @@ TESTS = (test_manifest_carries_the_schema_and_never_a_secret,
          test_the_read_surface,
          test_api_errors_are_json,
          test_the_write_surface,
+         test_a_mib_upload_is_stored_per_device_and_token_gated,
          test_a_write_with_an_unopenable_store_is_a_json_503,
          test_a_write_auth_refusal_does_not_poison_keep_alive,
          test_a_broken_module_setting_is_visible_in_status,

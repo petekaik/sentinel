@@ -33,7 +33,8 @@ import store
 # kind the store cannot render, and it may not authorise itself.
 INSIGHT_KINDS = ("anomaly", "diagnosis", "threshold_suggestion", "report")
 # Kinds that carry a CHANGE, so they must name values a human could approve.
-AUTHOR_KINDS = ("check_set", "settings_change", "threshold_change")
+AUTHOR_KINDS = ("check_set", "settings_change", "threshold_change",
+                "append_rows")
 # THE ANOMALY PASS IS BOUNDED LIKE EVERY OTHER READ IN THIS LAYER. One series
 # can be 20,000 rows (two weeks of minute samples); materialising 200 of them
 # as Python dicts measured 43.5 s for ~40 series against a 30 s cycle budget.
@@ -356,8 +357,13 @@ def pack_views(views, grants, max_tokens, cfg=None):
         '"severity":"info|notable|actionable","confidence":0.0,'
         '"evidence":{}}],'
         '"proposals":[{"module":"<module id>",'
-        '"kind":"check_set|settings_change|threshold_change|action",'
+        '"kind":"check_set|settings_change|threshold_change|append_rows|action",'
         '"payload":{},"rationale":"<text>"}]}. '
+        "To propose ADDING rows to a list setting (for example SNMP_CHECKS "
+        "from a discovery), use kind `append_rows` and payload "
+        '{"setting":"<setting key>","rows":[<complete row objects>]}. '
+        "Every row you propose must come from the discovery facts in the pack "
+        "for that module, and must carry every field its item schema needs. "
         "Every insight MUST carry kind, title and body; an item without them "
         "is discarded. Every item names one of the module ids you were given. "
         "Evidence must cite ids present in the pack. A proposal is a request "
@@ -688,6 +694,73 @@ def validate_model_output(payload, views, grants, conn=None):
                 "subject": live["subject"] or ""}
             out["classification"] = "action"
             out["diff"] = "action %s on %s" % (action_id, key)
+            proposals.append(out)
+            per_proposal[mid] = per_proposal.get(mid, 0) + 1
+            continue
+        if kind == "append_rows":
+            # ADDITIVE ROWS FOR A LIST SETTING (SNMP_CHECKS from a discovery).
+            # The model never produces the full list: it names rows, the
+            # platform merges them and classifies the result. A row whose OID
+            # is not in the module's own facts is an invented monitor and is
+            # dropped.
+            if grant.get("author") in (None, "off"):
+                _bump(dropped, mid)
+                continue
+            module = getattr(view, "mod", None)
+            before = getattr(view, "module_settings", None)
+            if module is None or not isinstance(before, dict):
+                _bump(dropped, mid)
+                continue
+            setting_key = str(body.get("setting") or "")
+            setting = next((s for s in module.settings
+                            if s.key == setting_key), None)
+            rows = body.get("rows")
+            if (setting is None or setting.kind != "list"
+                    or not isinstance(rows, list) or not rows):
+                _bump(dropped, mid)
+                continue
+            parsed, _why = setting.parse_item(rows)
+            if parsed is None or len(parsed) != len(rows):
+                _bump(dropped, mid)
+                continue
+            current = before.get(setting_key) or []
+            if not isinstance(current, list):
+                _bump(dropped, mid)
+                continue
+            try:
+                facts = module.intelligence_facts(
+                    getattr(view, "_conn", None), 0, 200)
+            except Exception:                       # noqa: BLE001 - isolated
+                facts = {}
+            known = {(d.get("device"), c.get("oid"))
+                     for d in (facts.get("devices") or [])
+                     for c in (d.get("candidates") or []) if c.get("oid")}
+            if known and any(
+                    (r.get("device"), r.get("oid")) not in known
+                    for r in parsed if r.get("oid")):
+                _bump(dropped, mid)
+                continue
+            merged = list(current) + [r for r in parsed if r not in current]
+            try:
+                why = module.validate_settings(dict(before,
+                                                   **{setting_key: merged}))
+            except Exception as exc:                # noqa: BLE001 - isolated
+                why = "the module could not validate it: %s" % exc
+            if why:
+                _bump(dropped, mid)
+                continue
+            classification, detail = authorize.classify(
+                {"settings": {setting_key: merged}}, module, before,
+                observations=_observations_from_view(
+                    view, {"settings": {setting_key: merged}}, before, module))
+            if classification == authorize.INVALID:
+                _bump(dropped, mid)
+                continue
+            out = dict(item)
+            out["payload"] = {"setting": setting_key, "rows": parsed,
+                              "before": {setting_key: current}}
+            out["classification"] = classification
+            out["diff"] = detail
             proposals.append(out)
             per_proposal[mid] = per_proposal.get(mid, 0) + 1
             continue

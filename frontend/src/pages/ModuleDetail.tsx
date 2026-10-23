@@ -10,7 +10,9 @@ import {
   type SettingsView,
   type Status,
 } from "../api";
+import Collapse from "../components/Collapse";
 import DiscoverySheet from "../components/DiscoverySheet";
+import MibManager from "../components/MibManager";
 import SettingsForm from "../components/SettingsForm";
 import StaleBanner from "../components/StaleBanner";
 import StatusPill, { tone } from "../components/StatusPill";
@@ -401,7 +403,7 @@ export default function ModuleDetail() {
         </div>
       )}
 
-      <h2>Targets</h2>
+      <Collapse title="Targets" count={mod.targets.length}>
       {!status ? (
         <p className="sub">
           No status document, so there is no target tile to show.
@@ -446,8 +448,9 @@ export default function ModuleDetail() {
           })}
         </div>
       )}
+      </Collapse>
 
-      <h2>Checks</h2>
+      <Collapse title="Checks" count={mod.checks.length}>
       {mod.checks.length === 0 ? (
         <p className="sub">
           This module declares no check classes. Settings-driven checks, if any,
@@ -533,10 +536,10 @@ export default function ModuleDetail() {
           </p>
         </div>
       )}
+      </Collapse>
 
       {flagged.length > 0 && (
-        <>
-          <h2>Flagged now</h2>
+        <Collapse title="Flagged now" count={flagged.length}>
           <div className="scroll">
             <table>
               <thead>
@@ -566,12 +569,11 @@ export default function ModuleDetail() {
               </tbody>
             </table>
           </div>
-        </>
+        </Collapse>
       )}
 
       {informational.length > 0 && (
-        <>
-          <h2>Informational readings</h2>
+        <Collapse title="Informational readings" count={informational.length}>
           <div className="scroll">
             <table>
               <thead>
@@ -597,12 +599,11 @@ export default function ModuleDetail() {
               </tbody>
             </table>
           </div>
-        </>
+        </Collapse>
       )}
 
       {incidents.length > 0 && (
-        <>
-          <h2>Live incidents</h2>
+        <Collapse title="Live incidents" count={incidents.length}>
           <div className="scroll">
             <table>
               <thead>
@@ -632,7 +633,7 @@ export default function ModuleDetail() {
               </tbody>
             </table>
           </div>
-        </>
+        </Collapse>
       )}
 
       {mod.id === "snmp" && (
@@ -650,7 +651,22 @@ export default function ModuleDetail() {
         />
       )}
 
-      <h2>Commands</h2>
+      {mod.id === "snmp" && (
+        <Collapse title="MIB files" defaultOpen={false}>
+          <MibManager
+            devices={snmpDevices}
+            readOnly={locked}
+            onAuthRequired={(again) => {
+              retry.current = again;
+              setReadOnly(true);
+              setTokenOpen(true);
+            }}
+          />
+        </Collapse>
+      )}
+
+      <Collapse title="Commands"
+                count={mod.commands.filter((c) => !c.hidden).length}>
       {mod.commands.filter((c) => !c.hidden).length === 0 ? (
         <p className="sub">This module exposes no commands.</p>
       ) : (
@@ -669,8 +685,9 @@ export default function ModuleDetail() {
           ))}
         </div>
       )}
+      </Collapse>
 
-      <h2>Command runs</h2>
+      <Collapse title="Command runs" count={commandRuns.length} defaultOpen={false}>
       {commandRuns.length === 0 ? (
         <p className="sub">No command has run for this module.</p>
       ) : (
@@ -709,8 +726,9 @@ export default function ModuleDetail() {
           </table>
         </div>
       )}
+      </Collapse>
 
-      <h2>Settings</h2>
+      <Collapse title="Settings">
       {settingsError ? (
         <div className="banner amber" role="alert">
           Settings could not be read: {settingsError}
@@ -730,6 +748,7 @@ export default function ModuleDetail() {
           }}
         />
       )}
+      </Collapse>
 
       <TokenDialog
         open={tokenOpen}

@@ -1768,3 +1768,12 @@ Two rules the suites enforce structurally, both learned by measurement:
   monitor is dead" stay different readings. That mitigates the confusion and
   does not remove the dependency. `docs/publishing.md` is the runbook; this is
   the same risk stated as a design trade.
+
+
+The author lane can also append rows to a list setting: kind `append_rows`,
+payload `{"setting": "<key>", "rows": [...]}`. The platform merges the rows
+over the current value, validates the merged configuration and stores a
+pending proposal; a row whose `oid` is not in the module's own intelligence
+facts (the persisted SNMP discovery) is dropped. Approval goes through the
+same `settings_change` path, so the same stale-diff guard and human decision
+apply.

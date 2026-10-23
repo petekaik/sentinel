@@ -453,6 +453,15 @@ export type NewDevice = {
   port?: number;
 };
 
+export type MibFile = { name: string; size: number; mtime?: number };
+
+export const listMibs = () =>
+  req<Record<string, MibFile[]>>("GET", "/api/v1/modules/snmp/mibs");
+
+export const uploadMib = (device: string, filename: string, content: string) =>
+  req<{ device: string; file: MibFile }>(
+    "POST", "/api/v1/modules/snmp/mibs", { device, filename, content });
+
 export const addDevice = (id: string, body: NewDevice) =>
   req<ModuleSettingsView>("POST", `/api/v1/modules/${id}/devices`, body);
 

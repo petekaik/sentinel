@@ -28,6 +28,13 @@ No row is sampled twice and no value is invented: `observed` is what the walk
 returned, and every other field is either the checked-in table or empty.
 """
 
+import store
+
+# What the author lane may see from a stored discovery. Bounded per device, so
+# a 40,000-object scan cannot crowd out the module's actual evidence.
+FACTS_PER_DEVICE = 40
+FACTS_NOTES = 10
+
 # Monotonic objects. A rate needs a delta over a known interval, which one walk
 # does not provide. Counters are named, never proposed as gauges.
 COUNTER_PREFIXES = {
@@ -423,6 +430,41 @@ def identity(rows):
         out["vendor"] = ENTERPRISE_NAMES.get(pen, "enterprise %s" % pen)
         out["enterprise"] = pen
     return out
+
+
+def intelligence_facts(conn, since, max_rows=200):
+    """The latest stored discovery per device, as a bounded, secret-free pack.
+
+    This is what lets the author lane propose rows from a scan instead of only
+    from the checks already configured. It carries the CLASSIFIED candidates
+    (never the raw walk, never a community), identity, truncation and the
+    notes; the model can cite an OID here and nowhere else.
+    """
+    devices = []
+    for row in store.list_snmp_discoveries(conn):
+        payload = row.get("payload") or {}
+        candidates = payload.get("candidates") or []
+        cap = max(1, min(FACTS_PER_DEVICE, int(max_rows or 0) or
+                         FACTS_PER_DEVICE))
+        keep = candidates[:cap]
+        identity = payload.get("identity") or {}
+        devices.append({
+            "device": row["device"],
+            "ts": row["ts"],
+            "identity": {k: identity.get(k) for k in
+                         ("sysDescr", "sysName", "sysObjectID", "vendor")
+                         if identity.get(k)},
+            "truncated": bool(payload.get("truncated")),
+            "candidates_total": len(candidates),
+            "candidates_omitted": max(0, len(candidates) - len(keep)),
+            "candidates": [
+                {k: c.get(k) for k in
+                 ("oid", "label", "kind", "unit", "direction", "green",
+                  "amber", "expected", "observed", "confidence", "note")}
+                for c in keep],
+            "notes": (payload.get("notes") or [])[:FACTS_NOTES],
+        })
+    return {"devices": devices} if devices else {}
 
 
 def candidates(device, rows, names=None):

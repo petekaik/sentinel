@@ -108,8 +108,10 @@ optional `root` argument overrides the derivation.
 The Discovery sheet is the command's surface: it sends `max_oids` (default
 40000) and the optional `root`, and `snmp.discover` is hidden from the generic
 Commands list. The command is bounded at 180 s, enough for a larger walk. It
-writes nothing: a walk has no path to the settings, so reviewing is always a
-separate, explicit step.
+writes no SETTINGS, so reviewing is always a separate, explicit step; the
+walk's RESULT is stored per device (`store.record_snmp_discovery`) so the
+intelligence layer's author lane can read the same candidates and propose rows
+(`append_rows`, below).
 
 The derivation matters because the enterprises tree is ordered: a 2000-object
 cap spent on Broadcom's `4413` branch never reaches Ubiquiti's `41112`, so an
@@ -148,6 +150,23 @@ the one stable, unique fact.
 **Add selected.** One `apply_discovery` call validates the whole merged
 `SNMP_CHECKS` list before writing, so a bad selected row refuses the entire
 selection rather than leaving half of it in force.
+
+**Author proposals.** The latest stored discovery per device is part of the
+module's scoped view (`intelligence_facts`): the classified candidates,
+identity, truncation and notes, bounded to 40 candidates per device. At an
+`author` grant of `propose`, the model may return an `append_rows` proposal
+naming rows from that pack; the platform merges them over the current
+`SNMP_CHECKS`, validates the result, and stores a pending proposal. Approval is
+the normal proposal path (a human decision), and a row whose OID is not in the
+stored discovery is dropped before it reaches the queue.
+
+**MIB files.** Each device row on the module page can carry one or more
+operator-supplied MIB files (the MIB files card below the discovery sheet).
+They are stored under the monitor's data volume at
+`MONITOR_DATA/mibs/<device>/<name>` (mode 600), validated as a plain file name
+with a `.mib`/`.txt`/`.my` extension, and never parsed or executed in this
+delivery. They are the operator's reference for what an OID means; parsing them
+into labels is a later step.
 
 **Next collection.** The rows appear on the next epoch. An interface that is
 currently down is proposed as a `state` row expecting `up`, so it reports

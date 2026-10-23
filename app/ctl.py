@@ -325,6 +325,27 @@ def _approve_settings(cfg, conn, mods, row, payload, actor):
     mod = mods.get(module_id)
     if mod is None:
         raise ProposalRefused("module %r is not discovered" % module_id)
+    if row["kind"] == "append_rows":
+        # TURN ADDITIVE ROWS INTO THE FULL VALUE the write path expects. The
+        # model named rows; `before` is the list it saw, and the stale check
+        # below proves the list has not moved since.
+        declared_all = {s.key: s for s in mod.settings}
+        key = payload.get("setting")
+        rows = payload.get("rows") or []
+        setting = declared_all.get(key)
+        if (setting is None or setting.kind != "list"
+                or not isinstance(rows, list) or not rows):
+            raise ProposalRefused(
+                "the append_rows proposal does not name a list setting and "
+                "rows")
+        current = settingsapi._effective_values(cfg, conn, mod, {},
+                                                declared_all)
+        merged = list(current.get(key) or [])
+        for row_value in rows:
+            if row_value not in merged:
+                merged.append(row_value)
+        payload = {"settings": {key: merged},
+                   "before": payload.get("before")}
     settings = payload.get("settings")
     if not isinstance(settings, dict):
         settings = {k: v for k, v in payload.items()
@@ -417,7 +438,7 @@ def approve_proposal(cfg, conn, mods, proposal_id, actor, ctx=None):
                 ctx if ctx is not None else _context(cfg, mods))
         elif row["kind"] == "threshold_change":
             detail = _approve_threshold(cfg, conn, mods, row, payload, actor)
-        elif row["kind"] in ("check_set", "settings_change"):
+        elif row["kind"] in ("check_set", "settings_change", "append_rows"):
             detail = _approve_settings(cfg, conn, mods, row, payload, actor)
         else:
             raise ProposalRefused(

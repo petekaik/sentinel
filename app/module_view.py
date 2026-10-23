@@ -214,6 +214,17 @@ class ModuleView(advisors.Snapshot):
                                   "direction": s.direction, "green": s.green,
                                   "amber": s.amber}
                              for sid, s in self.specs.items()}}
+        # MODULE FACTS THE CHECKS DO NOT CARRY (SNMP's latest discovery). A
+        # failure is named in the pack: an empty facts block and "could not
+        # read" must not look the same to the model or the operator.
+        try:
+            facts = self.mod.intelligence_facts(self._conn, since, max_rows)
+        except Exception as exc:                   # noqa: BLE001 - reported
+            payload["facts_error"] = ("%s: %s" % (type(exc).__name__,
+                                                  exc))[:200]
+        else:
+            if facts:
+                payload["facts"] = facts
         logs = []
         for target in self.targets:
             try:

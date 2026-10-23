@@ -1676,6 +1676,124 @@ def test_ucd_disk_usage_takes_its_path_as_the_name(results):
         "cands=%r" % (cands,))
 
 
+def test_the_latest_discovery_reaches_the_author_lane_view(results):
+    tmp, conn = _grant_store()
+    try:
+        cands = [{"device": "sw1",
+                  "oid": "1.3.6.1.2.1.2.2.1.8.%d" % i,
+                  "label": "Interface %d" % i, "kind": "state",
+                  "expected": 1, "unit": "", "direction": None,
+                  "green": None, "amber": None, "observed": 1,
+                  "confidence": "high", "note": ""}
+                 for i in range(1, 61)]
+        store.record_snmp_discovery(conn, "sw1", {
+            "candidates": cands,
+            "identity": {"sysName": "sw1", "vendor": "Test"},
+            "notes": ["vendor root 1.3.6.1.4.1.41112"], "truncated": False})
+        cfg = _cycle_cfg(
+            SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+            SNMP_COMMUNITIES='{"sw1":"public"}',
+            SNMP_INTELLIGENCE='{"observe": true}')
+        mods = tuple(module_loader.discover())
+        ctx = checks.Context(cfg, {}, {}, modules=mods)
+        mod = next(m for m in mods if m.id == "snmp")
+        grant, _ = cfg.intelligence_grant("snmp", tuple(mod.intelligence))
+        view = module_view.ModuleView(conn, mod, ctx, {}, grant)
+        pack = view.summaries(time.time() - 7 * 86400, max_rows=200)
+        facts = (pack.get("facts") or {}).get("devices") or []
+        first = facts[0] if facts else {}
+        results.check(
+            "the module's stored discovery is in the scoped view, bounded",
+            len(first.get("candidates") or []) == 40
+            and first.get("candidates_total") == 60
+            and first.get("candidates_omitted") == 20
+            and first.get("identity", {}).get("sysName") == "sw1",
+            "facts=%r" % (facts,))
+        results.check(
+            "the facts never carry a community",
+            "public" not in json.dumps(pack.get("facts") or {}),
+            "the author lane must see OIDs, not credentials")
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_an_append_rows_proposal_is_grounded_in_discovery(results):
+    tmp, conn, cfg, ctx, views = _model_views(
+        selector="none",
+        SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+        SNMP_COMMUNITIES='{"sw1":"public"}')
+    try:
+        oid = "1.3.6.1.2.1.2.2.1.8.1"
+        store.record_snmp_discovery(conn, "sw1", {"candidates": [
+            {"device": "sw1", "oid": oid, "label": "Interface lan1",
+             "kind": "state", "expected": 1}]})
+        grants = {m: cfg.intelligence_grant(m, tuple(v.mod.intelligence))[0]
+                  for m, v in views.items()}
+        row = {"device": "sw1", "oid": oid, "label": "Interface lan1",
+               "unit": "", "direction": None, "green": None, "amber": None,
+               "kind": "state", "expected": 1}
+        payload = {"proposals": [{
+            "module": "snmp", "kind": "append_rows",
+            "payload": {"setting": "SNMP_CHECKS", "rows": [row]},
+            "rationale": "the scan found a link-state object"}]}
+        _, props, dropped = intelligence_layer.validate_model_output(
+            payload, views, grants, conn=conn)
+        results.check(
+            "a grounded append_rows proposal survives validation",
+            len(props) == 1
+            and props[0]["payload"].get("setting") == "SNMP_CHECKS"
+            and props[0].get("classification") == authorize.ADDITIVE,
+            "props=%r dropped=%r" % (props, dropped))
+        invented = dict(row, oid="1.3.6.1.2.1.9.9.9")
+        _, props, dropped = intelligence_layer.validate_model_output(
+            {"proposals": [{"module": "snmp", "kind": "append_rows",
+                            "payload": {"setting": "SNMP_CHECKS",
+                                        "rows": [invented]},
+                            "rationale": "invented"}]},
+            views, grants, conn=conn)
+        results.check(
+            "a row whose OID is not in the discovery facts is dropped",
+            props == [] and dropped.get("snmp") == 1,
+            "props=%r dropped=%r" % (props, dropped))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_an_approved_append_rows_proposal_adds_the_check_row(results):
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = _cycle_cfg(
+            MONITOR_DB=os.path.join(tmp, "m.sqlite"),
+            SNMP_DEVICES='[{"name":"sw1","address":"192.0.2.10"}]',
+            SNMP_COMMUNITIES='{"sw1":"public"}', SNMP_CHECKS="[]")
+        conn = store.connect(cfg.db_path)
+        store.init(conn)
+        oid = "1.3.6.1.2.1.2.2.1.8.1"
+        row = {"device": "sw1", "oid": oid, "label": "Interface lan1",
+               "unit": "", "direction": None, "green": None, "amber": None,
+               "kind": "state", "expected": 1}
+        pid = store.record_proposal(
+            conn, "snmp", "append_rows",
+            {"setting": "SNMP_CHECKS", "rows": [row],
+             "before": {"SNMP_CHECKS": []}, "classification": "additive",
+             "diff": "additive: 1 row added", "requires_human": True},
+            "the scan found a link-state object",
+            expires_at=time.time() + 3600)
+        mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+        ctl.approve_proposal(cfg, conn, {"snmp": mod}, pid, "operator")
+        stored = store.setting_rows(conn)[("snmp", "SNMP_CHECKS")]
+        results.check(
+            "approval appends the proposed row to SNMP_CHECKS",
+            stored and stored[0].get("oid") == oid
+            and stored[0].get("label") == "Interface lan1",
+            "stored=%r" % (stored,))
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
 def test_discover_refuses_an_unknown_device_and_never_walks(results):
     mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
     cfg = config_mod.Config({"SNMP_DEVICES": "[]", "SNMP_TIMEOUT_S": "1"})
@@ -1938,6 +2056,16 @@ def test_the_discover_routes_walk_and_refuse_an_unknown_device(results):
             "POST /modules/snmp/discover returns labelled candidates",
             status == 200 and "Interface lan1" in labels,
             "status=%r body=%r" % (status, body))
+        read = store.connect(cfg.db_path)
+        saved = store.get_snmp_discovery(read, "sw1")
+        read.close()
+        results.check(
+            "the walk's result is persisted for the author lane",
+            saved is not None
+            and [c.get("label") for c in saved["payload"]["candidates"]]
+            == labels,
+            "saved=%r -- a walk that is shown once and forgotten can only be "
+            "acted on by the human looking at it" % (saved,))
         status, body = _http(cfg, "POST", "/api/v1/modules/snmp/discover",
                              {"device": "typo"}, token="tok")
         results.check(
@@ -4117,6 +4245,9 @@ TESTS = (
     test_semantics_classifies_each_kind_of_object,
     test_name_families_do_not_borrow_each_others_index,
     test_the_discover_command_walks_the_device_reported_vendor_root,
+    test_the_latest_discovery_reaches_the_author_lane_view,
+    test_an_append_rows_proposal_is_grounded_in_discovery,
+    test_an_approved_append_rows_proposal_adds_the_check_row,
     test_net_snmp_walks_its_ucd_branch_too,
     test_duplicate_interface_names_are_disambiguated_by_index,
     test_high_capacity_speed_supersedes_the_32_bit_speed,

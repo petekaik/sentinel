@@ -179,6 +179,62 @@ function ChangeDiff({ proposal }: { proposal: Proposal | AppliedProposal }) {
       </div>
     );
   }
+  if (proposal.kind === "append_rows") {
+    const rows = Array.isArray(payload.rows)
+      ? (payload.rows as Record<string, unknown>[])
+      : [];
+    const classification = String(payload.classification || "");
+    const notes = String(payload.diff || "").split("; ").filter(Boolean);
+    return (
+      <div className="diff">
+        {classification && (
+          <span className={`pill ${tone(classification)}`}>{classification}</span>
+        )}
+        {payload.requires_human && (
+          <span className="badge human">requires human</span>
+        )}
+        <p className="sub">
+          Adds {rows.length} row{rows.length === 1 ? "" : "s"} to{" "}
+          <code>{String(payload.setting || "")}</code>
+        </p>
+        {notes.length > 0 && (
+          <ul className="diff-notes">
+            {notes.map((note, i) => (
+              <li key={`${i}:${note}`}>{note}</li>
+            ))}
+          </ul>
+        )}
+        {rows.length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th>Label</th>
+                <th>OID</th>
+                <th>Kind</th>
+                <th>Band / expected</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={i}>
+                  <td>{String(r.label ?? "")}</td>
+                  <td>
+                    <code>{String(r.oid ?? "")}</code>
+                  </td>
+                  <td>{String(r.kind ?? "")}</td>
+                  <td>
+                    {r.kind === "state"
+                      ? `== ${String(r.expected ?? "")}`
+                      : `green ${String(r.green ?? "—")}, amber ${String(r.amber ?? "—")}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    );
+  }
   if (proposal.kind !== "check_set" && proposal.kind !== "settings_change") {
     return null;
   }

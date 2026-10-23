@@ -435,6 +435,15 @@ CREATE TABLE IF NOT EXISTS intelligence_cycle (
 );
 CREATE INDEX IF NOT EXISTS intelligence_cycle_ts ON intelligence_cycle (ts);
 
+-- THE LAST SNMP WALK PER DEVICE. The Discovery sheet is a review surface; the
+-- author lane needs the same candidates to propose check rows, so the result is
+-- kept per device. One row per device: a newer walk replaces the older one.
+CREATE TABLE IF NOT EXISTS snmp_discovery (
+    device       TEXT PRIMARY KEY,
+    ts           REAL NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS intelligence_usage (
     cycle_id   INTEGER NOT NULL,
     module     TEXT    NOT NULL,
@@ -722,6 +731,36 @@ def record_intelligence_cycle(conn, status, duration_ms, granted, read,
          json.dumps(list(read)), int(model_calls), tokens_in, tokens_out,
          detail, json.dumps(list(notes or ()))))
     return cur.lastrowid
+
+
+def record_snmp_discovery(conn, device, payload):
+    """Keep the latest discovery result for one device (replacing the old)."""
+    with _txn(conn):
+        conn.execute(
+            "INSERT INTO snmp_discovery (device, ts, payload_json) "
+            "VALUES (?,?,?) ON CONFLICT(device) DO UPDATE SET "
+            "ts = excluded.ts, payload_json = excluded.payload_json",
+            (str(device), time.time(), json.dumps(payload, default=str)))
+
+
+def list_snmp_discoveries(conn):
+    """[{device, ts, payload}] newest first. Never contains a community."""
+    rows = conn.execute(
+        "SELECT device, ts, payload_json FROM snmp_discovery "
+        "ORDER BY ts DESC").fetchall()
+    out = []
+    for device, ts, raw in rows:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        out.append({"device": device, "ts": ts, "payload": payload})
+    return out
+
+
+def get_snmp_discovery(conn, device):
+    rows = [r for r in list_snmp_discoveries(conn) if r["device"] == device]
+    return rows[0] if rows else None
 
 
 def record_intelligence_usage(conn, cycle_id, module, rows_read=0,

@@ -819,9 +819,21 @@ def test_the_manifest_lists_one_reachability_row_per_device(results):
         results.check(
             "item_fields carry their declared defaults for a new row",
             fields["enabled"].get("default") is True
-            and fields["port"].get("default") == 161,
+            and fields["port"].get("default") == 161
+            and fields["version"].get("default") == "v2c",
             "item_fields=%r -- a new device row that starts blank is saved "
             "disabled and never polled" % (fields,))
+        snmp_mod = next(m for m in mods if m.id == "snmp")
+        device_setting = next(
+            s for s in snmp_mod.settings if s.key == "SNMP_DEVICES")
+        parsed, _ = device_setting.parse_item(
+            [{"name": "sw9", "address": "192.0.2.99"}])
+        results.check(
+            "an omitted optional field takes its declared default",
+            parsed and parsed[0]["version"] == "v2c"
+            and parsed[0]["port"] == 161 and parsed[0]["enabled"] is True,
+            "parsed=%r -- a row without `version` must not read as '--'"
+            % (parsed,))
     finally:
         conn.close()
 

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import Collapse from "./Collapse";
 import {
   addDevice,
   applyDiscovery,
@@ -289,7 +290,7 @@ export default function DiscoverySheet({
         />
       </div>
 
-      <h3>Add a device</h3>
+      <Collapse title="Add a device" defaultOpen={false}>
       <p className="sub">
         The community is stored write-only in <code>SNMP_COMMUNITIES</code>:
         this form sends it once and the page never reads it back. Every
@@ -358,6 +359,7 @@ export default function DiscoverySheet({
           </span>
         )}
       </div>
+      </Collapse>
 
       {error && (
         <p className="banner red" role="alert">
@@ -513,14 +515,13 @@ export default function DiscoverySheet({
       )}
 
       {notes.length > 0 && (
-        <>
-          <h3>Not proposed</h3>
+        <Collapse title="Not proposed" count={notes.length} defaultOpen={false}>
           <ul className="sub">
             {notes.map((note) => (
               <li key={note}>{note}</li>
             ))}
           </ul>
-        </>
+        </Collapse>
       )}
     </section>
   );

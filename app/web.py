@@ -53,6 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import checks
 import commands
+import mibs
 import ctl
 import modules as module_loader
 import settingsapi
@@ -938,6 +939,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, settingsapi.settings_view(
                     cfg, conn, module_loader.discover()))
                 return
+            if path == "/api/v1/modules/snmp/mibs":
+                cfg.reload_settings(conn)
+                mod = self._snmp_module()
+                if mod is None:
+                    return
+                view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+                devices = [r.get("name") for r in
+                           (view.get("SNMP_DEVICES", {}).get("value") or [])
+                           if isinstance(r, dict) and r.get("name")]
+                self._json(200, mibs.list_all(cfg, devices))
+                return
             if path == "/api/v1/incidents":
                 # BOTH HALVES OF THE BOARD, and the freshness of the document
                 # that holds them. A list of live rows alone lets an empty
@@ -1216,6 +1228,9 @@ class Handler(BaseHTTPRequestHandler):
             if parts == ["api", "v1", "modules", "snmp", "devices"]:
                 self._add_device(cfg, conn, body)
                 return
+            if parts == ["api", "v1", "modules", "snmp", "mibs"]:
+                self._upload_mib(cfg, conn, body)
+                return
             self._error(404, "no_route", "no such /api/v1 route")
         except Exception as exc:                   # noqa: BLE001 - rendered
             self._error(500, "internal",
@@ -1303,7 +1318,52 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._error(500, "internal", "the walk returned no JSON payload")
             return
+        # THE AUTHOR LANE READS THIS. A walk that is shown once and forgotten
+        # can only be acted on by the human who was looking at it; persisting
+        # the result is what lets the next intelligence cycle propose rows from
+        # it. A failure here is visible: the walk happened, but its result did
+        # not. (The walk itself still wrote no SETTINGS.)
+        try:
+            store.record_snmp_discovery(conn, str(body.get("device") or ""),
+                                        payload)
+        except Exception as exc:                    # noqa: BLE001 - rendered
+            self._error(500, "internal",
+                        "the walk completed but its result could not be "
+                        "stored: %s" % str(exc)[:200])
+            return
         self._json(200, payload)
+
+    def _upload_mib(self, cfg, conn, body):
+        """POST /modules/snmp/mibs: store one operator-supplied MIB file.
+
+        The file is STORED, not parsed and not executed. It lives under the
+        monitor's data volume (`MONITOR_DATA/mibs/<device>/`) so it survives a
+        redeploy; the name is validated as a plain file name and the extension
+        limited to MIB/text.
+        """
+        mod = self._snmp_module()
+        if mod is None:
+            return
+        view = settingsapi.settings_view(cfg, conn, [mod])["snmp"]
+        devices = {r.get("name") for r in
+                   (view.get("SNMP_DEVICES", {}).get("value") or [])
+                   if isinstance(r, dict) and r.get("name")}
+        device = str(body.get("device") or "")
+        if device not in devices:
+            self._error(422, "invalid_value",
+                        "device %r is not in SNMP_DEVICES" % device)
+            return
+        try:
+            meta = mibs.store(cfg, device, body.get("filename"),
+                              body.get("content"))
+        except ValueError as exc:
+            self._error(422, "invalid_value", str(exc))
+            return
+        except OSError as exc:
+            self._error(500, "internal",
+                        "the MIB could not be stored: %s" % exc)
+            return
+        self._json(200, {"device": device, "file": meta})
 
     def _discover_apply(self, cfg, conn, body):
         """POST /modules/snmp/discover/apply: ONE validated settings write.

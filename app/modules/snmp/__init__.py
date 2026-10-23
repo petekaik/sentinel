@@ -16,6 +16,7 @@ from module import Module, Setting
 
 from modules.snmp import checks as snmp_checks
 from modules.snmp import commands as snmp_commands
+from modules.snmp import discovery
 from modules.snmp import preload
 from modules.snmp.settings import validate
 
@@ -36,7 +37,7 @@ MODULE = Module(
                  "required": True},
                 {"key": "port", "label": "Port", "kind": "int", "default": 161},
                 {"key": "version", "label": "Version", "kind": "str",
-                 "choices": ["v2c"]},
+                 "choices": ["v2c"], "default": "v2c"},
                 {"key": "enabled", "label": "Enabled", "kind": "bool",
                  "default": True},
             ]),
@@ -75,6 +76,7 @@ MODULE = Module(
     commands=snmp_commands.commands,
     check_instances=snmp_checks.instances,
     validate_settings=validate,
+    intelligence_facts=discovery.intelligence_facts,
     # The reachability id exists in no class either (it is built per device by
     # `check_instances`), so the static half of the ownership rule names it.
     extra_check_ids=("snmp_reachable",),

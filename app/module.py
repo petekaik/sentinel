@@ -100,6 +100,12 @@ class Setting:
                 if field.get("required") and (value is None or value == ""):
                     return None, "%s[%d].%s is required" % (
                         self.key, i, field["key"])
+                # A DECLARED DEFAULT IS THE VALUE. Storing None for an omitted
+                # optional field made the read surface show "--" for a device's
+                # `version` (the runtime defaulted to v2c, the row did not) and
+                # disagreed with the SPA's own blank-row rule.
+                if value is None and field.get("default") is not None:
+                    value = field["default"]
                 row[field["key"]] = value
             out.append(row)
         return out, ""
@@ -146,7 +152,7 @@ class Module:
                  checks=(), commands=None, actions=None, advisors=None,
                  after_epoch=None, extra_check_ids=(), check_instances=None,
                  validate_settings=None, intelligence=("observe",),
-                 owned_check_ids=None):
+                 owned_check_ids=None, intelligence_facts=None):
         for value, want, name in ((id, str, "id"), (title, str, "title"),
                                   (order, int, "order")):
             if not isinstance(value, want):
@@ -169,6 +175,7 @@ class Module:
         self._check_instances = check_instances
         self._validate_settings = validate_settings
         self._owned_check_ids = owned_check_ids
+        self._intelligence_facts = intelligence_facts
 
         self.intelligence = tuple(intelligence)
         for lane in self.intelligence:
@@ -273,6 +280,18 @@ class Module:
 
     def advisors(self):
         return list(self._advisors())
+
+    def intelligence_facts(self, conn, since, max_rows=200):
+        """Module-specific, read-only facts for the model's scoped view.
+
+        A module whose evidence is not a check result (SNMP's latest discovery)
+        contributes it here. The platform bounds nothing inside the dict; the
+        MODULE must keep it small, secret-free and JSON-ready. A failure is
+        reported in the pack by `ModuleView.summaries`, not raised into it.
+        """
+        if self._intelligence_facts is None:
+            return {}
+        return self._intelligence_facts(conn, since, max_rows)
 
     def after_epoch(self, ctx, conn, seq, dry_run=False):
         """Run the module's post-record hook and return its summary, if any."""

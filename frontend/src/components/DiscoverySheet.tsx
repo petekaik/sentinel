@@ -54,7 +54,7 @@ export default function DiscoverySheet({
   // The walk's two knobs. A modern router exposes more than the command's
   // 2000-object default, and cutting the walk short is what makes an
   // interface lose its ifName and fall back to a driver string.
-  const [maxOids, setMaxOids] = useState("4000");
+  const [maxOids, setMaxOids] = useState("8000");
   const [root, setRoot] = useState("");
   const [added, setAdded] = useState<string[]>([]);
   const [newName, setNewName] = useState("");

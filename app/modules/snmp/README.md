@@ -103,7 +103,7 @@ before. Each walk is capped by `max_oids`, with truncation reported, and an
 optional `root` argument overrides the derivation.
 
 The Discovery sheet is the command's surface: it sends `max_oids` (default
-4000) and the optional `root`, and `snmp.discover` is hidden from the generic
+8000) and the optional `root`, and `snmp.discover` is hidden from the generic
 Commands list. The command is bounded at 180 s, enough for a larger walk. It
 writes nothing: a walk has no path to the settings, so reviewing is always a
 separate, explicit step.

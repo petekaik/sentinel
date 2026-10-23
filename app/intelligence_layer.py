@@ -364,6 +364,11 @@ def pack_views(views, grants, max_tokens, cfg=None):
         '{"setting":"<setting key>","rows":[<complete row objects>]}. '
         "Every row you propose must come from the discovery facts in the pack "
         "for that module, and must carry every field its item schema needs. "
+        "When a module's facts.devices lists candidates, compare their OIDs "
+        "with that module's settings.SNMP_CHECKS and propose the most valuable "
+        "UNCONFIGURED health signals (state rows, bounded gauges) with "
+        "append_rows -- at most 10 per proposal. Skip counters, inventory "
+        "values and any OID already configured. "
         "Every insight MUST carry kind, title and body; an item without them "
         "is discarded. Every item names one of the module ids you were given. "
         "Evidence must cite ids present in the pack. A proposal is a request "

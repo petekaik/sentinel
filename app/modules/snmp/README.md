@@ -6,7 +6,8 @@ are rows in the settings, and saving a row makes it appear on the next
 collection.
 
 **Read-only, v2c only.** The module issues `GET` requests for its checks, plus
-the `GETNEXT` walk that only the explicit `discover` operator command uses; it
+the `GETBULK` walk (with a `GETNEXT` fallback) that only the explicit `discover`
+operator command uses; it
 never writes to a device and never sends a `SET`. A walk only proposes
 candidate rows and writes no setting by itself. SNMP v3
 (USM/encryption) is not implemented, and a device configured with any version
@@ -259,7 +260,7 @@ SNMP_CHECKS='[{"device":"switch-1","oid":"1.3.6.1.2.1.2.2.1.8.1",
 | File | Role |
 |---|---|
 | `ber.py` | minimal BER codec (integers, octet strings, OIDs, sequences) |
-| `snmp.py` | the v2c `GET` client: bounded UDP timeout, one retry, one error type per failure |
+| `snmp.py` | the v2c client: `GET`, `GETNEXT`, and the `GETBULK` walk (25 per request, `GETNEXT` fallback); bounded UDP timeout, one retry, one error type per failure |
 | `settings.py` | parsing (`SnmpConfig`), the community map, and the save-time rules (`validate`) |
 | `preload.py` | one poll per enabled device per epoch; installs `ctx.snmp_facts` |
 | `checks.py` | `SnmpReachable` / `SnmpOid` and the dynamic `instances(ctx)` |

@@ -720,7 +720,7 @@ The full model is
 
 ### Discovery — a walk proposes, the operator applies
 
-`GETNEXT` exists in the module for exactly one job.
+`GETBULK` (with a `GETNEXT` fallback) exists in the module for exactly one job.
 `POST /api/v1/modules/snmp/discover` runs the `snmp.discover` command, which
 walks the translated MIB-II groups (system, interfaces, bridge, host resources,
 ifXTable, sensors, PoE) and then the vendor root the device reports in

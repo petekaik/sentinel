@@ -722,7 +722,8 @@ The full model is
 
 `GETNEXT` exists in the module for exactly one job.
 `POST /api/v1/modules/snmp/discover` runs the `snmp.discover` command, which
-walks MIB-II (`1.3.6.1.2.1`) and then the vendor root the device reports in
+walks the translated MIB-II groups (system, interfaces, bridge, host resources,
+ifXTable, sensors, PoE) and then the vendor root the device reports in
 `sysObjectID` (falling back to the whole enterprises subtree, or to an explicit
 `root` argument) with `snmp.walk`, capped by `max_oids` and reporting whether
 the cap truncated either walk, then returns candidate check rows. The command

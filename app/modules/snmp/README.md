@@ -94,8 +94,10 @@ add a device row (name, address, community)
 one validated write. The community is merged server-side into
 `SNMP_COMMUNITIES` (the browser cannot read that map), and it is never returned.
 
-**Discover.** `discover` walks MIB-II (`1.3.6.1.2.1`) first, then the **vendor
-root the device reports** in `sysObjectID` (for `1.3.6.1.4.1.41112.1.6.3` that
+**Discover.** `discover` walks the MIB-II groups that carry semantics (system,
+interfaces, bridge, host resources, ifXTable, sensors, PoE) -- not the whole
+tree, whose RMON/IP tables can spend the object cap before ifXTable -- then the
+**vendor root the device reports** in `sysObjectID` (for `1.3.6.1.4.1.41112.1.6.3` that
 is `1.3.6.1.4.1.41112`). A Net-SNMP device (`8072`) also gets its UCD branch
 (`1.3.6.1.4.1.2021`), where Linux keeps memory, disk and CPU metrics. Without
 a usable `sysObjectID` it walks the whole enterprises tree (`1.3.6.1.4.1`), as

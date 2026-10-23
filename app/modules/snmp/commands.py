@@ -20,8 +20,15 @@ MIB2 = "1.3.6.1.2.1"
 SYS_OBJECT_ID = "1.3.6.1.2.1.1.2.0"
 
 
-def _vendor_root(rows, explicit=""):
-    """(root, why) for the vendor branch worth walking.
+# Branches worth walking IN ADDITION to the vendor root. Net-SNMP's UCD
+# subtree (PEN 2021) is a separate branch from its own 8072: a Linux router
+# reports sysObjectID ...8072 but keeps memory, disk and CPU metrics under
+# 2021, so walking only the reported root would miss the useful half.
+VENDOR_EXTRA = {"8072": ("1.3.6.1.4.1.2021",)}
+
+
+def _vendor_roots(rows, explicit=""):
+    """(roots, why) for the vendor branches worth walking.
 
     `sysObjectID` IS THE DEVICE TELLING US WHERE ITS VENDOR DATA LIVES. The
     whole enterprises tree is 41112 for an AP but starts at Broadcom's 4413 for
@@ -30,14 +37,16 @@ def _vendor_root(rows, explicit=""):
     is already in the MIB-II walk.
     """
     if explicit:
-        return explicit, "requested"
+        return [explicit], "requested"
     sys_oid = next((value for oid, value, _kind in rows
                     if oid == SYS_OBJECT_ID), None)
     if isinstance(sys_oid, str) and sys_oid.startswith("1.3.6.1.4.1."):
         parts = sys_oid.split(".")
         if len(parts) > 6 and parts[6].isdigit():
-            return ".".join(parts[:7]), "sysObjectID %s" % sys_oid
-    return "1.3.6.1.4.1", "no sysObjectID -- walked enterprises"
+            root = ".".join(parts[:7])
+            extra = [r for r in VENDOR_EXTRA.get(parts[6], ()) if r != root]
+            return [root] + extra, "sysObjectID %s" % sys_oid
+    return ["1.3.6.1.4.1"], "no sysObjectID -- walked enterprises"
 
 
 def _config(ctx):
@@ -116,21 +125,26 @@ def discover(ctx, args, dry_run=False):
     rows, truncated = snmp.walk(
         dev["address"], dev["community"], MIB2,
         port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
-    root, why = _vendor_root(rows, explicit)
-    ent, ent_truncated = ([], False)
-    if root != MIB2:
-        ent, ent_truncated = snmp.walk(
+    roots, why = _vendor_roots(rows, explicit)
+    all_rows = list(rows)
+    truncated_any = bool(truncated)
+    for root in roots:
+        if root == MIB2:
+            continue
+        extra_rows, extra_truncated = snmp.walk(
             dev["address"], dev["community"], root,
             port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
-    all_rows = rows + ent
+        all_rows.extend(extra_rows)
+        truncated_any = truncated_any or bool(extra_truncated)
     candidates, notes = discovery.candidates(
         dev["name"], all_rows, names=discovery.name_map(all_rows))
-    notes.insert(0, "vendor root %s (%s)" % (root, why))
+    notes.insert(0, "vendor root(s) %s (%s)" % (", ".join(roots), why))
     payload = {"device": dev["name"], "candidates": candidates,
                "notes": notes,
                "identity": discovery.identity(all_rows),
-               "roots": {"mib2": MIB2, "vendor": root, "why": why},
-               "truncated": bool(truncated or ent_truncated)}
+               "roots": {"mib2": MIB2, "vendor": roots[0],
+                         "extra": roots[1:], "why": why},
+               "truncated": truncated_any}
     return cmdlib.Result(
         True, "%d candidate(s) from %s%s" % (
             len(candidates), dev["name"],
@@ -149,9 +163,15 @@ def commands():
               cmdlib.Arg("root", required=False)),
         danger="read_only",
         validate=_refusal,
+        # The Discovery sheet is this command's surface; a second, raw-JSON
+        # form under Commands is the same action with a worse result.
+        hidden=True,
         # The device is validated in the handler because `commands()` has no
         # Context to read the configured names from. The resource is static, so
         # it is the whole device lock scope: a second walk of any device waits,
         # which is the conservative spelling of "two walks of one device".
         resources=("snmp:device",),
-        timeout_s=90)]
+        # A full walk of a large device is many round trips. The old 90 s bound
+        # cut a 4000-object walk off mid-table; 180 s covers it without turning
+        # a hung walk into an unbounded one.
+        timeout_s=180)]

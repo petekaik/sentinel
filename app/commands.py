@@ -78,7 +78,7 @@ class Result:
 
 class Command:
     def __init__(self, id, title, handler, args=(), danger="read_only",
-                 resources=(), timeout_s=60, validate=None):
+                 resources=(), timeout_s=60, validate=None, hidden=False):
         if danger not in ("read_only", "state_changing", "destructive"):
             raise ValueError("unknown danger %r" % danger)
         self.id = id
@@ -95,6 +95,11 @@ class Command:
         # do it". A validator lives on the COMMAND, in the module that knows what
         # its arguments mean, so the platform never imports a module to check one.
         self.validate = validate
+        # A command with a dedicated surface (SNMP discovery has its own review
+        # sheet) is still dispatchable by that surface, but is not rendered as a
+        # generic command form. The alternative -- two ways to walk a device,
+        # one of them a raw JSON blob -- is one duplicate too many.
+        self.hidden = bool(hidden)
 
 
 def call_bounded(fn, timeout_s):

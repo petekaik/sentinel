@@ -431,6 +431,53 @@ it("renders this module's recent command audit", async () => {
   expect(screen.queryByText("system output")).toBeNull();
 });
 
+it("does not render a command that has its own surface", async () => {
+  // `snmp.discover` is dispatchable by the Discovery sheet; a second generic
+  // form that printed its JSON output was the same action with a worse result.
+  const snmp = {
+    ...modules[0],
+    id: "snmp",
+    title: "Network devices",
+    commands: [
+      {
+        id: "discover",
+        title: "Walk an SNMP device and propose check rows",
+        danger: "read_only",
+        hidden: true,
+        args: [],
+      },
+      {
+        id: "visible",
+        title: "A visible command",
+        danger: "read_only",
+        args: [],
+      },
+    ],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      if (url === "/api/v1/modules") return respond(200, [snmp]);
+      if (url === "/api/v1/status") return respond(200, status);
+      if (url === "/api/v1/settings") return respond(200, {});
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+
+  render(
+    <MemoryRouter initialEntries={["/modules/snmp"]}>
+      <Routes>
+        <Route path="/modules/:id" element={<ModuleDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  expect(await screen.findByText("A visible command")).toBeInTheDocument();
+  expect(
+    screen.queryByText("Walk an SNMP device and propose check rows"),
+  ).toBeNull();
+});
+
 it("renders a command's args form and gates only destructive commands", async () => {
   const fleet = {
     ...modules[0],

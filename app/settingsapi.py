@@ -247,6 +247,7 @@ def module_manifests(cfg, conn, modules, specs):
             # required argument is invisible can only be run by guessing. The
             # manifest still carries no VALUE of anything.
             "commands": [{"id": c.id, "title": c.title, "danger": c.danger,
+                          "hidden": bool(getattr(c, "hidden", False)),
                           "args": [{"name": a.name,
                                     "choices": list(a.choices) if a.choices
                                     else None,

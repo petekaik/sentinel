@@ -1099,9 +1099,9 @@ def test_snmp_discover_is_declared_read_only_under_the_device_lock(results):
     if cmd is None:
         return
     results.check(
-        "discover is read-only, locks the device and is bounded at 90s",
+        "discover is read-only, locks the device and is bounded at 180s",
         cmd.danger == "read_only" and "snmp:device" in cmd.resources
-        and cmd.timeout_s == 90,
+        and cmd.timeout_s == 180 and cmd.hidden is True,
         "danger=%r resources=%r timeout=%r"
         % (cmd.danger, cmd.resources, cmd.timeout_s))
     results.check(

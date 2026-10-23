@@ -651,11 +651,11 @@ export default function ModuleDetail() {
       )}
 
       <h2>Commands</h2>
-      {mod.commands.length === 0 ? (
+      {mod.commands.filter((c) => !c.hidden).length === 0 ? (
         <p className="sub">This module exposes no commands.</p>
       ) : (
         <div className="grid">
-          {mod.commands.map((cmd) => (
+          {mod.commands.filter((c) => !c.hidden).map((cmd) => (
             <CommandPanel
               key={cmd.id}
               moduleId={mod.id}

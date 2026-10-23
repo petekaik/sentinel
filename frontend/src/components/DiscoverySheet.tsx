@@ -51,6 +51,11 @@ export default function DiscoverySheet({
   onDeviceAdded?: (name: string) => void;
 }) {
   const [device, setDevice] = useState(devices[0] ?? "");
+  // The walk's two knobs. A modern router exposes more than the command's
+  // 2000-object default, and cutting the walk short is what makes an
+  // interface lose its ifName and fall back to a driver string.
+  const [maxOids, setMaxOids] = useState("4000");
+  const [root, setRoot] = useState("");
   const [added, setAdded] = useState<string[]>([]);
   const [newName, setNewName] = useState("");
   const [address, setAddress] = useState("");
@@ -61,6 +66,7 @@ export default function DiscoverySheet({
   const [notes, setNotes] = useState<string[]>([]);
   const [identity, setIdentity] =
     useState<DiscoveryResult["identity"] | null>(null);
+  const [roots, setRoots] = useState<DiscoveryResult["roots"] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(() => new Set());
   const [labels, setLabels] = useState<Record<string, string>>({});
@@ -92,14 +98,23 @@ export default function DiscoverySheet({
       setError("Choose a device to walk.");
       return;
     }
+    const cap = Number(maxOids);
+    if (!Number.isInteger(cap) || cap < 1) {
+      setError("The OID cap must be an integer of 1 or more.");
+      return;
+    }
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const out = await discover(moduleId, name);
+      const out = await discover(moduleId, name, {
+        max_oids: cap,
+        ...(root.trim() ? { root: root.trim() } : {}),
+      });
       setCandidates(out.candidates);
       setNotes(out.notes ?? []);
       setIdentity(out.identity ?? null);
+      setRoots(out.roots ?? null);
       setTruncated(Boolean(out.truncated));
       setChecked(new Set());
       setLabels(
@@ -253,6 +268,26 @@ export default function DiscoverySheet({
           {busy ? "Working…" : "Discover"}
         </button>
       </div>
+      <div className="setting discover-opts">
+        <label htmlFor="discover-max-oids">OID cap per subtree</label>
+        <input
+          id="discover-max-oids"
+          type="number"
+          min={1}
+          value={maxOids}
+          disabled={busy}
+          onChange={(e) => setMaxOids(e.target.value)}
+        />
+        <label htmlFor="discover-root">Vendor root (blank = from sysObjectID)</label>
+        <input
+          id="discover-root"
+          type="text"
+          placeholder="e.g. 1.3.6.1.4.1.41112"
+          value={root}
+          disabled={busy}
+          onChange={(e) => setRoot(e.target.value)}
+        />
+      </div>
 
       <h3>Add a device</h3>
       <p className="sub">
@@ -332,8 +367,9 @@ export default function DiscoverySheet({
       {notice && <p className="notice">{notice}</p>}
       {truncated && (
         <p className="notice">
-          The walk hit its OID cap, so this list is truncated — some objects
-          were not reached.
+          The walk hit a subtree's OID cap, so this list is truncated — some
+          objects were not reached. Raise the OID cap (or set a narrower vendor
+          root), then walk again.
         </p>
       )}
 
@@ -342,6 +378,13 @@ export default function DiscoverySheet({
           {identity.sysDescr}
           {identity.vendor ? ` · ${identity.vendor}` : ""}
           {identity.sysName ? ` · ${identity.sysName}` : ""}
+        </p>
+      )}
+      {roots && (
+        <p className="sub">
+          Walked {roots.mib2} and {roots.vendor}
+          {roots.extra?.length ? ` + ${roots.extra.join(", ")}` : ""} —{" "}
+          {roots.why}.
         </p>
       )}
       {candidates && candidates.length === 0 && (

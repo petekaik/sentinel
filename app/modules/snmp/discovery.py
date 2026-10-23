@@ -157,6 +157,27 @@ SEMANTICS = {
     "1.3.6.1.2.1.25.3.3.1.2": {"kind": "gauge", "direction": "low_is_good",
                                "green": 70, "amber": 90, "unit": "%",
                                "label": "Processor {name}", "requires_name": False},
+    # -- UCD-SNMP / Net-SNMP (PEN 2021) ------------------------------------
+    # A Linux router reports sysObjectID under 8072 but keeps these under 2021;
+    # the command walks both (see VENDOR_EXTRA).
+    "1.3.6.1.4.1.2021.4.5": {"kind": "gauge", "unit": "kB",
+                             "label": "Total memory"},
+    "1.3.6.1.4.1.2021.4.6": {"kind": "gauge", "direction": "high_is_good",
+                             "green": 4096, "amber": 2048, "unit": "kB",
+                             "label": "Available memory"},
+    "1.3.6.1.4.1.2021.4.11": {"kind": "gauge", "unit": "kB",
+                              "label": "Total swap"},
+    "1.3.6.1.4.1.2021.4.12": {"kind": "gauge", "unit": "kB",
+                              "label": "Available swap"},
+    "1.3.6.1.4.1.2021.9.1.9": {"kind": "gauge", "direction": "low_is_good",
+                               "green": 85, "amber": 95, "unit": "%",
+                               "label": "Disk {name} used"},
+    "1.3.6.1.4.1.2021.9.1.10": {"kind": "gauge", "direction": "low_is_good",
+                                "green": 85, "amber": 95, "unit": "%",
+                                "label": "Disk {name} inodes used"},
+    "1.3.6.1.4.1.2021.11.11": {"kind": "gauge", "direction": "high_is_good",
+                               "green": 20, "amber": 10, "unit": "%",
+                               "label": "CPU idle"},
     # -- entity sensors (ENTITY-SENSOR-MIB) -------------------------------
     "1.3.6.1.2.1.99.1.1.1.4": {"kind": "gauge", "unit": "",
                                "label": "Sensor {name} value", "requires_name": False,
@@ -218,9 +239,12 @@ SEMANTICS = {
 # interface's name.
 NAME_SOURCES = (
     {
+        # ifAlias is the operator-assigned name and outranks the driver
+        # string many devices put in ifDescr. ifName -- the kernel name -- is
+        # first because it is stable and short.
         "columns": ("1.3.6.1.2.1.31.1.1.1.1",     # ifName
-                    "1.3.6.1.2.1.2.2.1.2",        # ifDescr
-                    "1.3.6.1.2.1.31.1.1.1.18"),   # ifAlias
+                    "1.3.6.1.2.1.31.1.1.1.18",    # ifAlias
+                    "1.3.6.1.2.1.2.2.1.2"),       # ifDescr
         "targets": ("1.3.6.1.2.1.2.2.1.5",
                     "1.3.6.1.2.1.2.2.1.7",
                     "1.3.6.1.2.1.2.2.1.8",
@@ -237,6 +261,11 @@ NAME_SOURCES = (
         "columns": ("1.3.6.1.2.1.47.1.1.1.7",),   # entPhysicalName
         "targets": ("1.3.6.1.2.1.99.1.1.1.4",
                     "1.3.6.1.2.1.99.1.1.1.5"),
+    },
+    {
+        "columns": ("1.3.6.1.4.1.2021.9.1.2",),   # dskPath
+        "targets": ("1.3.6.1.4.1.2021.9.1.9",
+                    "1.3.6.1.4.1.2021.9.1.10"),
     },
     {
         "columns": ("1.3.6.1.4.1.41112.1.6.1.1.1.2",),   # unifiRadioName
@@ -427,4 +456,14 @@ def candidates(device, rows, names=None):
         notes.append(
             "%d %s entr%s — counters are not proposed as gauges"
             % (counters[name], name, "y" if counters[name] == 1 else "ies"))
+    # A LABEL THAT TWO ROWS SHARE CANNOT BE TOLD APART in the sheet. Drivers
+    # often report the same ifDescr for every port ("MEDIATEK Corp. Device
+    # 7622"), so the index -- the one stable, unique fact -- disambiguates.
+    counts = {}
+    for row in out:
+        counts[row["label"]] = counts.get(row["label"], 0) + 1
+    for row in out:
+        if counts[row["label"]] > 1:
+            row["label"] = "%s (index %s)" % (
+                row["label"], row["oid"].rsplit(".", 1)[-1])
     return out, notes

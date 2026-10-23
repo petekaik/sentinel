@@ -1594,6 +1594,69 @@ def test_an_explicit_root_overrides_the_derived_vendor_root(results):
         "roots=%r" % (seen,))
 
 
+def test_net_snmp_walks_its_ucd_branch_too(results):
+    """A Linux router reports 8072 but keeps memory/disk/CPU under 2021."""
+    mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
+    cfg = config_mod.Config({
+        "SNMP_DEVICES": '[{"name":"gw","address":"192.0.2.30"}]',
+        "SNMP_COMMUNITIES": '{"gw":"public"}',
+        "SNMP_CHECKS": "[]", "SNMP_TIMEOUT_S": "1"})
+    ctx = checks.Context(cfg, {}, {}, modules=(mod,))
+    seen = []
+
+    def fake_walk(host, community, root, **kwargs):
+        seen.append(root)
+        if root == "1.3.6.1.2.1":
+            return ([("1.3.6.1.2.1.1.2.0", "1.3.6.1.4.1.8072.3.2.10",
+                      "oid")], False)
+        if root == "1.3.6.1.4.1.2021":
+            return ([("1.3.6.1.4.1.2021.4.6.0", 234676, "integer")], False)
+        return [], False
+
+    with mock.patch("modules.snmp.snmp.walk", side_effect=fake_walk):
+        res = cmdlib.run(mod, "discover", {"device": "gw"}, ctx=ctx)
+    payload = json.loads(res.output)
+    labels = [c["label"] for c in payload["candidates"]]
+    results.check(
+        "a Net-SNMP device gets its UCD subtree walked as well",
+        seen == ["1.3.6.1.2.1", "1.3.6.1.4.1.8072", "1.3.6.1.4.1.2021"]
+        and payload["roots"]["extra"] == ["1.3.6.1.4.1.2021"],
+        "roots=%r payload=%r" % (seen, payload.get("roots")))
+    results.check(
+        "the UCD memory object is proposed with its unit",
+        "Available memory" in labels,
+        "labels=%r" % (labels,))
+
+
+def test_duplicate_interface_names_are_disambiguated_by_index(results):
+    """Drivers report one ifDescr for every port; the sheet must tell them apart."""
+    rows = [("1.3.6.1.2.1.2.2.1.2.7", "MEDIATEK Corp. Device 7622", "string"),
+            ("1.3.6.1.2.1.2.2.1.2.8", "MEDIATEK Corp. Device 7622", "string"),
+            ("1.3.6.1.2.1.2.2.1.5.7", 1000, "integer"),
+            ("1.3.6.1.2.1.2.2.1.5.8", 100, "integer")]
+    cands, _ = discovery.candidates(
+        "gw", rows, names=discovery.name_map(rows))
+    labels = [c["label"] for c in cands]
+    results.check(
+        "two rows sharing a driver name keep distinct labels",
+        len(set(labels)) == 2
+        and any("index 7" in x for x in labels)
+        and any("index 8" in x for x in labels),
+        "labels=%r" % (labels,))
+
+
+def test_ucd_disk_usage_takes_its_path_as_the_name(results):
+    rows = [("1.3.6.1.4.1.2021.9.1.2.1", "/", "string"),
+            ("1.3.6.1.4.1.2021.9.1.9.1", 42, "integer")]
+    cands, _ = discovery.candidates(
+        "gw", rows, names=discovery.name_map(rows))
+    results.check(
+        "dskPercent is a gauge named by its dskPath with a starting band",
+        len(cands) == 1 and cands[0]["label"] == "Disk / used"
+        and cands[0]["unit"] == "%" and cands[0]["green"] == 85,
+        "cands=%r" % (cands,))
+
+
 def test_discover_refuses_an_unknown_device_and_never_walks(results):
     mod = [m for m in module_loader.discover() if m.id == "snmp"][0]
     cfg = config_mod.Config({"SNMP_DEVICES": "[]", "SNMP_TIMEOUT_S": "1"})
@@ -4032,6 +4095,9 @@ TESTS = (
     test_semantics_classifies_each_kind_of_object,
     test_name_families_do_not_borrow_each_others_index,
     test_the_discover_command_walks_the_device_reported_vendor_root,
+    test_net_snmp_walks_its_ucd_branch_too,
+    test_duplicate_interface_names_are_disambiguated_by_index,
+    test_ucd_disk_usage_takes_its_path_as_the_name,
     test_an_explicit_root_overrides_the_derived_vendor_root,
     test_discover_refuses_an_unknown_device_and_never_walks,
     test_discover_labels_an_interface_from_the_walk,

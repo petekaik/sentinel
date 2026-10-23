@@ -172,6 +172,43 @@ it("lists candidates without inventing a band and applies the edited checked row
   });
 });
 
+it("sends the OID cap and an explicit vendor root when the operator sets them", async () => {
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      record(calls, String(url), init);
+      if (url === "/api/v1/modules/snmp/discover") return respond(200, discovery);
+      throw new Error(`unexpected request: ${url}`);
+    }),
+  );
+
+  render(
+    <DiscoverySheet moduleId="snmp" devices={["sw1"]} readOnly={false} />,
+  );
+  fireEvent.change(screen.getByLabelText("OID cap per subtree"), {
+    target: { value: "6000" },
+  });
+  fireEvent.change(
+    screen.getByLabelText("Vendor root (blank = from sysObjectID)"),
+    { target: { value: "1.3.6.1.4.1.41112" } },
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Discover" }));
+
+  await waitFor(() =>
+    expect(
+      calls.filter((c) => c.url === "/api/v1/modules/snmp/discover"),
+    ).toHaveLength(1),
+  );
+  expect(
+    calls.filter((c) => c.url === "/api/v1/modules/snmp/discover")[0].body,
+  ).toEqual({
+    device: "sw1",
+    max_oids: 6000,
+    root: "1.3.6.1.4.1.41112",
+  });
+});
+
 it("refuses to add a gauge with no band, and sends nothing", async () => {
   const calls: Call[] = [];
   vi.stubGlobal(

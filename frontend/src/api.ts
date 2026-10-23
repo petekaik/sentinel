@@ -189,6 +189,9 @@ export type CommandField = {
   /* "read_only" | "state_changing" | "destructive". Only the last one asks
      for a confirmation, and the server enforces that independently. */
   danger?: string | null;
+  /* A command with a dedicated surface (SNMP discovery) is not rendered as
+     a generic form; its own sheet calls the same command. */
+  hidden?: boolean;
   args?: CommandArg[];
 };
 
@@ -415,11 +418,20 @@ export type DiscoveryResult = {
     vendor?: string;
     enterprise?: string;
   };
-  roots?: { mib2: string; vendor: string; why: string };
+  roots?: { mib2: string; vendor: string; extra?: string[]; why: string };
 };
 
-export const discover = (id: string, device: string) =>
-  req<DiscoveryResult>("POST", `/api/v1/modules/${id}/discover`, { device });
+export type DiscoverOptions = {
+  /** Per-subtree object cap. The command's own default is 2000. */
+  max_oids?: number;
+  /** Walk only this OID subtree instead of the sysObjectID-derived root. */
+  root?: string;
+};
+
+export const discover = (id: string, device: string,
+                         opts: DiscoverOptions = {}) =>
+  req<DiscoveryResult>("POST", `/api/v1/modules/${id}/discover`,
+                       { device, ...opts });
 
 export const applyDiscovery = (id: string, device: string,
                                 rows: DiscoveryRow[]) =>

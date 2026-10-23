@@ -142,6 +142,10 @@ td { padding:5px 7px; border-bottom:1px solid #1c212a; vertical-align:top;
 .band-edit { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .band-edit label { display:flex; align-items:center; gap:4px; font-size:12px; }
 .band-edit input { width:7ch; }
+.discover-opts { flex-direction:row; align-items:center; gap:8px; flex-wrap:wrap; }
+.discover-opts label { font-size:12px; }
+.discover-opts input[type="number"] { width:8ch; }
+.discover-opts input[type="text"] { flex:1 1 18ch; }
 
 input, select, textarea, button { font:inherit; color:var(--fg);
                                   background:#10151a; border:1px solid var(--line);

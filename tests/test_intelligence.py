@@ -1557,8 +1557,11 @@ def test_the_discover_command_walks_the_device_reported_vendor_root(results):
     labels = [c["label"] for c in payload["candidates"]]
     results.check(
         "sysObjectID selects the vendor root instead of all enterprises",
-        seen == ["1.3.6.1.2.1", "1.3.6.1.4.1.41112"],
-        "walk roots=%r" % (seen,))
+        seen[:2] == ["1.3.6.1.2.1", "1.3.6.1.4.1.41112"]
+        and "1.3.6.1.4.1" not in seen
+        and "1.3.6.1.2.1.31.1.1.1.1" in seen,
+        "walk roots=%r -- the name columns are walked on their own so a"
+        " truncated main tree still gets ifName" % (seen,))
     results.check(
         "the vendor identity is translated, not left as a PEN",
         payload["identity"].get("vendor") == "Ubiquiti"
@@ -1589,7 +1592,7 @@ def test_an_explicit_root_overrides_the_derived_vendor_root(results):
                           "root": "1.3.6.1.4.1.99999"}, ctx=ctx)
     results.check(
         "a requested root is walked as given",
-        seen == ["1.3.6.1.2.1", "1.3.6.1.4.1.99999"]
+        seen[:2] == ["1.3.6.1.2.1", "1.3.6.1.4.1.99999"]
         and json.loads(res.output)["roots"]["why"] == "requested",
         "roots=%r" % (seen,))
 
@@ -1619,7 +1622,7 @@ def test_net_snmp_walks_its_ucd_branch_too(results):
     labels = [c["label"] for c in payload["candidates"]]
     results.check(
         "a Net-SNMP device gets its UCD subtree walked as well",
-        seen == ["1.3.6.1.2.1", "1.3.6.1.4.1.8072", "1.3.6.1.4.1.2021"]
+        seen[:3] == ["1.3.6.1.2.1", "1.3.6.1.4.1.8072", "1.3.6.1.4.1.2021"]
         and payload["roots"]["extra"] == ["1.3.6.1.4.1.2021"],
         "roots=%r payload=%r" % (seen, payload.get("roots")))
     results.check(

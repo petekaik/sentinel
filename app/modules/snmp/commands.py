@@ -136,6 +136,16 @@ def discover(ctx, args, dry_run=False):
             port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
         all_rows.extend(extra_rows)
         truncated_any = truncated_any or bool(extra_truncated)
+    # NAME COLUMNS ARE WALKED ON THEIR OWN. The main tree's cap can cut MIB-II
+    # before ifXTable, and a truncated name column turns every port into its
+    # driver string in the sheet. These tables are small; one walk each is
+    # cheaper than raising the cap until the whole tree fits.
+    for column in discovery.name_columns():
+        name_rows, name_truncated = snmp.walk(
+            dev["address"], dev["community"], column,
+            port=dev["port"], timeout=cfg.timeout_s, max_oids=1000)
+        all_rows.extend(name_rows)
+        truncated_any = truncated_any or bool(name_truncated)
     candidates, notes = discovery.candidates(
         dev["name"], all_rows, names=discovery.name_map(all_rows))
     notes.insert(0, "vendor root(s) %s (%s)" % (", ".join(roots), why))

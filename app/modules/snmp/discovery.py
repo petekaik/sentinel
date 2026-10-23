@@ -295,6 +295,22 @@ STARTING_BANDS = {
 }
 
 
+def name_columns():
+    """Every name column the table knows, deduped in preference order.
+
+    The command walks these SEPARATELY as well as inside the main trees: a
+    big device truncates MIB-II before ifXTable, and losing ifName is what
+    turns every port into its driver string.
+    """
+    seen, out = set(), []
+    for group in NAME_SOURCES:
+        for column in group["columns"]:
+            if column not in seen:
+                seen.add(column)
+                out.append(column)
+    return tuple(out)
+
+
 def _match(oid, table):
     """The longest prefix in `table` that names `oid`, or None.
 

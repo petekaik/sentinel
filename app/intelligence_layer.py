@@ -724,6 +724,14 @@ def validate_model_output(payload, views, grants, conn=None):
                     or not isinstance(rows, list) or not rows):
                 _bump(dropped, mid)
                 continue
+            # THE MODEL COPIES OUR OWN FACT OBJECTS, which carry display-only
+            # fields (`observed`, `confidence`, `note`). The setting's schema
+            # refuses an undeclared key, so project each row onto its declared
+            # fields BEFORE validating -- the alternative is that every honest
+            # proposal is dropped for copying the evidence it was given.
+            declared_keys = [f["key"] for f in setting.item_fields]
+            rows = [{k: r.get(k) for k in declared_keys}
+                    for r in rows if isinstance(r, dict)]
             parsed, _why = setting.parse_item(rows)
             if parsed is None or len(parsed) != len(rows):
                 _bump(dropped, mid)

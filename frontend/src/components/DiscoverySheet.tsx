@@ -227,7 +227,6 @@ export default function DiscoverySheet({
 
   return (
     <section>
-      <h2>Discover checks</h2>
       <p className="sub">
         Walk a configured device and review the OIDs it answers on. The walk
         writes nothing; only the rows you check are added.

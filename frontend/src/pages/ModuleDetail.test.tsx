@@ -314,9 +314,7 @@ it("offers the discovery sheet the configured devices on the snmp page", async (
     </MemoryRouter>,
   );
 
-  expect(
-    await screen.findByRole("heading", { name: "Discover checks" }),
-  ).toBeInTheDocument();
+  expect(await screen.findByText("Discover checks")).toBeInTheDocument();
   const select = screen.getByLabelText(
     "Device to discover",
   ) as HTMLSelectElement;

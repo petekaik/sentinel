@@ -403,7 +403,7 @@ export default function ModuleDetail() {
         </div>
       )}
 
-      <Collapse title="Targets" count={mod.targets.length}>
+      <Collapse title="Targets" count={mod.targets.length} defaultOpen={false}>
       {!status ? (
         <p className="sub">
           No status document, so there is no target tile to show.
@@ -450,7 +450,75 @@ export default function ModuleDetail() {
       )}
       </Collapse>
 
-      <Collapse title="Checks" count={mod.checks.length}>
+      {flagged.length > 0 && (
+        <Collapse title="Flagged now" count={flagged.length} defaultOpen={false}>
+          <div className="scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Status</th>
+                  <th>Target</th>
+                  <th>Check</th>
+                  <th>Value</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {flagged.map((row) => (
+                  <tr key={`${row.target}|${row.check_id}|${row.subject ?? ""}`}>
+                    <td>
+                      <StatusPill status={row.status} />
+                    </td>
+                    <td>
+                      {row.target}
+                      {row.subject ? ` / ${row.subject}` : ""}
+                    </td>
+                    <td>{row.check_id}</td>
+                    <td>{value(row)}</td>
+                    <td>{row.detail ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Collapse>
+      )}
+
+      {incidents.length > 0 && (
+        <Collapse title="Live incidents" count={incidents.length} defaultOpen={false}>
+          <div className="scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Severity</th>
+                  <th>State</th>
+                  <th>Target</th>
+                  <th>Check</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {incidents.map((row) => (
+                  <tr key={row.key}>
+                    <td>
+                      <StatusPill status={row.severity} />
+                    </td>
+                    <td>{row.state}</td>
+                    <td>
+                      {row.target}
+                      {row.subject ? ` / ${row.subject}` : ""}
+                    </td>
+                    <td>{row.check_id}</td>
+                    <td>{row.detail ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Collapse>
+      )}
+
+      <Collapse title="Checks" count={mod.checks.length} defaultOpen={false}>
       {mod.checks.length === 0 ? (
         <p className="sub">
           This module declares no check classes. Settings-driven checks, if any,
@@ -538,42 +606,8 @@ export default function ModuleDetail() {
       )}
       </Collapse>
 
-      {flagged.length > 0 && (
-        <Collapse title="Flagged now" count={flagged.length}>
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>Status</th>
-                  <th>Target</th>
-                  <th>Check</th>
-                  <th>Value</th>
-                  <th>Detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {flagged.map((row) => (
-                  <tr key={`${row.target}|${row.check_id}|${row.subject ?? ""}`}>
-                    <td>
-                      <StatusPill status={row.status} />
-                    </td>
-                    <td>
-                      {row.target}
-                      {row.subject ? ` / ${row.subject}` : ""}
-                    </td>
-                    <td>{row.check_id}</td>
-                    <td>{value(row)}</td>
-                    <td>{row.detail ?? "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Collapse>
-      )}
-
       {informational.length > 0 && (
-        <Collapse title="Informational readings" count={informational.length}>
+        <Collapse title="Informational readings" count={informational.length} defaultOpen={false}>
           <div className="scroll">
             <table>
               <thead>
@@ -602,41 +636,8 @@ export default function ModuleDetail() {
         </Collapse>
       )}
 
-      {incidents.length > 0 && (
-        <Collapse title="Live incidents" count={incidents.length}>
-          <div className="scroll">
-            <table>
-              <thead>
-                <tr>
-                  <th>Severity</th>
-                  <th>State</th>
-                  <th>Target</th>
-                  <th>Check</th>
-                  <th>Detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {incidents.map((row) => (
-                  <tr key={row.key}>
-                    <td>
-                      <StatusPill status={row.severity} />
-                    </td>
-                    <td>{row.state}</td>
-                    <td>
-                      {row.target}
-                      {row.subject ? ` / ${row.subject}` : ""}
-                    </td>
-                    <td>{row.check_id}</td>
-                    <td>{row.detail ?? "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Collapse>
-      )}
-
       {mod.id === "snmp" && (
+        <Collapse title="Discover checks" defaultOpen={false}>
         <DiscoverySheet
           moduleId="snmp"
           devices={snmpDevices}
@@ -649,6 +650,7 @@ export default function ModuleDetail() {
           onApplied={() => void load()}
           onDeviceAdded={() => void load()}
         />
+        </Collapse>
       )}
 
       {mod.id === "snmp" && (
@@ -666,7 +668,8 @@ export default function ModuleDetail() {
       )}
 
       <Collapse title="Commands"
-                count={mod.commands.filter((c) => !c.hidden).length}>
+                count={mod.commands.filter((c) => !c.hidden).length}
+                defaultOpen={false}>
       {mod.commands.filter((c) => !c.hidden).length === 0 ? (
         <p className="sub">This module exposes no commands.</p>
       ) : (
@@ -728,7 +731,7 @@ export default function ModuleDetail() {
       )}
       </Collapse>
 
-      <Collapse title="Settings">
+      <Collapse title="Settings" defaultOpen={false}>
       {settingsError ? (
         <div className="banner amber" role="alert">
           Settings could not be read: {settingsError}

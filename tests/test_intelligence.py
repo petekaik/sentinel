@@ -1730,9 +1730,12 @@ def test_an_append_rows_proposal_is_grounded_in_discovery(results):
              "kind": "state", "expected": 1}]})
         grants = {m: cfg.intelligence_grant(m, tuple(v.mod.intelligence))[0]
                   for m, v in views.items()}
+        # The model copies the fact object, including its display-only
+        # fields; they must be projected away, not treated as undeclared.
         row = {"device": "sw1", "oid": oid, "label": "Interface lan1",
                "unit": "", "direction": None, "green": None, "amber": None,
-               "kind": "state", "expected": 1}
+               "kind": "state", "expected": 1,
+               "observed": 1, "confidence": "high", "note": ""}
         payload = {"proposals": [{
             "module": "snmp", "kind": "append_rows",
             "payload": {"setting": "SNMP_CHECKS", "rows": [row]},

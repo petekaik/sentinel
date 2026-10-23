@@ -114,7 +114,6 @@ export default function MibManager({
                 }}
                 type="file"
                 aria-label={`MIB file for ${device}`}
-                accept=".mib,.txt,.my"
                 disabled={busy || readOnly}
               />
               <button

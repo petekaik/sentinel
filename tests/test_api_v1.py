@@ -572,6 +572,17 @@ def test_a_mib_upload_is_stored_per_device_and_token_gated(results):
                 == ["UBNT-Combined-MIB.txt"],
                 "listing=%r" % (listing,))
 
+            status, _, out = _req(
+                base + "/api/v1/modules/snmp/mibs", "POST",
+                {"device": "sw1", "filename": "UI-Combined-MIB",
+                 "content": "UBNT-MIB DEFINITIONS ::= BEGIN\nEND\n"},
+                token="tok")
+            results.check(
+                "an extensionless MIB (a vendor download) is accepted",
+                status == 200
+                and out.get("file", {}).get("name") == "UI-Combined-MIB",
+                "status=%r out=%r" % (status, out))
+
             for name, why in (("../evil.mib", "traversal"),
                               ("evil.exe", "extension")):
                 status, _, _ = _req(

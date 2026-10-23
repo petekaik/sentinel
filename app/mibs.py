@@ -43,8 +43,13 @@ def check_name(filename):
     if name != str(filename or "").strip() or not _NAME.match(name):
         raise ValueError("the file name must be a plain name "
                          "(letters, digits, dot, dash, underscore)")
-    if not _EXT.search(name):
-        raise ValueError("only .mib, .txt or .my files can be uploaded")
+    # A MIB DOWNLOADED FROM A VENDOR SITE OFTEN HAS NO EXTENSION
+    # ("UI-Combined-MIB"). The extension is a hint, not a gate: a plain name
+    # with no suffix is allowed, and a WRONG suffix (.exe) is still refused.
+    _base, ext = os.path.splitext(name)
+    if ext and not _EXT.search(name):
+        raise ValueError("only .mib, .txt or .my files (or no extension) "
+                         "can be uploaded")
     return name
 
 

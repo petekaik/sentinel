@@ -164,8 +164,8 @@ stored discovery is dropped before it reaches the queue.
 operator-supplied MIB files (the MIB files card below the discovery sheet).
 They are stored under the monitor's data volume at
 `MONITOR_DATA/mibs/<device>/<name>` (mode 600), validated as a plain file name
-with a `.mib`/`.txt`/`.my` extension, and never parsed or executed in this
-delivery. They are the operator's reference for what an OID means; parsing them
+with a `.mib`/`.txt`/`.my` extension or no extension at all (vendor downloads
+often have none), and never parsed or executed in this delivery. They are the operator's reference for what an OID means; parsing them
 into labels is a later step.
 
 **Next collection.** The rows appear on the next epoch. An interface that is

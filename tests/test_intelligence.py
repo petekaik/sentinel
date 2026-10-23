@@ -1650,6 +1650,20 @@ def test_duplicate_interface_names_are_disambiguated_by_index(results):
         "labels=%r" % (labels,))
 
 
+def test_high_capacity_speed_supersedes_the_32_bit_speed(results):
+    rows = [("1.3.6.1.2.1.31.1.1.1.1.1", "eth0", "string"),
+            ("1.3.6.1.2.1.2.2.1.5.1", 1000000000, "integer"),
+            ("1.3.6.1.2.1.31.1.1.1.15.1", 1000, "integer")]
+    cands, _ = discovery.candidates(
+        "sw1", rows, names=discovery.name_map(rows))
+    speeds = [c for c in cands if "speed" in c["label"]]
+    results.check(
+        "one speed row per interface, the high-capacity one",
+        len(speeds) == 1 and speeds[0]["unit"] == "Mbit/s"
+        and speeds[0]["label"] == "Interface eth0 speed",
+        "speeds=%r" % (speeds,))
+
+
 def test_ucd_disk_usage_takes_its_path_as_the_name(results):
     rows = [("1.3.6.1.4.1.2021.9.1.2.1", "/", "string"),
             ("1.3.6.1.4.1.2021.9.1.9.1", 42, "integer")]
@@ -4105,6 +4119,7 @@ TESTS = (
     test_the_discover_command_walks_the_device_reported_vendor_root,
     test_net_snmp_walks_its_ucd_branch_too,
     test_duplicate_interface_names_are_disambiguated_by_index,
+    test_high_capacity_speed_supersedes_the_32_bit_speed,
     test_ucd_disk_usage_takes_its_path_as_the_name,
     test_an_explicit_root_overrides_the_derived_vendor_root,
     test_discover_refuses_an_unknown_device_and_never_walks,

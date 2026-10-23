@@ -489,6 +489,15 @@ def candidates(device, rows, names=None):
         notes.append(
             "%d %s entr%s — counters are not proposed as gauges"
             % (counters[name], name, "y" if counters[name] == 1 else "ies"))
+    # IF-MIB CARRIES THE SAME FACT TWICE. ifSpeed is 32-bit and wraps on a fast
+    # link; ifHighSpeed is the Mbit/s replacement. When both are present, one
+    # row per interface is enough -- proposing both made every speed label
+    # collide with itself.
+    high = {oid.rsplit(".", 1)[-1] for oid, _v, _k in rows
+            if oid.startswith("1.3.6.1.2.1.31.1.1.1.15.")}
+    out = [c for c in out
+           if not (c["oid"].startswith("1.3.6.1.2.1.2.2.1.5.")
+                   and c["oid"].rsplit(".", 1)[-1] in high)]
     # A LABEL THAT TWO ROWS SHARE CANNOT BE TOLD APART in the sheet. Drivers
     # often report the same ifDescr for every port ("MEDIATEK Corp. Device
     # 7622"), so the index -- the one stable, unique fact -- disambiguates.

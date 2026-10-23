@@ -582,6 +582,13 @@ def test_a_mib_upload_is_stored_per_device_and_token_gated(results):
                 status == 200
                 and out.get("file", {}).get("name") == "UI-Combined-MIB",
                 "status=%r out=%r" % (status, out))
+            status, _, listing = _req(base + "/api/v1/modules/snmp/mibs")
+            names = [f["name"] for f in listing.get("sw1", [])]
+            results.check(
+                "the extensionless MIB is listed back",
+                status == 200 and "UI-Combined-MIB" in names,
+                "listing=%r -- a stored file must not vanish from the page"
+                % (listing,))
 
             for name, why in (("../evil.mib", "traversal"),
                               ("evil.exe", "extension")):

@@ -38,18 +38,27 @@ def device_dir(cfg, device):
     return os.path.join(root(cfg), safe or "device")
 
 
+def _valid(name):
+    """A plain name, with a MIB/text extension or none at all.
+
+    A MIB DOWNLOADED FROM A VENDOR SITE OFTEN HAS NO EXTENSION
+    ("UI-Combined-MIB"). The extension is a hint, not a gate: a plain name
+    with no suffix is allowed, and a WRONG suffix (.exe) is still refused.
+    One rule for the write and the listing, so a stored file cannot vanish
+    from the page that wrote it.
+    """
+    if not _NAME.match(name):
+        return False
+    _base, ext = os.path.splitext(name)
+    return not ext or bool(_EXT.search(name))
+
+
 def check_name(filename):
     name = os.path.basename(str(filename or ""))
-    if name != str(filename or "").strip() or not _NAME.match(name):
+    if name != str(filename or "").strip() or not _valid(name):
         raise ValueError("the file name must be a plain name "
-                         "(letters, digits, dot, dash, underscore)")
-    # A MIB DOWNLOADED FROM A VENDOR SITE OFTEN HAS NO EXTENSION
-    # ("UI-Combined-MIB"). The extension is a hint, not a gate: a plain name
-    # with no suffix is allowed, and a WRONG suffix (.exe) is still refused.
-    _base, ext = os.path.splitext(name)
-    if ext and not _EXT.search(name):
-        raise ValueError("only .mib, .txt or .my files (or no extension) "
-                         "can be uploaded")
+                         "(letters, digits, dot, dash, underscore) with a "
+                         ".mib/.txt/.my extension or none")
     return name
 
 
@@ -85,7 +94,7 @@ def list_for(cfg, device):
         return []
     out = []
     for name in entries:
-        if not _NAME.match(name) or not _EXT.search(name):
+        if not _valid(name):
             continue
         path = os.path.join(directory, name)
         try:

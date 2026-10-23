@@ -96,11 +96,17 @@ one validated write. The community is merged server-side into
 
 **Discover.** `discover` walks MIB-II (`1.3.6.1.2.1`) first, then the **vendor
 root the device reports** in `sysObjectID` (for `1.3.6.1.4.1.41112.1.6.3` that
-is `1.3.6.1.4.1.41112`). Without a usable `sysObjectID` it walks the whole
-enterprises tree (`1.3.6.1.4.1`), as before. Both walks are capped by
-`max_oids`, with truncation reported. An optional `root` argument overrides the
-derivation. It writes nothing: a walk has no path to the settings, so reviewing
-is always a separate, explicit step.
+is `1.3.6.1.4.1.41112`). A Net-SNMP device (`8072`) also gets its UCD branch
+(`1.3.6.1.4.1.2021`), where Linux keeps memory, disk and CPU metrics. Without
+a usable `sysObjectID` it walks the whole enterprises tree (`1.3.6.1.4.1`), as
+before. Each walk is capped by `max_oids`, with truncation reported, and an
+optional `root` argument overrides the derivation.
+
+The Discovery sheet is the command's surface: it sends `max_oids` (default
+4000) and the optional `root`, and `snmp.discover` is hidden from the generic
+Commands list. The command is bounded at 180 s, enough for a larger walk. It
+writes nothing: a walk has no path to the settings, so reviewing is always a
+separate, explicit step.
 
 The derivation matters because the enterprises tree is ordered: a 2000-object
 cap spent on Broadcom's `4413` branch never reaches Ubiquiti's `41112`, so an
@@ -125,11 +131,16 @@ device identity (`sysDescr`, `sysName`, `sysLocation`, `sysObjectID`, vendor) is
 returned alongside the candidates.
 
 Starting bands are reviewed values: `STARTING_BANDS` is the gauge/state subset
-of `SEMANTICS`, and a band is never widened to fit the observation. An interface
-row whose index has no name from `ifName`/`ifDescr`/`ifAlias` is reported, not
-proposed -- a label a human cannot verify is not invented. Name columns are
-applied per table family (`ifIndex`, `entPhysicalIndex`, radio/VAP/unifiIf
-indices), so one family's index cannot label another's row.
+of `SEMANTICS`, and a band is never widened to fit the observation. Band inputs
+in the sheet let the operator set one where the table has no defensible
+suggestion; a gauge cannot be applied without it. An interface row whose index
+has no name from `ifName`/`ifAlias`/`ifDescr` is reported, not proposed -- a
+label a human cannot verify is not invented. Name columns are applied per table
+family (`ifIndex`, `entPhysicalIndex`, `dskPath`, radio/VAP/unifiIf indices), so
+one family's index cannot label another's row. When several rows share a name
+(drivers often report one `ifDescr` for every port), the label gets its index --
+`Interface MEDIATEK Corp. Device 7622 speed (index 8)` -- because the index is
+the one stable, unique fact.
 
 **Add selected.** One `apply_discovery` call validates the whole merged
 `SNMP_CHECKS` list before writing, so a bad selected row refuses the entire

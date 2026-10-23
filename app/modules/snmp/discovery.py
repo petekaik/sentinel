@@ -295,6 +295,23 @@ STARTING_BANDS = {
 }
 
 
+def mib2_roots():
+    """The MIB-II groups this table can translate, as walk roots.
+
+    WALKING ALL OF MIB-II IS NOT THE SAME AS WALKING THE USEFUL PARTS. A router
+    with a large RMON/IP table spends the whole object cap before reaching
+    ifXTable, which is where ifName lives; walking the groups that carry
+    semantics (system, interfaces, bridge, host, ifXTable, sensors, PoE) is
+    smaller, faster, and cannot truncate a meaningful group away.
+    """
+    roots = set()
+    for prefix in SEMANTICS:
+        parts = prefix.split(".")
+        if prefix.startswith("1.3.6.1.2.1.") and len(parts) > 6:
+            roots.add(".".join(parts[:7]))
+    return tuple(sorted(roots, key=lambda o: [int(x) for x in o.split(".")]))
+
+
 def name_columns():
     """Every name column the table knows, deduped in preference order.
 

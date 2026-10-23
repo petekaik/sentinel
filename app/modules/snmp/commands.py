@@ -122,14 +122,21 @@ def discover(ctx, args, dry_run=False):
     if dry_run:
         return cmdlib.Result(True, "would walk %s" % dev["name"])
     explicit = str(args.get("root") or "").strip().lstrip(".")
-    rows, truncated = snmp.walk(
-        dev["address"], dev["community"], MIB2,
-        port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
-    roots, why = _vendor_roots(rows, explicit)
-    all_rows = list(rows)
-    truncated_any = bool(truncated)
-    for root in roots:
-        if root == MIB2:
+    # Walk the translated MIB-II groups, not the whole tree: the RMON/IP tables
+    # can spend the cap before ifXTable, and every group below is one this
+    # module can actually grade.
+    groups = [] if explicit else list(discovery.mib2_roots())
+    all_rows = []
+    truncated_any = False
+    for root in ([explicit] if explicit else groups):
+        group_rows, group_truncated = snmp.walk(
+            dev["address"], dev["community"], root,
+            port=dev["port"], timeout=cfg.timeout_s, max_oids=max_oids)
+        all_rows.extend(group_rows)
+        truncated_any = truncated_any or bool(group_truncated)
+    vendor, why = _vendor_roots(all_rows, explicit)
+    for root in vendor:
+        if root in groups or root == explicit:
             continue
         extra_rows, extra_truncated = snmp.walk(
             dev["address"], dev["community"], root,
@@ -148,12 +155,15 @@ def discover(ctx, args, dry_run=False):
         truncated_any = truncated_any or bool(name_truncated)
     candidates, notes = discovery.candidates(
         dev["name"], all_rows, names=discovery.name_map(all_rows))
-    notes.insert(0, "vendor root(s) %s (%s)" % (", ".join(roots), why))
+    notes.insert(0, "walked MIB-II groups %s; vendor root(s) %s (%s)"
+                 % (", ".join(groups) or "(explicit root only)",
+                    ", ".join(vendor), why))
     payload = {"device": dev["name"], "candidates": candidates,
                "notes": notes,
                "identity": discovery.identity(all_rows),
-               "roots": {"mib2": MIB2, "vendor": roots[0],
-                         "extra": roots[1:], "why": why},
+               "roots": {"mib2": MIB2, "groups": groups,
+                         "vendor": vendor[0] if vendor else "",
+                         "extra": vendor[1:], "why": why},
                "truncated": truncated_any}
     return cmdlib.Result(
         True, "%d candidate(s) from %s%s" % (

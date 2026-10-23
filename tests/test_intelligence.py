@@ -1542,7 +1542,7 @@ def test_the_discover_command_walks_the_device_reported_vendor_root(results):
 
     def fake_walk(host, community, root, **kwargs):
         seen.append(root)
-        if root == "1.3.6.1.2.1":
+        if root == "1.3.6.1.2.1.1":
             return ([("1.3.6.1.2.1.1.1.0", "UniFi AP", "string"),
                      ("1.3.6.1.2.1.1.2.0", "1.3.6.1.4.1.41112.1.6.3", "oid"),
                      ("1.3.6.1.2.1.1.5.0", "ap1", "string")], False)
@@ -1557,11 +1557,13 @@ def test_the_discover_command_walks_the_device_reported_vendor_root(results):
     labels = [c["label"] for c in payload["candidates"]]
     results.check(
         "sysObjectID selects the vendor root instead of all enterprises",
-        seen[:2] == ["1.3.6.1.2.1", "1.3.6.1.4.1.41112"]
+        seen[0] == "1.3.6.1.2.1.1"
+        and "1.3.6.1.2.1" not in seen
+        and "1.3.6.1.4.1.41112" in seen
         and "1.3.6.1.4.1" not in seen
         and "1.3.6.1.2.1.31.1.1.1.1" in seen,
-        "walk roots=%r -- the name columns are walked on their own so a"
-        " truncated main tree still gets ifName" % (seen,))
+        "walk roots=%r -- the meaningful MIB-II groups and the name columns"
+        " are walked on their own" % (seen,))
     results.check(
         "the vendor identity is translated, not left as a PEN",
         payload["identity"].get("vendor") == "Ubiquiti"
@@ -1592,7 +1594,7 @@ def test_an_explicit_root_overrides_the_derived_vendor_root(results):
                           "root": "1.3.6.1.4.1.99999"}, ctx=ctx)
     results.check(
         "a requested root is walked as given",
-        seen[:2] == ["1.3.6.1.2.1", "1.3.6.1.4.1.99999"]
+        seen[0] == "1.3.6.1.4.1.99999"
         and json.loads(res.output)["roots"]["why"] == "requested",
         "roots=%r" % (seen,))
 
@@ -1609,7 +1611,7 @@ def test_net_snmp_walks_its_ucd_branch_too(results):
 
     def fake_walk(host, community, root, **kwargs):
         seen.append(root)
-        if root == "1.3.6.1.2.1":
+        if root == "1.3.6.1.2.1.1":
             return ([("1.3.6.1.2.1.1.2.0", "1.3.6.1.4.1.8072.3.2.10",
                       "oid")], False)
         if root == "1.3.6.1.4.1.2021":
@@ -1622,7 +1624,7 @@ def test_net_snmp_walks_its_ucd_branch_too(results):
     labels = [c["label"] for c in payload["candidates"]]
     results.check(
         "a Net-SNMP device gets its UCD subtree walked as well",
-        seen[:3] == ["1.3.6.1.2.1", "1.3.6.1.4.1.8072", "1.3.6.1.4.1.2021"]
+        "1.3.6.1.4.1.8072" in seen and "1.3.6.1.4.1.2021" in seen
         and payload["roots"]["extra"] == ["1.3.6.1.4.1.2021"],
         "roots=%r payload=%r" % (seen, payload.get("roots")))
     results.check(
@@ -1697,9 +1699,10 @@ def test_discover_labels_an_interface_from_the_walk(results):
     ctx = checks.Context(cfg, {}, {}, modules=(mod,))
 
     def fake_walk(host, community, root, **kwargs):
-        if root == "1.3.6.1.2.1":
-            return ([("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string"),
-                     ("1.3.6.1.2.1.2.2.1.8.1", 1, "integer")], False)
+        if root == "1.3.6.1.2.1.2":
+            return ([("1.3.6.1.2.1.2.2.1.8.1", 1, "integer")], False)
+        if root == "1.3.6.1.2.1.31.1.1.1.1":
+            return ([("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string")], False)
         return ([], False)
 
     with mock.patch("modules.snmp.snmp.walk", side_effect=fake_walk):
@@ -1906,9 +1909,11 @@ def test_the_discover_routes_walk_and_refuse_an_unknown_device(results):
         conn.close()
 
         def fake_walk(host, community, root, **kwargs):
-            if root == "1.3.6.1.2.1":
-                return ([("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string"),
-                         ("1.3.6.1.2.1.2.2.1.8.1", 1, "integer")], False)
+            if root == "1.3.6.1.2.1.2":
+                return ([("1.3.6.1.2.1.2.2.1.8.1", 1, "integer")], False)
+            if root == "1.3.6.1.2.1.31.1.1.1.1":
+                return ([("1.3.6.1.2.1.31.1.1.1.1.1", "lan1", "string")],
+                        False)
             return ([], False)
 
         with mock.patch("modules.snmp.snmp.walk", side_effect=fake_walk):

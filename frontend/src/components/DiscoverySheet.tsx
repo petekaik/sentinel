@@ -382,7 +382,8 @@ export default function DiscoverySheet({
       )}
       {roots && (
         <p className="sub">
-          Walked {roots.mib2} and {roots.vendor}
+          Walked MIB-II groups {roots.groups?.join(", ") || roots.mib2} and{" "}
+          {roots.vendor}
           {roots.extra?.length ? ` + ${roots.extra.join(", ")}` : ""} —{" "}
           {roots.why}.
         </p>

@@ -418,7 +418,13 @@ export type DiscoveryResult = {
     vendor?: string;
     enterprise?: string;
   };
-  roots?: { mib2: string; vendor: string; extra?: string[]; why: string };
+  roots?: {
+    mib2: string;
+    groups?: string[];
+    vendor: string;
+    extra?: string[];
+    why: string;
+  };
 };
 
 export type DiscoverOptions = {
